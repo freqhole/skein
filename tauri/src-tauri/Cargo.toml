@@ -31,5 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
 iroh = "0.97"
+base64 = "0.22"
+blake3 = "1"
 
 reliquary = { path = "../../reliquary" }

@@ -74,6 +74,8 @@ async fn start_service() -> anyhow::Result<(
         service::ServiceConfig {
             data_dir,
             username,
+            bio: String::new(),
+            avatar_path: None,
         },
     )
     .await?;
@@ -115,11 +117,7 @@ pub fn run() {
         .manage(app_state)
         .manage(runtime)
         .invoke_handler(tauri::generate_handler![
-            commands::skein_node_id,
-            commands::skein_status,
-            commands::skein_friend_add,
-            commands::skein_friend_list,
-            commands::blob_list,
+            commands::skein_dispatch,
         ])
         .setup(move |app| {
             let cancel = cancel.clone();
