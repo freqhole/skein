@@ -102,29 +102,29 @@ impl HubPeerService {
                 avatar_data_url,
             } => {
                 // update the remote peer's profile in userz.
-                // NOTE: phase-2 still passes the data URL through verbatim.
-                // future cleanup: extract the bytes, persist into blobz,
-                // and store only the blake3 reference (parity with how the
-                // hub stores its own avatar). leaving as-is for now to keep
-                // the wire format compatible with existing browser peers.
+                //
+                // avatar handling: decode the data URL, re-encode to a
+                // canonical 128px webp, persist into blobz (deduped by
+                // blake3), and store only the blake3 reference in
+                // userz.avatar_blake3. mirrors how `process_hub_avatar`
+                // handles the hub's own avatar in hub/mod.rs.
                 tracing::debug!(
                     peer = %from_node_id,
                     username = %username,
                     "received profile response"
                 );
+
+                let avatar_blake3 = self
+                    .persist_peer_avatar(from_node_id, &avatar_data_url)
+                    .await;
+
                 if let Err(e) = self
                     .userz
                     .upsert_profile(
                         from_node_id,
                         Some(&username),
                         Some(&bio),
-                        // store the data URL in avatar_blake3 column for now;
-                        // re-encoded to a blob ref in a follow-up pass
-                        if avatar_data_url.is_empty() {
-                            None
-                        } else {
-                            Some(avatar_data_url.as_str())
-                        },
+                        avatar_blake3.as_deref(),
                     )
                     .await
                 {
@@ -548,6 +548,71 @@ impl HubPeerService {
                 // trigger a snatch scan since we now have new information about
                 // where blobs might be available
                 self.snatch_trigger.notify_one();
+            }
+        }
+    }
+
+    /// re-encode an inbound peer avatar data URL to a canonical 128px webp
+    /// blob, persist it into `blobz`, and return the blake3 ref.
+    ///
+    /// returns `None` for empty/malformed data URLs or when image processing
+    /// fails — callers should fall through to clearing the avatar reference.
+    pub(crate) async fn persist_peer_avatar(
+        &self,
+        peer_node_id: &str,
+        data_url: &str,
+    ) -> Option<String> {
+        use crate::hub::avatar;
+
+        let (_mime, raw_bytes) = avatar::decode_data_url(data_url)?;
+        if raw_bytes.is_empty() {
+            return None;
+        }
+
+        let webp = match avatar::resize_to_square_webp(&raw_bytes, 128) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(
+                    peer = %peer_node_id,
+                    error = %e,
+                    "failed to re-encode peer avatar; skipping"
+                );
+                return None;
+            }
+        };
+
+        let blake3_hash = blake3::hash(&webp).to_hex().to_string();
+
+        // dedupe: skip insert if already present.
+        match self.blobz.get(&blake3_hash).await {
+            Ok(Some(_)) => Some(blake3_hash),
+            Ok(None) => match self
+                .blobz
+                .insert(
+                    blake3_hash.clone(),
+                    Some("peer-avatar.webp".to_string()),
+                    Some("image/webp".to_string()),
+                    &webp,
+                )
+                .await
+            {
+                Ok(blob_ref) => Some(blob_ref.blake3),
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %peer_node_id,
+                        error = %e,
+                        "failed to persist peer avatar to blobz"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    peer = %peer_node_id,
+                    error = %e,
+                    "blobz lookup for peer avatar failed"
+                );
+                None
             }
         }
     }

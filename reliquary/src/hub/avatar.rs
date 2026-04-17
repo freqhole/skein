@@ -21,6 +21,30 @@ pub fn resize_to_square_webp(bytes: &[u8], size: u32) -> anyhow::Result<Vec<u8>>
     Ok(encoder.encode(75.0).to_vec())
 }
 
+/// decode a `data:image/...;base64,...` URL into raw bytes.
+///
+/// returns the decoded payload (any image format the `image` crate can
+/// understand) along with the declared mime type. returns `None` for empty
+/// or malformed input — callers should treat that as "no avatar".
+pub fn decode_data_url(data_url: &str) -> Option<(String, Vec<u8>)> {
+    use base64::Engine;
+    let trimmed = data_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // expected shape: "data:<mime>;base64,<payload>"
+    let rest = trimmed.strip_prefix("data:")?;
+    let (header, payload) = rest.split_once(',')?;
+    let mime = header.split(';').next()?.trim();
+    if mime.is_empty() {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .ok()?;
+    Some((mime.to_string(), bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,5 +76,25 @@ mod tests {
     fn rejects_non_image_bytes() {
         let result = resize_to_square_webp(b"not an image at all", 64);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_data_url_round_trip() {
+        use base64::Engine;
+        let payload = b"hello-bytes";
+        let url = format!(
+            "data:image/webp;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(payload)
+        );
+        let (mime, bytes) = decode_data_url(&url).expect("decode");
+        assert_eq!(mime, "image/webp");
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn decode_data_url_rejects_garbage() {
+        assert!(decode_data_url("").is_none());
+        assert!(decode_data_url("not-a-data-url").is_none());
+        assert!(decode_data_url("data:image/png;base64,!!!not-base64!!!").is_none());
     }
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use iroh::SecretKey;
-use reliquary::{db, identity};
+use reliquary::{db, friendz, identity, userz};
 
 #[derive(Parser, Debug)]
 #[command(name = "reliquary", version, about = "skein hub peer")]
@@ -31,6 +31,26 @@ enum Command {
 
     /// print the persisted node id and exit
     NodeId,
+
+    /// manage the friendz allow-list (operator-controlled access to the hub)
+    #[command(subcommand)]
+    Friend(FriendCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum FriendCommand {
+    /// pre-approve a peer so the hub auto-accepts an inbound friend-request from them
+    Allow {
+        /// the peer's iroh node id (hex public key)
+        node_id: String,
+    },
+    /// list every peer the hub knows about, with status
+    List,
+    /// remove a peer from the friendz table entirely (revokes any prior approval)
+    Remove {
+        /// the peer's iroh node id (hex public key)
+        node_id: String,
+    },
 }
 
 fn default_data_dir() -> PathBuf {
@@ -94,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Serve => serve(data_dir, cli.port).await,
+        Command::Friend(cmd) => friend(data_dir, cmd).await,
     }
 }
 
@@ -141,6 +162,62 @@ async fn serve(data_dir: PathBuf, port: u16) -> anyhow::Result<()> {
     });
 
     service.run(cancel).await;
+    Ok(())
+}
+
+async fn friend(data_dir: PathBuf, cmd: FriendCommand) -> anyhow::Result<()> {
+    let pool = db::open(&data_dir).await?;
+    let users = userz::Directory::new(pool.clone());
+    let store = friendz::Store::new(pool);
+
+    match cmd {
+        FriendCommand::Allow { node_id } => {
+            let node_id = node_id.trim();
+            if node_id.is_empty() {
+                anyhow::bail!("node_id cannot be empty");
+            }
+            // promote-or-leave: never demote an already-Accepted friend back to Allowed.
+            let existing = store.get(node_id).await?;
+            if matches!(
+                existing.as_ref().map(|f| f.status),
+                Some(friendz::FriendStatus::Accepted)
+            ) {
+                println!("{node_id} is already an accepted friend; leaving as-is");
+                return Ok(());
+            }
+            // ensure a userz row exists so the FK on friendz.friend_node_id holds.
+            users.touch(node_id).await?;
+            let friend = store
+                .upsert(node_id, friendz::FriendStatus::Allowed, None)
+                .await?;
+            println!("allowed {} (status = {})", friend.friend_node_id, friend.status.as_str());
+        }
+        FriendCommand::List => {
+            let friends = store.list(false).await?;
+            if friends.is_empty() {
+                println!("(no friendz rows)");
+                return Ok(());
+            }
+            println!("{:<64}  {:<10}  updated_at", "node_id", "status");
+            for f in friends {
+                println!(
+                    "{:<64}  {:<10}  {}",
+                    f.friend_node_id,
+                    f.status.as_str(),
+                    f.updated_at
+                );
+            }
+        }
+        FriendCommand::Remove { node_id } => {
+            let node_id = node_id.trim();
+            if node_id.is_empty() {
+                anyhow::bail!("node_id cannot be empty");
+            }
+            store.delete(node_id).await?;
+            println!("removed {node_id}");
+        }
+    }
+
     Ok(())
 }
 
