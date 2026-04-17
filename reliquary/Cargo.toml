@@ -1,0 +1,42 @@
+[package]
+name = "reliquary"
+version.workspace = true
+edition.workspace = true
+description = "headless hub peer for skein canvas P2P ecosystem"
+
+[lib]
+name = "reliquary"
+path = "src/lib.rs"
+
+[[bin]]
+name = "reliquary"
+path = "src/main.rs"
+
+[dependencies]
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_bytes = { workspace = true }
+ciborium = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+automerge = { workspace = true }
+blake3 = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+base64 = { workspace = true }
+time = { workspace = true }
+indexmap = { workspace = true }
+getrandom = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = { workspace = true }

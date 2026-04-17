@@ -1,0 +1,68 @@
+[workspace]
+members = ["reliquary"]
+# tauri/ added in phase 3
+# midden/ is a wasm crate, built separately with wasm-pack
+exclude = ["midden"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+
+# p2p + doc sync
+iroh = "0.97"
+iroh-blobs = "0.99"
+automerge = "0.8"
+
+# storage
+sqlx = { version = "0.8", features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "migrate",
+    "macros",
+    "uuid",
+    "time",
+] }
+
+# ser/de
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+ciborium = "0.2"
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# errors
+thiserror = "1"
+anyhow = "1"
+
+# misc
+blake3 = "1.5"
+uuid = { version = "1", features = ["v4", "serde"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+base64 = "0.22"
+time = { version = "0.3", features = [
+    "serde",
+    "macros",
+    "formatting",
+    "parsing",
+] }
+tempfile = "3"
+indexmap = "2"
+
+# release profile optimizations for smaller binaries
+[profile.release]
+lto = "thin"
+strip = "symbols"
+panic = "abort"
+codegen-units = 1
+opt-level = "z"
