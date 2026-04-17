@@ -125,9 +125,11 @@ async fn serve(data_dir: PathBuf, port: u16) -> anyhow::Result<()> {
     let config = reliquary::service::ServiceConfig {
         data_dir: data_dir.clone(),
         username: std::env::var("SKEIN_USERNAME").unwrap_or_else(|_| "reliquary".to_string()),
+        bio: std::env::var("SKEIN_BIO").unwrap_or_default(),
+        avatar_path: std::env::var("SKEIN_AVATAR_PATH").ok(),
     };
 
-    let service = reliquary::service::Service::start(endpoint, pool, config).await?;
+    let service = reliquary::service::start_hub(endpoint, pool, config).await?;
 
     let cancel = tokio_util::sync::CancellationToken::new();
     let ctrlc_cancel = cancel.clone();

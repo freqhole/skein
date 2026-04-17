@@ -34,6 +34,7 @@ use crate::protocol::messages::{FriendzMessage, FRIENDZ_ALPN};
 use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
 use crate::userz;
 
+use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
 
@@ -119,8 +120,15 @@ pub struct HubPeerService {
     /// peer blob inventory — maps peer node ID → set of blake3 hashes they have.
     /// populated by BlobOffer responses. cleared when peer goes offline.
     pub(crate) peer_blob_inventory: Arc<Mutex<HashMap<String, HashSet<String>>>>,
-    /// trigger to wake the blob snatcher for an immediate scan (currently a
-    /// no-op; snatcher integration lands with the phase-2 snatch.rs port).
+    /// the change-driven blob snatcher — subscribes to hub_repo doc changes
+    /// and snatches blobs only for the docs that actually changed.
+    /// wrapped in [`Arc`] so it can be moved into the spawned run loop while
+    /// the hub keeps a handle for accessor / shutdown purposes.
+    pub(crate) snatcher: Arc<crate::snatch::BlobSnatcher>,
+    /// legacy "wake the snatcher now" trigger. preserved as a no-op so that
+    /// canvas/messages handlers from the prototype still compile; the new
+    /// change-driven snatcher subscribes to `hub_repo.subscribe_doc_changes`
+    /// directly and ignores this notify.
     pub(crate) snatch_trigger: Arc<tokio::sync::Notify>,
 
     // skein store handles
@@ -210,6 +218,28 @@ impl HubPeerService {
             Arc::new(Mutex::new(persisted.into_iter().collect()))
         };
 
+        // construct the change-driven blob snatcher.
+        // it subscribes to hub_repo's doc_notify channel internally, so we
+        // don't pass an external trigger — the legacy `snatch_trigger` field
+        // below is kept only because canvas/messages prototype code still
+        // calls notify_one on it.
+        let downloader = Downloader::new(fs_store, &endpoint);
+        let peer_blob_inventory = Arc::new(Mutex::new(HashMap::new()));
+        let snatch_trigger_legacy = Arc::new(tokio::sync::Notify::new());
+        let snatcher = Arc::new(crate::snatch::BlobSnatcher::new(
+            hub_repo.clone(),
+            endpoint.clone(),
+            downloader,
+            node_id_str.clone(),
+            // BlobSnatcher::new still accepts a scan trigger for the older
+            // `run_scan_loop` path; the new `run` (change-driven) path ignores
+            // it. nothing in this service notifies the snatcher's copy.
+            Arc::new(tokio::sync::Notify::new()),
+            peer_blob_inventory.clone(),
+            fs_store,
+            blobz.clone(),
+        ));
+
         Ok(Self {
             endpoint,
             router,
@@ -222,8 +252,9 @@ impl HubPeerService {
             profile_bio: config.bio,
             profile_avatar_data_url,
             canvas_doc_ids,
-            peer_blob_inventory: Arc::new(Mutex::new(HashMap::new())),
-            snatch_trigger: Arc::new(tokio::sync::Notify::new()),
+            peer_blob_inventory,
+            snatcher,
+            snatch_trigger: snatch_trigger_legacy,
             userz,
             friendz_store,
             blobz,
@@ -237,43 +268,13 @@ impl HubPeerService {
             "hub peer service running"
         );
 
-        // doc-change debouncer — wakes the (future) snatcher shortly after
-        // sync activity settles. for now just notifies snatch_trigger; the
-        // snatcher loop itself lands in a follow-up phase-2 round.
-        let debounce_trigger = self.snatch_trigger.clone();
-        let mut doc_rx = self.hub_repo.subscribe_doc_changes();
-        let debounce_cancel = cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = debounce_cancel.cancelled() => break,
-                    result = doc_rx.recv() => {
-                        match result {
-                            Ok(doc_id) => {
-                                tracing::debug!(doc_id, "doc change detected, starting debounce");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::debug!(skipped = n, "doc_notify lagged, triggering scan");
-                                debounce_trigger.notify_one();
-                                continue;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-
-                // drain changes for 3 seconds of quiet
-                loop {
-                    match tokio::time::timeout(Duration::from_secs(3), doc_rx.recv()).await {
-                        Ok(Ok(_)) => continue,
-                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                        _ => break,
-                    }
-                }
-
-                tracing::debug!("doc changes settled, would trigger blob snatch scan");
-                debounce_trigger.notify_one();
-            }
+        // change-driven blob snatcher: does one boot-time catch-up scan,
+        // then only acts on doc-change notifications. replaces the prototype's
+        // "scan everything every time anything changes" debounce loop.
+        let snatcher = self.snatcher.clone();
+        let snatcher_cancel = cancel.clone();
+        let snatcher_handle = tokio::spawn(async move {
+            snatcher.run(snatcher_cancel).await;
         });
 
         // heartbeat loop — pulls friend node IDs from friendz store on each tick
@@ -367,6 +368,7 @@ impl HubPeerService {
         }
 
         heartbeat_handle.abort();
+        snatcher_handle.abort();
         self.shutdown().await;
     }
 

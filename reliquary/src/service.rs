@@ -70,6 +70,12 @@ pub struct ServiceConfig {
     pub data_dir: PathBuf,
     /// display name advertised in heartbeat/profile messages.
     pub username: String,
+    /// short bio served with profile responses (used by the hub variant).
+    pub bio: String,
+    /// optional path to an avatar image file. processed into a 128px webp
+    /// thumbnail and stored in `blobz` on boot. relative paths resolve
+    /// against `data_dir`.
+    pub avatar_path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -416,4 +422,58 @@ impl Service {
     pub fn node_id(&self) -> &str {
         &self.node_id_str
     }
+}
+
+// ---------------------------------------------------------------------------
+// hub variant
+//
+// `start_hub` is the phase-2 entry point used by `reliquary serve`. it
+// constructs the same set of stores/handlers as `Service::start`, then hands
+// them to [`crate::hub::HubPeerService`] which adds canvas invite/gossip/
+// blob-snatch logic and runs the full event loop.
+// ---------------------------------------------------------------------------
+
+/// bootstrap a [`crate::hub::HubPeerService`] sharing the same data_dir +
+/// sqlite pool as the minimal `Service`.
+///
+/// returns a ready-to-run hub. spawn `service.run(cancel)` to drive it.
+pub async fn start_hub(
+    endpoint: Endpoint,
+    pool: SqlitePool,
+    config: ServiceConfig,
+) -> Result<crate::hub::HubPeerService, ServiceError> {
+    use crate::hub::{HubPeerConfig, HubPeerService};
+
+    let node_id_str = endpoint.id().to_string();
+
+    let userz = userz::Directory::new(pool.clone());
+    let blobz = blobz::Store::new(pool.clone(), &config.data_dir);
+    let friendz_store = friendz::Store::new(pool.clone());
+
+    // automerge sync — hub_repo owns its own sqlite db for the doc graph
+    let hub_repo = HubRepo::new(node_id_str.clone(), &config.data_dir.join("skein-docs.db"))
+        .await
+        .map_err(|e| ServiceError::HubRepo(format!("{e}")))?;
+
+    // shared iroh-blobs FsStore (process-wide singleton)
+    let store = fs_store(&config.data_dir).await?;
+
+    let hub_config = HubPeerConfig {
+        data_dir: config.data_dir.clone(),
+        username: config.username,
+        bio: config.bio,
+        avatar_path: config.avatar_path,
+    };
+
+    HubPeerService::start(
+        endpoint,
+        hub_repo,
+        store,
+        userz,
+        friendz_store,
+        blobz,
+        hub_config,
+    )
+    .await
+    .map_err(|e| ServiceError::HubRepo(format!("hub start: {e}")))
 }

@@ -3,9 +3,9 @@
 //! the snatcher scans ALL automerge documents in the hub repo for file widgets
 //! that reference blobs the hub doesn't have locally. docs without a `widgets`
 //! map are skipped cheaply. for each missing blob, it probes canvas peers via
-//! `ensure_blob_request` over `freqhole/1`, downloads the blob via iroh-blobs
-//! verified transfer, and ingests it into grimoire's `media_blobz` + `blob_data`
-//! storage.
+//! `ensure_blob_request` over the `skein/1` ALPN, downloads the blob via
+//! iroh-blobs verified transfer, and ingests it into skein's [`blobz::Store`]
+//! (blake3-keyed; sha256 is no longer computed).
 //!
 //! scanning is triggered reactively via doc change notifications from hub_repo
 //! (debounced 3s). no periodic timer — the snatcher only runs when docs change.
@@ -18,10 +18,12 @@ use std::time::Duration;
 use futures::stream::{self, StreamExt};
 use iroh::Endpoint;
 use iroh_blobs::api::downloader::Downloader;
+use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{Hash, HashAndFormat};
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::freqhole::{PeerMessage, FREQHOLE_ALPN};
+use crate::blobz;
+use crate::protocol::blob_proxy::{PeerMessage, SKEIN_ALPN};
 
 /// timeout for a single ensure_blob probe to a peer (seconds).
 const PROBE_TIMEOUT_SECS: u64 = 15;
@@ -91,10 +93,16 @@ pub struct BlobSnatcher {
     /// populated by BlobOffer responses via the hub service. used as fallback
     /// when snatchedBy is empty for a blob.
     peer_blob_inventory: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// shared iroh-blobs FsStore for reading downloaded blob bytes.
+    fs_store: &'static FsStore,
+    /// blob metadata + filesystem store (the skein equivalent of grimoire's
+    /// `media_blobz` + `blob_data`).
+    blobz: blobz::Store,
 }
 
 impl BlobSnatcher {
     /// create a new blob snatcher.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: crate::hub_repo::HubRepo,
         endpoint: Endpoint,
@@ -102,6 +110,8 @@ impl BlobSnatcher {
         local_node_id: String,
         scan_trigger: Arc<tokio::sync::Notify>,
         peer_blob_inventory: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+        fs_store: &'static FsStore,
+        blobz: blobz::Store,
     ) -> Self {
         Self {
             repo,
@@ -111,6 +121,8 @@ impl BlobSnatcher {
             scan_trigger,
             peer_semaphores: Arc::new(Mutex::new(HashMap::new())),
             peer_blob_inventory,
+            fs_store,
+            blobz,
         }
     }
 
@@ -293,8 +305,8 @@ impl BlobSnatcher {
                         continue;
                     }
 
-                    // check if we already have this blob in grimoire
-                    let already_have = check_blob_exists(&blob_ref).await;
+                    // check if we already have this blob locally
+                    let already_have = self.check_blob_exists(&blob_ref).await;
 
                     if !already_have {
                         tracing::info!(
@@ -319,6 +331,227 @@ impl BlobSnatcher {
         }
 
         (resolved_refs, peers)
+    }
+
+    // -------------------------------------------------------------------
+    // change-driven snatching
+    //
+    // instead of waking on a coarse scan trigger and walking every doc,
+    // the change-driven path subscribes to `hub_repo.subscribe_doc_changes`
+    // and only acts on the doc that actually changed:
+    //
+    // - canvas doc changed -> scan only that canvas
+    // - widget state doc changed -> snatch just that widget's blob, using
+    //   peers gathered from any canvases that reference it
+    // - other doc kinds -> ignored
+    //
+    // this keeps the hub from re-scanning unrelated canvases on every
+    // sync event (the original prototype's behavior). steady-state cost
+    // is dominated by the actual download, not the scan.
+    // -------------------------------------------------------------------
+
+    /// run the change-driven snatch loop until `cancel` fires.
+    ///
+    /// on boot, performs one full `scan_and_snatch` so we catch up on any
+    /// canvases that arrived in previous sessions and never had their blobs
+    /// snatched. after that, only doc-change notifications drive work.
+    pub async fn run(&self, cancel: tokio_util::sync::CancellationToken) {
+        tracing::info!("blob snatcher: change-driven loop starting");
+
+        // boot-time catch-up — covers persisted canvases whose blobs are
+        // still missing (e.g. the hub was killed mid-sync last run).
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            count = self.scan_and_snatch() => {
+                if count > 0 {
+                    tracing::info!(snatched = count, "boot-time snatch caught up missing blobs");
+                }
+            }
+        }
+
+        let mut rx = self.repo.subscribe_doc_changes();
+
+        loop {
+            let doc_id = tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!("blob snatcher shutting down");
+                    return;
+                }
+                result = rx.recv() => match result {
+                    Ok(id) => id,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "doc-change channel lagged; running full scan");
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = self.scan_and_snatch() => {}
+                        }
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("doc-change channel closed");
+                        return;
+                    }
+                }
+            };
+
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                count = self.handle_doc_change(&doc_id) => {
+                    if count > 0 {
+                        tracing::info!(
+                            doc_id = %doc_id,
+                            snatched = count,
+                            "snatched blobs after doc change"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// react to a single doc-change event.
+    ///
+    /// classifies the doc by its top-level shape:
+    /// - has a `widgets` map -> treat as canvas, scan + snatch missing
+    /// - has a `blake3` field -> treat as widget state, snatch the one blob
+    /// - otherwise ignore
+    ///
+    /// returns the number of blobs successfully snatched.
+    pub async fn handle_doc_change(&self, doc_id: &str) -> usize {
+        let handle = match self.repo.find(doc_id).await {
+            Some(h) => h,
+            None => {
+                tracing::trace!(doc_id, "doc-change for unknown doc, ignoring");
+                return 0;
+            }
+        };
+
+        // classify the doc shape on the blocking pool
+        let kind = {
+            let h = handle.clone();
+            tokio::task::spawn_blocking(move || classify_doc(&h))
+                .await
+                .unwrap_or(DocKind::Unknown)
+        };
+
+        match kind {
+            DocKind::Canvas => {
+                let (refs, peers) = self.scan_canvas_resolved(doc_id).await;
+                self.snatch_refs(refs, peers).await
+            }
+            DocKind::WidgetState => {
+                self.snatch_widget_state(doc_id).await
+            }
+            DocKind::Unknown => {
+                tracing::trace!(doc_id, "doc-change for unrecognized doc shape, ignoring");
+                0
+            }
+        }
+    }
+
+    /// snatch a list of blob refs concurrently using the supplied peer set.
+    /// shared by canvas-doc dispatch and full-scan paths.
+    async fn snatch_refs(&self, refs: Vec<BlobRef>, peers: Vec<String>) -> usize {
+        if refs.is_empty() {
+            return 0;
+        }
+        let snatched = AtomicUsize::new(0);
+        stream::iter(refs.iter())
+            .for_each_concurrent(Some(MAX_CONCURRENT_SNATCHES), |blob_ref| {
+                let snatched = &snatched;
+                let peers = &peers;
+                async move {
+                    match self.snatch_blob(blob_ref, peers).await {
+                        Ok(()) => {
+                            snatched.fetch_add(1, Ordering::Relaxed);
+                            tracing::info!(
+                                blake3 = trunc(&blob_ref.blake3),
+                                filename = %blob_ref.filename,
+                                "blob snatched successfully"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                blake3 = trunc(&blob_ref.blake3),
+                                error = %e,
+                                "snatch attempt failed"
+                            );
+                        }
+                    }
+                }
+            })
+            .await;
+        snatched.load(Ordering::Relaxed)
+    }
+
+    /// handle a doc-change event for a widget-state doc.
+    ///
+    /// reads the widget's blob ref, then aggregates peers from any known
+    /// canvases that reference this widget so [`Self::snatch_blob`] has
+    /// real candidates to probe.
+    async fn snatch_widget_state(&self, widget_doc_id: &str) -> usize {
+        let handle = match self.repo.find(widget_doc_id).await {
+            Some(h) => h,
+            None => return 0,
+        };
+        let canvas_id_placeholder = String::new();
+        let wid = widget_doc_id.to_string();
+        let blob_ref = match tokio::task::spawn_blocking(move || {
+            read_widget_state(&handle, &canvas_id_placeholder, &wid)
+        })
+        .await
+        {
+            Ok(Some(b)) if !b.blake3.is_empty() => b,
+            _ => return 0,
+        };
+
+        // already have it?
+        if self.check_blob_exists(&blob_ref).await {
+            return 0;
+        }
+
+        // gather peers from canvases that reference this widget doc
+        let peers = self.peers_for_widget(widget_doc_id).await;
+        if peers.is_empty() {
+            tracing::debug!(
+                widget_doc_id,
+                "widget changed but no canvas peers known yet; will try again on next change"
+            );
+            return 0;
+        }
+
+        match self.snatch_blob(&blob_ref, &peers).await {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::debug!(
+                    widget_doc_id,
+                    blake3 = trunc(&blob_ref.blake3),
+                    error = %e,
+                    "widget snatch failed"
+                );
+                0
+            }
+        }
+    }
+
+    /// walk known canvases to find ones that reference `widget_doc_id`,
+    /// returning the union of their peer lists.
+    async fn peers_for_widget(&self, widget_doc_id: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for canvas_id in self.repo.all_doc_ids().await {
+            let (placeholder_refs, peers) = self.scan_canvas_for_widgets(&canvas_id).await;
+            let referenced = placeholder_refs
+                .iter()
+                .any(|r| r.widget_doc_id == widget_doc_id);
+            if referenced {
+                for p in peers {
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// read a canvas doc to find file widget docIds and peer node IDs.
@@ -353,14 +586,14 @@ impl BlobSnatcher {
         }
     }
 
-    /// snatch a single blob: probe peers, download, ingest into grimoire.
+    /// snatch a single blob: probe peers, download, ingest into the local store.
     async fn snatch_blob(&self, blob_ref: &BlobRef, peers: &[String]) -> Result<(), SnatchError> {
         if blob_ref.blake3.is_empty() {
             return Err(SnatchError::NoBlake3);
         }
 
         // double-check local availability (may have been snatched by another cycle)
-        if check_blob_exists(blob_ref).await {
+        if self.check_blob_exists(blob_ref).await {
             tracing::debug!(
                 blake3 = trunc(&blob_ref.blake3),
                 "blob appeared locally, skipping"
@@ -629,10 +862,7 @@ impl BlobSnatcher {
         );
 
         // read the downloaded blob from the store
-        let fs_store = grimoire::blobz::get_blobs_store()
-            .await
-            .map_err(|e| SnatchError::StoreRead(format!("failed to get FsStore: {e}")))?;
-        let bytes = match fs_store.get_bytes(hash).await {
+        let bytes = match self.fs_store.get_bytes(hash).await {
             Ok(b) => b,
             Err(e) => {
                 tracing::error!(
@@ -655,65 +885,47 @@ impl BlobSnatcher {
         Ok(bytes.to_vec())
     }
 
-    /// ingest downloaded blob data into grimoire's media_blobz + blob_data.
+    /// ingest downloaded blob data into the skein blobz store.
+    ///
+    /// blake3 is canonical here — sha256 is no longer computed (see phase-2
+    /// design decisions). `blobz::Store::insert` handles disk write +
+    /// metadata row, recomputes blake3 from `data`, and is idempotent if
+    /// the blob is already present.
     async fn ingest_blob(&self, blob_ref: &BlobRef, data: Vec<u8>) -> Result<(), SnatchError> {
-        // compute sha256 for grimoire's primary content addressing
-        let sha256 = {
-            use sha2::Digest;
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(&data);
-            format!("{:x}", hasher.finalize())
-        };
-
-        // check again by sha256 (race condition guard)
-        if grimoire::media_blobz::get_media_blob_by_sha256(&sha256)
-            .await
-            .is_ok()
-        {
+        // race-condition guard: another task may have ingested this blob
+        // while the download was in flight
+        if let Ok(Some(_)) = self.blobz.get(&blob_ref.blake3).await {
             tracing::debug!(
-                sha256 = trunc(&sha256),
-                "blob appeared in grimoire during download"
+                blake3 = trunc(&blob_ref.blake3),
+                "blob appeared in blobz during download"
             );
             return Ok(());
         }
 
-        // create the media blob entry in grimoire
-        let request = grimoire::media_blobz::CreateMediaBlobRequest {
-            sha256: sha256.clone(),
-            size: Some(blob_ref.size as i64),
-            mime: if blob_ref.mime.is_empty() {
-                Some("application/octet-stream".to_string())
-            } else {
-                Some(blob_ref.mime.clone())
-            },
-            source_client_id: None,
-            local_path: None,
-            filename: if blob_ref.filename.is_empty() {
-                None
-            } else {
-                Some(blob_ref.filename.clone())
-            },
-            parent_blob_id: None,
-            blob_type: None,
-            metadata: serde_json::Value::Object(serde_json::Map::new()),
-            created_by: None,
-            data: Some(grimoire::Bytes::from(data)),
-            width: None,
-            height: None,
-            blake3: Some(blob_ref.blake3.clone()),
+        let filename = if blob_ref.filename.is_empty() {
+            None
+        } else {
+            Some(blob_ref.filename.clone())
+        };
+        let mime = if blob_ref.mime.is_empty() {
+            Some("application/octet-stream".to_string())
+        } else {
+            Some(blob_ref.mime.clone())
         };
 
-        let blob = grimoire::media_blobz::create_media_blob(request)
+        // iroh_hash for verified-download lookup is the same blake3 hex
+        // (iroh-blobs uses BLAKE3 internally).
+        let stored = self
+            .blobz
+            .insert(blob_ref.blake3.clone(), filename, mime, &data)
             .await
             .map_err(|e| SnatchError::Ingest(format!("{e}")))?;
 
         tracing::info!(
-            id = %blob.id,
-            sha256 = trunc(&sha256),
-            blake3 = trunc(&blob_ref.blake3),
-            filename = %blob_ref.filename,
-            size = blob_ref.size,
-            "blob ingested into grimoire"
+            blake3 = trunc(&stored.blake3),
+            filename = ?stored.filename,
+            size = stored.size,
+            "blob ingested into blobz"
         );
 
         Ok(())
@@ -777,30 +989,21 @@ fn trunc(s: &str) -> &str {
     }
 }
 
-/// check whether a blob already exists in grimoire (by blake3 or blob_id/sha256).
-async fn check_blob_exists(blob_ref: &BlobRef) -> bool {
-    if !blob_ref.blake3.is_empty() {
-        if grimoire::media_blobz::get_media_blob_by_blake3(&blob_ref.blake3)
-            .await
-            .is_ok()
-        {
-            return true;
+/// check whether a blob already exists locally (by blake3).
+///
+/// sha256 lookups are gone in phase-2 (see design decisions): blake3 is
+/// canonical, and `blob_ref.blob_id` may be a sha256 from older clients
+/// but we no longer index by it.
+impl BlobSnatcher {
+    async fn check_blob_exists(&self, blob_ref: &BlobRef) -> bool {
+        if blob_ref.blake3.is_empty() {
+            return false;
         }
+        matches!(self.blobz.get(&blob_ref.blake3).await, Ok(Some(_)))
     }
-
-    if !blob_ref.blob_id.is_empty() {
-        if grimoire::media_blobz::get_media_blob_by_sha256(&blob_ref.blob_id)
-            .await
-            .is_ok()
-        {
-            return true;
-        }
-    }
-
-    false
 }
 
-/// send `ensure_blob_request` to a single peer over `freqhole/1`.
+/// send `ensure_blob_request` to a single peer over the `skein/1` ALPN.
 ///
 /// returns `true` if the peer has the blob and it's now available for download.
 async fn probe_single_peer(
@@ -815,7 +1018,7 @@ async fn probe_single_peer(
     let addr = iroh::EndpointAddr::from(node_id);
 
     let conn = endpoint
-        .connect(addr, FREQHOLE_ALPN)
+        .connect(addr, SKEIN_ALPN)
         .await
         .map_err(|e| SnatchError::Connection(format!("{e}")))?;
 
@@ -936,6 +1139,44 @@ async fn consume_download_progress(
 // ---------------------------------------------------------------------------
 // automerge doc reading (sync — runs in spawn_blocking)
 // ---------------------------------------------------------------------------
+
+/// classify a hub-repo doc by inspecting its top-level shape.
+///
+/// canvases have a `widgets` map and usually a `peers` map. file widget
+/// state docs have a `blake3` field at the root. anything else is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocKind {
+    Canvas,
+    WidgetState,
+    Unknown,
+}
+
+fn classify_doc(handle: &crate::hub_repo::DocHandle) -> DocKind {
+    use automerge::ReadDoc;
+    let mut kind = DocKind::Unknown;
+    handle.with_document(|doc| {
+        // skip deleted canvases — treat as unknown so we don't try to scan them
+        if let Ok(Some((automerge::Value::Scalar(s), _))) = doc.get(automerge::ROOT, "deleted") {
+            if s.as_ref() == &automerge::ScalarValue::Boolean(true) {
+                return;
+            }
+        }
+        if matches!(
+            doc.get(automerge::ROOT, "widgets"),
+            Ok(Some((automerge::Value::Object(automerge::ObjType::Map), _)))
+        ) {
+            kind = DocKind::Canvas;
+            return;
+        }
+        // a widget state doc has blake3 (or at minimum blobId) at the root
+        let blake3 = read_str(doc, &automerge::ROOT, "blake3");
+        let blob_id = read_str(doc, &automerge::ROOT, "blobId");
+        if !blake3.is_empty() || !blob_id.is_empty() {
+            kind = DocKind::WidgetState;
+        }
+    });
+    kind
+}
 
 /// read a canvas automerge doc to find file widget docIds and peer node IDs.
 ///
