@@ -3,11 +3,11 @@
 skein is a peer-to-peer canvas prototype. there are three ways to run it
 depending on how much of the stack you want:
 
-| mode                      | binary                | runs what                                                  |
-| ------------------------- | --------------------- | ---------------------------------------------------------- |
-| **web only**              | `skein/skein/` (vite) | browser-only p2p — iroh-over-webtransport via `midden` wasm |
-| **web + reliquary hub**   | `reliquary` + browser | long-lived headless hub peer + your browser tab            |
-| **desktop (tauri)**       | `skein-tauri`         | tauri shell with reliquary running in-process              |
+| mode                    | binary                | runs what                                                   |
+| ----------------------- | --------------------- | ----------------------------------------------------------- |
+| **web only**            | `skein/skein/` (vite) | browser-only p2p — iroh-over-webtransport via `midden` wasm |
+| **web + reliquary hub** | `reliquary` + browser | long-lived headless hub peer + your browser tab             |
+| **desktop (tauri)**     | `skein-tauri`         | tauri shell with reliquary running in-process               |
 
 all three share:
 
@@ -48,8 +48,8 @@ npm run dev
 open `http://localhost:5173`. in devtools:
 
 ```js
-await window.skein.identity.nodeId()   // hex node id
-await window.skein.friends.list()      // [] on first run
+await window.skein.identity.nodeId(); // hex node id
+await window.skein.friends.list(); // [] on first run
 ```
 
 peers are added by pasting invites (see below).
@@ -110,13 +110,13 @@ cargo check
 the IPC surface exposed to the webview (see
 [tauri/src-tauri/src/commands.rs](../tauri/src-tauri/src/commands.rs)):
 
-| command            | args                        | returns                    |
-| ------------------ | --------------------------- | -------------------------- |
-| `skein_node_id`    | —                           | `String`                   |
-| `skein_status`     | —                           | `{ node_id, friend_count, uptime_s }` |
-| `skein_friend_add` | `{ nodeId, status? }`       | `null`                     |
-| `skein_friend_list`| —                           | `Friend[]`                 |
-| `blob_list`        | `{ limit?, offset? }`       | `Blob[]`                   |
+| command             | args                  | returns                               |
+| ------------------- | --------------------- | ------------------------------------- |
+| `skein_node_id`     | —                     | `String`                              |
+| `skein_status`      | —                     | `{ node_id, friend_count, uptime_s }` |
+| `skein_friend_add`  | `{ nodeId, status? }` | `null`                                |
+| `skein_friend_list` | —                     | `Friend[]`                            |
+| `blob_list`         | `{ limit?, offset? }` | `Blob[]`                              |
 
 full `cargo tauri dev` workflow will arrive once real icons + the skein
 vite-tauri build target land (phase-1 backlog item).

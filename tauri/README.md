@@ -40,12 +40,12 @@ compile-clean backend crate. see [docs/getting-started.md](../docs/getting-start
 
 ## IPC surface (phase-1)
 
-| command            | args                            | returns                              |
-| ------------------ | ------------------------------- | ------------------------------------ |
-| `skein_node_id`    | —                               | `String` (iroh node id hex)          |
-| `skein_status`     | —                               | `{ node_id, friend_count, uptime_s }` |
-| `skein_friend_add` | `{ node_id, status? }`          | `()` (upserts with status=accepted)  |
-| `skein_friend_list`| —                               | `Vec<Friend>`                         |
-| `blob_list`        | `{ limit?, offset? }`           | `Vec<BlobRef>`                        |
+| command             | args                   | returns                               |
+| ------------------- | ---------------------- | ------------------------------------- |
+| `skein_node_id`     | —                      | `String` (iroh node id hex)           |
+| `skein_status`      | —                      | `{ node_id, friend_count, uptime_s }` |
+| `skein_friend_add`  | `{ node_id, status? }` | `()` (upserts with status=accepted)   |
+| `skein_friend_list` | —                      | `Vec<Friend>`                         |
+| `blob_list`         | `{ limit?, offset? }`  | `Vec<BlobRef>`                        |
 
 p2p message sending, canvas invites, and gossip are phase-2.
