@@ -46,7 +46,7 @@ const RECONNECT_JITTER_MS = 1000;
 export const SYNC_ALPN = "iroh/automerge-repo/1";
 
 /** ALPN protocol identifier for friend requests, profile sharing, and presence heartbeat. */
-export const FRIENDZ_ALPN = "freqhole-friendz/1";
+export const FRIENDZ_ALPN = "skein-friendz/1";
 
 /** summary of the adapter's connection state for UI display */
 export interface ConnectionSummary {
@@ -71,7 +71,7 @@ export interface BiStreamLike {
   write_message(data: Uint8Array): Promise<void>;
   read_message(): Promise<Uint8Array | null>; // null = stream closed
   close(): void;
-  // raw framing (no length prefix) — used by freqhole/1 protocol.
+  // raw framing (no length prefix) — used by skein/1 protocol.
   // grimoire and midden both send raw JSON terminated by finish(),
   // NOT length-delimited. these methods are optional because only
   // midden BiStream implements them; TauriBiStream does not need them.
@@ -371,7 +371,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
    * register a handler for incoming streams with a specific ALPN.
    * the accept loop will dispatch matching streams to this handler
    * instead of closing them. used to support additional protocols
-   * (e.g. freqhole-friendz/1) alongside automerge sync.
+   * (e.g. skein-friendz/1) alongside automerge sync.
    */
   registerAlpnHandler(alpn: string, handler: (stream: BiStreamLike) => void): void {
     this.alpnHandlers.set(alpn, handler);

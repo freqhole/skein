@@ -132,13 +132,18 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for LoggingIo<T> {
 ///
 /// implements `ProtocolHandler` to accept inbound connections from other iroh
 /// peers and routes them to `hub_repo` for automerge-repo v2.x sync.
-#[derive(derive_more::Debug, Clone)]
+#[derive(Clone)]
 pub struct IrohRepo {
     /// kept for future outbound dialing (hub-to-hub sync).
     #[allow(dead_code)]
     endpoint: Endpoint,
-    #[debug(skip)]
     hub_repo: crate::hub_repo::HubRepo,
+}
+
+impl std::fmt::Debug for IrohRepo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IrohRepo").finish_non_exhaustive()
+    }
 }
 
 impl IrohRepo {

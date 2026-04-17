@@ -4,7 +4,7 @@
 //! accepts either plain node_id or full endpoint address JSON with relay/IP hints.
 //!
 //! supports two protocols:
-//! - freqhole/1: custom protocol for API proxying and small blob streaming
+//! - skein/1: custom protocol for API proxying and small blob streaming
 //! - freqhole-blobz: iroh-blobs protocol for verified streaming of audio files
 
 use bao_tree::ChunkRanges;
@@ -26,14 +26,14 @@ use tracing::{info, warn};
 use tracing_subscriber_wasm::MakeConsoleWriter;
 use wasm_bindgen::{prelude::wasm_bindgen, JsError, JsValue};
 
-/// ALPN protocol identifier (must match grimoire's FREQHOLE_ALPN)
-const FREQHOLE_ALPN: &[u8] = b"freqhole/1";
+/// ALPN protocol identifier (must match grimoire's SKEIN_ALPN)
+const SKEIN_ALPN: &[u8] = b"skein/1";
 
 /// ALPN for automerge-repo document sync (used by skein canvas P2P)
 const AUTOMERGE_ALPN: &[u8] = b"iroh/automerge-repo/1";
 
 /// ALPN for friend requests, profile sharing, and presence heartbeat (used by skein social layer)
-const FRIENDZ_ALPN: &[u8] = b"freqhole-friendz/1";
+const FRIENDZ_ALPN: &[u8] = b"skein-friendz/1";
 
 /// protocol messages (must match grimoire's PeerMessage)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,7 +339,7 @@ fn parse_peer_addr(peer_addr: &str) -> Result<EndpointAddr, String> {
 /// browser P2P node for freqhole federation
 ///
 /// supports two protocols:
-/// - freqhole/1: API proxying and small blob streaming
+/// - skein/1: API proxying and small blob streaming
 /// - iroh-blobs: verified streaming for audio files
 #[wasm_bindgen]
 pub struct MiddenNode {
@@ -388,7 +388,7 @@ impl MiddenNode {
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .alpns(vec![
-                FREQHOLE_ALPN.to_vec(),
+                SKEIN_ALPN.to_vec(),
                 AUTOMERGE_ALPN.to_vec(),
                 FRIENDZ_ALPN.to_vec(),
                 iroh_blobs::ALPN.to_vec(),
@@ -440,7 +440,7 @@ impl MiddenNode {
     /// create a node from existing secret key with additional ALPN protocols.
     ///
     /// `extra_alpns` is a JS array of strings (e.g. ["iroh/automerge-repo/1"]).
-    /// the node always registers "freqhole/1" plus whatever extra ALPNs are given.
+    /// the node always registers "skein/1" plus whatever extra ALPNs are given.
     pub async fn create_with_alpns(
         key_bytes: &[u8],
         extra_alpns: &js_sys::Array,
@@ -454,7 +454,7 @@ impl MiddenNode {
 
         // collect extra ALPNs from JS array
         let mut alpns = vec![
-            FREQHOLE_ALPN.to_vec(),
+            SKEIN_ALPN.to_vec(),
             AUTOMERGE_ALPN.to_vec(),
             FRIENDZ_ALPN.to_vec(),
             iroh_blobs::ALPN.to_vec(),
@@ -606,7 +606,7 @@ impl MiddenNode {
     async fn connect_to_peer(&self, addr: &EndpointAddr) -> Result<Connection, JsError> {
         let conn = self
             .endpoint
-            .connect(addr.clone(), FREQHOLE_ALPN)
+            .connect(addr.clone(), SKEIN_ALPN)
             .await
             .map_err(to_js_err)?;
         Ok(conn)

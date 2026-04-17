@@ -341,7 +341,7 @@ if (Symbol.dispose) IntoUnderlyingSource.prototype[Symbol.dispose] = IntoUnderly
  * browser P2P node for freqhole federation
  *
  * supports two protocols:
- * - freqhole/1: API proxying and small blob streaming
+ * - skein/1: API proxying and small blob streaming
  * - iroh-blobs: verified streaming for audio files
  */
 export class MiddenNode {
@@ -440,7 +440,7 @@ export class MiddenNode {
      * create a node from existing secret key with additional ALPN protocols.
      *
      * `extra_alpns` is a JS array of strings (e.g. ["iroh/automerge-repo/1"]).
-     * the node always registers "freqhole/1" plus whatever extra ALPNs are given.
+     * the node always registers "skein/1" plus whatever extra ALPNs are given.
      * @param {Uint8Array} key_bytes
      * @param {Array<any>} extra_alpns
      * @returns {Promise<MiddenNode>}

@@ -72,7 +72,7 @@ midden accepts two formats for `peer_addr`:
 
 uses same protocol as grimoire's federation transport:
 
-- ALPN: `freqhole/1`
+- ALPN: `skein/1`
 - messages: `ProxyRequest`, `ProxyResponse`, `BlobStreamRequest`, `BlobStreamResponse`
 - blob streaming: length-prefixed header followed by raw bytes
 

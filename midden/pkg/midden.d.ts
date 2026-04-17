@@ -116,7 +116,7 @@ export class IntoUnderlyingSource {
  * browser P2P node for freqhole federation
  *
  * supports two protocols:
- * - freqhole/1: API proxying and small blob streaming
+ * - skein/1: API proxying and small blob streaming
  * - iroh-blobs: verified streaming for audio files
  */
 export class MiddenNode {
@@ -163,7 +163,7 @@ export class MiddenNode {
      * create a node from existing secret key with additional ALPN protocols.
      *
      * `extra_alpns` is a JS array of strings (e.g. ["iroh/automerge-repo/1"]).
-     * the node always registers "freqhole/1" plus whatever extra ALPNs are given.
+     * the node always registers "skein/1" plus whatever extra ALPNs are given.
      */
     static create_with_alpns(key_bytes: Uint8Array, extra_alpns: Array<any>): Promise<MiddenNode>;
     /**

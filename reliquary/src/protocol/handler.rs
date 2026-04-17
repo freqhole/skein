@@ -1,6 +1,6 @@
 //! friendz protocol handler — manages P2P presence, heartbeat, and message dispatch.
 //!
-//! implements `iroh::protocol::ProtocolHandler` for the `freqhole-friendz/1` ALPN
+//! implements `iroh::protocol::ProtocolHandler` for the `skein-friendz/1` ALPN
 //! and provides methods for sending messages to peers, tracking online status,
 //! and running the heartbeat/discovery loops.
 //!
@@ -81,7 +81,7 @@ struct Inner {
 // FriendzHandler
 // ---------------------------------------------------------------------------
 
-/// manages P2P presence and message dispatch over the `freqhole-friendz/1` ALPN.
+/// manages P2P presence and message dispatch over the `skein-friendz/1` ALPN.
 ///
 /// clone is cheap — the handler is backed by an `Arc<Inner>`.
 #[derive(Clone)]

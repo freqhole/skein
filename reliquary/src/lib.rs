@@ -12,15 +12,14 @@
 
 pub mod blobz;
 pub mod db;
+pub mod documents;
 pub mod friendz;
+pub mod hub_repo;
 pub mod identity;
+pub mod protocol;
+pub mod sync;
 pub mod userz;
 
 // TODO(phase-1): port these off grimoire, then re-enable.
-// pub mod documents;
-// pub mod freqhole;
 // pub mod hub;
-// pub mod hub_repo;
-// pub mod protocol;
 // pub mod snatch;
-// pub mod sync;

@@ -10,7 +10,7 @@ import type { ConnectionStateSource } from "../canvas/connection-status";
 import { initCanvas, type SkeinCanvas } from "../canvas/init";
 import { showShareDialog, type FriendInfo } from "../canvas/share-dialog";
 import { preloadFonts } from "../fonts/font-loader";
-import { handleFreqholeStream } from "../p2p/freqhole-handler";
+import { handleSkeinStream } from "../p2p/skein-handler";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
 import {
   destroyBridge,
@@ -108,12 +108,12 @@ class SkeinRouter {
       await ensureSingletonWidgets(this.repo, this.narthexDocId as DocumentId);
     }
 
-    // register freqhole/1 ALPN handler early so the browser can serve blobs
+    // register skein/1 ALPN handler early so the browser can serve blobs
     // to peers regardless of friendz protocol initialization state.
     // (friendz-wiring.ts also registers this, but that happens later and
     // only when navigating to the narthex with a valid identity.)
     if (!isTauriMode()) {
-      this.irohAdapter.registerAlpnHandler("freqhole/1", handleFreqholeStream);
+      this.irohAdapter.registerAlpnHandler("skein/1", handleSkeinStream);
     }
 
     // listen for hash changes (browser back/forward, programmatic navigation)

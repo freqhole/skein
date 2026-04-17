@@ -17,7 +17,7 @@ import {
 
 import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
-import { handleFreqholeStream } from "../p2p/freqhole-handler";
+import { handleSkeinStream } from "../p2p/skein-handler";
 import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
 
 export interface FriendzWiringDeps {
@@ -187,8 +187,8 @@ export async function initFriendzWiring(
     protocol.handleStream(stream);
   });
 
-  // register ALPN handler for incoming freqhole/1 streams (blob serving, proxy requests)
-  irohAdapter.registerAlpnHandler("freqhole/1", handleFreqholeStream);
+  // register ALPN handler for incoming skein/1 streams (blob serving, proxy requests)
+  irohAdapter.registerAlpnHandler("skein/1", handleSkeinStream);
 
   // collect unsub callbacks so the caller can tear everything down
   const unsubs: Array<() => void> = [];

@@ -1,8 +1,8 @@
 // ---------------------------------------------------------------------------
-// friends protocol handler — freqhole-friendz/1
+// friends protocol handler — skein-friendz/1
 //
 // handles P2P communication for friend requests, profile sharing, and
-// presence heartbeat over the freqhole-friendz/1 ALPN. runs alongside
+// presence heartbeat over the skein-friendz/1 ALPN. runs alongside
 // the automerge sync adapter, sharing the same midden WASM transport.
 // ---------------------------------------------------------------------------
 
@@ -330,7 +330,7 @@ export interface FriendzProtocolOptions {
 }
 
 /**
- * handles the freqhole-friendz/1 protocol for friend requests,
+ * handles the skein-friendz/1 protocol for friend requests,
  * profile sharing, and presence heartbeat.
  *
  * usage:
@@ -453,7 +453,7 @@ export class FriendzProtocol {
   // --- incoming stream handling (called by the ALPN router) ---
 
   /**
-   * handle an incoming freqhole-friendz/1 stream.
+   * handle an incoming skein-friendz/1 stream.
    * this is registered as the ALPN handler with the iroh adapter.
    */
   handleStream(stream: BiStreamLike): void {

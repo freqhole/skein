@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
-// freqhole-handler.ts — browser-side handler for incoming freqhole/1 ALPN streams
+// skein-handler.ts — browser-side handler for incoming skein/1 ALPN streams
 //
-// when a peer (tauri or browser) opens a freqhole/1 stream to us,
+// when a peer (tauri or browser) opens a skein/1 stream to us,
 // this handler reads the request, dispatches to the appropriate
 // local handler (blob data from OPFS, metadata from IndexedDB),
 // and writes back a response.
@@ -10,7 +10,7 @@
 // to other peers on the canvas.
 //
 // protocol framing: grimoire and midden both use RAW JSON (no length prefix)
-// for the freqhole/1 protocol. messages are terminated by the sender calling
+// for the skein/1 protocol. messages are terminated by the sender calling
 // finish() on the send stream, and the receiver reads with read_to_end().
 // this is NOT the length-delimited framing used by BiStream.read_message().
 // ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ type PeerMessage =
 
 // ---- constants ------------------------------------------------------------
 
-const TAG = "[freqhole-handler]";
+const TAG = "[skein-handler]";
 
 // ---- helpers --------------------------------------------------------------
 
@@ -574,12 +574,12 @@ async function handleStreamAsync(stream: BiStreamLike): Promise<void> {
 }
 
 /**
- * handle an incoming freqhole/1 ALPN stream.
+ * handle an incoming skein/1 ALPN stream.
  *
- * this is the entry point registered with `adapter.registerAlpnHandler("freqhole/1", ...)`.
+ * this is the entry point registered with `adapter.registerAlpnHandler("skein/1", ...)`.
  * it fires-and-forgets an async handler — errors are caught and logged internally.
  */
-export function handleFreqholeStream(stream: BiStreamLike): void {
+export function handleSkeinStream(stream: BiStreamLike): void {
   handleStreamAsync(stream)
     .catch((err) => {
       console.error(TAG, "stream handler error:", err);

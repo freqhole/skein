@@ -8,7 +8,7 @@
  *
  * usage:
  *   const node = await TauriStreamNode.create();
- *   const stream = await node.open_bi(peerId, "freqhole-friendz/1");
+ *   const stream = await node.open_bi(peerId, "skein-friendz/1");
  *   await stream.write_message(data);
  *   const msg = await stream.read_message();
  */

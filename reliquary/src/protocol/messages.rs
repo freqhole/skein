@@ -1,4 +1,4 @@
-//! friendz protocol message types — `freqhole-friendz/1`
+//! friendz protocol message types — `skein-friendz/1`
 //!
 //! all 15 message types that comprise the friendz P2P protocol.
 //! these match the existing JS wire format exactly: the `type` discriminant
@@ -289,7 +289,7 @@ pub const DISCOVERY_SWEEP_MS: u64 = 300_000;
 // ---------------------------------------------------------------------------
 
 /// the ALPN protocol identifier for the friendz protocol.
-pub const FRIENDZ_ALPN: &[u8] = b"freqhole-friendz/1";
+pub const FRIENDZ_ALPN: &[u8] = b"skein-friendz/1";
 
 #[cfg(test)]
 mod tests {
