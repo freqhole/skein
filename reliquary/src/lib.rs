@@ -17,9 +17,12 @@ pub mod friendz;
 pub mod hub_repo;
 pub mod identity;
 pub mod protocol;
+pub mod service;
 pub mod sync;
 pub mod userz;
 
-// TODO(phase-1): port these off grimoire, then re-enable.
+// TODO(phase-2): port the canvas-invite/gossip/snatcher hub layer off grimoire
+// and re-enable. for phase-1 the minimal `service` module above is enough to
+// run a reliquary peer.
 // pub mod hub;
 // pub mod snatch;

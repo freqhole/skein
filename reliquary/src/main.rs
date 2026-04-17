@@ -103,10 +103,6 @@ async fn serve(data_dir: PathBuf, port: u16) -> anyhow::Result<()> {
 
     let pool = db::open(&data_dir).await?;
 
-    // mark ourselves in userz so the hub has a known "self" row
-    let userz = reliquary::userz::Directory::new(pool.clone());
-    userz.upsert_self(&node_id.to_string(), None).await?;
-
     tracing::info!(
         node_id = %node_id,
         port,
@@ -114,12 +110,35 @@ async fn serve(data_dir: PathBuf, port: u16) -> anyhow::Result<()> {
         "reliquary starting"
     );
 
-    // TODO(phase-1): construct iroh::Endpoint(secret, port) and spawn
-    // HubPeerService once the handler modules have been ported off grimoire.
-    // for now this subcommand just validates wiring and waits for ctrl-c.
+    // build the iroh endpoint with n0 discovery + the persisted secret key
+    let builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret);
+    let builder = if port != 0 {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+        tracing::info!(port, "binding to specific UDP port");
+        builder.bind_addr(addr)?
+    } else {
+        builder
+    };
+    let endpoint = builder.bind().await?;
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutdown");
+    let config = reliquary::service::ServiceConfig {
+        data_dir: data_dir.clone(),
+        username: std::env::var("SKEIN_USERNAME").unwrap_or_else(|_| "reliquary".to_string()),
+    };
+
+    let service = reliquary::service::Service::start(endpoint, pool, config).await?;
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let ctrlc_cancel = cancel.clone();
+    tokio::spawn(async move {
+        if let Ok(()) = tokio::signal::ctrl_c().await {
+            tracing::info!("ctrl-c received");
+            ctrlc_cancel.cancel();
+        }
+    });
+
+    service.run(cancel).await;
     Ok(())
 }
 
