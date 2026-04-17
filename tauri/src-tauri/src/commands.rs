@@ -8,18 +8,73 @@
 //! see [docs/tauri-progress.md](../../../docs/tauri-progress.md) for the
 //! current action list and what's stubbed.
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use reliquary::{blobz, friendz, service::ServiceHandle, userz};
+use iroh::Endpoint;
+use reliquary::{blobz, friendz, service, userz};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::SqlitePool;
 use tauri::State;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
-/// shared state injected into tauri::Builder.
+/// runtime state for the one-and-only tauri command.
+///
+/// the endpoint, pool, and stores are always alive — they exist for the
+/// lifetime of the tauri process. `hub` is optional and can be toggled on
+/// and off at runtime via `hub_start` / `hub_stop`.
 pub struct AppState {
-    pub service: ServiceHandle,
+    pub endpoint: Endpoint,
+    pub pool: SqlitePool,
+    pub data_dir: PathBuf,
+    pub username: String,
+    pub node_id: String,
+
+    pub blobz: blobz::Store,
+    pub friendz_store: friendz::Store,
+    pub userz: userz::Directory,
+
+    pub process_started_at: Instant,
+    pub app_config_path: PathBuf,
+
+    pub hub: Arc<Mutex<Option<HubState>>>,
+}
+
+/// bookkeeping for a running hub. kept in `Option<_>` — `Some` means the
+/// hub is up, `None` means it's stopped.
+pub struct HubState {
+    pub cancel: CancellationToken,
+    pub join: tokio::task::JoinHandle<()>,
     pub started_at: Instant,
+}
+
+/// persistent app config — written to `<data_dir>/skein-app.toml`. currently
+/// just tracks whether the user wants the hub to start automatically.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub hub_enabled: bool,
+}
+
+impl AppConfig {
+    pub fn load(path: &PathBuf) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &PathBuf) -> std::io::Result<()> {
+        let toml = toml::to_string_pretty(self).unwrap_or_default();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, toml)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +106,8 @@ enum DispatchError {
     },
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
+    #[error("hub: {0}")]
+    Hub(String),
     #[error("blob: {0}")]
     Blob(#[from] blobz::BlobError),
     #[error("friend: {0}")]
@@ -68,7 +125,7 @@ async fn dispatch(
 ) -> Result<Value, DispatchError> {
     match action {
         // identity / status
-        "get_node_id" => Ok(json!({ "node_id": state.service.node_id() })),
+        "get_node_id" => Ok(json!({ "node_id": state.node_id })),
         "status" => status(state).await,
 
         // friends
@@ -81,15 +138,10 @@ async fn dispatch(
         "blob_get" => blob_get(decode("blob_get", payload)?, state).await,
         "blob_insert" => blob_insert(decode("blob_insert", payload)?, state).await,
 
-        // hub control — stubbed pending iteration 3
-        "hub_start" | "hub_stop" => Err(DispatchError::NotImplemented(
-            "hub_start / hub_stop ship in iteration 3",
-        )),
-        "hub_status" => Ok(json!({
-            "running": true,
-            "node_id": state.service.node_id(),
-            "uptime_s": state.started_at.elapsed().as_secs(),
-        })),
+        // hub control
+        "hub_start" => hub_start_inner(state).await,
+        "hub_stop" => hub_stop_inner(state).await,
+        "hub_status" => hub_status(state).await,
 
         // bi-stream IPC — stubbed pending iteration 2
         "open_bi" | "accept_stream" | "write_message" | "read_message"
@@ -126,6 +178,7 @@ struct StatusResponse {
     node_id: String,
     friend_count: usize,
     uptime_s: u64,
+    hub_running: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,11 +230,13 @@ impl From<blobz::BlobRef> for BlobDto {
 // ---------------------------------------------------------------------------
 
 async fn status(state: &AppState) -> Result<Value, DispatchError> {
-    let friends = state.service.friendz_store().list(false).await?;
+    let friends = state.friendz_store.list(false).await?;
+    let hub_running = state.hub.lock().await.is_some();
     let resp = StatusResponse {
-        node_id: state.service.node_id().to_string(),
+        node_id: state.node_id.clone(),
         friend_count: friends.len(),
-        uptime_s: state.started_at.elapsed().as_secs(),
+        uptime_s: state.process_started_at.elapsed().as_secs(),
+        hub_running,
     };
     Ok(serde_json::to_value(resp).expect("status serialize"))
 }
@@ -204,17 +259,16 @@ async fn friend_add(args: FriendAddArgs, state: &AppState) -> Result<Value, Disp
         _ => friendz::FriendStatus::Accepted,
     };
     // friendz fk → userz: ensure a user row exists before upserting the edge.
-    state.service.userz().touch(&args.node_id).await?;
+    state.userz.touch(&args.node_id).await?;
     let friend = state
-        .service
-        .friendz_store()
+        .friendz_store
         .upsert(&args.node_id, status, None)
         .await?;
     Ok(serde_json::to_value(FriendDto::from(friend)).expect("friend serialize"))
 }
 
 async fn friend_list(state: &AppState) -> Result<Value, DispatchError> {
-    let friends = state.service.friendz_store().list(false).await?;
+    let friends = state.friendz_store.list(false).await?;
     let dtos: Vec<FriendDto> = friends.into_iter().map(Into::into).collect();
     Ok(serde_json::to_value(dtos).expect("friend list serialize"))
 }
@@ -228,11 +282,7 @@ async fn friend_remove(
     args: FriendRemoveArgs,
     state: &AppState,
 ) -> Result<Value, DispatchError> {
-    state
-        .service
-        .friendz_store()
-        .delete(&args.node_id)
-        .await?;
+    state.friendz_store.delete(&args.node_id).await?;
     Ok(Value::Null)
 }
 
@@ -248,8 +298,7 @@ struct BlobListArgs {
 
 async fn blob_list(args: BlobListArgs, state: &AppState) -> Result<Value, DispatchError> {
     let blobs = state
-        .service
-        .blobz()
+        .blobz
         .list(args.limit.unwrap_or(200), args.offset.unwrap_or(0))
         .await?;
     let dtos: Vec<BlobDto> = blobs.into_iter().map(Into::into).collect();
@@ -262,12 +311,11 @@ struct BlobGetArgs {
 }
 
 async fn blob_get(args: BlobGetArgs, state: &AppState) -> Result<Value, DispatchError> {
-    let Some(meta) = state.service.blobz().get(&args.blake3).await? else {
+    let Some(meta) = state.blobz.get(&args.blake3).await? else {
         return Err(DispatchError::NotFound);
     };
     let bytes = state
-        .service
-        .blobz()
+        .blobz
         .read_bytes(&args.blake3)
         .await?
         .ok_or(DispatchError::NotFound)?;
@@ -280,8 +328,8 @@ async fn blob_get(args: BlobGetArgs, state: &AppState) -> Result<Value, Dispatch
 #[derive(Debug, Deserialize)]
 struct BlobInsertArgs {
     /// optional iroh hash (if the blob is also being shared via iroh-blobs).
-    /// for purely local blobs, callers can pass an empty string and the rust
-    /// side will mirror the blake3.
+    /// for purely local blobs, callers can omit and the rust side mirrors
+    /// the blake3.
     iroh_hash: Option<String>,
     filename: Option<String>,
     mime: Option<String>,
@@ -302,9 +350,90 @@ async fn blob_insert(
     let blake3_hex = blake3::hash(&bytes).to_hex().to_string();
     let iroh_hash = args.iroh_hash.unwrap_or_else(|| blake3_hex.clone());
     let blob = state
-        .service
-        .blobz()
+        .blobz
         .insert(iroh_hash, args.filename, args.mime, &bytes)
         .await?;
     Ok(serde_json::to_value(BlobDto::from(blob)).expect("blob insert serialize"))
+}
+
+// ---------------------------------------------------------------------------
+// hub control
+// ---------------------------------------------------------------------------
+
+/// start the hub. noop (with ok response) if already running. used both
+/// from the dispatch action and from boot.
+pub async fn hub_start(state: &AppState) -> Result<Value, String> {
+    hub_start_inner(state).await.map_err(|e| e.to_string())
+}
+
+async fn hub_start_inner(state: &AppState) -> Result<Value, DispatchError> {
+    let mut slot = state.hub.lock().await;
+    if slot.is_some() {
+        return Ok(json!({ "running": true, "already_running": true }));
+    }
+
+    let svc = service::Service::start(
+        state.endpoint.clone(),
+        state.pool.clone(),
+        service::ServiceConfig {
+            data_dir: state.data_dir.clone(),
+            username: state.username.clone(),
+            bio: String::new(),
+            avatar_path: None,
+        },
+    )
+    .await
+    .map_err(|e| DispatchError::Hub(format!("service start: {e}")))?;
+
+    let cancel = CancellationToken::new();
+    let run_cancel = cancel.clone();
+    let join = tokio::spawn(async move {
+        svc.run_keep_endpoint(run_cancel).await;
+    });
+    let started_at = Instant::now();
+    *slot = Some(HubState {
+        cancel,
+        join,
+        started_at,
+    });
+    drop(slot);
+
+    persist_hub_state(state, true);
+    Ok(json!({ "running": true, "already_running": false }))
+}
+
+/// stop the hub. noop if already stopped.
+async fn hub_stop_inner(state: &AppState) -> Result<Value, DispatchError> {
+    let taken = state.hub.lock().await.take();
+    let Some(hub) = taken else {
+        return Ok(json!({ "running": false, "already_stopped": true }));
+    };
+    hub.cancel.cancel();
+    // run_keep_endpoint shuts down the router internally; await the spawn.
+    if let Err(e) = hub.join.await {
+        tracing::warn!(error = ?e, "hub run task join error");
+    }
+    persist_hub_state(state, false);
+    Ok(json!({ "running": false, "already_stopped": false }))
+}
+
+async fn hub_status(state: &AppState) -> Result<Value, DispatchError> {
+    let slot = state.hub.lock().await;
+    match &*slot {
+        Some(hub) => Ok(json!({
+            "running": true,
+            "node_id": state.node_id,
+            "uptime_s": hub.started_at.elapsed().as_secs(),
+        })),
+        None => Ok(json!({ "running": false, "node_id": state.node_id })),
+    }
+}
+
+/// write `hub_enabled` into `<data_dir>/skein-app.toml`. errors are logged
+/// but not surfaced — persistence is best-effort.
+fn persist_hub_state(state: &AppState, hub_enabled: bool) {
+    let cfg = AppConfig { hub_enabled };
+    if let Err(e) = cfg.save(&state.app_config_path) {
+        tracing::warn!(error = %e, path = ?state.app_config_path, "failed to persist hub state");
+    }
 }

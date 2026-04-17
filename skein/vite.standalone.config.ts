@@ -20,7 +20,9 @@ export default defineConfig({
     rollupOptions: {
       input: {
         skein: path.resolve(dirname, "skein.html"),
-        ...(isTauriBuild ? {} : { gallery: path.resolve(dirname, "widget-gallery.html") }),
+        ...(isTauriBuild
+          ? { settings: path.resolve(dirname, "settings.html") }
+          : { gallery: path.resolve(dirname, "widget-gallery.html") }),
       },
     },
     sourcemap: true,

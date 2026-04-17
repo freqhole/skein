@@ -35,7 +35,7 @@ export function isTauriMode(): boolean {
  * lazily imports @tauri-apps/api/core so the module can be parsed
  * even when Tauri is not present (the stub will throw at runtime).
  */
-async function dispatch(action: string, payload: Record<string, unknown> = {}): Promise<any> {
+export async function dispatch(action: string, payload: Record<string, unknown> = {}): Promise<any> {
   // dynamic import so the module graph doesn't fail in non-Tauri builds
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke("skein_dispatch", { action, payload });

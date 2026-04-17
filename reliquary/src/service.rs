@@ -230,7 +230,22 @@ impl Service {
     /// run until `cancel` is fired.
     ///
     /// drives the friendz heartbeat loop plus incoming-event processing.
-    pub async fn run(mut self, cancel: CancellationToken) {
+    /// on exit, tears down the router *and* closes the endpoint — suitable
+    /// for callers (like the CLI) that own the endpoint exclusively.
+    ///
+    /// use [`Service::run_keep_endpoint`] instead when the endpoint is
+    /// shared (e.g. the tauri app's always-on `Endpoint`).
+    pub async fn run(self, cancel: CancellationToken) {
+        self.run_inner(cancel, true).await
+    }
+
+    /// like [`Service::run`], but leaves the endpoint open on exit so an
+    /// embedder can keep using it.
+    pub async fn run_keep_endpoint(self, cancel: CancellationToken) {
+        self.run_inner(cancel, false).await
+    }
+
+    async fn run_inner(mut self, cancel: CancellationToken, close_endpoint: bool) {
         tracing::info!(node_id = %self.node_id_str, "service run loop started");
 
         // heartbeat loop — reads the accepted friend list from our friendz store
@@ -282,7 +297,11 @@ impl Service {
         }
 
         heartbeat_handle.abort();
-        self.shutdown().await;
+        if close_endpoint {
+            self.shutdown().await;
+        } else {
+            self.shutdown_keep_endpoint().await;
+        }
     }
 
     async fn handle_event(&self, event: FriendzEvent) -> Result<(), ServiceError> {
@@ -376,6 +395,21 @@ impl Service {
         }
         self.endpoint.close().await;
         tracing::info!("reliquary service stopped");
+    }
+
+    /// graceful shutdown of router only — leaves the `Endpoint` open so an
+    /// embedder (e.g. the tauri app) can keep using it. used for the
+    /// start/stop hub-toggle flow where the endpoint's lifetime is tied to
+    /// the host process, not to any individual `Service` instance.
+    pub async fn shutdown_keep_endpoint(self) {
+        tracing::info!("shutting down reliquary service (keeping endpoint open)");
+        let timeout = std::time::Duration::from_secs(10);
+        match tokio::time::timeout(timeout, self.router.shutdown()).await {
+            Ok(Ok(())) => tracing::debug!("router shut down cleanly"),
+            Ok(Err(e)) => tracing::warn!(error = ?e, "error shutting down router"),
+            Err(_) => tracing::warn!("router shutdown timed out after 10s"),
+        }
+        tracing::info!("reliquary service stopped (endpoint left open)");
     }
 
     // accessors ---------------------------------------------------------

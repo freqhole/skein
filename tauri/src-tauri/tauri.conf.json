@@ -18,6 +18,19 @@
         "height": 800,
         "resizable": true,
         "fullscreen": false
+      },
+      {
+        "label": "settings",
+        "title": "skein settings",
+        "url": "settings.html",
+        "width": 520,
+        "height": 480,
+        "minWidth": 360,
+        "minHeight": 320,
+        "resizable": true,
+        "visible": false,
+        "center": true,
+        "focus": true
       }
     ],
     "security": {
