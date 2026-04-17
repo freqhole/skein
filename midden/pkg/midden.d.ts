@@ -113,11 +113,11 @@ export class IntoUnderlyingSource {
 }
 
 /**
- * browser P2P node for freqhole federation
+ * browser P2P node for the skein canvas ecosystem.
  *
  * supports two protocols:
  * - skein/1: API proxying and small blob streaming
- * - iroh-blobs: verified streaming for audio files
+ * - iroh-blobs: verified streaming for file blobs
  */
 export class MiddenNode {
     private constructor();

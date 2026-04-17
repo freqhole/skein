@@ -1,7 +1,7 @@
 {
   "name": "midden",
   "type": "module",
-  "description": "WASM bindings for freqhole P2P client (iroh-based)",
+  "description": "WASM bindings for the skein P2P canvas (iroh-based)",
   "version": "0.1.14",
   "files": [
     "midden_bg.wasm",

@@ -2,14 +2,19 @@
 name = "midden"
 version = "0.1.14"
 edition = "2021"
-description = "WASM bindings for freqhole P2P client (iroh-based)"
+description = "WASM bindings for the skein P2P canvas (iroh-based)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1"
-bao-tree = { version = "0.16", default-features = false, features = ["experimental-mixed", "tokio_fsm", "validate", "serde"] }
+bao-tree = { version = "0.16", default-features = false, features = [
+    "experimental-mixed",
+    "tokio_fsm",
+    "validate",
+    "serde",
+] }
 blake3 = "1.5"
 bytes = "1.10"
 indexmap = "2"

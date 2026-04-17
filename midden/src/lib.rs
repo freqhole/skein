@@ -1,11 +1,11 @@
-//! midden: browser WASM client for freqhole P2P federation
+//! midden: browser WASM client for the skein P2P canvas ecosystem.
 //!
-//! uses iroh to connect to freqhole peers from the browser.
+//! uses iroh to connect to skein peers from the browser.
 //! accepts either plain node_id or full endpoint address JSON with relay/IP hints.
 //!
 //! supports two protocols:
 //! - skein/1: custom protocol for API proxying and small blob streaming
-//! - freqhole-blobz: iroh-blobs protocol for verified streaming of audio files
+//! - iroh-blobs: verified streaming of file blobs
 
 use bao_tree::ChunkRanges;
 use indexmap::IndexMap;
@@ -336,11 +336,11 @@ fn parse_peer_addr(peer_addr: &str) -> Result<EndpointAddr, String> {
     Ok(EndpointAddr::from_parts(node_id, []))
 }
 
-/// browser P2P node for freqhole federation
+/// browser P2P node for the skein canvas ecosystem.
 ///
 /// supports two protocols:
 /// - skein/1: API proxying and small blob streaming
-/// - iroh-blobs: verified streaming for audio files
+/// - iroh-blobs: verified streaming for file blobs
 #[wasm_bindgen]
 pub struct MiddenNode {
     endpoint: Endpoint,

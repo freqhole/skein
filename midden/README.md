@@ -1,10 +1,10 @@
 # midden
 
-browser WASM client for freqhole P2P federation.
+browser WASM client for the skein P2P canvas ecosystem.
 
 ## what it does
 
-midden provides a `MiddenNode` class that lets browsers connect to freqhole peers over iroh P2P. just need the peer's node_id (public key) to connect - iroh handles discovery via relay.
+midden provides a `MiddenNode` class that lets browsers connect to skein peers over iroh P2P. just need the peer's node_id (public key) to connect — iroh handles discovery via relay.
 
 ## building
 
