@@ -32,8 +32,6 @@ export const fileSchema = z.object({
   blobId: z.string().default(""),
   /** media domain: audio, photo, video, document, file */
   domain: z.string().default(""),
-  /** domain entity ID (audioz, photoz, etc.) */
-  entityId: z.string().default(""),
   /** original filename */
   filename: z.string().default(""),
   /** MIME type */
@@ -1136,7 +1134,6 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             childDocHandle.change((draft: any) => {
               draft.blobId = result.blobId;
               draft.domain = result.domain;
-              draft.entityId = result.entityId;
               draft.filename = file.filename;
               draft.mime = result.mime;
               draft.size = result.size;
@@ -1264,7 +1261,6 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           ctx.doc.change((draft) => {
             draft.blobId = result.blobId;
             draft.domain = result.domain;
-            draft.entityId = result.entityId;
             draft.filename = file.filename;
             draft.mime = result.mime;
             draft.size = result.size;
@@ -1423,7 +1419,6 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           ctx.doc.change((draft) => {
             draft.blobId = result.blobId;
             draft.domain = result.domain;
-            draft.entityId = result.entityId;
             draft.mime = result.mime;
             draft.size = result.size;
             draft.blake3 = result.blake3 ?? "";

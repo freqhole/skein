@@ -360,7 +360,6 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
           docHandle.change((draft: any) => {
             draft.blobId = result.blobId;
             draft.domain = result.domain;
-            draft.entityId = result.entityId;
             draft.filename = file.filename;
             draft.mime = result.mime;
             draft.size = result.size;

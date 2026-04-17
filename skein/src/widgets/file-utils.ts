@@ -64,7 +64,6 @@ export interface PickedFile {
 export interface FileUploadResult {
   blobId: string;
   domain: string;
-  entityId: string;
   jobId: string | null;
   sha256: string;
   blake3: string | null;
@@ -435,7 +434,6 @@ export async function snatchBlob(
         return {
           blobId: d.id ?? d.blob_id ?? info.blobId,
           domain: d.domain ?? info.domain,
-          entityId: d.entity_id ?? "",
           jobId: null,
           sha256: d.sha256 ?? "",
           blake3: d.blake3 ?? info.blake3,
@@ -609,7 +607,7 @@ async function snatchFromBrowserPeer(
   options?: SnatchOptions
 ): Promise<FileUploadResult> {
   const { getMiddenNode } = await import("../p2p/identity");
-  const { storeBlob, storeDomainEntity, computeSha256 } =
+  const { storeBlob, computeSha256 } =
     await import("../storage/skein-blob-store");
 
   const node = await getMiddenNode();
@@ -709,17 +707,6 @@ async function snatchFromBrowserPeer(
     metadata: { source: "snatch" },
   });
 
-  const entityId = crypto.randomUUID();
-  await storeDomainEntity({
-    entity_id: entityId,
-    blob_id: sha256,
-    domain: info.domain,
-    title: info.filename,
-    description: "",
-    metadata: {},
-    created_at: Date.now(),
-  });
-
   // clear thumbnail cache for this blob
   const key200 = cacheKey(info.blobId, 200);
   const key50 = cacheKey(info.blobId, 50);
@@ -737,7 +724,6 @@ async function snatchFromBrowserPeer(
   return {
     blobId: sha256,
     domain: info.domain,
-    entityId,
     jobId: null,
     sha256: sha256,
     blake3: blake3Hash || null,
@@ -862,7 +848,6 @@ async function snatchFromTauriPeer(
   return {
     blobId: d.blob_id,
     domain: d.domain,
-    entityId: d.entity_id,
     jobId: d.job_id ?? null,
     sha256: d.sha256,
     blake3: d.blake3 ?? null,
@@ -945,7 +930,6 @@ export async function snatchBlobBatch(
       const result: FileUploadResult = {
         blobId: cached.metadata?.id ?? info.blobId,
         domain: info.domain,
-        entityId: "",
         jobId: null,
         sha256: "",
         blake3: cached.metadata?.blake3 ?? info.blake3 ?? null,
@@ -977,7 +961,6 @@ export async function snatchBlobBatch(
           const result: FileUploadResult = {
             blobId: d.id ?? d.blob_id ?? info.blobId,
             domain: d.domain ?? info.domain,
-            entityId: d.entity_id ?? "",
             jobId: null,
             sha256: d.sha256 ?? "",
             blake3: d.blake3 ?? info.blake3 ?? null,
@@ -1005,7 +988,6 @@ export async function snatchBlobBatch(
           const result: FileUploadResult = {
             blobId: localInfo.metadata?.id ?? info.blobId,
             domain: info.domain,
-            entityId: "",
             jobId: null,
             sha256: "",
             blake3: localInfo.metadata?.blake3 ?? info.blake3 ?? null,
@@ -1935,20 +1917,9 @@ export async function uploadFile(
       throw new Error("no File object available in browser mode");
     }
 
-    const { storeBlobFromFile, storeDomainEntity } = await import("../storage/skein-blob-store");
+    const { storeBlobFromFile } = await import("../storage/skein-blob-store");
 
     const record = await storeBlobFromFile(picked.file);
-
-    const entityId = crypto.randomUUID();
-    await storeDomainEntity({
-      entity_id: entityId,
-      blob_id: record.blob_id,
-      domain: record.domain,
-      title: options?.title || picked.filename,
-      description: options?.description || "",
-      metadata: {},
-      created_at: Date.now(),
-    });
 
     // generate browser-side thumbnail for images
     let thumbnailDataUrl: string | null = null;
@@ -1959,7 +1930,6 @@ export async function uploadFile(
     return {
       blobId: record.blob_id,
       domain: record.domain,
-      entityId,
       jobId: null,
       sha256: record.sha256,
       blake3: record.blake3 || "",
@@ -2015,7 +1985,6 @@ export async function uploadFile(
   return {
     blobId: d.blob_id,
     domain: d.domain,
-    entityId: d.entity_id,
     jobId: d.job_id ?? null,
     sha256: d.sha256,
     blake3: d.blake3 ?? null,

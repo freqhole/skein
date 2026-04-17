@@ -52,9 +52,6 @@ pub struct FileWidgetState {
     /// media domain: audio, photo, video, document, file.
     #[serde(default)]
     pub domain: String,
-    /// domain entity ID (audioz, photoz, etc.).
-    #[serde(default)]
-    pub entity_id: String,
     /// original filename.
     #[serde(default)]
     pub filename: String,
@@ -160,7 +157,6 @@ mod tests {
         let state = FileWidgetState {
             blob_id: "blob-123".to_string(),
             domain: "audio".to_string(),
-            entity_id: "song-456".to_string(),
             filename: "track.mp3".to_string(),
             mime: "audio/mpeg".to_string(),
             size: 5_000_000,
@@ -173,7 +169,6 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed["blobId"], "blob-123");
-        assert_eq!(parsed["entityId"], "song-456");
         assert_eq!(parsed["thumbnailDataUrl"], "");
         assert_eq!(
             parsed["snatchedBy"],
@@ -226,7 +221,6 @@ mod tests {
         let js_json = r#"{
             "blobId": "blob-abc",
             "domain": "photo",
-            "entityId": "",
             "filename": "sunset.jpg",
             "mime": "image/jpeg",
             "size": 2500000,
@@ -246,7 +240,6 @@ mod tests {
         let js_json_with_snatched = r#"{
             "blobId": "blob-abc",
             "domain": "photo",
-            "entityId": "",
             "filename": "sunset.jpg",
             "mime": "image/jpeg",
             "size": 2500000,

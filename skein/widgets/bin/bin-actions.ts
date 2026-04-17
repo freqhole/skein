@@ -234,7 +234,6 @@ export async function snatchAllInBin(
         childHandle.change((draft: any) => {
           draft.blobId = result.blobId;
           draft.domain = result.domain;
-          draft.entityId = result.entityId;
           draft.mime = result.mime;
           draft.size = result.size;
           draft.blake3 = result.blake3 ?? "";

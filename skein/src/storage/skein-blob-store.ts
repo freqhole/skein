@@ -22,21 +22,10 @@ export interface SkeinBlobRecord {
   created_at: number;
 }
 
-export interface SkeinDomainEntity {
-  entity_id: string;
-  blob_id: string;
-  domain: string;
-  title: string;
-  description: string;
-  metadata: Record<string, unknown>;
-  created_at: number;
-}
-
 // ---- constants ------------------------------------------------------------
 
 const BLOB_DB_NAME = "skein-blobs";
 const BLOB_STORE = "blobs";
-const ENTITY_STORE = "domain_entities";
 const OPFS_DIR = "skein-blobs";
 const BAO_OPFS_DIR = "skein-blobs-bao";
 
@@ -72,32 +61,32 @@ export function clearBlobUrlCache(): void {
 /**
  * open (or create) the skein-blobs indexeddb database.
  *
- * version 1 created the "blobs" and "domain_entities" object stores
- * with sha256 and domain indexes. version 2 adds a blake3 index to
- * the blobs store. callers are responsible for closing the returned
- * database when done.
+ * version history:
+ *   v1 — initial: "blobs" + "domain_entities" object stores; sha256 + domain
+ *        indexes on blobs.
+ *   v2 — added blake3 index to blobs.
+ *   v3 — dropped the "domain_entities" store entirely (skein never reads it;
+ *        the freqhole-era entity layer is gone). the `domain` field on
+ *        SkeinBlobRecord is preserved — the file widget still classifies media
+ *        by it.
+ *
+ * callers are responsible for closing the returned database when done.
  */
 export async function openBlobDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(BLOB_DB_NAME, 2);
+    const req = indexedDB.open(BLOB_DB_NAME, 3);
     req.onupgradeneeded = (event) => {
       const db = req.result;
       const oldVersion = event.oldVersion;
 
       if (oldVersion < 1) {
-        // fresh install — create stores and all indexes
+        // fresh install — create the blobs store and all indexes
         const blobStore = db.createObjectStore(BLOB_STORE, {
           keyPath: "blob_id",
         });
         blobStore.createIndex("sha256", "sha256", { unique: false });
         blobStore.createIndex("domain", "domain", { unique: false });
         blobStore.createIndex("blake3", "blake3", { unique: false });
-
-        const entityStore = db.createObjectStore(ENTITY_STORE, {
-          keyPath: "entity_id",
-        });
-        entityStore.createIndex("blob_id", "blob_id", { unique: false });
-        entityStore.createIndex("domain", "domain", { unique: false });
       }
 
       if (oldVersion < 2) {
@@ -108,6 +97,13 @@ export async function openBlobDb(): Promise<IDBDatabase> {
           if (!blobStore.indexNames.contains("blake3")) {
             blobStore.createIndex("blake3", "blake3", { unique: false });
           }
+        }
+      }
+
+      if (oldVersion < 3) {
+        // upgrade from v2 — drop the now-unused "domain_entities" store.
+        if (db.objectStoreNames.contains("domain_entities")) {
+          db.deleteObjectStore("domain_entities");
         }
       }
     };
@@ -521,68 +517,13 @@ export async function getBlobObjectURL(blobId: string): Promise<string | null> {
   return url;
 }
 
-// ---- domain entity operations ---------------------------------------------
-
-/**
- * store a domain entity record in IndexedDB.
- */
-export async function storeDomainEntity(entity: SkeinDomainEntity): Promise<void> {
-  const db = await openBlobDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(ENTITY_STORE, "readwrite");
-    const store = tx.objectStore(ENTITY_STORE);
-    store.put(entity);
-    tx.oncomplete = () => {
-      db.close();
-      resolve();
-    };
-    tx.onerror = () => {
-      db.close();
-      reject(tx.error);
-    };
-  });
-}
-
-/**
- * retrieve a domain entity by its id.
- *
- * returns `null` when the entity does not exist.
- */
-export async function getDomainEntity(entityId: string): Promise<SkeinDomainEntity | null> {
-  const db = await openBlobDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(ENTITY_STORE, "readonly");
-    const store = tx.objectStore(ENTITY_STORE);
-    const req = store.get(entityId);
-    req.onsuccess = () => resolve((req.result as SkeinDomainEntity) ?? null);
-    req.onerror = () => reject(req.error);
-    tx.oncomplete = () => db.close();
-  });
-}
-
-/**
- * retrieve all domain entities associated with a given blob id.
- */
-export async function getDomainEntitiesByBlob(blobId: string): Promise<SkeinDomainEntity[]> {
-  const db = await openBlobDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(ENTITY_STORE, "readonly");
-    const store = tx.objectStore(ENTITY_STORE);
-    const index = store.index("blob_id");
-    const req = index.getAll(blobId);
-    req.onsuccess = () => resolve((req.result as SkeinDomainEntity[]) ?? []);
-    req.onerror = () => reject(req.error);
-    tx.oncomplete = () => db.close();
-  });
-}
-
 // ---- deletion -------------------------------------------------------------
 
 /**
  * delete a blob and all associated data.
  *
- * removes the OPFS file, the IndexedDB metadata record, any domain
- * entities referencing this blob, and any cached object url.
+ * removes the OPFS file, the IndexedDB metadata record, the cached bao
+ * outboard data, and any cached object url.
  */
 export async function deleteBlob(blobId: string): Promise<void> {
   // look up the record so we can clean up the bao cache by blake3 hash
@@ -608,27 +549,11 @@ export async function deleteBlob(blobId: string): Promise<void> {
     blobUrlCache.delete(blobId);
   }
 
-  // delete the blob record and associated domain entities from IDB
+  // delete the blob record from IDB
   const db = await openBlobDb();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction([BLOB_STORE, ENTITY_STORE], "readwrite");
-
-    // delete the blob record
-    const blobStore = tx.objectStore(BLOB_STORE);
-    blobStore.delete(blobId);
-
-    // find and delete all domain entities referencing this blob
-    const entityStore = tx.objectStore(ENTITY_STORE);
-    const index = entityStore.index("blob_id");
-    const cursorReq = index.openCursor(blobId);
-    cursorReq.onsuccess = () => {
-      const cursor = cursorReq.result;
-      if (cursor) {
-        cursor.delete();
-        cursor.continue();
-      }
-    };
-
+    const tx = db.transaction(BLOB_STORE, "readwrite");
+    tx.objectStore(BLOB_STORE).delete(blobId);
     tx.oncomplete = () => {
       db.close();
       resolve();
@@ -641,19 +566,18 @@ export async function deleteBlob(blobId: string): Promise<void> {
 }
 
 /**
- * clear all blob data — both IndexedDB stores, the OPFS directory,
+ * clear all blob data — the IndexedDB blob store, both OPFS directories,
  * and the session url cache.
  */
 export async function clearAll(): Promise<void> {
   // clear the url cache
   clearBlobUrlCache();
 
-  // clear both IDB stores
+  // clear the blob store
   const db = await openBlobDb();
   await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction([BLOB_STORE, ENTITY_STORE], "readwrite");
+    const tx = db.transaction(BLOB_STORE, "readwrite");
     tx.objectStore(BLOB_STORE).clear();
-    tx.objectStore(ENTITY_STORE).clear();
     tx.oncomplete = () => {
       db.close();
       resolve();
