@@ -97,6 +97,45 @@ async fn fs_store(data_dir: &Path) -> Result<&'static FsStore, ServiceError> {
 // service
 // ---------------------------------------------------------------------------
 
+/// cheaply-cloneable accessor bundle. hand this out to callers (tauri IPC,
+/// embedders, tests) that only need to read from / send messages into the
+/// running service — the heavyweight drive loop is owned exclusively by the
+/// [`Service`] passed to [`Service::run`].
+#[derive(Clone)]
+pub struct ServiceHandle {
+    endpoint: Endpoint,
+    friendz_handler: FriendzHandler,
+    iroh_repo: IrohRepo,
+    blobz: blobz::Store,
+    friendz_store: friendz::Store,
+    userz: userz::Directory,
+    node_id_str: String,
+}
+
+impl ServiceHandle {
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+    pub fn friendz(&self) -> &FriendzHandler {
+        &self.friendz_handler
+    }
+    pub fn iroh_repo(&self) -> &IrohRepo {
+        &self.iroh_repo
+    }
+    pub fn blobz(&self) -> &blobz::Store {
+        &self.blobz
+    }
+    pub fn friendz_store(&self) -> &friendz::Store {
+        &self.friendz_store
+    }
+    pub fn userz(&self) -> &userz::Directory {
+        &self.userz
+    }
+    pub fn node_id(&self) -> &str {
+        &self.node_id_str
+    }
+}
+
 /// the running peer service. hold on to it for the lifetime of the process;
 /// call [`Service::run`] to drive event processing and [`Service::shutdown`]
 /// to tear everything down.
@@ -334,6 +373,21 @@ impl Service {
     }
 
     // accessors ---------------------------------------------------------
+
+    /// snapshot a cloneable handle with all of the accessor surfaces.
+    /// use this when handing the service to callers that don't drive the
+    /// run loop (e.g. tauri IPC commands).
+    pub fn handle(&self) -> ServiceHandle {
+        ServiceHandle {
+            endpoint: self.endpoint.clone(),
+            friendz_handler: self.friendz_handler.clone(),
+            iroh_repo: self.iroh_repo.clone(),
+            blobz: self.blobz.clone(),
+            friendz_store: self.friendz_store.clone(),
+            userz: self.userz.clone(),
+            node_id_str: self.node_id_str.clone(),
+        }
+    }
 
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint

@@ -1,8 +1,10 @@
 [workspace]
 members = ["reliquary"]
-# tauri/ added in phase 3
+# tauri/src-tauri added explicitly once icons + gen/ are populated; keeping
+# it excluded for now so `cargo check` at the workspace root stays green
+# without a working `cargo tauri` bootstrap.
 # midden/ is a wasm crate, built separately with wasm-pack
-exclude = ["midden"]
+exclude = ["midden", "tauri"]
 resolver = "2"
 
 [workspace.package]

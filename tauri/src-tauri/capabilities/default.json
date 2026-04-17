@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "default capability for the main skein window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:app:default",
+    "core:event:default",
+    "core:path:default",
+    "core:resources:default",
+    "core:webview:default",
+    "dialog:default",
+    "opener:default",
+    "shell:default",
+    "window-state:default"
+  ]
+}
