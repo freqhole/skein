@@ -168,7 +168,7 @@ impl Service {
         // record ourselves in userz
         let userz = userz::Directory::new(pool.clone());
         userz
-            .upsert_self(&node_id_str, Some(&config.username))
+            .upsert_self(&node_id_str, Some(&config.username), None, None)
             .await?;
 
         let blobz = blobz::Store::new(pool.clone(), &config.data_dir);
@@ -284,7 +284,7 @@ impl Service {
             FriendzEvent::PeerOnline { node_id, username } => {
                 tracing::info!(peer = %node_id, username = %username, "peer online");
                 self.userz
-                    .upsert_profile(&node_id, Some(&username), None)
+                    .upsert_profile(&node_id, Some(&username), None, None)
                     .await?;
             }
             FriendzEvent::PeerOffline { node_id } => {
@@ -326,7 +326,7 @@ impl Service {
                 // phase-1: ignore avatar_data_url; userz.avatar_blake3 takes a
                 // blake3 hash, not a data url. avatar transfer comes back later.
                 self.userz
-                    .upsert_profile(from, Some(&username), None)
+                    .upsert_profile(from, Some(&username), None, None)
                     .await?;
             }
             FriendzMessage::FriendRequest { from_username, .. } => {

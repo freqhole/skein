@@ -17,6 +17,7 @@ CREATE UNIQUE INDEX blobz_iroh_hash_idx ON blobz (iroh_hash);
 CREATE TABLE userz (
     node_id       TEXT PRIMARY KEY NOT NULL,
     display_name  TEXT,
+    bio           TEXT,
     avatar_blake3 TEXT,
     first_seen_at INTEGER NOT NULL,
     last_seen_at  INTEGER NOT NULL,

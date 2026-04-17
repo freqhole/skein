@@ -18,6 +18,7 @@ pub enum UserError {
 pub struct PeerRecord {
     pub node_id: String,
     pub display_name: Option<String>,
+    pub bio: Option<String>,
     pub avatar_blake3: Option<String>,
     pub first_seen_at: i64,
     pub last_seen_at: i64,
@@ -35,24 +36,34 @@ impl Directory {
     }
 
     /// upsert the local node. called once on hub startup.
+    ///
+    /// `display_name`, `bio`, and `avatar_blake3` are all optional and
+    /// merged with COALESCE — passing `None` for a field leaves the
+    /// existing value alone, so partial updates work without read-modify-write.
     pub async fn upsert_self(
         &self,
         node_id: &str,
         display_name: Option<&str>,
+        bio: Option<&str>,
+        avatar_blake3: Option<&str>,
     ) -> Result<(), UserError> {
         let now = now_secs();
         sqlx::query(
             r#"
-            INSERT INTO userz (node_id, display_name, first_seen_at, last_seen_at, is_self)
-            VALUES (?1, ?2, ?3, ?3, 1)
+            INSERT INTO userz (node_id, display_name, bio, avatar_blake3, first_seen_at, last_seen_at, is_self)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)
             ON CONFLICT(node_id) DO UPDATE SET
-                display_name = COALESCE(excluded.display_name, userz.display_name),
-                last_seen_at = excluded.last_seen_at,
-                is_self = 1
+                display_name  = COALESCE(excluded.display_name,  userz.display_name),
+                bio           = COALESCE(excluded.bio,           userz.bio),
+                avatar_blake3 = COALESCE(excluded.avatar_blake3, userz.avatar_blake3),
+                last_seen_at  = excluded.last_seen_at,
+                is_self       = 1
             "#,
         )
         .bind(node_id)
         .bind(display_name)
+        .bind(bio)
+        .bind(avatar_blake3)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -76,27 +87,30 @@ impl Directory {
         Ok(())
     }
 
-    /// update a peer's profile (display_name + avatar). any None fields are
-    /// left untouched.
+    /// update a peer's profile (display_name + bio + avatar). any None fields
+    /// are left untouched (COALESCE-based merge).
     pub async fn upsert_profile(
         &self,
         node_id: &str,
         display_name: Option<&str>,
+        bio: Option<&str>,
         avatar_blake3: Option<&str>,
     ) -> Result<(), UserError> {
         let now = now_secs();
         sqlx::query(
             r#"
-            INSERT INTO userz (node_id, display_name, avatar_blake3, first_seen_at, last_seen_at, is_self)
-            VALUES (?1, ?2, ?3, ?4, ?4, 0)
+            INSERT INTO userz (node_id, display_name, bio, avatar_blake3, first_seen_at, last_seen_at, is_self)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0)
             ON CONFLICT(node_id) DO UPDATE SET
                 display_name  = COALESCE(excluded.display_name,  userz.display_name),
+                bio           = COALESCE(excluded.bio,           userz.bio),
                 avatar_blake3 = COALESCE(excluded.avatar_blake3, userz.avatar_blake3),
                 last_seen_at  = excluded.last_seen_at
             "#,
         )
         .bind(node_id)
         .bind(display_name)
+        .bind(bio)
         .bind(avatar_blake3)
         .bind(now)
         .execute(&self.pool)
@@ -107,7 +121,7 @@ impl Directory {
     pub async fn get(&self, node_id: &str) -> Result<Option<PeerRecord>, UserError> {
         let row = sqlx::query_as::<_, PeerRow>(
             r#"
-            SELECT node_id, display_name, avatar_blake3, first_seen_at, last_seen_at, is_self
+            SELECT node_id, display_name, bio, avatar_blake3, first_seen_at, last_seen_at, is_self
             FROM userz WHERE node_id = ?1
             "#,
         )
@@ -122,6 +136,7 @@ impl Directory {
 struct PeerRow {
     node_id: String,
     display_name: Option<String>,
+    bio: Option<String>,
     avatar_blake3: Option<String>,
     first_seen_at: i64,
     last_seen_at: i64,
@@ -133,6 +148,7 @@ impl From<PeerRow> for PeerRecord {
         Self {
             node_id: r.node_id,
             display_name: r.display_name,
+            bio: r.bio,
             avatar_blake3: r.avatar_blake3,
             first_seen_at: r.first_seen_at,
             last_seen_at: r.last_seen_at,

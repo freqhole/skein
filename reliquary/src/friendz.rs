@@ -20,14 +20,24 @@ pub enum FriendError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FriendStatus {
+    /// peer is pre-approved by the operator (e.g. via `reliquary friend allow`).
+    /// inbound `FriendRequest` from an `Allowed` peer auto-promotes to
+    /// `Accepted` and triggers a `FriendAccept` reply.
+    Allowed,
+    /// inbound `FriendRequest` recorded but not yet acted on. operator must
+    /// promote with `reliquary friend allow` (or its equivalent ipc) for the
+    /// hub to send `FriendAccept`.
     Pending,
+    /// mutual friendship established.
     Accepted,
+    /// peer is denied — drop their requests on the floor.
     Blocked,
 }
 
 impl FriendStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Allowed => "allowed",
             Self::Pending => "pending",
             Self::Accepted => "accepted",
             Self::Blocked => "blocked",
@@ -36,6 +46,7 @@ impl FriendStatus {
 
     pub fn parse(s: &str) -> Result<Self, FriendError> {
         match s {
+            "allowed" => Ok(Self::Allowed),
             "pending" => Ok(Self::Pending),
             "accepted" => Ok(Self::Accepted),
             "blocked" => Ok(Self::Blocked),

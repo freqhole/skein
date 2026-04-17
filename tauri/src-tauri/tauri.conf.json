@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "net.freqhole.skein",
   "build": {
-    "beforeDevCommand": "",
+    "beforeDevCommand": "npm --prefix ../../skein run dev:tauri",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "",
-    "frontendDist": "../dist"
+    "beforeBuildCommand": "npm --prefix ../../skein run build:tauri",
+    "frontendDist": "../../skein/dist"
   },
   "app": {
     "windows": [
