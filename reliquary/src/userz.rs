@@ -163,3 +163,94 @@ fn now_secs() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    async fn make_dir() -> Directory {
+        Directory::new(db::open_in_memory().await)
+    }
+
+    #[tokio::test]
+    async fn upsert_self_creates_row_marked_is_self() {
+        let dir = make_dir().await;
+        dir.upsert_self("node-self", Some("me"), Some("hi"), Some("bk3"))
+            .await
+            .unwrap();
+
+        let got = dir.get("node-self").await.unwrap().expect("present");
+        assert!(got.is_self);
+        assert_eq!(got.display_name.as_deref(), Some("me"));
+        assert_eq!(got.bio.as_deref(), Some("hi"));
+        assert_eq!(got.avatar_blake3.as_deref(), Some("bk3"));
+        assert_eq!(got.first_seen_at, got.last_seen_at);
+    }
+
+    #[tokio::test]
+    async fn upsert_self_partial_update_preserves_existing_fields() {
+        let dir = make_dir().await;
+        dir.upsert_self("n", Some("name1"), Some("bio1"), Some("av1"))
+            .await
+            .unwrap();
+        // pass None for everything except node_id; existing values must remain.
+        dir.upsert_self("n", None, None, None).await.unwrap();
+
+        let got = dir.get("n").await.unwrap().unwrap();
+        assert_eq!(got.display_name.as_deref(), Some("name1"));
+        assert_eq!(got.bio.as_deref(), Some("bio1"));
+        assert_eq!(got.avatar_blake3.as_deref(), Some("av1"));
+        assert!(got.is_self);
+    }
+
+    #[tokio::test]
+    async fn touch_creates_minimal_peer_row() {
+        let dir = make_dir().await;
+        dir.touch("peer-1").await.unwrap();
+        let got = dir.get("peer-1").await.unwrap().expect("present");
+        assert!(!got.is_self);
+        assert!(got.display_name.is_none());
+        assert!(got.bio.is_none());
+        assert!(got.avatar_blake3.is_none());
+    }
+
+    #[tokio::test]
+    async fn touch_updates_last_seen_only() {
+        let dir = make_dir().await;
+        dir.touch("p").await.unwrap();
+        let first = dir.get("p").await.unwrap().unwrap();
+        // sleep past the 1s timestamp resolution so last_seen_at can advance.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        dir.touch("p").await.unwrap();
+        let second = dir.get("p").await.unwrap().unwrap();
+        assert_eq!(first.first_seen_at, second.first_seen_at);
+        assert!(second.last_seen_at >= first.last_seen_at);
+    }
+
+    #[tokio::test]
+    async fn upsert_profile_writes_then_merges() {
+        let dir = make_dir().await;
+        dir.upsert_profile("p", Some("alice"), Some("hello"), Some("av-a"))
+            .await
+            .unwrap();
+        let after_first = dir.get("p").await.unwrap().unwrap();
+        assert_eq!(after_first.display_name.as_deref(), Some("alice"));
+
+        // overwrite display_name only; bio + avatar must be preserved.
+        dir.upsert_profile("p", Some("alice2"), None, None)
+            .await
+            .unwrap();
+        let after_second = dir.get("p").await.unwrap().unwrap();
+        assert_eq!(after_second.display_name.as_deref(), Some("alice2"));
+        assert_eq!(after_second.bio.as_deref(), Some("hello"));
+        assert_eq!(after_second.avatar_blake3.as_deref(), Some("av-a"));
+        assert!(!after_second.is_self);
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_unknown_node() {
+        let dir = make_dir().await;
+        assert!(dir.get("ghost").await.unwrap().is_none());
+    }
+}

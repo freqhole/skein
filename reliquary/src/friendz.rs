@@ -170,3 +170,139 @@ fn now_secs() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{db, userz};
+
+    /// build a fresh in-memory pool with a peer row already touched, so the
+    /// FK from friendz.friend_node_id -> userz.node_id is satisfied.
+    async fn make_store_with_peer(node_id: &str) -> Store {
+        let pool = db::open_in_memory().await;
+        let users = userz::Directory::new(pool.clone());
+        users.touch(node_id).await.unwrap();
+        Store::new(pool)
+    }
+
+    #[test]
+    fn status_round_trips_through_string() {
+        for s in [
+            FriendStatus::Allowed,
+            FriendStatus::Pending,
+            FriendStatus::Accepted,
+            FriendStatus::Blocked,
+        ] {
+            assert_eq!(FriendStatus::parse(s.as_str()).unwrap(), s);
+        }
+        assert!(matches!(
+            FriendStatus::parse("garbage"),
+            Err(FriendError::UnknownStatus(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn upsert_inserts_then_updates_status() {
+        let store = make_store_with_peer("peer-a").await;
+        let inserted = store
+            .upsert("peer-a", FriendStatus::Allowed, None)
+            .await
+            .unwrap();
+        assert_eq!(inserted.status, FriendStatus::Allowed);
+        assert!(inserted.narthex_doc_id.is_none());
+        assert_eq!(inserted.created_at, inserted.updated_at);
+
+        // promotion to Accepted should preserve created_at, advance updated_at.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let promoted = store
+            .upsert("peer-a", FriendStatus::Accepted, Some("doc-1"))
+            .await
+            .unwrap();
+        assert_eq!(promoted.status, FriendStatus::Accepted);
+        assert_eq!(promoted.narthex_doc_id.as_deref(), Some("doc-1"));
+        assert_eq!(promoted.created_at, inserted.created_at);
+        assert!(promoted.updated_at >= inserted.updated_at);
+    }
+
+    #[tokio::test]
+    async fn upsert_preserves_existing_doc_id_when_none_passed() {
+        let store = make_store_with_peer("peer-b").await;
+        store
+            .upsert("peer-b", FriendStatus::Allowed, Some("doc-original"))
+            .await
+            .unwrap();
+        // pass None — COALESCE should keep the original doc id.
+        let after = store
+            .upsert("peer-b", FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+        assert_eq!(after.narthex_doc_id.as_deref(), Some("doc-original"));
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_unknown_friend() {
+        let pool = db::open_in_memory().await;
+        let store = Store::new(pool);
+        assert!(store.get("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_only_accepted() {
+        let pool = db::open_in_memory().await;
+        let users = userz::Directory::new(pool.clone());
+        for n in ["a", "b", "c"] {
+            users.touch(n).await.unwrap();
+        }
+        let store = Store::new(pool);
+
+        store
+            .upsert("a", FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+        store
+            .upsert("b", FriendStatus::Pending, None)
+            .await
+            .unwrap();
+        store
+            .upsert("c", FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+
+        let all = store.list(false).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        let accepted = store.list(true).await.unwrap();
+        assert_eq!(accepted.len(), 2);
+        assert!(accepted
+            .iter()
+            .all(|f| f.status == FriendStatus::Accepted));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_friend_row() {
+        let store = make_store_with_peer("peer-d").await;
+        store
+            .upsert("peer-d", FriendStatus::Allowed, None)
+            .await
+            .unwrap();
+        assert!(store.get("peer-d").await.unwrap().is_some());
+
+        store.delete("peer-d").await.unwrap();
+        assert!(store.get("peer-d").await.unwrap().is_none());
+
+        // delete on missing row is a no-op.
+        store.delete("never-existed").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upsert_without_userz_row_violates_fk() {
+        // friendz.friend_node_id REFERENCES userz(node_id) — inserting
+        // without a peer row first should fail with a sqlx error.
+        let pool = db::open_in_memory().await;
+        let store = Store::new(pool);
+        let res = store
+            .upsert("orphan", FriendStatus::Allowed, None)
+            .await;
+        assert!(matches!(res, Err(FriendError::Sqlx(_))));
+    }
+}

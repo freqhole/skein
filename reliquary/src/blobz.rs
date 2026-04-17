@@ -207,3 +207,160 @@ fn now_secs() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    async fn make_store() -> (Store, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = db::open_in_memory().await;
+        let store = Store::new(pool, tmp.path());
+        (store, tmp)
+    }
+
+    #[tokio::test]
+    async fn insert_then_get_round_trips() {
+        let (store, _tmp) = make_store().await;
+        let bytes = b"hello blobz";
+        let blob = store
+            .insert(
+                "ihash-1".to_string(),
+                Some("hello.txt".to_string()),
+                Some("text/plain".to_string()),
+                bytes,
+            )
+            .await
+            .expect("insert");
+
+        let expected_blake3 = blake3::hash(bytes).to_hex().to_string();
+        assert_eq!(blob.blake3, expected_blake3);
+        assert_eq!(blob.iroh_hash, "ihash-1");
+        assert_eq!(blob.size, bytes.len() as i64);
+        assert!(blob.path.starts_with(&blob.blake3[..2]));
+
+        let got = store.get(&blob.blake3).await.unwrap().expect("found");
+        assert_eq!(got.blake3, blob.blake3);
+        assert_eq!(got.filename.as_deref(), Some("hello.txt"));
+    }
+
+    #[tokio::test]
+    async fn insert_is_idempotent_on_duplicate_blake3() {
+        let (store, _tmp) = make_store().await;
+        let first = store
+            .insert("ihash-a".into(), None, None, b"same bytes")
+            .await
+            .unwrap();
+        // second insert with a different iroh_hash + filename should still
+        // dedupe to the existing row (blake3 is the canonical id).
+        let second = store
+            .insert(
+                "different-ihash".into(),
+                Some("ignored.txt".into()),
+                Some("text/plain".into()),
+                b"same bytes",
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.blake3, second.blake3);
+        assert_eq!(first.iroh_hash, second.iroh_hash);
+        assert_eq!(first.filename, second.filename);
+
+        // exactly one row in the table.
+        let rows = store.list(100, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_bytes_returns_payload() {
+        let (store, _tmp) = make_store().await;
+        let payload = b"some bytes here";
+        let blob = store
+            .insert("h".into(), None, None, payload)
+            .await
+            .unwrap();
+        let read = store.read_bytes(&blob.blake3).await.unwrap();
+        assert_eq!(read.as_deref(), Some(payload.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_unknown_hash() {
+        let (store, _tmp) = make_store().await;
+        assert!(store.get("nope").await.unwrap().is_none());
+        assert!(store.read_bytes("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_by_iroh_hash_works() {
+        let (store, _tmp) = make_store().await;
+        let blob = store
+            .insert("unique-iroh".into(), None, None, b"x")
+            .await
+            .unwrap();
+        let got = store
+            .get_by_iroh_hash("unique-iroh")
+            .await
+            .unwrap()
+            .expect("present");
+        assert_eq!(got.blake3, blob.blake3);
+        assert!(store
+            .get_by_iroh_hash("missing")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn list_orders_by_created_at_desc_with_limit_offset() {
+        let (store, _tmp) = make_store().await;
+        for i in 0u8..5 {
+            // distinct payloads -> distinct blake3 -> distinct rows.
+            // sleep a tick so created_at strictly increases (resolution = 1s).
+            store
+                .insert(format!("h{i}"), None, None, &[i; 8])
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
+        let page = store.list(2, 0).await.unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(page[0].created_at >= page[1].created_at);
+
+        let next = store.list(2, 2).await.unwrap();
+        assert_eq!(next.len(), 2);
+        assert!(next[0].created_at <= page[1].created_at);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_row_and_file() {
+        let (store, _tmp) = make_store().await;
+        let blob = store
+            .insert("h".into(), None, None, b"bye")
+            .await
+            .unwrap();
+        let path = store.path_for(&blob);
+        assert!(path.exists());
+
+        store.delete(&blob.blake3).await.unwrap();
+        assert!(store.get(&blob.blake3).await.unwrap().is_none());
+        assert!(!path.exists());
+
+        // delete on missing row is a no-op (no error).
+        store.delete("missing-blake3").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn path_for_uses_2char_prefix_split() {
+        let (store, _tmp) = make_store().await;
+        let blob = store
+            .insert("h".into(), None, None, b"a")
+            .await
+            .unwrap();
+        let path = store.path_for(&blob);
+        let parent = path.parent().unwrap().file_name().unwrap();
+        assert_eq!(parent.to_string_lossy().len(), 2);
+        let fname = path.file_name().unwrap().to_string_lossy();
+        assert_eq!(fname, blob.blake3[2..]);
+    }
+}
