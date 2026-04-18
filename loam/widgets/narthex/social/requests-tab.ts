@@ -499,6 +499,16 @@ export function createRequestsTab(ctx: TabContext): TabController {
   // -- doc change subscription ----------------------------------------------
 
   const unsub = ctx.doc.on("change", () => {
+    const state = ctx.doc.current;
+    const pendingCount = (state.pendingRequests ?? []).filter(
+      (r: any) => r.status === "pending"
+    ).length;
+    const outboundCount = (state.outboundRequests ?? []).filter(
+      (r: any) => r.status === "pending"
+    ).length;
+    console.log(
+      "[requests-tab] doc change \u2014 pending=" + pendingCount + " outbound=" + outboundCount
+    );
     rebuild();
   });
 

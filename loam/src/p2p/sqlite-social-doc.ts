@@ -386,7 +386,12 @@ export class SqliteSocialDoc implements SocialDoc {
     this.diffOutboundRequests(prev, next, promises);
 
     if (promises.length > 0) {
-      await Promise.allSettled(promises);
+      const results = await Promise.allSettled(promises);
+      results.forEach((r) => {
+        if (r.status === "rejected") {
+          console.warn(TAG, "dispatch failed:", r.reason);
+        }
+      });
     }
   }
 

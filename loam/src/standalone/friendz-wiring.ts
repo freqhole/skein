@@ -214,21 +214,94 @@ export async function initFriendzWiring(
 
   // --- wire event callbacks ---
 
-  // incoming friend request -> write to social doc
+  // incoming friend request -> write to social doc.
+  // edge cases handled here:
+  //   1. duplicate request from same peer: skip the push
+  //   2. sender is already in our friends list (reciprocal add): auto-accept
+  //   3. we have a still-pending outbound request to this peer: auto-accept
+  //      (their request races our request — both sides add each other)
   protocol.onFriendRequest = (msg, fromNodeId) => {
+    const friends = sDoc.current.friends ?? [];
+    const isAlreadyFriend = friends.some((f: any) =>
+      f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
+    );
+    const outbound = sDoc.current.outboundRequests ?? [];
+    const hasPendingOutbound = outbound.some(
+      (r: any) => r.toNodeId === fromNodeId && r.status === "pending"
+    );
+    const reciprocal = isAlreadyFriend || hasPendingOutbound;
+
+    let didAdd = false;
     sDoc.change((draft: any) => {
       if (!draft.pendingRequests) draft.pendingRequests = [];
-      // don't add duplicate pending requests from the same node
-      const exists = draft.pendingRequests.some((r: any) => r.fromNodeId === fromNodeId);
-      if (!exists) {
+      const idx = draft.pendingRequests.findIndex((r: any) => r.fromNodeId === fromNodeId);
+      if (idx === -1) {
         draft.pendingRequests.push({
           fromNodeId,
           fromUsername: msg.fromUsername ?? "unknown",
           receivedAt: new Date().toISOString(),
-          status: "pending",
+          status: reciprocal ? "accepted" : "pending",
         });
+        didAdd = true;
+      } else if (reciprocal && draft.pendingRequests[idx].status === "pending") {
+        // upgrade an existing pending entry to accepted on reciprocal match
+        draft.pendingRequests[idx].status = "accepted";
+      }
+      // mirror status on outbound request if present
+      if (reciprocal && draft.outboundRequests) {
+        for (const r of draft.outboundRequests) {
+          if (r.toNodeId === fromNodeId && r.status === "pending") {
+            r.status = "accepted";
+          }
+        }
       }
     });
+    const pendingCount = (sDoc.current.pendingRequests ?? []).filter(
+      (r: any) => r.status === "pending"
+    ).length;
+    console.log(
+      "[friendz-wiring] onFriendRequest from " +
+        fromNodeId.slice(0, 16) +
+        "... didAdd=" +
+        didAdd +
+        " reciprocal=" +
+        reciprocal +
+        " pending-count=" +
+        pendingCount
+    );
+
+    if (reciprocal) {
+      // auto-accept: tell the peer we accept and add them to friends if needed
+      protocol.sendFriendAccept(fromNodeId).catch((err) => {
+        console.warn(
+          "[friendz-wiring] auto-accept friend-request failed for",
+          fromNodeId.slice(0, 16) + "...",
+          err
+        );
+      });
+      if (!isAlreadyFriend) {
+        sDoc.change((draft: any) => {
+          if (!draft.friends) draft.friends = [];
+          draft.friends.push({
+            id: crypto.randomUUID(),
+            alias: "",
+            username: msg.fromUsername ?? "",
+            group: "default",
+            nodeIds: [
+              {
+                nodeId: fromNodeId,
+                addedAt: new Date().toISOString(),
+                lastSeenAt: new Date().toISOString(),
+                username: msg.fromUsername ?? "",
+                bio: "",
+                avatarDataUrl: "",
+              },
+            ],
+            createdAt: new Date().toISOString(),
+          });
+        });
+      }
+    }
   };
 
   // incoming friend accept -> add to friends list
@@ -283,9 +356,9 @@ export async function initFriendzWiring(
         }
       }
 
-      // update sent request status
-      if (draft.sentRequests) {
-        for (const req of draft.sentRequests) {
+      // update outbound request status
+      if (draft.outboundRequests) {
+        for (const req of draft.outboundRequests) {
           if (req.toNodeId === fromNodeId && req.status === "pending") {
             req.status = "accepted";
           }
@@ -298,11 +371,11 @@ export async function initFriendzWiring(
     protocol.requestProfile(fromNodeId).catch(() => {});
   };
 
-  // incoming friend reject -> update pending request status
+  // incoming friend reject -> update outbound request status
   protocol.onFriendReject = (_msg, fromNodeId) => {
     sDoc.change((draft: any) => {
-      if (draft.sentRequests) {
-        for (const req of draft.sentRequests) {
+      if (draft.outboundRequests) {
+        for (const req of draft.outboundRequests) {
           if (req.toNodeId === fromNodeId && req.status === "pending") {
             req.status = "rejected";
           }
@@ -551,10 +624,10 @@ export async function initFriendzWiring(
   // hook outbound request side-effects: track sent friend requests in social doc
   setOutboundRequestHook((targetNodeId: string) => {
     sDoc.change((draft: any) => {
-      if (!draft.sentRequests) draft.sentRequests = [];
-      const exists = draft.sentRequests.some((r: any) => r.toNodeId === targetNodeId);
+      if (!draft.outboundRequests) draft.outboundRequests = [];
+      const exists = draft.outboundRequests.some((r: any) => r.toNodeId === targetNodeId);
       if (!exists) {
-        draft.sentRequests.push({
+        draft.outboundRequests.push({
           toNodeId: targetNodeId,
           toUsername: "unknown",
           sentAt: new Date().toISOString(),
@@ -890,9 +963,60 @@ export async function initFriendzWiring(
   // send a gossip digest when a friend peer transitions to online.
   // this fires on BOTH sides of the heartbeat handshake, making the exchange
   // bidirectional — each peer tells the other about canvas updates and pending invites.
+  //
+  // also: take this chance to retry anything that may have been lost when
+  // the prior connection died (e.g. the browser-WASM iroh transport drops
+  // outbound streams under nat conditions). edge cases handled here:
+  //   1. pending outbound friend-request to this peer: resend (idempotent on
+  //      receiver side because reciprocal auto-accept now dedupes)
+  //   2. peer is in our friends list but we have no profile data yet: ask
+  //      again so bio/avatar populate after the first reachable round-trip
   protocol.onPeerBecameOnline = (peerNodeId: string) => {
     const friends = sDoc.current.friends ?? [];
-    const isFriend = friends.some((f: any) => f.nodeIds?.some((n: any) => n.nodeId === peerNodeId));
+    const friendEntry = friends.find((f: any) =>
+      f.nodeIds?.some((n: any) => n.nodeId === peerNodeId)
+    );
+    const isFriend = !!friendEntry;
+
+    // (1) retry pending outbound friend-request to this peer
+    const outbound = sDoc.current.outboundRequests ?? [];
+    const stillPending = outbound.find(
+      (r: any) => r.toNodeId === peerNodeId && r.status === "pending"
+    );
+    if (stillPending) {
+      console.log(
+        "[friendz-wiring] retrying pending outbound friend-request to:",
+        peerNodeId.slice(0, 16) + "..."
+      );
+      protocol.sendFriendRequest(peerNodeId).catch((err) => {
+        console.warn(
+          "[friendz-wiring] retry sendFriendRequest failed for",
+          peerNodeId.slice(0, 16) + "...",
+          err
+        );
+      });
+    }
+
+    // (2) retry profile-request if friend's nodeId entry has no display data
+    if (isFriend) {
+      const node = friendEntry.nodeIds?.find((n: any) => n.nodeId === peerNodeId);
+      const hasProfile =
+        !!(node?.username || node?.bio || node?.avatarDataUrl);
+      if (!hasProfile) {
+        console.log(
+          "[friendz-wiring] retrying profile-request to:",
+          peerNodeId.slice(0, 16) + "..."
+        );
+        protocol.requestProfile(peerNodeId).catch((err) => {
+          console.warn(
+            "[friendz-wiring] retry requestProfile failed for",
+            peerNodeId.slice(0, 16) + "...",
+            err
+          );
+        });
+      }
+    }
+
     if (!isFriend) return;
 
     computeAndSendGossipDigest(peerNodeId).catch((err) => {
@@ -1206,13 +1330,31 @@ export async function initFriendzWiring(
     const isFriendPeer = currentFriends.some((f: any) =>
       f.nodeIds?.some((n: any) => n.nodeId === peerId)
     );
-    if (!isFriendPeer) return;
+    // also probe if we have a pending outbound request to this peer — they
+    // may have just come back online and we need to deliver the request.
+    const outbound = sDoc.current.outboundRequests ?? [];
+    const hasPendingOutbound = outbound.some(
+      (r: any) => r.toNodeId === peerId && r.status === "pending"
+    );
+    if (!isFriendPeer && !hasPendingOutbound) {
+      console.log(
+        "[friendz-wiring] peer connected but not a friend / no pending outbound, skipping probe:",
+        peerId.slice(0, 16) + "..."
+      );
+      return;
+    }
 
     // only probe if they're not already online (avoid redundant heartbeats)
-    if (protocol.isOnline(peerId)) return;
+    if (protocol.isOnline(peerId)) {
+      console.log(
+        "[friendz-wiring] peer connected but already online, skipping probe:",
+        peerId.slice(0, 16) + "..."
+      );
+      return;
+    }
 
     console.log(
-      "[friendz-wiring] friend connected at transport, probing:",
+      "[friendz-wiring] peer connected at transport, probing:",
       peerId.slice(0, 16) + "..."
     );
     protocol.probePeer(peerId).catch(() => {

@@ -18,7 +18,7 @@ use reliquary::{blobz, friendz, service, userz};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -53,12 +53,36 @@ pub struct HubState {
     pub started_at: Instant,
 }
 
-/// persistent app config — written to `<data_dir>/skein-app.toml`. currently
-/// just tracks whether the user wants the hub to start automatically.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// persistent app config — written to `<data_dir>/skein-app.toml`. tracks
+/// hub auto-start plus the user's social settings (visibility / who can send
+/// friend requests). add fields with `#[serde(default)]` so older toml files
+/// still load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub hub_enabled: bool,
+    #[serde(default = "default_profile_visibility")]
+    pub profile_visibility: String,
+    #[serde(default = "default_friend_requests_from")]
+    pub friend_requests_from: String,
+}
+
+fn default_profile_visibility() -> String {
+    "friends".to_string()
+}
+
+fn default_friend_requests_from() -> String {
+    "everyone".to_string()
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            hub_enabled: false,
+            profile_visibility: default_profile_visibility(),
+            friend_requests_from: default_friend_requests_from(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -87,12 +111,43 @@ impl AppConfig {
 pub async fn skein_dispatch(
     action: String,
     payload: Option<Value>,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
     let payload = payload.unwrap_or(Value::Null);
-    dispatch(&action, payload, state.inner())
-        .await
-        .map_err(|e| e.to_string())
+    let result = dispatch(&action, payload, &app, state.inner()).await;
+
+    // any successful social mutation triggers a state-changed event so
+    // SqliteSocialDoc refetches its snapshot on the frontend.
+    if result.is_ok() && is_social_mutation(&action) {
+        if let Err(e) = app.emit("social-state-changed", ()) {
+            tracing::warn!(error = %e, "failed to emit social-state-changed");
+        }
+    }
+
+    result.map_err(|e| e.to_string())
+}
+
+/// returns true for actions that mutate persisted social state. used to
+/// gate the `social-state-changed` event so reads don't trigger refetches.
+fn is_social_mutation(action: &str) -> bool {
+    matches!(
+        action,
+        "social_add_friend"
+            | "social_remove_friend"
+            | "social_create_request"
+            | "social_update_request"
+            | "social_delete_request"
+            | "social_set_friend_alias"
+            | "social_update_friend"
+            | "social_update_node_profile"
+            | "social_update_profile"
+            | "social_update_settings"
+            | "social_upsert_group"
+            | "social_delete_group"
+            | "friend_add"
+            | "friend_remove"
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +177,7 @@ enum DispatchError {
 async fn dispatch(
     action: &str,
     payload: Value,
+    _app: &AppHandle,
     state: &AppState,
 ) -> Result<Value, DispatchError> {
     match action {
@@ -134,14 +190,54 @@ async fn dispatch(
         "friend_list" => friend_list(state).await,
         "friend_remove" => friend_remove(decode("friend_remove", payload)?, state).await,
 
-        // social doc snapshot (stub: returns empty defaults so SqliteSocialDoc
-        // can initialize. real backing comes later.)
+        // social doc reads + writes (back the SqliteSocialDoc adapter on the
+        // frontend). every mutation triggers `social-state-changed` via the
+        // dispatch wrapper above.
         "social_get_state" => social_get_state(state).await,
+        "social_add_friend" => {
+            social_add_friend(decode("social_add_friend", payload)?, state).await
+        }
+        "social_remove_friend" => {
+            social_remove_friend(decode("social_remove_friend", payload)?, state).await
+        }
+        "social_create_request" => {
+            social_create_request(decode("social_create_request", payload)?, state).await
+        }
+        "social_update_request" => {
+            social_update_request(decode("social_update_request", payload)?, state).await
+        }
+        "social_delete_request" => {
+            social_delete_request(decode("social_delete_request", payload)?, state).await
+        }
+        "social_set_friend_alias" => {
+            social_set_friend_alias(decode("social_set_friend_alias", payload)?, state).await
+        }
+        "social_update_friend" => {
+            social_update_friend(decode("social_update_friend", payload)?, state).await
+        }
+        "social_update_node_profile" => {
+            social_update_node_profile(decode("social_update_node_profile", payload)?, state).await
+        }
+        "social_update_profile" => {
+            social_update_profile(decode("social_update_profile", payload)?, state).await
+        }
+        "social_update_settings" => {
+            social_update_settings(decode("social_update_settings", payload)?, state).await
+        }
+        // groups are derived from `friendz.group_name` rather than persisted
+        // separately, so upsert/delete are accept-and-ignore. groups appear
+        // automatically once a friend is assigned to one.
+        "social_upsert_group" => Ok(Value::Null),
+        "social_delete_group" => Ok(Value::Null),
 
         // blobs
         "blob_list" => blob_list(decode_or_default(payload), state).await,
         "blob_get" => blob_get(decode("blob_get", payload)?, state).await,
+        "blob_get_path" => blob_get_path(decode("blob_get_path", payload)?, state).await,
         "blob_insert" => blob_insert(decode("blob_insert", payload)?, state).await,
+        "blob_insert_from_path" => {
+            blob_insert_from_path(decode("blob_insert_from_path", payload)?, state).await
+        }
 
         // hub control
         "hub_start" => hub_start_inner(state).await,
@@ -317,33 +413,406 @@ async fn friend_remove(
 }
 
 // ---------------------------------------------------------------------------
-// social doc snapshot (stub)
-//
-// returns a minimal RawSocialSnapshot so the frontend's SqliteSocialDoc can
-// initialize without a real grimoire-style social schema. once we wire up
-// real friendz/userz reads here, replace the empty defaults.
+// social doc — wires SqliteSocialDoc on the frontend to the friendz/userz
+// stores. snapshot reads pull from sqlite; mutation handlers write via the
+// existing reliquary primitives. groups are derived from friend.group_name
+// (no separate table). settings persist in app_config.toml.
 // ---------------------------------------------------------------------------
 
 async fn social_get_state(state: &AppState) -> Result<Value, DispatchError> {
+    let cfg = AppConfig::load(&state.app_config_path);
+    let me = state.userz.get_self().await?;
+
+    let profile = json!({
+        "user_id": state.node_id,
+        "username": me
+            .as_ref()
+            .and_then(|u| u.display_name.clone())
+            .unwrap_or_else(|| state.username.clone()),
+        "alias": me.as_ref().and_then(|u| u.alias.clone()).unwrap_or_default(),
+        "bio": me.as_ref().and_then(|u| u.bio.clone()).unwrap_or_default(),
+        "avatar_url": me
+            .as_ref()
+            .and_then(|u| u.avatar_blake3.clone())
+            .unwrap_or_default(),
+        "accent_color": me.as_ref().map(|u| u.accent_color).unwrap_or(0),
+        "node_id": state.node_id,
+    });
+
+    let rows = state.friendz_store.list(false).await?;
+
+    let mut friends = Vec::new();
+    let mut pending = Vec::new();
+    let mut outbound = Vec::new();
+    let mut group_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for f in rows {
+        let peer = state.userz.get(&f.friend_node_id).await?;
+        let username = peer
+            .as_ref()
+            .and_then(|p| p.display_name.clone())
+            .unwrap_or_default();
+        let bio = peer
+            .as_ref()
+            .and_then(|p| p.bio.clone())
+            .unwrap_or_default();
+        let avatar = peer
+            .as_ref()
+            .and_then(|p| p.avatar_blake3.clone())
+            .unwrap_or_default();
+        let accent = peer.as_ref().map(|p| p.accent_color).unwrap_or(0);
+        let last_seen = peer.as_ref().map(|p| p.last_seen_at);
+        let alias = f.alias.clone().unwrap_or_default();
+        let group_name = f.group_name.clone().unwrap_or_default();
+        if !group_name.is_empty() {
+            group_names.insert(group_name.clone());
+        }
+
+        match (f.status, f.direction) {
+            (friendz::FriendStatus::Accepted, _) | (friendz::FriendStatus::Allowed, _) => {
+                friends.push(json!({
+                    "id": f.friend_node_id,
+                    "group_name": group_name,
+                    "created_at": f.created_at,
+                    "friend_user_id": f.friend_node_id,
+                    "username": username,
+                    "alias": alias,
+                    "bio": bio,
+                    "avatar_url": avatar,
+                    "accent_color": accent,
+                    "node_ids": [{
+                        "node_id": f.friend_node_id,
+                        "display_name": username,
+                        "bio": bio,
+                        "avatar_url": avatar,
+                        "accent_color": accent,
+                        "instance_name": Value::Null,
+                        "last_seen_at": last_seen,
+                        "created_at": f.created_at,
+                    }],
+                }));
+            }
+            (friendz::FriendStatus::Pending, dir) => {
+                let direction = match dir {
+                    Some(friendz::Direction::Outbound) => "outbound",
+                    _ => "inbound",
+                };
+                let req = json!({
+                    "id": f.friend_node_id,
+                    "user_id": state.node_id,
+                    "remote_user_id": f.friend_node_id,
+                    "direction": direction,
+                    "status": "pending",
+                    "created_at": f.created_at,
+                    "updated_at": f.updated_at,
+                    "remote_username": username,
+                    "remote_alias": alias,
+                    "remote_node_id": f.friend_node_id,
+                    "remote_display_name": username,
+                });
+                if direction == "outbound" {
+                    outbound.push(req);
+                } else {
+                    pending.push(req);
+                }
+            }
+            // Blocked rows are intentionally not surfaced in the social doc.
+            (friendz::FriendStatus::Blocked, _) => {}
+        }
+    }
+
+    let groups: Vec<Value> = group_names
+        .into_iter()
+        .map(|name| {
+            json!({
+                "id": name.clone(),
+                "user_id": state.node_id,
+                "name": name,
+                "color": 0,
+            })
+        })
+        .collect();
+
     Ok(json!({
-        "profile": {
-            "user_id": "",
-            "username": state.username,
-            "alias": "",
-            "bio": "",
-            "avatar_url": "",
-            "accent_color": 0,
-            "node_id": state.node_id,
-        },
-        "friends": [],
-        "groups": [],
-        "pending_requests": [],
-        "outbound_requests": [],
+        "profile": profile,
+        "friends": friends,
+        "groups": groups,
+        "pending_requests": pending,
+        "outbound_requests": outbound,
         "settings": {
-            "profile_visibility": "friends",
-            "friend_requests_from": "everyone",
+            "profile_visibility": cfg.profile_visibility,
+            "friend_requests_from": cfg.friend_requests_from,
         },
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialAddFriendArgs {
+    node_id: String,
+    alias: Option<String>,
+}
+
+async fn social_add_friend(
+    args: SocialAddFriendArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    state.userz.touch(&args.node_id).await?;
+    state
+        .friendz_store
+        .upsert_full(
+            &args.node_id,
+            friendz::FriendStatus::Accepted,
+            None,
+            args.alias.as_deref(),
+            None,
+            None,
+        )
+        .await?;
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialRemoveFriendArgs {
+    id: String,
+}
+
+async fn social_remove_friend(
+    args: SocialRemoveFriendArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    state.friendz_store.delete(&args.id).await?;
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialCreateRequestArgs {
+    node_id: String,
+    direction: String,
+    display_name: Option<String>,
+}
+
+async fn social_create_request(
+    args: SocialCreateRequestArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    let direction = friendz::Direction::parse(&args.direction);
+
+    state.userz.touch(&args.node_id).await?;
+    if let Some(name) = args.display_name.as_deref() {
+        if !name.is_empty() {
+            state
+                .userz
+                .upsert_profile(&args.node_id, Some(name), None, None)
+                .await?;
+        }
+    }
+
+    // don't downgrade an existing accepted/allowed/blocked row to pending.
+    if let Some(existing) = state.friendz_store.get(&args.node_id).await? {
+        match existing.status {
+            friendz::FriendStatus::Accepted
+            | friendz::FriendStatus::Allowed
+            | friendz::FriendStatus::Blocked => return Ok(Value::Null),
+            friendz::FriendStatus::Pending => {}
+        }
+    }
+
+    state
+        .friendz_store
+        .upsert_full(
+            &args.node_id,
+            friendz::FriendStatus::Pending,
+            direction,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialUpdateRequestArgs {
+    id: String,
+    status: String,
+}
+
+async fn social_update_request(
+    args: SocialUpdateRequestArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    match args.status.as_str() {
+        "accepted" | "accepted-pending-ack" => {
+            state.userz.touch(&args.id).await?;
+            state
+                .friendz_store
+                .upsert(&args.id, friendz::FriendStatus::Accepted, None)
+                .await?;
+        }
+        "rejected" | "cancelled" => {
+            // reliquary has no rejected status — drop the row.
+            state.friendz_store.delete(&args.id).await?;
+        }
+        "pending" => {
+            state.userz.touch(&args.id).await?;
+            state
+                .friendz_store
+                .upsert(&args.id, friendz::FriendStatus::Pending, None)
+                .await?;
+        }
+        other => {
+            return Err(DispatchError::InvalidPayload {
+                action: "social_update_request",
+                source: serde::de::Error::custom(format!("unknown status {other}")),
+            });
+        }
+    }
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialDeleteRequestArgs {
+    id: String,
+}
+
+async fn social_delete_request(
+    args: SocialDeleteRequestArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    // only delete if the row is still in a pending/rejected request state —
+    // never blow away a real friendship via this code path.
+    if let Some(existing) = state.friendz_store.get(&args.id).await? {
+        if matches!(existing.status, friendz::FriendStatus::Pending) {
+            state.friendz_store.delete(&args.id).await?;
+        }
+    }
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialSetFriendAliasArgs {
+    friend_user_id: String,
+    alias: String,
+}
+
+async fn social_set_friend_alias(
+    args: SocialSetFriendAliasArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    let alias = if args.alias.is_empty() {
+        None
+    } else {
+        Some(args.alias.as_str())
+    };
+    state.userz.touch(&args.friend_user_id).await?;
+    state.userz.set_alias(&args.friend_user_id, alias).await?;
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialUpdateFriendArgs {
+    id: String,
+    group_name: Option<String>,
+}
+
+async fn social_update_friend(
+    args: SocialUpdateFriendArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    // upsert_full COALESCE-merges so we need to write the existing status
+    // back rather than letting it default. read first.
+    let existing = state
+        .friendz_store
+        .get(&args.id)
+        .await?
+        .ok_or(DispatchError::NotFound)?;
+
+    state
+        .friendz_store
+        .upsert_full(
+            &args.id,
+            existing.status,
+            existing.direction,
+            existing.alias.as_deref(),
+            args.group_name.as_deref(),
+            existing.narthex_doc_id.as_deref(),
+        )
+        .await?;
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialUpdateNodeProfileArgs {
+    node_id: String,
+    display_name: Option<String>,
+    bio: Option<String>,
+    avatar_url: Option<String>,
+}
+
+async fn social_update_node_profile(
+    args: SocialUpdateNodeProfileArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    state.userz.touch(&args.node_id).await?;
+    state
+        .userz
+        .upsert_profile(
+            &args.node_id,
+            args.display_name.as_deref(),
+            args.bio.as_deref(),
+            args.avatar_url.as_deref(),
+        )
+        .await?;
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialUpdateProfileArgs {
+    alias: Option<String>,
+    bio: Option<String>,
+    avatar_url: Option<String>,
+    accent_color: Option<i64>,
+}
+
+async fn social_update_profile(
+    args: SocialUpdateProfileArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    state
+        .userz
+        .upsert_self_full(
+            &state.node_id,
+            None,
+            args.alias.as_deref(),
+            args.bio.as_deref(),
+            args.avatar_url.as_deref(),
+            args.accent_color,
+        )
+        .await?;
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialUpdateSettingsArgs {
+    profile_visibility: Option<String>,
+    friend_requests_from: Option<String>,
+}
+
+async fn social_update_settings(
+    args: SocialUpdateSettingsArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    let mut cfg = AppConfig::load(&state.app_config_path);
+    if let Some(v) = args.profile_visibility {
+        cfg.profile_visibility = v;
+    }
+    if let Some(v) = args.friend_requests_from {
+        cfg.friend_requests_from = v;
+    }
+    if let Err(e) = cfg.save(&state.app_config_path) {
+        tracing::warn!(error = %e, "failed to persist social settings");
+    }
+    Ok(Value::Null)
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +854,21 @@ async fn blob_get(args: BlobGetArgs, state: &AppState) -> Result<Value, Dispatch
     }))
 }
 
+/// resolve a blob id (blake3) to its on-disk filesystem path so the frontend
+/// can hand it to tauri's asset:// protocol for native streaming. avoids
+/// base64-roundtripping the entire file for `<video>` / `<audio>` previews.
+async fn blob_get_path(args: BlobGetArgs, state: &AppState) -> Result<Value, DispatchError> {
+    let Some(meta) = state.blobz.get(&args.blake3).await? else {
+        return Err(DispatchError::NotFound);
+    };
+    let path = state.blobz.path_for(&meta);
+    Ok(json!({
+        "path": path.to_string_lossy(),
+        "mime": meta.mime,
+        "size": meta.size,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 struct BlobInsertArgs {
     /// optional iroh hash (if the blob is also being shared via iroh-blobs).
@@ -414,6 +898,63 @@ async fn blob_insert(
         .insert(iroh_hash, args.filename, args.mime, &bytes)
         .await?;
     Ok(serde_json::to_value(BlobDto::from(blob)).expect("blob insert serialize"))
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobInsertFromPathArgs {
+    /// absolute path on the local filesystem (e.g. from the tauri native
+    /// file picker). the file is read into memory, hashed (blake3), and
+    /// copied into reliquary's blob-files dir.
+    local_path: String,
+    filename: Option<String>,
+    mime: Option<String>,
+    /// optional iroh hash override. defaults to mirroring the blake3.
+    iroh_hash: Option<String>,
+}
+
+async fn blob_insert_from_path(
+    args: BlobInsertFromPathArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    let path = std::path::PathBuf::from(&args.local_path);
+    if !path.is_absolute() {
+        return Err(DispatchError::InvalidPayload {
+            action: "blob_insert_from_path",
+            source: serde::de::Error::custom(format!(
+                "local_path must be absolute, got {}",
+                args.local_path
+            )),
+        });
+    }
+
+    let bytes = tokio::fs::read(&path).await.map_err(|e| {
+        DispatchError::Blob(blobz::BlobError::Io(std::io::Error::new(
+            e.kind(),
+            format!("read {}: {}", path.display(), e),
+        )))
+    })?;
+
+    // derive a filename from the path tail when caller didn't pass one.
+    let filename = args.filename.or_else(|| {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+    });
+
+    let blake3_hex = blake3::hash(&bytes).to_hex().to_string();
+    let iroh_hash = args.iroh_hash.unwrap_or_else(|| blake3_hex.clone());
+    let blob = state
+        .blobz
+        .insert(iroh_hash, filename, args.mime, &bytes)
+        .await?;
+
+    // return both the row metadata and the raw bytes so the JS caller can
+    // mirror the file into IndexedDB / OPFS for its existing display paths
+    // without a second filesystem read.
+    Ok(json!({
+        "meta": BlobDto::from(blob),
+        "data": B64.encode(&bytes),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -490,9 +1031,11 @@ async fn hub_status(state: &AppState) -> Result<Value, DispatchError> {
 }
 
 /// write `hub_enabled` into `<data_dir>/skein-app.toml`. errors are logged
-/// but not surfaced — persistence is best-effort.
+/// but not surfaced — persistence is best-effort. preserves the rest of
+/// AppConfig (e.g. social settings) by load-modify-save.
 fn persist_hub_state(state: &AppState, hub_enabled: bool) {
-    let cfg = AppConfig { hub_enabled };
+    let mut cfg = AppConfig::load(&state.app_config_path);
+    cfg.hub_enabled = hub_enabled;
     if let Err(e) = cfg.save(&state.app_config_path) {
         tracing::warn!(error = %e, path = ?state.app_config_path, "failed to persist hub state");
     }

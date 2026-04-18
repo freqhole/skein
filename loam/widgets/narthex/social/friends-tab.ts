@@ -1865,10 +1865,26 @@ export function createFriendsTab(ctx: TabContext): TabController {
 
     // if a node ID was provided and the protocol is ready, also send
     // a friend request so the remote peer gets notified
-    if (nodeId && bridgeIsProtocolReady()) {
-      sendFriendRequest(nodeId).catch((err) => {
-        console.warn("[friends-tab] failed to send friend request after add:", err);
-      });
+    if (nodeId) {
+      const ready = bridgeIsProtocolReady();
+      console.log(
+        "[friends-tab] add-friend submit nodeId=" + nodeId.slice(0, 16) + "... protocolReady=" + ready
+      );
+      if (ready) {
+        sendFriendRequest(nodeId)
+          .then(() => {
+            console.log(
+              "[friends-tab] sendFriendRequest resolved for " + nodeId.slice(0, 16) + "..."
+            );
+          })
+          .catch((err) => {
+            console.warn("[friends-tab] failed to send friend request after add:", err);
+          });
+      } else {
+        console.warn(
+          "[friends-tab] skipped sendFriendRequest \u2014 friendz protocol bridge not ready yet"
+        );
+      }
     }
   });
 

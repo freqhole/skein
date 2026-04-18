@@ -18,11 +18,70 @@
  * path via the native save dialog.
  */
 
-import { isTauriMode } from "../p2p/tauri-transport";
+import { dispatch, isTauriMode } from "../p2p/tauri-transport";
 
 const TAG = "[file-utils]";
 
 const PEER_TIMEOUT_MS = 8000;
+
+/** minimal extension -> mime guesser used when the tauri native file picker
+ *  hands us only a path (no mime). intentionally tiny: just covers the file
+ *  types the canvas widgets actually render. unknown extensions fall back
+ *  to application/octet-stream and the file widget treats them as opaque. */
+function guessMimeFromFilename(filename: string): string {
+  const dot = filename.lastIndexOf(".");
+  if (dot < 0) return "application/octet-stream";
+  const ext = filename.slice(dot + 1).toLowerCase();
+  switch (ext) {
+    case "png":
+      return "image/png";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "gif":
+      return "image/gif";
+    case "webp":
+      return "image/webp";
+    case "svg":
+      return "image/svg+xml";
+    case "bmp":
+      return "image/bmp";
+    case "pdf":
+      return "application/pdf";
+    case "mp4":
+      return "video/mp4";
+    case "webm":
+      return "video/webm";
+    case "mov":
+      return "video/quicktime";
+    case "mp3":
+      return "audio/mpeg";
+    case "wav":
+      return "audio/wav";
+    case "ogg":
+      return "audio/ogg";
+    case "flac":
+      return "audio/flac";
+    case "txt":
+      return "text/plain";
+    case "md":
+      return "text/markdown";
+    case "json":
+      return "application/json";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+/** decode a base64 string to a fresh Uint8Array. browser-native, no deps. */
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
 
 /** coerce automerge Text objects (or any value) to a plain JS string.
  *  automerge stores strings as Text objects which have toString() but lack
@@ -1910,7 +1969,7 @@ async function pickFilesBrowser(): Promise<PickedFile[]> {
  */
 export async function uploadFile(
   picked: PickedFile,
-  options?: UploadOptions
+  _options?: UploadOptions
 ): Promise<FileUploadResult> {
   if (!isTauriMode()) {
     if (!picked.file) {
@@ -1940,57 +1999,86 @@ export async function uploadFile(
     };
   }
 
-  const body: Record<string, unknown> = {
+  // ---- tauri mode --------------------------------------------------------
+  // route the raw bytes through the rust side so reliquary owns the file
+  // (and iroh-blobs can serve it to peers), then mirror the bytes into
+  // OPFS / IndexedDB so the widget's existing browser-mode display paths
+  // (thumbnail load, image full-data url, etc.) keep working in tauri.
+
+  if (!picked.path) {
+    throw new Error("tauri uploadFile requires picked.path");
+  }
+
+  const mime = guessMimeFromFilename(picked.filename);
+
+  const response = (await dispatch("blob_insert_from_path", {
+    local_path: picked.path,
     filename: picked.filename,
-    title: options?.title,
-    description: options?.description,
-    metadata: options?.metadata,
-    wait_for_completion: options?.waitForCompletion ?? true,
+    mime,
+  })) as {
+    meta: {
+      blake3: string;
+      iroh_hash: string;
+      filename: string | null;
+      mime: string | null;
+      size: number;
+      created_at: number;
+    };
+    data: string;
   };
 
-  if (picked.path) {
-    // Tauri mode — pass the native file path directly
-    body.file_path = picked.path;
-  } else if (picked.file) {
-    // browser File object available — read as base64 for IPC transport
-    const base64 = await fileToBase64(picked.file);
-    body.data = base64;
-  } else {
-    throw new Error("picked file has neither a path nor a File object");
+  const meta = response.meta;
+  const bytes = base64ToBytes(response.data);
+  const buffer = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength
+  ) as ArrayBuffer;
+
+  const { storeBlob, classifyDomain, getBlobRecord } = await import(
+    "../storage/skein-blob-store"
+  );
+
+  // dedup: if we already mirrored this blake3, skip the OPFS write.
+  const existingRecord = await getBlobRecord(meta.blake3);
+  const resolvedMime = meta.mime || mime;
+  const domain = classifyDomain(resolvedMime);
+
+  if (!existingRecord) {
+    await storeBlob(meta.blake3, buffer, {
+      blob_id: meta.blake3,
+      sha256: "",
+      blake3: meta.blake3,
+      filename: meta.filename || picked.filename,
+      mime: resolvedMime,
+      size: meta.size,
+      domain,
+      blob_type: "original",
+      parent_blob_id: null,
+      metadata: {},
+    });
   }
 
-  const response = await tauriInvoke("api_call", {
-    path: "/api/upload/file",
-    body,
-  });
-
-  if (!response.success) {
-    const detail = response.errors?.[0]?.detail ?? response.message ?? "upload failed";
-    throw new Error(`file upload failed: ${detail}`);
-  }
-
-  const d = response.data;
-  if (!d) {
-    throw new Error("file upload returned no data");
-  }
-
-  // try to get the generated thumbnail from grimoire (Tauri mode)
+  // generate a thumbnail data url for images so the widget can paint
+  // immediately without a follow-up fetch.
   let thumbnailDataUrl: string | null = null;
-  try {
-    thumbnailDataUrl = await fetchThumbnailLocal(d.blob_id, 200);
-  } catch {
-    // thumbnail may not be ready yet — that's OK
+  if (resolvedMime.startsWith("image/")) {
+    try {
+      const blob = new Blob([new Uint8Array(buffer)], { type: resolvedMime });
+      thumbnailDataUrl = await generateThumbnailDataUrl(blob);
+    } catch (err) {
+      console.debug(TAG, "tauri thumbnail generation failed:", err);
+    }
   }
 
   return {
-    blobId: d.blob_id,
-    domain: d.domain,
-    jobId: d.job_id ?? null,
-    sha256: d.sha256,
-    blake3: d.blake3 ?? null,
-    size: d.size,
-    mime: d.mime,
-    existing: d.existing ?? false,
+    blobId: meta.blake3,
+    domain,
+    jobId: null,
+    sha256: "",
+    blake3: meta.blake3,
+    size: meta.size,
+    mime: resolvedMime,
+    existing: !!existingRecord,
     thumbnailDataUrl,
   };
 }
@@ -2273,17 +2361,3 @@ export function formatFileSize(bytes: number): string {
 // internal helpers
 // ---------------------------------------------------------------------------
 
-/** read a File as a base64-encoded string (without the data URL prefix) */
-async function fileToBase64(file: File): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = reader.result as string;
-      // strip "data:<mime>;base64," prefix to get raw base64
-      const commaIndex = dataUrl.indexOf(",");
-      resolve(commaIndex >= 0 ? dataUrl.slice(commaIndex + 1) : dataUrl);
-    };
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-}

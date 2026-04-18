@@ -182,6 +182,38 @@ export function classifyDomain(mime: string): string {
 }
 
 /**
+ * try to write bytes to OPFS using the (writable-stream) api. silently
+ * skips when OPFS itself is unavailable, when `createWritable` is not
+ * exposed (webkit / tauri webview on main thread), or when the write
+ * itself fails. a warning is logged so the failure is visible.
+ */
+async function tryWriteOpfs(blobId: string, data: ArrayBuffer): Promise<void> {
+  try {
+    const dir = await getOpfsDir(true);
+    if (!dir) return;
+    const fileHandle = await dir.getFileHandle(blobId, { create: true });
+    // webkit's main-thread OPFS handle has no createWritable()
+    const create = (fileHandle as any).createWritable as
+      | (() => Promise<FileSystemWritableFileStream>)
+      | undefined;
+    if (typeof create !== "function") {
+      console.warn(
+        "[skein-blob-store] createWritable unavailable on this platform — " +
+          "skipping OPFS bytes for " +
+          blobId.slice(0, 16) +
+          "..."
+      );
+      return;
+    }
+    const writable = await create.call(fileHandle);
+    await writable.write(data);
+    await writable.close();
+  } catch (err) {
+    console.warn("[skein-blob-store] tryWriteOpfs failed for", blobId.slice(0, 16), err);
+  }
+}
+
+/**
  * store raw blob bytes in OPFS and write the metadata record to IndexedDB.
  *
  * the `meta` parameter should contain everything except `created_at`,
@@ -192,15 +224,11 @@ export async function storeBlob(
   data: ArrayBuffer,
   meta: Omit<SkeinBlobRecord, "created_at">
 ): Promise<void> {
-  // write bytes to OPFS
-  const dir = await getOpfsDir(true);
-  if (!dir) {
-    throw new Error("OPFS is not available — cannot store blob data");
-  }
-  const fileHandle = await dir.getFileHandle(blobId, { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(data);
-  await writable.close();
+  // write bytes to OPFS — best-effort. webkit (tauri's webview) does not
+  // expose `createWritable()` on the main thread; in that case the bytes
+  // are expected to live in the rust-side blob store and `getBlobData()`
+  // will fall back to a `blob_get` dispatch.
+  await tryWriteOpfs(blobId, data);
 
   // write metadata record to IndexedDB
   const record: SkeinBlobRecord = {
@@ -346,19 +374,46 @@ export async function getBlobRecordByBlake3(blake3Hash: string): Promise<SkeinBl
 }
 
 /**
- * read the raw blob bytes from OPFS.
+ * read the raw blob bytes from OPFS, with a tauri fallback to the
+ * rust-side blob store via `blob_get` when OPFS doesn't have the bytes
+ * (eg. webkit can't write OPFS on the main thread, so the canonical
+ * copy lives in reliquary).
  *
- * returns `null` if the file is not found or OPFS is unavailable.
+ * returns `null` if the bytes can't be located anywhere.
  */
 export async function getBlobData(blobId: string): Promise<ArrayBuffer | null> {
   try {
     const dir = await getOpfsDir(false);
-    if (!dir) return null;
-    const fileHandle = await dir.getFileHandle(blobId);
-    const file = await fileHandle.getFile();
-    return await file.arrayBuffer();
+    if (dir) {
+      try {
+        const fileHandle = await dir.getFileHandle(blobId);
+        const file = await fileHandle.getFile();
+        return await file.arrayBuffer();
+      } catch {
+        // fall through to tauri fallback below
+      }
+    }
   } catch (err) {
-    console.warn("[skein-blob-store] getBlobData failed for", blobId, err);
+    console.warn("[skein-blob-store] getBlobData OPFS access failed for", blobId, err);
+  }
+
+  // tauri fallback — ask the rust side for the bytes by blake3.
+  try {
+    const { isTauriMode, dispatch } = await import("../p2p/tauri-transport");
+    if (!isTauriMode()) return null;
+    const response = (await dispatch("blob_get", { blake3: blobId })) as
+      | { data: string }
+      | null;
+    if (!response?.data) return null;
+    const bin = atob(response.data);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    // best-effort: cache the bytes back into OPFS so future reads are local.
+    // (no-op on webkit where createWritable is missing.)
+    void tryWriteOpfs(blobId, out.buffer);
+    return out.buffer;
+  } catch (err) {
+    console.warn("[skein-blob-store] getBlobData tauri fallback failed for", blobId, err);
     return null;
   }
 }

@@ -19,7 +19,7 @@
  * new one is created.
  */
 
-import { isTauriMode } from "../p2p/tauri-transport";
+import { dispatch as tauriDispatch, isTauriMode } from "../p2p/tauri-transport";
 
 const TAG = "[media-urls]";
 
@@ -94,19 +94,6 @@ async function getConvertFileSrc(): Promise<(path: string) => string> {
   return convertFileSrc;
 }
 
-/** lazy-import and cache invoke from @tauri-apps/api/core */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type InvokeFn = (cmd: string, args?: any) => Promise<any>;
-
-let _invoke: InvokeFn | null = null;
-
-async function getInvoke(): Promise<InvokeFn> {
-  if (_invoke) return _invoke;
-  const { invoke } = await import("@tauri-apps/api/core");
-  _invoke = invoke as unknown as InvokeFn;
-  return _invoke;
-}
-
 // ---------------------------------------------------------------------------
 // internal: resolve blob to a local filesystem path (tauri only)
 // ---------------------------------------------------------------------------
@@ -120,18 +107,16 @@ async function getBlobLocalPath(blobId: string): Promise<BlobPathInfo | null> {
   if (!isTauriMode()) return null;
 
   try {
-    const invoke = await getInvoke();
-    const response = (await invoke("api_call", {
-      path: `/api/blobs/${blobId}/path`,
-      body: {},
-    })) as { success: boolean; data?: { path?: string; mime?: string } };
+    const response = (await tauriDispatch("blob_get_path", { blake3: blobId })) as {
+      path?: string;
+      mime?: string | null;
+    } | null;
 
-    if (!response.success || !response.data?.path) {
-      return null;
-    }
+    if (!response?.path) return null;
 
-    return { path: response.data.path, mime: response.data.mime };
-  } catch {
+    return { path: response.path, mime: response.mime ?? undefined };
+  } catch (err) {
+    console.debug(TAG, "getBlobLocalPath failed:", err);
     return null;
   }
 }
@@ -222,18 +207,16 @@ async function getBlobDataUrl(blobId: string): Promise<string | null> {
   if (!isTauriMode()) return null;
 
   try {
-    const invoke = await getInvoke();
-    const response = (await invoke("api_call", {
-      path: `/api/blobs/${blobId}/data`,
-      body: {},
-    })) as { success: boolean; data?: { data?: string; mime?: string } };
+    const response = (await tauriDispatch("blob_get", { blake3: blobId })) as {
+      meta?: { mime?: string | null };
+      data?: string;
+    } | null;
 
-    if (!response.success || !response.data?.data || !response.data?.mime) {
-      return null;
-    }
-
-    return `data:${response.data.mime};base64,${response.data.data}`;
-  } catch {
+    if (!response?.data) return null;
+    const mime = response.meta?.mime ?? "application/octet-stream";
+    return `data:${mime};base64,${response.data}`;
+  } catch (err) {
+    console.debug(TAG, "getBlobDataUrl failed:", err);
     return null;
   }
 }
@@ -287,38 +270,16 @@ export async function getMediaPlaybackUrl(
   // ---- tauri mode: prefer local filesystem path ----
 
   if (isTauriMode()) {
-    // resolve the effective grimoire blob ID — the blobId in the automerge doc
-    // might be a browser-peer's SHA256 hash that doesn't exist in grimoire.
-    // try direct lookup first, fall back to blake3 to find the real ID.
-    let resolvedId = blobId;
-
-    console.debug(TAG, "getMediaPlaybackUrl: trying getBlobLocalPath for", blobId);
-    let pathInfo = await getBlobLocalPath(blobId);
-
-    // direct ID failed — try blake3 lookup to find the real grimoire blob ID
-    if (!pathInfo && blake3) {
-      console.debug(
-        TAG,
-        "getMediaPlaybackUrl: direct ID miss, trying blake3:",
-        blake3.slice(0, 12)
-      );
-      try {
-        const invoke = await getInvoke();
-        const blake3Response = (await invoke("api_call", {
-          path: "/api/blob_metadata_by_blake3",
-          body: { blake3 },
-        })) as { success: boolean; data?: { id?: string } };
-        if (blake3Response?.success && blake3Response.data?.id) {
-          resolvedId = blake3Response.data.id;
-          console.debug(TAG, "getMediaPlaybackUrl: blake3 resolved to:", resolvedId);
-          pathInfo = await getBlobLocalPath(resolvedId);
-        }
-      } catch (err) {
-        console.debug(TAG, "getMediaPlaybackUrl: blake3 lookup threw:", err);
-      }
-    }
-
-    console.debug(TAG, "getMediaPlaybackUrl: getBlobLocalPath returned:", pathInfo);
+    // on skein-tauri, blob ids ARE blake3 hashes — no separate lookup needed.
+    // try `blob_get_path` first (gives us a real filesystem path we can hand
+    // to asset:// for native streaming with range requests). if the blobId
+    // isn't a known blake3 (e.g. it's a browser-peer SHA256 from a remote
+    // canvas), `blob_get_path` returns null and we fall through to the
+    // base64 IPC fallback (which also won't find it, leaving P2P below).
+    const lookupId = blake3 || blobId;
+    console.debug(TAG, "getMediaPlaybackUrl: trying blob_get_path for", lookupId);
+    const pathInfo = await getBlobLocalPath(lookupId);
+    console.debug(TAG, "getMediaPlaybackUrl: blob_get_path returned:", pathInfo);
 
     if (pathInfo) {
       // on Linux WebKitGTK, asset:// doesn't work for media elements —
@@ -353,8 +314,8 @@ export async function getMediaPlaybackUrl(
     }
 
     // tauri fallback: base64 data URL from IPC
-    console.debug(TAG, "getMediaPlaybackUrl: trying base64 data URL fallback for", resolvedId);
-    const dataUrl = await getBlobDataUrl(resolvedId);
+    console.debug(TAG, "getMediaPlaybackUrl: trying base64 data URL fallback for", lookupId);
+    const dataUrl = await getBlobDataUrl(lookupId);
     console.debug(
       TAG,
       "getMediaPlaybackUrl: getBlobDataUrl returned:",
