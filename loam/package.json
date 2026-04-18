@@ -4,11 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --port 5890",
     "build": "vite build",
     "build:deploy": "vite build --config vite.standalone.config.ts",
     "build:cloudflare": "VITE_SKEIN_BASE=/skein/ vite build --config vite.standalone.config.ts && mv dist/skein.html dist/index.html",
-    "dev:tauri": "VITE_TAURI=1 vite --config vite.standalone.config.ts --port 5173 --strictPort",
+    "dev:tauri": "VITE_TAURI=1 vite --config vite.standalone.config.ts --port 5891 --strictPort",
     "build:tauri": "VITE_TAURI=1 vite build --config vite.standalone.config.ts && mv dist/skein.html dist/index.html",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

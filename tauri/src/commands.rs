@@ -42,6 +42,7 @@ pub struct AppState {
     pub app_config_path: PathBuf,
 
     pub hub: Arc<Mutex<Option<HubState>>>,
+    pub streams: Arc<crate::streams::StreamRegistry>,
 }
 
 /// bookkeeping for a running hub. kept in `Option<_>` — `Some` means the
@@ -104,8 +105,6 @@ enum DispatchError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("not implemented: {0}")]
-    NotImplemented(&'static str),
     #[error("hub: {0}")]
     Hub(String),
     #[error("blob: {0}")]
@@ -143,14 +142,39 @@ async fn dispatch(
         "hub_stop" => hub_stop_inner(state).await,
         "hub_status" => hub_status(state).await,
 
-        // bi-stream IPC — stubbed pending iteration 2
-        "open_bi" | "accept_stream" | "write_message" | "read_message"
-        | "close_stream" => Err(DispatchError::NotImplemented(
-            "bi-stream IPC ships in iteration 2",
-        )),
+        // bi-stream IPC
+        "open_bi" => crate::streams::open_bi(
+            decode("open_bi", payload)?,
+            &state.endpoint,
+            &state.streams,
+        )
+        .await
+        .map_err(stream_err),
+        "accept_stream" => crate::streams::accept_stream(&state.streams)
+            .await
+            .map_err(stream_err),
+        "write_message" => {
+            crate::streams::write_message(decode("write_message", payload)?, &state.streams)
+                .await
+                .map_err(stream_err)
+        }
+        "read_message" => {
+            crate::streams::read_message(decode("read_message", payload)?, &state.streams)
+                .await
+                .map_err(stream_err)
+        }
+        "close_stream" => {
+            crate::streams::close_stream(decode("close_stream", payload)?, &state.streams)
+                .await
+                .map_err(stream_err)
+        }
 
         other => Err(DispatchError::UnknownAction(other.to_string())),
     }
+}
+
+fn stream_err(e: crate::streams::StreamError) -> DispatchError {
+    DispatchError::Hub(e.to_string())
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(

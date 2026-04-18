@@ -6,6 +6,7 @@
 //! stays up across toggles.
 
 mod commands;
+mod streams;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -86,6 +87,8 @@ async fn build_state() -> anyhow::Result<AppState> {
 
     let app_config_path = data_dir.join(APP_CONFIG_FILENAME);
 
+    let streams = streams::StreamRegistry::start(endpoint.clone()).await?;
+
     Ok(AppState {
         endpoint,
         pool,
@@ -98,6 +101,7 @@ async fn build_state() -> anyhow::Result<AppState> {
         process_started_at: Instant::now(),
         app_config_path,
         hub: Arc::new(Mutex::new(None)),
+        streams,
     })
 }
 
@@ -165,7 +169,29 @@ pub fn run() {
                 .item(&quit)
                 .build()?;
 
-            let menu = MenuBuilder::new(app).item(&app_submenu).build()?;
+            // edit submenu — required for cmd+c/v/x/a accelerators to reach
+            // the webview text inputs on macos.
+            let undo = PredefinedMenuItem::undo(app, None)?;
+            let redo = PredefinedMenuItem::redo(app, None)?;
+            let edit_sep = PredefinedMenuItem::separator(app)?;
+            let cut = PredefinedMenuItem::cut(app, None)?;
+            let copy = PredefinedMenuItem::copy(app, None)?;
+            let paste = PredefinedMenuItem::paste(app, None)?;
+            let select_all = PredefinedMenuItem::select_all(app, None)?;
+            let edit_submenu = SubmenuBuilder::new(app, "Edit")
+                .item(&undo)
+                .item(&redo)
+                .item(&edit_sep)
+                .item(&cut)
+                .item(&copy)
+                .item(&paste)
+                .item(&select_all)
+                .build()?;
+
+            let menu = MenuBuilder::new(app)
+                .item(&app_submenu)
+                .item(&edit_submenu)
+                .build()?;
             app.set_menu(menu)?;
 
             app.on_menu_event(|app, event| {

@@ -1,51 +1,49 @@
 # skein tauri app
 
 desktop shell for the skein p2p canvas prototype. wraps the web frontend
-(`skein/skein/`) and runs an in-process `reliquary::service::Service`
-sharing a single `iroh::Endpoint` between the optional hub and the normal
+(`skein/loam/`) and runs an in-process `reliquary::service::Service` sharing
+a single `iroh::Endpoint` between the optional hub and the normal
 browser-like p2p code paths.
 
 ## layout
 
 ```
 tauri/
-├── Cargo.toml            # rust workspace member (tauri backend only)
-├── src-tauri/            # standard tauri scaffolding
-│   ├── Cargo.toml
-│   ├── build.rs
-│   ├── tauri.conf.json
-│   ├── capabilities/
-│   ├── icons/
-│   └── src/
-│       ├── lib.rs
-│       ├── main.rs
-│       └── commands.rs   # ipc: skein_* + blob_* + hub_*
-└── README.md
+├── Cargo.toml         # rust crate (tauri backend)
+├── build.rs
+├── tauri.conf.json
+├── capabilities/
+├── icons/
+├── gen/
+└── src/
+    ├── lib.rs
+    ├── main.rs
+    └── commands.rs    # ipc: skein_dispatch (single entry point)
 ```
 
 ## building
 
 icons are placeholder 1x1 PNGs; swap in real ones before shipping. the
-frontend bundle is not yet wired (`frontendDist` points at `dist/`, expected
-to be populated by `cd ../skein && npm run build:tauri`).
+frontend bundle is wired through `loam`:
+
+- `beforeDevCommand` runs `npm --prefix ../loam run dev:tauri`
+- `beforeBuildCommand` runs `npm --prefix ../loam run build:tauri`
+- `frontendDist` points at `../loam/dist`
 
 ```
-cd skein/tauri/src-tauri
+cd skein/tauri
 cargo build --no-default-features     # sanity-check the rust side
+cargo tauri dev                       # full dev workflow (needs cargo-tauri)
 ```
 
-full tauri workflow (`cargo tauri dev` etc.) needs the `tauri` CLI plus
-matching icons. phase-1 deliverable here is the structural scaffolding +
-compile-clean backend crate. see [docs/getting-started.md](../docs/getting-started.md).
+`cargo tauri dev` requires the `tauri-cli`:
 
-## IPC surface (phase-1)
+```
+cargo install tauri-cli --version "^2.0"
+```
 
-| command             | args                   | returns                               |
-| ------------------- | ---------------------- | ------------------------------------- |
-| `skein_node_id`     | —                      | `String` (iroh node id hex)           |
-| `skein_status`      | —                      | `{ node_id, friend_count, uptime_s }` |
-| `skein_friend_add`  | `{ node_id, status? }` | `()` (upserts with status=accepted)   |
-| `skein_friend_list` | —                      | `Vec<Friend>`                         |
-| `blob_list`         | `{ limit?, offset? }`  | `Vec<BlobRef>`                        |
+## IPC surface
 
-p2p message sending, canvas invites, and gossip are phase-2.
+single command `skein_dispatch(action, payload)` — see
+[src/commands.rs](src/commands.rs) for the action list (friend_*, blob_*,
+hub_*, status, get_node_id).

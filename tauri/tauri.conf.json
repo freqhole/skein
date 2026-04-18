@@ -4,10 +4,16 @@
   "version": "0.1.0",
   "identifier": "net.freqhole.skein",
   "build": {
-    "beforeDevCommand": "npm --prefix ../../skein run dev:tauri",
-    "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm --prefix ../../skein run build:tauri",
-    "frontendDist": "../../skein/dist"
+    "beforeDevCommand": {
+      "cwd": "../loam",
+      "script": "npm run dev:tauri"
+    },
+    "devUrl": "http://localhost:5891",
+    "beforeBuildCommand": {
+      "cwd": "../loam",
+      "script": "npm run build:tauri"
+    },
+    "frontendDist": "../loam/dist"
   },
   "app": {
     "windows": [

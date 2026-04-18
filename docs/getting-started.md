@@ -5,7 +5,7 @@ depending on how much of the stack you want:
 
 | mode                    | binary                | runs what                                                   |
 | ----------------------- | --------------------- | ----------------------------------------------------------- |
-| **web only**            | `skein/skein/` (vite) | browser-only p2p — iroh-over-webtransport via `midden` wasm |
+| **web only**            | `skein/loam/` (vite)  | browser-only p2p — iroh-over-webtransport via `midden` wasm |
 | **web + reliquary hub** | `reliquary` + browser | long-lived headless hub peer + your browser tab             |
 | **desktop (tauri)**     | `skein-tauri`         | tauri shell with reliquary running in-process               |
 
@@ -40,12 +40,12 @@ wasm-pack build --target web --out-dir pkg --release
 rm -f pkg/.gitignore
 
 # run the dev server
-cd ../skein
+cd ../loam
 npm install
 npm run dev
 ```
 
-open `http://localhost:5173`. in devtools:
+open `http://localhost:5890`. in devtools:
 
 ```js
 await window.skein.identity.nodeId(); // hex node id
@@ -98,17 +98,17 @@ identity.secret     # iroh ed25519 secret key (chmod 600)
 the tauri app runs a full reliquary peer in-process and shares its iroh
 endpoint with the webview. **not yet bundle-ready** — icons are placeholders
 copied from tomb/charnel; frontend wiring (`beforeDevCommand`/`frontendDist`)
-still needs a `npm run build:tauri` target in `skein/skein/`.
+still needs a `npm run build:tauri` target in `skein/loam/`.
 
 structural sanity-check of the rust side:
 
 ```sh
-cd skein/tauri/src-tauri
+cd skein/tauri
 cargo check
 ```
 
 the IPC surface exposed to the webview (see
-[tauri/src-tauri/src/commands.rs](../tauri/src-tauri/src/commands.rs)):
+[tauri/src/commands.rs](../tauri/src/commands.rs)):
 
 | command             | args                  | returns                               |
 | ------------------- | --------------------- | ------------------------------------- |

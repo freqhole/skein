@@ -1,5 +1,4 @@
 /target
-/tauri/src-tauri/target
-/tauri/src-tauri/gen/schemas
-/midden/target
 /tauri/target
+/tauri/gen/schemas
+/midden/target

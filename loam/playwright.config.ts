@@ -8,7 +8,7 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   reporter: [["html", { outputFolder: "playwright-report" }], ["list"]],
   use: {
-    baseURL: "http://localhost:5177",
+    baseURL: "http://localhost:5897",
     trace: "on-first-retry",
   },
   projects: [
@@ -18,8 +18,8 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "npx vite --port 5177",
-    port: 5177,
+    command: "npx vite --port 5897",
+    port: 5897,
     reuseExistingServer: !process.env.CI,
   },
 });

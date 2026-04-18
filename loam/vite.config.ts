@@ -31,7 +31,7 @@ export default defineConfig({
     : {}),
   // dev server serves test-harness.html for playwright tests
   server: {
-    port: 5177,
+    port: 5897,
   },
   test: {
     globals: true,
