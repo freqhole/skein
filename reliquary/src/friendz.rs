@@ -55,10 +55,37 @@ impl FriendStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Inbound,
+    Outbound,
+}
+
+impl Direction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "inbound" => Some(Self::Inbound),
+            "outbound" => Some(Self::Outbound),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Friend {
     pub friend_node_id: String,
     pub status: FriendStatus,
+    pub direction: Option<Direction>,
+    pub alias: Option<String>,
+    pub group_name: Option<String>,
     pub narthex_doc_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -80,19 +107,40 @@ impl Store {
         status: FriendStatus,
         narthex_doc_id: Option<&str>,
     ) -> Result<Friend, FriendError> {
+        self.upsert_full(friend_node_id, status, None, None, None, narthex_doc_id)
+            .await
+    }
+
+    /// upsert with all optional fields. None values use COALESCE-style merge:
+    /// existing row values are preserved when the parameter is None.
+    pub async fn upsert_full(
+        &self,
+        friend_node_id: &str,
+        status: FriendStatus,
+        direction: Option<Direction>,
+        alias: Option<&str>,
+        group_name: Option<&str>,
+        narthex_doc_id: Option<&str>,
+    ) -> Result<Friend, FriendError> {
         let now = now_secs();
         sqlx::query(
             r#"
-            INSERT INTO friendz (friend_node_id, status, narthex_doc_id, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?4)
+            INSERT INTO friendz (friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
             ON CONFLICT(friend_node_id) DO UPDATE SET
-                status = excluded.status,
+                status         = excluded.status,
+                direction      = COALESCE(excluded.direction,      friendz.direction),
+                alias          = COALESCE(excluded.alias,          friendz.alias),
+                group_name     = COALESCE(excluded.group_name,     friendz.group_name),
                 narthex_doc_id = COALESCE(excluded.narthex_doc_id, friendz.narthex_doc_id),
-                updated_at = excluded.updated_at
+                updated_at     = excluded.updated_at
             "#,
         )
         .bind(friend_node_id)
         .bind(status.as_str())
+        .bind(direction.map(|d| d.as_str()))
+        .bind(alias)
+        .bind(group_name)
         .bind(narthex_doc_id)
         .bind(now)
         .execute(&self.pool)
@@ -103,13 +151,10 @@ impl Store {
             .ok_or_else(|| FriendError::UnknownStatus("friend missing after upsert".into()))
     }
 
-    pub async fn get(
-        &self,
-        friend_node_id: &str,
-    ) -> Result<Option<Friend>, FriendError> {
+    pub async fn get(&self, friend_node_id: &str) -> Result<Option<Friend>, FriendError> {
         let row = sqlx::query_as::<_, FriendRow>(
             r#"
-            SELECT friend_node_id, status, narthex_doc_id, created_at, updated_at
+            SELECT friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at
             FROM friendz WHERE friend_node_id = ?1
             "#,
         )
@@ -122,13 +167,43 @@ impl Store {
 
     pub async fn list(&self, only_accepted: bool) -> Result<Vec<Friend>, FriendError> {
         let sql = if only_accepted {
-            r#"SELECT friend_node_id, status, narthex_doc_id, created_at, updated_at
+            r#"SELECT friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at
                FROM friendz WHERE status = 'accepted' ORDER BY created_at ASC"#
         } else {
-            r#"SELECT friend_node_id, status, narthex_doc_id, created_at, updated_at
+            r#"SELECT friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at
                FROM friendz ORDER BY created_at ASC"#
         };
         let rows: Vec<FriendRow> = sqlx::query_as(sql).fetch_all(&self.pool).await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// list all friendz rows where status='pending' filtered by direction.
+    /// pass None to get pending rows of either direction.
+    pub async fn list_pending(
+        &self,
+        direction: Option<Direction>,
+    ) -> Result<Vec<Friend>, FriendError> {
+        let rows: Vec<FriendRow> = match direction {
+            Some(d) => {
+                sqlx::query_as(
+                    r#"SELECT friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at
+                       FROM friendz WHERE status = 'pending' AND direction = ?1
+                       ORDER BY created_at ASC"#,
+                )
+                .bind(d.as_str())
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    r#"SELECT friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at
+                       FROM friendz WHERE status = 'pending'
+                       ORDER BY created_at ASC"#,
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
@@ -145,6 +220,9 @@ impl Store {
 struct FriendRow {
     friend_node_id: String,
     status: String,
+    direction: Option<String>,
+    alias: Option<String>,
+    group_name: Option<String>,
     narthex_doc_id: Option<String>,
     created_at: i64,
     updated_at: i64,
@@ -157,6 +235,9 @@ impl TryFrom<FriendRow> for Friend {
         Ok(Self {
             friend_node_id: r.friend_node_id,
             status: FriendStatus::parse(&r.status)?,
+            direction: r.direction.as_deref().and_then(Direction::parse),
+            alias: r.alias,
+            group_name: r.group_name,
             narthex_doc_id: r.narthex_doc_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -273,9 +354,7 @@ mod tests {
 
         let accepted = store.list(true).await.unwrap();
         assert_eq!(accepted.len(), 2);
-        assert!(accepted
-            .iter()
-            .all(|f| f.status == FriendStatus::Accepted));
+        assert!(accepted.iter().all(|f| f.status == FriendStatus::Accepted));
     }
 
     #[tokio::test]
@@ -300,9 +379,7 @@ mod tests {
         // without a peer row first should fail with a sqlx error.
         let pool = db::open_in_memory().await;
         let store = Store::new(pool);
-        let res = store
-            .upsert("orphan", FriendStatus::Allowed, None)
-            .await;
+        let res = store.upsert("orphan", FriendStatus::Allowed, None).await;
         assert!(matches!(res, Err(FriendError::Sqlx(_))));
     }
 }

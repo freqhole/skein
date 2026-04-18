@@ -18,8 +18,10 @@ pub enum UserError {
 pub struct PeerRecord {
     pub node_id: String,
     pub display_name: Option<String>,
+    pub alias: Option<String>,
     pub bio: Option<String>,
     pub avatar_blake3: Option<String>,
+    pub accent_color: i64,
     pub first_seen_at: i64,
     pub last_seen_at: i64,
     pub is_self: bool,
@@ -47,23 +49,41 @@ impl Directory {
         bio: Option<&str>,
         avatar_blake3: Option<&str>,
     ) -> Result<(), UserError> {
+        self.upsert_self_full(node_id, display_name, None, bio, avatar_blake3, None)
+            .await
+    }
+
+    /// upsert the local node with all profile fields. None preserves existing.
+    pub async fn upsert_self_full(
+        &self,
+        node_id: &str,
+        display_name: Option<&str>,
+        alias: Option<&str>,
+        bio: Option<&str>,
+        avatar_blake3: Option<&str>,
+        accent_color: Option<i64>,
+    ) -> Result<(), UserError> {
         let now = now_secs();
         sqlx::query(
             r#"
-            INSERT INTO userz (node_id, display_name, bio, avatar_blake3, first_seen_at, last_seen_at, is_self)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)
+            INSERT INTO userz (node_id, display_name, alias, bio, avatar_blake3, accent_color, first_seen_at, last_seen_at, is_self)
+            VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, 0), ?7, ?7, 1)
             ON CONFLICT(node_id) DO UPDATE SET
                 display_name  = COALESCE(excluded.display_name,  userz.display_name),
+                alias         = COALESCE(excluded.alias,         userz.alias),
                 bio           = COALESCE(excluded.bio,           userz.bio),
                 avatar_blake3 = COALESCE(excluded.avatar_blake3, userz.avatar_blake3),
+                accent_color  = COALESCE(?6, userz.accent_color),
                 last_seen_at  = excluded.last_seen_at,
                 is_self       = 1
             "#,
         )
         .bind(node_id)
         .bind(display_name)
+        .bind(alias)
         .bind(bio)
         .bind(avatar_blake3)
+        .bind(accent_color)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -118,14 +138,38 @@ impl Directory {
         Ok(())
     }
 
+    /// set the local user's free-form alias for a peer (or for self).
+    /// the row must already exist (caller should `touch` first).
+    pub async fn set_alias(&self, node_id: &str, alias: Option<&str>) -> Result<(), UserError> {
+        sqlx::query("UPDATE userz SET alias = ?1 WHERE node_id = ?2")
+            .bind(alias)
+            .bind(node_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get(&self, node_id: &str) -> Result<Option<PeerRecord>, UserError> {
         let row = sqlx::query_as::<_, PeerRow>(
             r#"
-            SELECT node_id, display_name, bio, avatar_blake3, first_seen_at, last_seen_at, is_self
+            SELECT node_id, display_name, alias, bio, avatar_blake3, accent_color, first_seen_at, last_seen_at, is_self
             FROM userz WHERE node_id = ?1
             "#,
         )
         .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    /// fetch the local self row (the one with is_self = 1), if any.
+    pub async fn get_self(&self) -> Result<Option<PeerRecord>, UserError> {
+        let row = sqlx::query_as::<_, PeerRow>(
+            r#"
+            SELECT node_id, display_name, alias, bio, avatar_blake3, accent_color, first_seen_at, last_seen_at, is_self
+            FROM userz WHERE is_self = 1 LIMIT 1
+            "#,
+        )
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(Into::into))
@@ -136,8 +180,10 @@ impl Directory {
 struct PeerRow {
     node_id: String,
     display_name: Option<String>,
+    alias: Option<String>,
     bio: Option<String>,
     avatar_blake3: Option<String>,
+    accent_color: i64,
     first_seen_at: i64,
     last_seen_at: i64,
     is_self: i64,
@@ -148,8 +194,10 @@ impl From<PeerRow> for PeerRecord {
         Self {
             node_id: r.node_id,
             display_name: r.display_name,
+            alias: r.alias,
             bio: r.bio,
             avatar_blake3: r.avatar_blake3,
+            accent_color: r.accent_color,
             first_seen_at: r.first_seen_at,
             last_seen_at: r.last_seen_at,
             is_self: r.is_self != 0,

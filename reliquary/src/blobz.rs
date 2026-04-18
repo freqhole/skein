@@ -31,7 +31,10 @@ pub struct BlobRef {
     pub filename: Option<String>,
     pub mime: Option<String>,
     pub size: i64,
+    /// when `external` is true, this is an absolute path the store does not
+    /// own. when false, this is a relative path under `<data_dir>/blob-files/`.
     pub path: String,
+    pub external: bool,
     pub created_at: i64,
 }
 
@@ -74,8 +77,8 @@ impl Store {
 
         sqlx::query(
             r#"
-            INSERT INTO blobz (blake3, iroh_hash, filename, mime, size, path, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            INSERT INTO blobz (blake3, iroh_hash, filename, mime, size, path, external, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
             "#,
         )
         .bind(&blake3)
@@ -95,6 +98,80 @@ impl Store {
             mime,
             size,
             path: rel_path,
+            external: false,
+            created_at,
+        })
+    }
+
+    /// register an existing on-disk file as a blob without copying its bytes.
+    /// the file remains where it is; only metadata is recorded. callers are
+    /// responsible for not deleting/moving the file out from under the store.
+    ///
+    /// streams the file through blake3 so large files don't have to be loaded
+    /// into memory. dedupes on blake3 — if the same content is already
+    /// registered (external or not), returns the existing ref.
+    pub async fn register_path(
+        &self,
+        abs_path: &Path,
+        filename: Option<String>,
+        mime: Option<String>,
+    ) -> Result<BlobRef, BlobError> {
+        if !abs_path.is_absolute() {
+            return Err(BlobError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("register_path requires an absolute path, got {abs_path:?}"),
+            )));
+        }
+
+        // stream the file through blake3 + count bytes.
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::open(abs_path).await?;
+        let mut hasher = blake3::Hasher::new();
+        let mut size: i64 = 0;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            size += n as i64;
+        }
+        drop(file);
+        let blake3_hex = hasher.finalize().to_hex().to_string();
+
+        if let Some(existing) = self.get(&blake3_hex).await? {
+            return Ok(existing);
+        }
+
+        let path_str = abs_path.to_string_lossy().to_string();
+        let iroh_hash = blake3_hex.clone();
+        let created_at = now_secs();
+
+        sqlx::query(
+            r#"
+            INSERT INTO blobz (blake3, iroh_hash, filename, mime, size, path, external, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
+            "#,
+        )
+        .bind(&blake3_hex)
+        .bind(&iroh_hash)
+        .bind(&filename)
+        .bind(&mime)
+        .bind(size)
+        .bind(&path_str)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(BlobRef {
+            blake3: blake3_hex,
+            iroh_hash,
+            filename,
+            mime,
+            size,
+            path: path_str,
+            external: true,
             created_at,
         })
     }
@@ -102,7 +179,7 @@ impl Store {
     pub async fn get(&self, blake3: &str) -> Result<Option<BlobRef>, BlobError> {
         let row = sqlx::query_as::<_, BlobRow>(
             r#"
-            SELECT blake3, iroh_hash, filename, mime, size, path, created_at
+            SELECT blake3, iroh_hash, filename, mime, size, path, external, created_at
             FROM blobz WHERE blake3 = ?1
             "#,
         )
@@ -113,13 +190,10 @@ impl Store {
         Ok(row.map(Into::into))
     }
 
-    pub async fn get_by_iroh_hash(
-        &self,
-        iroh_hash: &str,
-    ) -> Result<Option<BlobRef>, BlobError> {
+    pub async fn get_by_iroh_hash(&self, iroh_hash: &str) -> Result<Option<BlobRef>, BlobError> {
         let row = sqlx::query_as::<_, BlobRow>(
             r#"
-            SELECT blake3, iroh_hash, filename, mime, size, path, created_at
+            SELECT blake3, iroh_hash, filename, mime, size, path, external, created_at
             FROM blobz WHERE iroh_hash = ?1
             "#,
         )
@@ -131,7 +205,11 @@ impl Store {
     }
 
     pub fn path_for(&self, blob: &BlobRef) -> PathBuf {
-        self.blob_dir.join(&blob.path)
+        if blob.external {
+            PathBuf::from(&blob.path)
+        } else {
+            self.blob_dir.join(&blob.path)
+        }
     }
 
     pub async fn read_bytes(&self, blake3: &str) -> Result<Option<Vec<u8>>, BlobError> {
@@ -142,14 +220,10 @@ impl Store {
         Ok(Some(bytes))
     }
 
-    pub async fn list(
-        &self,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<BlobRef>, BlobError> {
+    pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<BlobRef>, BlobError> {
         let rows = sqlx::query_as::<_, BlobRow>(
             r#"
-            SELECT blake3, iroh_hash, filename, mime, size, path, created_at
+            SELECT blake3, iroh_hash, filename, mime, size, path, external, created_at
             FROM blobz
             ORDER BY created_at DESC
             LIMIT ?1 OFFSET ?2
@@ -165,8 +239,11 @@ impl Store {
 
     pub async fn delete(&self, blake3: &str) -> Result<(), BlobError> {
         if let Some(blob) = self.get(blake3).await? {
-            let path = self.path_for(&blob);
-            let _ = tokio::fs::remove_file(&path).await;
+            // never touch external files — the user owns them.
+            if !blob.external {
+                let path = self.path_for(&blob);
+                let _ = tokio::fs::remove_file(&path).await;
+            }
         }
         sqlx::query("DELETE FROM blobz WHERE blake3 = ?1")
             .bind(blake3)
@@ -184,6 +261,7 @@ struct BlobRow {
     mime: Option<String>,
     size: i64,
     path: String,
+    external: i64,
     created_at: i64,
 }
 
@@ -196,6 +274,7 @@ impl From<BlobRow> for BlobRef {
             mime: r.mime,
             size: r.size,
             path: r.path,
+            external: r.external != 0,
             created_at: r.created_at,
         }
     }
@@ -276,10 +355,7 @@ mod tests {
     async fn read_bytes_returns_payload() {
         let (store, _tmp) = make_store().await;
         let payload = b"some bytes here";
-        let blob = store
-            .insert("h".into(), None, None, payload)
-            .await
-            .unwrap();
+        let blob = store.insert("h".into(), None, None, payload).await.unwrap();
         let read = store.read_bytes(&blob.blake3).await.unwrap();
         assert_eq!(read.as_deref(), Some(payload.as_ref()));
     }
@@ -304,11 +380,7 @@ mod tests {
             .unwrap()
             .expect("present");
         assert_eq!(got.blake3, blob.blake3);
-        assert!(store
-            .get_by_iroh_hash("missing")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(store.get_by_iroh_hash("missing").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -335,10 +407,7 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_row_and_file() {
         let (store, _tmp) = make_store().await;
-        let blob = store
-            .insert("h".into(), None, None, b"bye")
-            .await
-            .unwrap();
+        let blob = store.insert("h".into(), None, None, b"bye").await.unwrap();
         let path = store.path_for(&blob);
         assert!(path.exists());
 
@@ -353,10 +422,7 @@ mod tests {
     #[tokio::test]
     async fn path_for_uses_2char_prefix_split() {
         let (store, _tmp) = make_store().await;
-        let blob = store
-            .insert("h".into(), None, None, b"a")
-            .await
-            .unwrap();
+        let blob = store.insert("h".into(), None, None, b"a").await.unwrap();
         let path = store.path_for(&blob);
         let parent = path.parent().unwrap().file_name().unwrap();
         assert_eq!(parent.to_string_lossy().len(), 2);
