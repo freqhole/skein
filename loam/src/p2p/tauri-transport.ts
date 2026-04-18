@@ -161,9 +161,11 @@ export class TauriStreamNode implements MiddenStreamNode {
 
   async accept(): Promise<BiStreamLike | null> {
     try {
+      console.log(TAG, "accept(): polling backend for next inbound stream");
       const result = await dispatch("accept_stream");
       if (result.handle === null || result.handle === undefined) {
         // channel closed or not configured — no more incoming streams
+        console.log(TAG, "accept(): backend signalled channel closed");
         return null;
       }
       console.log(

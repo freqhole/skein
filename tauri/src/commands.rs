@@ -105,6 +105,8 @@ enum DispatchError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("stream: {0}")]
+    Stream(String),
     #[error("hub: {0}")]
     Hub(String),
     #[error("blob: {0}")]
@@ -131,6 +133,10 @@ async fn dispatch(
         "friend_add" => friend_add(decode("friend_add", payload)?, state).await,
         "friend_list" => friend_list(state).await,
         "friend_remove" => friend_remove(decode("friend_remove", payload)?, state).await,
+
+        // social doc snapshot (stub: returns empty defaults so SqliteSocialDoc
+        // can initialize. real backing comes later.)
+        "social_get_state" => social_get_state(state).await,
 
         // blobs
         "blob_list" => blob_list(decode_or_default(payload), state).await,
@@ -174,7 +180,7 @@ async fn dispatch(
 }
 
 fn stream_err(e: crate::streams::StreamError) -> DispatchError {
-    DispatchError::Hub(e.to_string())
+    DispatchError::Stream(e.to_string())
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(
@@ -308,6 +314,36 @@ async fn friend_remove(
 ) -> Result<Value, DispatchError> {
     state.friendz_store.delete(&args.node_id).await?;
     Ok(Value::Null)
+}
+
+// ---------------------------------------------------------------------------
+// social doc snapshot (stub)
+//
+// returns a minimal RawSocialSnapshot so the frontend's SqliteSocialDoc can
+// initialize without a real grimoire-style social schema. once we wire up
+// real friendz/userz reads here, replace the empty defaults.
+// ---------------------------------------------------------------------------
+
+async fn social_get_state(state: &AppState) -> Result<Value, DispatchError> {
+    Ok(json!({
+        "profile": {
+            "user_id": "",
+            "username": state.username,
+            "alias": "",
+            "bio": "",
+            "avatar_url": "",
+            "accent_color": 0,
+            "node_id": state.node_id,
+        },
+        "friends": [],
+        "groups": [],
+        "pending_requests": [],
+        "outbound_requests": [],
+        "settings": {
+            "profile_visibility": "friends",
+            "friend_requests_from": "everyone",
+        },
+    }))
 }
 
 // ---------------------------------------------------------------------------

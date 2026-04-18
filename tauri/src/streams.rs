@@ -86,8 +86,8 @@ pub enum StreamError {
 }
 
 struct Slot {
-    send: SendStream,
-    recv: RecvStream,
+    send: Arc<Mutex<SendStream>>,
+    recv: Arc<Mutex<RecvStream>>,
     peer_node_id: String,
     #[allow(dead_code)]
     alpn: String,
@@ -152,8 +152,8 @@ impl StreamRegistry {
         self.slots.lock().await.insert(
             handle,
             Slot {
-                send,
-                recv,
+                send: Arc::new(Mutex::new(send)),
+                recv: Arc::new(Mutex::new(recv)),
                 peer_node_id,
                 alpn,
             },
@@ -190,9 +190,11 @@ impl ProtocolHandler for AcceptHandler {
         // accept exactly one bi-stream per inbound connection — matches
         // midden's `accept()` semantics and what the frontend expects.
         let (send, recv) = connection.accept_bi().await?;
+        let cap_remaining = self.tx.capacity();
         tracing::info!(
             peer = %peer_node_id,
             alpn = %alpn,
+            accept_capacity_remaining = cap_remaining,
             "frontend: accepted bi-stream, queuing for accept_stream"
         );
         if self
@@ -267,8 +269,14 @@ pub(crate) async fn open_bi_with_addr(
 pub async fn accept_stream(registry: &StreamRegistry) -> Result<Value, StreamError> {
     let mut guard = registry.accept_rx.lock().await;
     let rx = guard.as_mut().ok_or(StreamError::AcceptClosed)?;
+    tracing::debug!("frontend: accept_stream dispatch waiting for inbound");
     match rx.recv().await {
         Some(inbound) => {
+            tracing::info!(
+                peer = %inbound.peer_node_id,
+                alpn = %inbound.alpn,
+                "frontend: accept_stream draining queued inbound"
+            );
             let handle = registry
                 .insert(
                     inbound.send,
@@ -298,6 +306,10 @@ pub struct WriteArgs {
 }
 
 /// length-delimited write (4-byte BE prefix). matches midden framing.
+///
+/// only locks the global slot map briefly to clone the per-slot send arc,
+/// then does I/O under the per-slot mutex so reads on the same slot
+/// (or operations on other slots) are not blocked.
 pub async fn write_message(
     args: WriteArgs,
     registry: &StreamRegistry,
@@ -305,17 +317,19 @@ pub async fn write_message(
     let bytes = B64
         .decode(args.data.as_bytes())
         .map_err(|e| StreamError::B64(e.to_string()))?;
-    let mut slots = registry.slots.lock().await;
-    let slot = slots
-        .get_mut(&args.handle)
-        .ok_or(StreamError::UnknownHandle(args.handle))?;
+    let send = {
+        let slots = registry.slots.lock().await;
+        let slot = slots
+            .get(&args.handle)
+            .ok_or(StreamError::UnknownHandle(args.handle))?;
+        slot.send.clone()
+    };
+    let mut send = send.lock().await;
     let len = (bytes.len() as u32).to_be_bytes();
-    slot.send
-        .write_all(&len)
+    send.write_all(&len)
         .await
         .map_err(|e| StreamError::Write(e.to_string()))?;
-    slot.send
-        .write_all(&bytes)
+    send.write_all(&bytes)
         .await
         .map_err(|e| StreamError::Write(e.to_string()))?;
     Ok(Value::Null)
@@ -327,21 +341,29 @@ pub struct HandleArgs {
 }
 
 /// length-delimited read. returns `{ data: null }` on clean eof.
+///
+/// only locks the global slot map briefly to clone the per-slot recv arc,
+/// then does I/O under the per-slot mutex so writes on the same slot
+/// (or operations on other slots) are not blocked while we await data.
 pub async fn read_message(
     args: HandleArgs,
     registry: &StreamRegistry,
 ) -> Result<Value, StreamError> {
-    let mut slots = registry.slots.lock().await;
-    let slot = slots
-        .get_mut(&args.handle)
-        .ok_or(StreamError::UnknownHandle(args.handle))?;
+    let (recv, peer_node_id) = {
+        let slots = registry.slots.lock().await;
+        let slot = slots
+            .get(&args.handle)
+            .ok_or(StreamError::UnknownHandle(args.handle))?;
+        (slot.recv.clone(), slot.peer_node_id.clone())
+    };
+    let mut recv = recv.lock().await;
 
     let mut len_buf = [0u8; 4];
-    match slot.recv.read_exact(&mut len_buf).await {
+    match recv.read_exact(&mut len_buf).await {
         Ok(()) => {}
         Err(e) => {
             // peer closed the stream cleanly or otherwise — surface as eof.
-            tracing::debug!(handle = args.handle, peer = %slot.peer_node_id, error = %e, "read eof");
+            tracing::debug!(handle = args.handle, peer = %peer_node_id, error = %e, "read eof");
             return Ok(json!({ "data": Value::Null }));
         }
     }
@@ -350,8 +372,7 @@ pub async fn read_message(
         return Ok(json!({ "data": B64.encode(&[] as &[u8]) }));
     }
     let mut buf = vec![0u8; len];
-    slot.recv
-        .read_exact(&mut buf)
+    recv.read_exact(&mut buf)
         .await
         .map_err(|e| StreamError::Read(e.to_string()))?;
     Ok(json!({ "data": B64.encode(&buf) }))
@@ -363,9 +384,10 @@ pub async fn close_stream(
     registry: &StreamRegistry,
 ) -> Result<Value, StreamError> {
     let removed = registry.slots.lock().await.remove(&args.handle);
-    if let Some(mut slot) = removed {
-        let _ = slot.send.finish();
-        // drop recv implicitly.
+    if let Some(slot) = removed {
+        let mut send = slot.send.lock().await;
+        let _ = send.finish();
+        // recv arc dropped implicitly when slot goes out of scope.
     }
     Ok(Value::Null)
 }
@@ -620,6 +642,122 @@ mod tests {
         .expect("read timeout")
         .expect("read");
         assert!(resp["data"].is_null(), "expected null on eof, got {resp}");
+    }
+
+    /// regression: write_message and read_message must not deadlock when
+    /// invoked concurrently on the same handle. previously both held the
+    /// global slots-map mutex across async I/O, so a parked read would
+    /// block any subsequent write on the same connection. this is the bug
+    /// that broke tauri<->browser friend-accept replies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "binds real iroh endpoints; run with --ignored"]
+    async fn concurrent_read_and_write_on_same_handle_does_not_deadlock() {
+        let dialer = make_endpoint().await.expect("dialer endpoint");
+        let listener = make_endpoint().await.expect("listener endpoint");
+
+        let listener_registry = StreamRegistry::start(listener.clone())
+            .await
+            .expect("listener registry");
+        let dialer_registry = StreamRegistry::start(dialer.clone())
+            .await
+            .expect("dialer registry");
+
+        // bring up a stream from dialer to listener and write one byte so
+        // the listener's accept_bi resolves.
+        let open = open_bi_with_addr(
+            target_addr(&listener),
+            "skein-friendz/1",
+            &dialer,
+            &dialer_registry,
+        )
+        .await
+        .expect("open_bi");
+        let dialer_handle = open["handle"].as_u64().unwrap();
+        write_message(
+            WriteArgs {
+                handle: dialer_handle,
+                data: B64.encode(b"hello"),
+            },
+            &dialer_registry,
+        )
+        .await
+        .expect("first write");
+
+        let acc = tokio::time::timeout(Duration::from_secs(15), accept_stream(&listener_registry))
+            .await
+            .expect("accept timeout")
+            .expect("accept");
+        let listener_handle = acc["handle"].as_u64().unwrap();
+        // drain the initial "hello" so listener's recv buffer is empty.
+        let drain = read_message(HandleArgs { handle: listener_handle }, &listener_registry)
+            .await
+            .expect("drain");
+        assert_eq!(
+            drain["data"].as_str().unwrap(),
+            B64.encode(b"hello"),
+            "drain payload mismatch",
+        );
+
+        // now park a read on the dialer side (no data is coming yet) and,
+        // while it is parked, do a write on the SAME handle. before the fix
+        // the write would block on the same global mutex held by the read
+        // and we'd hit the timeout. after the fix the write should complete.
+        let read_dialer_registry = dialer_registry.clone();
+        let parked_read = tokio::spawn(async move {
+            read_message(
+                HandleArgs { handle: dialer_handle },
+                &read_dialer_registry,
+            )
+            .await
+        });
+
+        // give the read a moment to grab the recv mutex and park.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let write_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_message(
+                WriteArgs {
+                    handle: dialer_handle,
+                    data: B64.encode(b"out"),
+                },
+                &dialer_registry,
+            ),
+        )
+        .await;
+        assert!(
+            write_result.is_ok(),
+            "write_message timed out while a read was parked on the same handle - global lock deadlock regression",
+        );
+        write_result.unwrap().expect("concurrent write should succeed");
+
+        // listener should now see the second write.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_message(HandleArgs { handle: listener_handle }, &listener_registry),
+        )
+        .await
+        .expect("listener read timeout")
+        .expect("listener read");
+        assert_eq!(resp["data"].as_str().unwrap(), B64.encode(b"out"));
+
+        // unblock the parked dialer read by writing back from the listener.
+        write_message(
+            WriteArgs {
+                handle: listener_handle,
+                data: B64.encode(b"reply"),
+            },
+            &listener_registry,
+        )
+        .await
+        .expect("listener write");
+
+        let parked_resp = tokio::time::timeout(Duration::from_secs(5), parked_read)
+            .await
+            .expect("parked read timeout")
+            .expect("parked read join")
+            .expect("parked read result");
+        assert_eq!(parked_resp["data"].as_str().unwrap(), B64.encode(b"reply"));
     }
 
     #[tokio::test]

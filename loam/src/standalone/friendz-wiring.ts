@@ -73,7 +73,10 @@ export async function initFriendzWiring(
     localNodeId = node.node_id();
   } else {
     const identity = await getStoredIdentity();
-    if (!identity) return null;
+    if (!identity) {
+      console.warn("[friendz-wiring] aborting: no stored identity (browser mode)");
+      return null;
+    }
     localNodeId = identity.node_id;
   }
 
@@ -83,7 +86,13 @@ export async function initFriendzWiring(
     sDoc = deps.socialDoc;
   } else {
     const socialEntry = store.getWidget(socialWidgetId);
-    if (!socialEntry) return null;
+    if (!socialEntry) {
+      console.warn(
+        "[friendz-wiring] aborting: socialWidgetId not found in store, FRIENDZ_ALPN handler will NOT be registered",
+        { socialWidgetId }
+      );
+      return null;
+    }
 
     const socialHandle = await repo.find<any>(socialEntry.docId as DocumentId);
     sDoc = docHandleAsSocialDoc(socialHandle);
@@ -183,11 +192,21 @@ export async function initFriendzWiring(
   });
 
   // register ALPN handler for incoming friendz streams
+  console.log(
+    "[friendz-wiring] registering FRIENDZ_ALPN handler on irohAdapter, localNodeId:",
+    localNodeId.slice(0, 16) + "..."
+  );
   irohAdapter.registerAlpnHandler(FRIENDZ_ALPN, (stream) => {
+    console.log(
+      "[friendz-wiring] FRIENDZ_ALPN callback fired, peer:",
+      stream.peer_node_id().slice(0, 16) + "...",
+      "-> handing to protocol.handleStream"
+    );
     protocol.handleStream(stream);
   });
 
   // register ALPN handler for incoming skein/1 streams (blob serving, proxy requests)
+  console.log("[friendz-wiring] registering skein/1 handler on irohAdapter");
   irohAdapter.registerAlpnHandler("skein/1", handleSkeinStream);
 
   // collect unsub callbacks so the caller can tear everything down

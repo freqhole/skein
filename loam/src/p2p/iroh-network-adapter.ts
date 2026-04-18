@@ -458,7 +458,13 @@ export class IrohNetworkAdapter extends NetworkAdapter {
               handler(stream);
             } else {
               // no handler registered — close the stream
-              console.log(TAG, "ignoring stream with ALPN:", alpn);
+              console.warn(
+                TAG,
+                "DROPPING inbound stream — no handler registered for ALPN:",
+                alpn,
+                "registered handlers:",
+                Array.from(this.alpnHandlers.keys())
+              );
               stream.close();
             }
           }
