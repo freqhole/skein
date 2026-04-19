@@ -674,6 +674,21 @@ async function snatchFromBrowserPeer(
       }
     : () => {};
 
+  // log capability matrix up-front so we never wonder again why a strategy
+  // was skipped. critical for diagnosing tauri-side snatch where the local
+  // node is `TauriStreamNode`, which has no `download_verified_*` methods
+  // \u2014 strategies 1+2 always silently no-op there and we always end up on
+  // the proxy_request fallback.
+  console.log(TAG, "snatch capabilities:", {
+    have_blake3_in_doc: !!blake3Hash,
+    download_verified_with_ensure_progress:
+      typeof nodeAny.download_verified_with_ensure_progress === "function",
+    download_verified_by_id_progress:
+      typeof nodeAny.download_verified_by_id_progress === "function",
+    proxy_request: typeof nodeAny.proxy_request === "function",
+    declared_size: info.size || 0,
+  });
+
   // strategy 1: iroh-blobs verified download when blake3 is known from doc.
   // timeout is generous (10 min) because the responding peer may need to
   // import the blob into its iroh-blobs FsStore on first request, which
@@ -701,8 +716,17 @@ async function snatchFromBrowserPeer(
       );
       downloaded = true;
     } catch (err) {
-      console.debug(TAG, `iroh-blobs verified (blake3 known) failed:`, err);
+      console.warn(TAG, `strategy 1 (verified, blake3 known) failed:`, err);
     }
+  } else if (!downloaded) {
+    console.log(
+      TAG,
+      `strategy 1 skipped — ${
+        !blake3Hash
+          ? "no blake3 in doc"
+          : "node has no download_verified_with_ensure_progress (likely tauri TauriStreamNode)"
+      }`
+    );
   }
 
   // strategy 2: iroh-blobs verified download with on-demand blake3 compute
@@ -725,8 +749,13 @@ async function snatchFromBrowserPeer(
       blake3Hash = (result[1] as string) || blake3Hash;
       downloaded = true;
     } catch (err) {
-      console.debug(TAG, `iroh-blobs verified (compute blake3) failed:`, err);
+      console.warn(TAG, `strategy 2 (verified, compute blake3) failed:`, err);
     }
+  } else if (!downloaded) {
+    console.log(
+      TAG,
+      "strategy 2 skipped — node has no download_verified_by_id_progress (likely tauri TauriStreamNode)"
+    );
   }
 
   if (!bytes) {

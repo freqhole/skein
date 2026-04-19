@@ -261,6 +261,14 @@ impl BiStream {
     /// this matches grimoire's `send_response()` framing where the message
     /// is terminated by calling `finish()` on the send stream. the receiver
     /// uses `read_to_end()` to read all bytes.
+    ///
+    /// after `finish()` we await `stopped()` so the peer's ack is observed
+    /// before this method returns. without this, JS callers that drop /
+    /// `close()` the stream immediately after `write_raw_and_finish` can
+    /// race the QUIC flush — the peer's `read_to_end` then errors with
+    /// "connection lost" mid-payload because the in-flight frames are
+    /// torn down with the connection. matters most for large payloads
+    /// (e.g. base64-encoded blob bodies in `proxy_response`).
     pub async fn write_raw_and_finish(&self, data: &[u8]) -> Result<(), JsError> {
         let mut send = self
             .send
@@ -271,6 +279,9 @@ impl BiStream {
         let result = async {
             send.write_all(data).await.map_err(to_js_err)?;
             send.finish().map_err(to_js_err)?;
+            // wait for the peer to ack / reset; ignore result, this is a
+            // best-effort flush barrier, not a correctness check.
+            let _ = send.stopped().await;
             Ok::<(), JsError>(())
         }
         .await;
@@ -639,9 +650,13 @@ impl MiddenNode {
         send.write_all(&bytes).await.map_err(to_js_err)?;
         send.finish().map_err(to_js_err)?;
 
-        // read response (no length prefix, read to end)
+        // read response (no length prefix, read to end). 64 MiB matches the
+        // tauri-transport requester cap so browser-to-browser snatch over the
+        // proxy_request fallback can carry mp3 / video bodies. note: this path
+        // is only used as a last-resort fallback — verified iroh-blobs is the
+        // happy path and has no such cap.
         let response_bytes: Vec<u8> = recv
-            .read_to_end(10 * 1024 * 1024)
+            .read_to_end(64 * 1024 * 1024)
             .await
             .map_err(to_js_err)?;
         let response: PeerMessage = serde_json::from_slice(&response_bytes).map_err(to_js_err)?;
