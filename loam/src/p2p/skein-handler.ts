@@ -414,20 +414,33 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
 
   console.log(TAG, `ensure_blob ${blake3_hash.slice(0, 16)}... from ${peerId}...`);
 
-  // tauri short-circuit: the iroh-blobs MemStore path doesn't apply (we have
-  // no midden / no iroh-blobs handler on the rust side). just confirm the
-  // blob exists in rust blobz so the requester knows we have it, then they
-  // fall back to a skein/1 proxy_request for the bytes.
+  // tauri short-circuit: import the blob's bytes from rust `blobz` into
+  // the iroh-blobs FsStore (rust-side, registered on the same endpoint via
+  // `StreamRegistry::start_with_blobs`). once it returns `available: true`
+  // the requester can pull bytes from us over `iroh-blobs/4` directly —
+  // chunked, verified, no size cap. the JS-side MemStore code below never
+  // runs in tauri mode (we have no midden in the webview).
   try {
-    const { isTauriMode } = await import("./tauri-transport");
+    const { isTauriMode, dispatch } = await import("./tauri-transport");
     if (isTauriMode()) {
-      const store = await getBlobStore();
-      const record = await store.getBlobRecordByBlake3(blake3_hash);
-      const available = record !== null;
-      console.log(
-        TAG,
-        `tauri ensure_blob ${blake3_hash.slice(0, 16)}... → ${available ? "available" : "missing"}`
-      );
+      let available = false;
+      try {
+        const result = await dispatch("blob_iroh_ensure", { blake3: blake3_hash });
+        available = result?.available === true;
+        if (!available) {
+          console.log(
+            TAG,
+            `tauri ensure_blob ${blake3_hash.slice(0, 16)}... → missing (${result?.reason ?? "unknown"})`
+          );
+        } else {
+          console.log(
+            TAG,
+            `tauri ensure_blob ${blake3_hash.slice(0, 16)}... → loaded into FsStore`
+          );
+        }
+      } catch (err) {
+        console.warn(TAG, "blob_iroh_ensure dispatch failed:", err);
+      }
       await sendRawResponse(stream, { type: "ensure_blob_response", id, available });
       return;
     }

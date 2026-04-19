@@ -6185,6 +6185,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "iroh",
+ "iroh-blobs",
  "reliquary",
  "serde",
  "serde_json",

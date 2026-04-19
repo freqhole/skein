@@ -87,7 +87,43 @@ async fn build_state() -> anyhow::Result<AppState> {
 
     let app_config_path = data_dir.join(APP_CONFIG_FILENAME);
 
-    let streams = streams::StreamRegistry::start(endpoint.clone()).await?;
+    // boot the iroh-blobs FsStore that backs verified blob streaming. peers
+    // (browser midden) hit us on `iroh-blobs/4` and pull bytes directly out
+    // of this store; the `blob_iroh_ensure` dispatch action pre-loads the
+    // requested blob from `blobz` so the FsStore has the bytes when the
+    // peer asks for them. leaked to satisfy `BlobsProtocol`'s `&'static`
+    // requirement — there's only ever one of these per process.
+    let fs_store_dir = data_dir.join("iroh-blobs");
+    tokio::fs::create_dir_all(&fs_store_dir).await?;
+    let fs_store: &'static iroh_blobs::store::fs::FsStore =
+        Box::leak(Box::new(iroh_blobs::store::fs::FsStore::load(&fs_store_dir).await?));
+
+    let streams = streams::StreamRegistry::start_with_blobs(endpoint.clone(), fs_store).await?;
+
+    // pre-warm the FsStore for every blob already in blobz. without this,
+    // the first browser peer to ask for a pre-existing blob has to wait
+    // for `add_path` (BAO tree compute) inside the dispatch handler, and
+    // for large files that easily exceeds the browser's snatch timeout.
+    // best-effort: errors are logged and ignored \u2014 the lazy
+    // `blob_iroh_ensure` path will still work as a fallback.
+    match blobz_store.list(i64::MAX, 0).await {
+        Ok(blobs) => {
+            tracing::info!(count = blobs.len(), "pre-warming iroh-blobs FsStore");
+            for blob in blobs {
+                let path = blobz_store.path_for(&blob);
+                if !path.exists() {
+                    tracing::warn!(blake3 = %blob.blake3, "prewarm: blob file missing on disk");
+                    continue;
+                }
+                if let Err(e) = fs_store.blobs().add_path(path).await {
+                    tracing::warn!(blake3 = %blob.blake3, error = %e, "prewarm: FsStore add_path failed");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "prewarm: failed to list blobz, skipping FsStore seed");
+        }
+    }
 
     Ok(AppState {
         endpoint,
@@ -102,6 +138,7 @@ async fn build_state() -> anyhow::Result<AppState> {
         app_config_path,
         hub: Arc::new(Mutex::new(None)),
         streams,
+        fs_store,
     })
 }
 

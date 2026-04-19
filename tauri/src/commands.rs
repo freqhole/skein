@@ -43,6 +43,11 @@ pub struct AppState {
 
     pub hub: Arc<Mutex<Option<HubState>>>,
     pub streams: Arc<crate::streams::StreamRegistry>,
+    /// iroh-blobs FsStore — leaked at boot so `BlobsProtocol` (registered on
+    /// `iroh-blobs/4` by [`crate::streams::StreamRegistry::start_with_blobs`])
+    /// can hold a `'static` reference. used by the `blob_iroh_ensure`
+    /// dispatch action to import blob bytes from `blobz` on demand.
+    pub fs_store: &'static iroh_blobs::store::fs::FsStore,
 }
 
 /// bookkeeping for a running hub. kept in `Option<_>` — `Some` means the
@@ -237,6 +242,9 @@ async fn dispatch(
         "blob_insert" => blob_insert(decode("blob_insert", payload)?, state).await,
         "blob_insert_from_path" => {
             blob_insert_from_path(decode("blob_insert_from_path", payload)?, state).await
+        }
+        "blob_iroh_ensure" => {
+            blob_iroh_ensure(decode("blob_iroh_ensure", payload)?, state).await
         }
 
         // hub control
@@ -882,6 +890,78 @@ async fn blob_get_path(args: BlobGetArgs, state: &AppState) -> Result<Value, Dis
     }))
 }
 
+/// best-effort: import a freshly-inserted blob into the iroh-blobs FsStore
+/// so the `BlobsProtocol` handler can serve it instantly when a browser
+/// peer asks. without this, the first `blob_iroh_ensure` call on a large
+/// blob has to compute the BAO tree synchronously inside the dispatch
+/// handler — easily blowing past the browser's 30 s strategy-1 timeout
+/// for video files. errors are logged and swallowed: the lazy
+/// `blob_iroh_ensure` path will still work as a fallback.
+async fn prewarm_fs_store(state: &AppState, blob: &blobz::BlobRef) {
+    let path = state.blobz.path_for(blob);
+    if !path.exists() {
+        tracing::warn!(blake3 = %blob.blake3, "prewarm: blob file missing on disk");
+        return;
+    }
+    match state.fs_store.blobs().add_path(path).await {
+        Ok(_tag) => {
+            tracing::debug!(blake3 = %blob.blake3, "prewarm: imported into FsStore");
+        }
+        Err(e) => {
+            tracing::warn!(blake3 = %blob.blake3, error = %e, "prewarm: FsStore add_path failed");
+        }
+    }
+}
+
+/// import a blob from `blobz` into the iroh-blobs FsStore so the
+/// `BlobsProtocol` handler (registered on `iroh-blobs/4` by
+/// [`crate::streams::StreamRegistry::start_with_blobs`]) can serve it to a
+/// peer over verified streaming.
+///
+/// called from the frontend's `handleEnsureBlob` over `skein/1`: when a
+/// peer probes us for a blob via `ensure_blob_request`, the JS layer
+/// dispatches this action so the underlying bytes are loaded into the
+/// FsStore before we reply `available: true`. without this preload, the
+/// peer's subsequent `download_verified_*` call would 404 inside iroh-blobs
+/// because the FsStore has no record of the hash yet. blobs inserted via
+/// `blob_insert` / `blob_insert_from_path` are pre-warmed at insert time
+/// (see [`prewarm_fs_store`]); this dispatch is the catch-all for blobs
+/// that arrived through other paths (e.g. snatched from another peer).
+///
+/// returns `{ available: true }` on success or `{ available: false, reason }`
+/// when the blob is unknown / missing on disk / fails to import. mirrors
+/// reliquary's [`reliquary::protocol::blob_proxy::BlobProxyHandler::ensure`]
+/// shape.
+async fn blob_iroh_ensure(
+    args: BlobGetArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    if args.blake3.len() != 64 {
+        return Ok(json!({
+            "available": false,
+            "reason": format!("expected 64-char blake3 hex, got {}", args.blake3.len()),
+        }));
+    }
+    let meta = match state.blobz.get(&args.blake3).await? {
+        Some(m) => m,
+        None => return Ok(json!({ "available": false, "reason": "unknown blake3" })),
+    };
+    let path = state.blobz.path_for(&meta);
+    if !path.exists() {
+        return Ok(json!({ "available": false, "reason": "blob file missing on disk" }));
+    }
+    // import by reference into the iroh-blobs store. iroh-blobs computes
+    // blake3 internally and dedupes on hash, so re-imports are cheap (only
+    // the outboard metadata is recomputed).
+    match state.fs_store.blobs().add_path(path).await {
+        Ok(_tag) => Ok(json!({ "available": true })),
+        Err(e) => Ok(json!({
+            "available": false,
+            "reason": format!("FsStore import failed: {e}"),
+        })),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct BlobInsertArgs {
     /// optional iroh hash (if the blob is also being shared via iroh-blobs).
@@ -910,6 +990,7 @@ async fn blob_insert(
         .blobz
         .insert(iroh_hash, args.filename, args.mime, &bytes)
         .await?;
+    prewarm_fs_store(state, &blob).await;
     Ok(serde_json::to_value(BlobDto::from(blob)).expect("blob insert serialize"))
 }
 
@@ -960,6 +1041,7 @@ async fn blob_insert_from_path(
         .blobz
         .insert(iroh_hash, filename, args.mime, &bytes)
         .await?;
+    prewarm_fs_store(state, &blob).await;
 
     // return both the row metadata and the raw bytes so the JS caller can
     // mirror the file into IndexedDB / OPFS for its existing display paths

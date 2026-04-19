@@ -674,7 +674,12 @@ async function snatchFromBrowserPeer(
       }
     : () => {};
 
-  // strategy 1: iroh-blobs verified download when blake3 is known from doc
+  // strategy 1: iroh-blobs verified download when blake3 is known from doc.
+  // timeout is generous (10 min) because the responding peer may need to
+  // import the blob into its iroh-blobs FsStore on first request, which
+  // includes computing the BAO tree (proportional to file size). tauri
+  // peers pre-warm the FsStore at insert time so this only matters for
+  // blobs that arrived via paths that bypass the pre-warm.
   if (
     !downloaded &&
     blake3Hash &&
@@ -692,7 +697,7 @@ async function snatchFromBrowserPeer(
           info.size || 0,
           progressFn
         ) as Promise<Uint8Array>,
-        30000
+        10 * 60_000
       );
       downloaded = true;
     } catch (err) {
@@ -778,6 +783,18 @@ async function snatchFromBrowserPeer(
 
   if (!bytes) {
     throw new Error("iroh-blobs download failed — no fallback available");
+  }
+
+  // refuse to store empty payloads. a 0-byte file would hash to the
+  // well-known empty-bytes blake3 / sha256 (e3b0c442... / af1349b9...),
+  // poisoning OPFS / IDB with a record that points at nothing — the
+  // `<video>` element later returns ERR_REQUEST_RANGE_NOT_SATISFIABLE
+  // because there's no byte 0 to range-fetch. fail loudly instead so the
+  // upstream snatcher can retry / show an error.
+  if (bytes.length === 0) {
+    throw new Error(
+      "snatch returned 0 bytes — refusing to store empty payload (would mask future fetches)"
+    );
   }
 
   console.log(

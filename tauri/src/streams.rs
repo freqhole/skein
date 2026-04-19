@@ -37,6 +37,8 @@ use std::sync::Arc;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
+use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::BlobsProtocol;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
@@ -115,7 +117,32 @@ impl StreamRegistry {
     /// start the always-on frontend router on every alpn in `FRONTEND_ALPNS`
     /// and return a fresh registry. failures spawning the router are bubbled
     /// back so boot can fail loudly.
+    ///
+    /// the iroh-blobs ALPN is **not** registered — useful for tests that
+    /// don't need verified blob streaming. production callers should use
+    /// [`StreamRegistry::start_with_blobs`] so browser peers can pull blobs
+    /// over `iroh-blobs/4` directly (chunked / verified) instead of falling
+    /// back to the size-capped `skein/1` proxy_request envelope.
     pub async fn start(endpoint: Endpoint) -> anyhow::Result<Arc<Self>> {
+        Self::start_inner(endpoint, None).await
+    }
+
+    /// like [`StreamRegistry::start`] but also registers `iroh_blobs::ALPN`
+    /// on the router with a [`BlobsProtocol`] backed by `fs_store`. peers
+    /// can then download verified blob bytes from us once the bytes have
+    /// been ensured into the FsStore (see the `blob_iroh_ensure` dispatch
+    /// action in `commands.rs`).
+    pub async fn start_with_blobs(
+        endpoint: Endpoint,
+        fs_store: &'static FsStore,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::start_inner(endpoint, Some(fs_store)).await
+    }
+
+    async fn start_inner(
+        endpoint: Endpoint,
+        fs_store: Option<&'static FsStore>,
+    ) -> anyhow::Result<Arc<Self>> {
         let (tx, rx) = mpsc::channel(ACCEPT_BUFFER);
         let mut builder = Router::builder(endpoint);
         for alpn in FRONTEND_ALPNS {
@@ -124,6 +151,15 @@ impl StreamRegistry {
                 alpn: alpn.to_vec(),
             };
             builder = builder.accept(*alpn, handler);
+        }
+        if let Some(fs_store) = fs_store {
+            // serve verified blob bytes over iroh-blobs/4. this is what
+            // browser peers (midden) reach for first when they see we own a
+            // blob — see `download_verified_with_ensure_progress` in
+            // `midden/src/lib.rs`. handled fully in rust; no JS dispatch.
+            let blobs_protocol = BlobsProtocol::new(fs_store, None);
+            builder = builder.accept(iroh_blobs::ALPN, blobs_protocol);
+            tracing::info!("frontend router: registered iroh_blobs::ALPN");
         }
         let router = builder.spawn();
         Ok(Arc::new(Self {
