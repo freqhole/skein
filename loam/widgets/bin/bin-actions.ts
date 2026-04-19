@@ -1,14 +1,15 @@
 /**
  * batch actions for the bin widget — currently provides "snatch all" which
- * downloads all remote file blobs from P2P peers sequentially with progress.
+ * downloads all remote file blobs from P2P peers via a single batched
+ * probe-and-download (see `snatchBlobBatch`).
  */
 
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import {
-    checkBlobLocality,
     getThumbnailDataUrl,
-    snatchBlob,
+    snatchBlobBatch,
+    type FileUploadResult,
     type PeersMap,
     type SnatchBlobInfo,
 } from "../../src/widgets/file-utils";
@@ -28,9 +29,9 @@ export interface SnatchAllProgress {
   snatched: number;
   /** items that failed */
   failed: number;
-  /** currently downloading item index (0-based within remote items) */
+  /** currently downloading item index (0-based across all items) */
   currentIndex: number;
-  /** download progress of current item (0.0 to 1.0) */
+  /** download progress of current item (0.0 to 1.0; 0 between items) */
   currentProgress: number;
   /** whether the operation is complete */
   done: boolean;
@@ -49,8 +50,8 @@ const TAG = "[bin-actions]";
 // helpers
 // -----------------------------------------------------------------------
 
-/** info about a remote file that needs snatching */
-interface RemoteItem {
+/** info about a file widget child of a bin */
+interface BinFileChild {
   widgetId: string;
   docId: string;
   state: FileState;
@@ -65,7 +66,7 @@ async function collectFileChildren(
   binWidgetId: string,
   store: CanvasStore,
   repo: Repo
-): Promise<RemoteItem[]> {
+): Promise<BinFileChild[]> {
   const binEntry = store.getWidget(binWidgetId);
   if (!binEntry || !binEntry.docId) return [];
 
@@ -85,7 +86,7 @@ async function collectFileChildren(
     return [];
   }
 
-  const result: RemoteItem[] = [];
+  const result: BinFileChild[] = [];
 
   for (const item of items) {
     const childEntry = store.getWidget(item.widgetId);
@@ -124,13 +125,55 @@ async function collectFileChildren(
   return result;
 }
 
+/**
+ * write a successful snatch result back into the corresponding file
+ * widget's automerge doc, then best-effort fetch + write a thumbnail.
+ */
+async function applySnatchResult(
+  child: BinFileChild,
+  result: FileUploadResult,
+  repo: Repo
+): Promise<void> {
+  const childHandle = repo.handles[child.docId as DocumentId];
+  if (!childHandle) return;
+
+  childHandle.change((draft: any) => {
+    draft.blobId = result.blobId;
+    draft.domain = result.domain;
+    draft.mime = result.mime;
+    draft.size = result.size;
+    draft.blake3 = result.blake3 ?? "";
+  });
+
+  try {
+    const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200 });
+    if (thumbDataUrl) {
+      childHandle.change((draft: any) => {
+        draft.thumbnailDataUrl = thumbDataUrl;
+      });
+    }
+  } catch {
+    // thumbnail generation is best-effort — don't fail the snatch
+    console.debug(TAG, "thumbnail generation failed for", result.blobId);
+  }
+}
+
 // -----------------------------------------------------------------------
 // main
 // -----------------------------------------------------------------------
 
 /**
- * download all remote file blobs inside a bin (and nested bins) sequentially.
- * already-local files are skipped. progress is reported via the callback.
+ * download all remote file blobs inside a bin (and nested bins) via a
+ * single batched probe-and-download. already-local files are skipped (the
+ * batch helper handles that internally via locality cache + grimoire
+ * lookup). progress is reported via the callback.
+ *
+ * graceful failure modes:
+ *   - empty bin: returns immediately with done=true
+ *   - all already local: returns done=true with alreadyLocal=total
+ *   - no peers available: marks all remote files failed (no throw)
+ *   - per-blob download failure: counted as failed, others continue
+ *   - aborted: returns early with done=true
  */
 export async function snatchAllInBin(
   binWidgetId: string,
@@ -164,113 +207,93 @@ export async function snatchAllInBin(
     return progress;
   }
 
-  // step 2: check locality for each file and partition into local vs remote
-  const remoteFiles: RemoteItem[] = [];
-
-  for (const file of allFiles) {
-    if (signal?.aborted) {
-      progress.done = true;
-      emit();
-      return progress;
-    }
-
-    try {
-      const localityInfo = await checkBlobLocality(file.state.blobId, file.state.blake3 || undefined);
-      if (localityInfo.locality === "local") {
-        progress.alreadyLocal++;
-        emit();
-        continue;
-      }
-    } catch (err) {
-      console.debug(TAG, "locality check failed for", file.state.blobId, err);
-      // treat as remote — try snatching anyway
-    }
-
-    remoteFiles.push(file);
-  }
-
-  // if everything is already local, we're done
-  if (remoteFiles.length === 0) {
+  if (signal?.aborted) {
     progress.done = true;
     emit();
     return progress;
   }
 
-  // step 3: snatch each remote file sequentially
-  for (let i = 0; i < remoteFiles.length; i++) {
-    if (signal?.aborted) {
-      progress.done = true;
-      emit();
-      return progress;
-    }
+  // step 2: build SnatchBlobInfo[] parallel to allFiles. snatchBlobBatch
+  // handles already-local detection internally so we don't need a
+  // separate locality pass here.
+  const blobInfos: SnatchBlobInfo[] = allFiles.map((file) => ({
+    blobId: file.state.blobId,
+    filename: file.state.filename,
+    mime: file.state.mime,
+    size: file.state.size,
+    blake3: file.state.blake3,
+    domain: file.state.domain,
+  }));
 
-    const file = remoteFiles[i];
-    progress.currentIndex = i;
-    progress.currentProgress = 0;
+  // step 3: short-circuit when no peers — snatchBlobBatch would throw
+  // "no peers available", which is a poor UX when the user just isn't
+  // connected to anyone yet. mark everything failed and surface that
+  // through the normal progress channel.
+  const peerCount = Object.keys(peers).length;
+  if (peerCount === 0) {
+    console.warn(TAG, "snatch all: no peers connected, nothing to snatch from");
+    progress.failed = allFiles.length;
+    progress.done = true;
     emit();
+    return progress;
+  }
 
-    const info: SnatchBlobInfo = {
-      blobId: file.state.blobId,
-      filename: file.state.filename,
-      mime: file.state.mime,
-      size: file.state.size,
-      blake3: file.state.blake3,
-      domain: file.state.domain,
-    };
+  // step 4: hand the batch off. onBlobComplete fires for both
+  // already-local and successfully-downloaded blobs (distinguished by
+  // result.existing). per-blob failures show up as `null` entries in the
+  // returned array.
+  let lastDownloadIndex = 0;
 
-    try {
-      const result = await snatchBlob(info, peers, {
-        onProgress: (fraction) => {
-          progress.currentProgress = fraction >= 0 ? fraction : 0;
-          emit();
-        },
-        signal,
-        isPeerOnline: (nodeId: string) => store.isPeerOnline(nodeId),
-      });
-
-      // update the child widget's automerge doc with the snatch result
-      const childHandle = repo.handles[file.docId as DocumentId];
-      if (childHandle) {
-        childHandle.change((draft: any) => {
-          draft.blobId = result.blobId;
-          draft.domain = result.domain;
-          draft.mime = result.mime;
-          draft.size = result.size;
-          draft.blake3 = result.blake3 ?? "";
-        });
-
-        // attempt to generate/fetch a thumbnail and write it to the doc
-        try {
-          const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200 });
-          if (thumbDataUrl) {
-            childHandle.change((draft: any) => {
-              draft.thumbnailDataUrl = thumbDataUrl;
-            });
-          }
-        } catch {
-          // thumbnail generation is best-effort — don't fail the snatch
-          console.debug(TAG, "thumbnail generation failed for", result.blobId);
+  try {
+    const results = await snatchBlobBatch(blobInfos, peers, {
+      signal,
+      isPeerOnline: (nodeId: string) => store.isPeerOnline(nodeId),
+      onBlobComplete: (index, result) => {
+        if (result.existing) {
+          progress.alreadyLocal++;
+        } else {
+          progress.snatched++;
+          // fire-and-forget doc update for the freshly-snatched blob.
+          // batch advances to the next download while this settles, so
+          // we don't await it here.
+          void applySnatchResult(allFiles[index], result, repo);
         }
-      }
-
-      progress.snatched++;
-      progress.currentProgress = 1;
-      emit();
-    } catch (err) {
-      if (signal?.aborted) {
-        progress.done = true;
+        progress.currentIndex = index;
+        progress.currentProgress = 1;
+        lastDownloadIndex = index;
         emit();
-        return progress;
-      }
+      },
+      onProgress: (_completed, _total, blobProgress) => {
+        // blobProgress is -1 between downloads, 0..1 during one. only
+        // emit fractional updates so we don't spam the renderer.
+        if (blobProgress >= 0) {
+          progress.currentIndex = lastDownloadIndex;
+          progress.currentProgress = blobProgress;
+          emit();
+        }
+      },
+    });
 
-      console.warn(TAG, `snatch failed for ${file.state.filename}:`, err);
-      progress.failed++;
-      emit();
-      // continue to next item — don't abort the whole batch
+    // count blobs that came back null — the batch couldn't snatch them
+    // from any peer.
+    for (const r of results) {
+      if (r === null) progress.failed++;
+    }
+  } catch (err) {
+    if (signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) {
+      // user-initiated cancel — leave counters as they stand
+    } else {
+      // batch threw an unexpected error (e.g. all peers vanished
+      // mid-flight). attribute anything un-accounted-for to failures so
+      // the progress bar reflects reality.
+      console.warn(TAG, "snatch all: batch threw:", err);
+      const accounted = progress.alreadyLocal + progress.snatched + progress.failed;
+      progress.failed += Math.max(0, allFiles.length - accounted);
     }
   }
 
   progress.done = true;
+  progress.currentProgress = 0;
   emit();
   return progress;
 }

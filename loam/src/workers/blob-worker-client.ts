@@ -111,12 +111,16 @@ export async function hashSha256(data: ArrayBuffer): Promise<string> {
 }
 
 /**
- * base64-encode an ArrayBuffer. transfers ownership of `buffer` to the
- * worker — the caller must not use it after this returns.
+ * base64-encode an ArrayBuffer.
+ *
+ * NOTE: the buffer is structured-cloned (copied) across the worker
+ * boundary so callers can safely reuse it afterwards. if you have a
+ * dedicated buffer that won't be touched again, you can transfer
+ * ownership manually for a small perf win.
  */
 export async function base64Encode(buffer: ArrayBuffer): Promise<string> {
   const worker = await getBlobWorker();
-  if (worker) return worker.base64Encode(Comlink.transfer(buffer, [buffer]));
+  if (worker) return worker.base64Encode(buffer);
   return fallbackBase64Encode(buffer);
 }
 
@@ -157,12 +161,18 @@ export async function processBlobBytes(
 
 /**
  * write a blob to OPFS via the worker (uses `FileSystemSyncAccessHandle`
- * for max throughput). transfers the buffer.
+ * for max throughput).
+ *
+ * NOTE: the buffer is structured-cloned (copied) across the worker
+ * boundary so callers can safely reuse it afterwards — important for
+ * code paths like snatch / `getBlobData` cache-back-fill that read or
+ * return the buffer after kicking off an OPFS write. for the upload
+ * pipeline use `processBlobBytes` instead, which transfers.
  */
 export async function writeBlobToOpfs(blobId: string, buffer: ArrayBuffer): Promise<void> {
   const worker = await getBlobWorker();
   if (worker) {
-    await worker.writeBlobToOpfs(blobId, Comlink.transfer(buffer, [buffer]));
+    await worker.writeBlobToOpfs(blobId, buffer);
     return;
   }
   // no main-thread fallback — opfs writes from main thread don't have a
