@@ -246,6 +246,12 @@ async fn dispatch(
         "blob_iroh_ensure" => {
             blob_iroh_ensure(decode("blob_iroh_ensure", payload)?, state).await
         }
+        "blob_iroh_download" => {
+            blob_iroh_download(decode("blob_iroh_download", payload)?, state).await
+        }
+        "blob_iroh_probe" => {
+            blob_iroh_probe(decode("blob_iroh_probe", payload)?, state).await
+        }
 
         // hub control
         "hub_start" => hub_start_inner(state).await,
@@ -1050,6 +1056,255 @@ async fn blob_insert_from_path(
         "meta": BlobDto::from(blob),
         "data": B64.encode(&bytes),
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobIrohDownloadArgs {
+    /// peer's iroh node id (64-char hex). same convention as `open_bi`.
+    peer_addr: String,
+    /// blake3 hex hash of the blob to fetch.
+    blake3: String,
+    /// optional original filename to record in `blobz`.
+    filename: Option<String>,
+    /// optional mime to record in `blobz`.
+    mime: Option<String>,
+}
+
+/// download a blob from a peer over iroh-blobs verified transfer, ingest
+/// it into the local `blobz` store (and FsStore via prewarm), and return
+/// the blob row + base64 bytes so the JS caller can mirror it into OPFS /
+/// IndexedDB the same way `blob_insert_from_path` does.
+///
+/// mirrors tomb's `reliquary::snatch::BlobSnatcher::download_blob` — the
+/// canonical native-rust impl of the iroh-blobs consumer side.
+async fn blob_iroh_download(
+    args: BlobIrohDownloadArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    use iroh_blobs::api::downloader::{DownloadProgressItem, Downloader};
+    use iroh_blobs::{Hash, HashAndFormat};
+    use n0_future::StreamExt;
+
+    if args.blake3.len() != 64 {
+        return Err(DispatchError::Stream(format!(
+            "expected 64-char blake3 hex, got {}",
+            args.blake3.len()
+        )));
+    }
+
+    let hash: Hash = args
+        .blake3
+        .parse()
+        .map_err(|e| DispatchError::Stream(format!("parse blake3: {e}")))?;
+
+    let node_id: iroh::PublicKey = args
+        .peer_addr
+        .parse()
+        .map_err(|e: iroh::KeyParsingError| {
+            DispatchError::Stream(format!("parse peer_addr (node id): {e}"))
+        })?;
+
+    tracing::info!(
+        blake3 = %args.blake3,
+        peer = %node_id,
+        "blob_iroh_download: starting"
+    );
+
+    let downloader = Downloader::new(state.fs_store, &state.endpoint);
+    let progress = downloader.download(HashAndFormat::raw(hash), [node_id]);
+    let mut stream = progress
+        .stream()
+        .await
+        .map_err(|e| DispatchError::Stream(format!("download stream: {e}")))?;
+
+    let mut last_error: Option<String> = None;
+    let started = std::time::Instant::now();
+    let mut last_log = std::time::Instant::now();
+    let mut event_count: u64 = 0;
+    while let Some(event) = stream.next().await {
+        event_count += 1;
+        match event {
+            DownloadProgressItem::Error(e) => {
+                last_error = Some(format!("{e:?}"));
+                tracing::warn!(blake3 = %args.blake3, error = ?e, "download progress: error");
+            }
+            DownloadProgressItem::DownloadError => {
+                last_error = Some("download error".to_string());
+                tracing::warn!(blake3 = %args.blake3, "download progress: DownloadError");
+            }
+            other => {
+                // heartbeat at info every ~2s so a hanging/slow relay download
+                // is visible without spamming for fast downloads.
+                if last_log.elapsed() >= std::time::Duration::from_secs(2) {
+                    tracing::info!(
+                        blake3 = %args.blake3,
+                        events = event_count,
+                        elapsed_s = started.elapsed().as_secs(),
+                        last = ?other,
+                        "blob_iroh_download: progress"
+                    );
+                    last_log = std::time::Instant::now();
+                } else {
+                    tracing::debug!(blake3 = %args.blake3, event = ?other, "download progress");
+                }
+            }
+        }
+    }
+    tracing::info!(
+        blake3 = %args.blake3,
+        events = event_count,
+        elapsed_s = started.elapsed().as_secs(),
+        "blob_iroh_download: stream ended"
+    );
+
+    if let Some(err) = last_error {
+        return Err(DispatchError::Stream(format!("download failed: {err}")));
+    }
+
+    let bytes = state
+        .fs_store
+        .get_bytes(hash)
+        .await
+        .map_err(|e| DispatchError::Stream(format!("FsStore.get_bytes: {e}")))?;
+
+    tracing::info!(
+        blake3 = %args.blake3,
+        size = bytes.len(),
+        "blob_iroh_download: download complete, ingesting into blobz"
+    );
+
+    // ingest into blobz so subsequent `blob_get` / `blob_get_path` succeed
+    // and asset:// playback works without a re-download. iroh_hash mirrors
+    // blake3 (same as blob_insert when no override given).
+    let blob = state
+        .blobz
+        .insert(
+            args.blake3.clone(),
+            args.filename,
+            args.mime,
+            bytes.as_ref(),
+        )
+        .await?;
+    // FsStore is already populated (the download itself wrote it) — no
+    // need to re-prewarm.
+
+    Ok(json!({
+        "meta": BlobDto::from(blob),
+        "data": B64.encode(&bytes),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobIrohProbeArgs {
+    /// peer's iroh node id (hex). same convention as `open_bi`.
+    peer_addr: String,
+    /// blake3 hex hash of the blob to ask the peer about.
+    blake3: String,
+}
+
+/// lightweight peer-availability probe over the `skein/1` ALPN.
+///
+/// mirrors tomb's `grimoire::federation::p2p_client::ensure_blob` /
+/// `PeerConnection::ensure_blob` — opens a single bi stream, writes one
+/// `ensure_blob_request` JSON frame, reads the response, returns whether
+/// the peer has the blob ready. doing this in a single rust dispatch
+/// avoids the 4-IPC-round-trip race that the JS-side fallback hits when
+/// the connection flaps mid-handshake.
+async fn blob_iroh_probe(
+    args: BlobIrohProbeArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REQ_ID: AtomicU64 = AtomicU64::new(1);
+
+    if args.blake3.len() != 64 {
+        return Err(DispatchError::Stream(format!(
+            "expected 64-char blake3 hex, got {}",
+            args.blake3.len()
+        )));
+    }
+
+    let node_id: iroh::PublicKey = args.peer_addr.parse().map_err(
+        |e: iroh::KeyParsingError| {
+            DispatchError::Stream(format!("parse peer_addr (node id): {e}"))
+        },
+    )?;
+
+    let id = REQ_ID.fetch_add(1, Ordering::Relaxed);
+    let req = json!({
+        "type": "ensure_blob_request",
+        "id": id,
+        "blake3_hash": args.blake3,
+    });
+    let req_bytes = serde_json::to_vec(&req)
+        .map_err(|e| DispatchError::Stream(format!("serialize ensure_blob_request: {e}")))?;
+
+    tracing::info!(
+        peer = %node_id,
+        blake3 = %args.blake3,
+        id,
+        "blob_iroh_probe: connecting"
+    );
+
+    let conn = state
+        .endpoint
+        .connect(iroh::EndpointAddr::from(node_id), b"skein/1")
+        .await
+        .map_err(|e| DispatchError::Stream(format!("connect: {e}")))?;
+
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| DispatchError::Stream(format!("open_bi: {e}")))?;
+
+    send.write_all(&req_bytes)
+        .await
+        .map_err(|e| DispatchError::Stream(format!("write: {e}")))?;
+    send.finish()
+        .map_err(|e| DispatchError::Stream(format!("finish: {e}")))?;
+    // wait for the peer to ack our finish before we start reading. without
+    // this the peer can observe a "connection lost" mid-`read_to_end` if
+    // we drop too early. matches `streams::write_raw_and_finish`.
+    let _ = send.stopped().await;
+
+    // 64 KiB cap is plenty for a JSON ensure_blob_response.
+    let resp_bytes = recv
+        .read_to_end(64 * 1024)
+        .await
+        .map_err(|e| DispatchError::Stream(format!("read_to_end: {e}")))?;
+
+    let resp: Value = serde_json::from_slice(&resp_bytes)
+        .map_err(|e| DispatchError::Stream(format!("parse response: {e}")))?;
+
+    let resp_type = resp.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if resp_type != "ensure_blob_response" {
+        return Err(DispatchError::Stream(format!(
+            "unexpected response type: {resp_type}"
+        )));
+    }
+    let resp_id = resp.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+    if resp_id != id {
+        return Err(DispatchError::Stream(format!(
+            "response id mismatch: expected {id}, got {resp_id}"
+        )));
+    }
+    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+        tracing::debug!(peer = %node_id, blake3 = %args.blake3, %err, "probe: peer reported error");
+        return Ok(json!({ "available": false }));
+    }
+    let available = resp
+        .get("available")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    tracing::info!(
+        peer = %node_id,
+        blake3 = %args.blake3,
+        available,
+        "blob_iroh_probe: complete"
+    );
+
+    Ok(json!({ "available": available }))
 }
 
 // ---------------------------------------------------------------------------

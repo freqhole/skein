@@ -564,7 +564,7 @@ async function probePeersForBlob(
   // sort so connected peers are probed first (their responses arrive faster)
   const sorted = sortPeersByConnectivity(peerAddrs, options?.isPeerOnline);
 
-  console.log(TAG, `probing ${sorted.length} peer(s) for blob ${info.blobId.slice(0, 8)}...`);
+  console.log(TAG, `probing ${sorted.length} peer(s) for blob ${info.blobId.slice(0, 8)}... blake3=${info.blake3?.slice(0, 16) ?? "<none>"}`);
 
   const probes = sorted.map((peerAddr) => probeSinglePeer(info, peerAddr, options));
 
@@ -572,9 +572,16 @@ async function probePeersForBlob(
     // Promise.any resolves with the first fulfilled promise.
     // rejected probes (offline, doesn't have blob) are ignored until all fail.
     return await Promise.any(probes);
-  } catch {
-    // AggregateError — all probes failed
-    console.debug(TAG, "all peer probes failed");
+  } catch (err) {
+    // AggregateError — all probes failed. surface each underlying error so
+    // the failure mode (connection lost, blob unavailable, timeout, etc.)
+    // is visible instead of just "all peer probes failed".
+    const errs = (err as AggregateError | undefined)?.errors ?? [];
+    console.warn(
+      TAG,
+      `all ${sorted.length} peer probe(s) failed for blob ${info.blobId.slice(0, 8)}...`,
+      errs.map((e: unknown) => (e instanceof Error ? e.message : String(e)))
+    );
     return null;
   }
 }
@@ -603,11 +610,48 @@ async function probeSinglePeer(
     throw new Error("p2p node does not support ensure_blob");
   }
 
-  const available: boolean = await withPeerTimeout(
-    nodeAny.ensure_blob(peerAddr, info.blake3) as Promise<boolean>,
-    PROBE_TIMEOUT_MS
+  console.log(
+    TAG,
+    `probing peer ${peerAddr.slice(0, 16)}... for blake3=${info.blake3?.slice(0, 16) ?? "<none>"} (blobId=${info.blobId.slice(0, 16)}...)`
   );
-  if (available) return peerAddr;
+
+  const attempt = async (label: string): Promise<boolean> => {
+    return await withPeerTimeout(
+      nodeAny.ensure_blob(peerAddr, info.blake3) as Promise<boolean>,
+      PROBE_TIMEOUT_MS
+    ).catch((err) => {
+      console.warn(
+        TAG,
+        `probe ${label} to ${peerAddr.slice(0, 16)} threw:`,
+        err instanceof Error ? err.message : err
+      );
+      throw err;
+    });
+  };
+
+  let available: boolean;
+  try {
+    available = await attempt("attempt 1");
+  } catch (err) {
+    // connection lost / closed mid-probe is the common failure when the
+    // friend transport is mid-reconnect. retry once after a short delay
+    // — the iroh adapter auto-reconnect typically lands within a second.
+    const msg = err instanceof Error ? err.message : String(err);
+    const isTransient = /connection (lost|closed)|stream closed|reset|broken/i.test(msg);
+    if (!isTransient) throw err;
+    console.log(TAG, `retrying probe to ${peerAddr.slice(0, 16)} after transient error`);
+    await new Promise((r) => setTimeout(r, 1500));
+    available = await attempt("attempt 2");
+  }
+
+  if (available) {
+    console.log(TAG, `probe to ${peerAddr.slice(0, 16)}: available=true`);
+    return peerAddr;
+  }
+  console.warn(
+    TAG,
+    `probe to ${peerAddr.slice(0, 16)}: peer reported blob unavailable (blake3=${info.blake3?.slice(0, 16) ?? "<none>"})`
+  );
   throw new Error(`peer ${peerAddr.slice(0, 16)} does not have the blob`);
 }
 

@@ -217,32 +217,43 @@ export class TauriStreamNode implements MiddenStreamNode {
 
   /**
    * skein/1 ensure_blob exchange — mirrors midden's `MiddenNode::ensure_blob`.
-   * opens a stream, sends an `ensure_blob_request`, reads the response, and
-   * resolves to the `available` flag. used by the snatch probe step.
+   * dispatches to rust-side `blob_iroh_probe` which performs the whole
+   * open_bi + write + finish + read_to_end in a single native call. mirrors
+   * tomb's `p2p_probe_blob` / `PeerConnection::ensure_blob`. doing the
+   * exchange atomically in rust avoids the 4-IPC-round-trip race the
+   * previous JS-side fallback hit when the connection flapped mid-handshake.
    */
   async ensure_blob(peer_addr: string, blake3_hash: string): Promise<boolean> {
-    const stream = await this.open_bi(peer_addr, "skein/1");
-    try {
-      const req = JSON.stringify({
-        type: "ensure_blob_request",
-        id: 1,
-        blake3_hash,
-      });
-      await stream.write_raw_and_finish(new TextEncoder().encode(req));
-      const respBytes = await stream.read_to_end(64 * 1024);
-      const resp = JSON.parse(new TextDecoder().decode(respBytes)) as {
-        type?: string;
-        available?: boolean;
-        error?: string | null;
-      };
-      if (resp?.error) {
-        console.warn(TAG, "ensure_blob remote error:", resp.error);
-        return false;
-      }
-      return resp?.available === true;
-    } finally {
-      stream.close();
+    const resp = (await dispatch("blob_iroh_probe", {
+      peer_addr,
+      blake3: blake3_hash,
+    })) as { available?: boolean };
+    return resp?.available === true;
+  }
+
+  /**
+   * iroh-blobs verified download — mirrors midden's
+   * `MiddenNode::download_verified_with_ensure_progress`. dispatches to the
+   * rust-side `blob_iroh_download` action which uses iroh-blobs'
+   * `Downloader` to fetch the blob into the local FsStore, then ingests it
+   * into `blobz` and returns the bytes (base64). progress callback is
+   * accepted for API compatibility but not currently wired through.
+   */
+  async download_verified_with_ensure_progress(
+    peer_addr: string,
+    blake3_hash: string,
+    _total_size: number,
+    _on_progress?: (fraction: number) => void
+  ): Promise<Uint8Array> {
+    const resp = await dispatch("blob_iroh_download", {
+      peer_addr,
+      blake3: blake3_hash,
+    });
+    const data = (resp && typeof resp === "object" ? (resp as any).data : null) as string | null;
+    if (typeof data !== "string") {
+      throw new Error("blob_iroh_download: missing data field in response");
     }
+    return fromBase64(data);
   }
 
   /**

@@ -6186,6 +6186,7 @@ dependencies = [
  "blake3",
  "iroh",
  "iroh-blobs",
+ "n0-future",
  "reliquary",
  "serde",
  "serde_json",
