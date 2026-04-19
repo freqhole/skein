@@ -115,6 +115,36 @@ export class TauriBiStream implements BiStreamLike {
       console.warn(TAG, "close_stream error (handle", this.handle, "):", err);
     });
   }
+
+  /**
+   * raw framing: write all bytes and finish the send side. matches midden's
+   * `BiStream::write_raw_and_finish`. used by skein/1 protocol exchanges
+   * where the receiver reads to eof rather than length-delimited frames.
+   */
+  async write_raw_and_finish(data: Uint8Array): Promise<void> {
+    if (this.closed) throw new Error("stream closed");
+    await dispatch("write_raw_and_finish", {
+      handle: this.handle,
+      data: toBase64(data),
+    });
+  }
+
+  /**
+   * raw framing: read until the peer finishes the send side. matches
+   * midden's `BiStream::read_to_end`. up to `max_size` bytes will be
+   * accepted; the iroh recv stream errors if the peer sends more.
+   */
+  async read_to_end(max_size: number): Promise<Uint8Array> {
+    if (this.closed) return new Uint8Array(0);
+    const result = await dispatch("read_to_end", {
+      handle: this.handle,
+      max_size,
+    });
+    if (result?.data === null || result?.data === undefined) {
+      return new Uint8Array(0);
+    }
+    return fromBase64(result.data);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +212,74 @@ export class TauriStreamNode implements MiddenStreamNode {
     } catch (err) {
       console.error(TAG, "accept_stream failed:", err);
       return null;
+    }
+  }
+
+  /**
+   * skein/1 ensure_blob exchange — mirrors midden's `MiddenNode::ensure_blob`.
+   * opens a stream, sends an `ensure_blob_request`, reads the response, and
+   * resolves to the `available` flag. used by the snatch probe step.
+   */
+  async ensure_blob(peer_addr: string, blake3_hash: string): Promise<boolean> {
+    const stream = await this.open_bi(peer_addr, "skein/1");
+    try {
+      const req = JSON.stringify({
+        type: "ensure_blob_request",
+        id: 1,
+        blake3_hash,
+      });
+      await stream.write_raw_and_finish(new TextEncoder().encode(req));
+      const respBytes = await stream.read_to_end(64 * 1024);
+      const resp = JSON.parse(new TextDecoder().decode(respBytes)) as {
+        type?: string;
+        available?: boolean;
+        error?: string | null;
+      };
+      if (resp?.error) {
+        console.warn(TAG, "ensure_blob remote error:", resp.error);
+        return false;
+      }
+      return resp?.available === true;
+    } finally {
+      stream.close();
+    }
+  }
+
+  /**
+   * skein/1 proxy_request exchange — mirrors midden's `MiddenNode::proxy_request`.
+   * returns the `{status, body}` envelope where `body` is the raw response
+   * string the peer's handler produced (typically JSON).
+   */
+  async proxy_request(
+    peer_addr: string,
+    method: string,
+    path: string,
+    body: string | null
+  ): Promise<{ status: number; body: string }> {
+    const stream = await this.open_bi(peer_addr, "skein/1");
+    try {
+      const req = JSON.stringify({
+        type: "proxy_request",
+        id: 1,
+        method,
+        path,
+        body,
+      });
+      await stream.write_raw_and_finish(new TextEncoder().encode(req));
+      // blob payloads can be large — allow up to 64MiB for now. the rust
+      // side caps reads at this exact size.
+      const respBytes = await stream.read_to_end(64 * 1024 * 1024);
+      const resp = JSON.parse(new TextDecoder().decode(respBytes)) as {
+        type?: string;
+        status?: number;
+        body?: string;
+      };
+      return {
+        status: typeof resp?.status === "number" ? resp.status : 0,
+        body: typeof resp?.body === "string" ? resp.body : "",
+      };
+    } finally {
+      stream.close();
     }
   }
 }

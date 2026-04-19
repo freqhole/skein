@@ -270,6 +270,19 @@ async fn dispatch(
                 .await
                 .map_err(stream_err)
         }
+        "write_raw_and_finish" => {
+            crate::streams::write_raw_and_finish(
+                decode("write_raw_and_finish", payload)?,
+                &state.streams,
+            )
+            .await
+            .map_err(stream_err)
+        }
+        "read_to_end" => {
+            crate::streams::read_to_end(decode("read_to_end", payload)?, &state.streams)
+                .await
+                .map_err(stream_err)
+        }
 
         other => Err(DispatchError::UnknownAction(other.to_string())),
     }

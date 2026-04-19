@@ -468,41 +468,36 @@ export async function snatchBlob(
   let remaining = [...allPeerAddrs];
   let lastError: unknown;
 
-  // tauri: check grimoire locally first — the blob may already exist under
-  // a different ID (e.g. uploaded on this device but blobId in automerge doc
-  // was assigned by a different peer). this avoids unnecessary P2P snatching.
+  // tauri: short-circuit if the blob already exists in the local rust
+  // blobz store under the same blake3 — no need to round-trip P2P. the
+  // freqhole-era `api_call("/api/blob_metadata_by_blake3")` path doesn't
+  // exist in skein, so we use the skein blob_get_path dispatch instead.
   if (isTauriMode() && info.blake3) {
     try {
-      const localCheck = await tauriInvoke("api_call", {
-        path: "/api/blob_metadata_by_blake3",
-        body: { blake3: info.blake3 },
-      });
-      if (localCheck.success && localCheck.data) {
-        const d = localCheck.data;
+      const local = await dispatch("blob_get_path", { blake3: info.blake3 });
+      if (local?.path) {
         console.log(
           TAG,
-          `blob found locally in grimoire by blake3 (id=${String(d.id).slice(0, 8)}...), skipping P2P snatch`
+          `blob found locally in rust blobz by blake3 (${info.blake3.slice(0, 16)}...), skipping P2P snatch`
         );
-        // clear caches so the widget picks up the local blob
         const key200 = cacheKey(info.blobId, 200);
         const key50 = cacheKey(info.blobId, 50);
         thumbnailCache.delete(key200);
         thumbnailCache.delete(key50);
         localityCache.set(info.blobId, { locality: "local" });
-
         return {
-          blobId: d.id ?? d.blob_id ?? info.blobId,
-          domain: d.domain ?? info.domain,
+          blobId: info.blake3,
+          domain: info.domain,
           jobId: null,
-          sha256: d.sha256 ?? "",
-          blake3: d.blake3 ?? info.blake3,
-          size: d.size ?? info.size,
-          mime: d.mime ?? info.mime,
+          sha256: "",
+          blake3: info.blake3,
+          size: typeof local.size === "number" ? local.size : info.size,
+          mime: typeof local.mime === "string" ? local.mime : info.mime,
           existing: true,
         };
       }
     } catch (err) {
-      console.debug(TAG, "local grimoire blake3 check failed, proceeding to P2P:", err);
+      console.debug(TAG, "local rust blobz blake3 check failed, proceeding to P2P:", err);
     }
   }
 
@@ -529,9 +524,11 @@ export async function snatchBlob(
     );
 
     try {
-      const result = isTauriMode()
-        ? await snatchFromTauriPeer(info, bestPeer, options)
-        : await snatchFromBrowserPeer(info, bestPeer, options);
+      // both browser midden and TauriStreamNode satisfy the snatch contract
+      // (download_verified_* on midden, proxy_request fallback on tauri).
+      // the freqhole-era `snatchFromTauriPeer` referenced commands that do
+      // not exist in skein's tauri shell.
+      const result = await snatchFromBrowserPeer(info, bestPeer, options);
       return result;
     } catch (err) {
       lastError = err;
@@ -595,30 +592,19 @@ async function probeSinglePeer(
     throw new DOMException("snatch cancelled", "AbortError");
   }
 
-  if (!isTauriMode()) {
-    // browser: use midden's ensure_blob method
-    const { getMiddenNode } = await import("../p2p/identity");
-    const node = await getMiddenNode();
-    const nodeAny = node as any;
+  // both browser midden and TauriStreamNode expose the same `ensure_blob`
+  // shape (skein/1 protocol). the previous `tauriInvoke("p2p_probe_blob")`
+  // path referenced a freqhole-era command that doesn't exist in skein.
+  const { getMiddenNode } = await import("../p2p/identity");
+  const node = await getMiddenNode();
+  const nodeAny = node as any;
 
-    if (typeof nodeAny.ensure_blob !== "function") {
-      throw new Error("midden node does not support ensure_blob");
-    }
-
-    const available: boolean = await withPeerTimeout(
-      nodeAny.ensure_blob(peerAddr, info.blake3) as Promise<boolean>,
-      PROBE_TIMEOUT_MS
-    );
-    if (available) return peerAddr;
-    throw new Error(`peer ${peerAddr.slice(0, 16)} does not have the blob`);
+  if (typeof nodeAny.ensure_blob !== "function") {
+    throw new Error("p2p node does not support ensure_blob");
   }
 
-  // tauri: use the p2p_probe_blob command (sends EnsureBlobRequest)
   const available: boolean = await withPeerTimeout(
-    tauriInvoke("p2p_probe_blob", {
-      peerAddr,
-      blake3Hash: info.blake3,
-    }) as Promise<boolean>,
+    nodeAny.ensure_blob(peerAddr, info.blake3) as Promise<boolean>,
     PROBE_TIMEOUT_MS
   );
   if (available) return peerAddr;
@@ -845,130 +831,6 @@ async function snatchFromBrowserPeer(
 }
 
 // ---------------------------------------------------------------------------
-// per-peer download (tauri)
-// ---------------------------------------------------------------------------
-
-/**
- * download and ingest a blob from a single peer via Tauri IPC.
- */
-async function snatchFromTauriPeer(
-  info: SnatchBlobInfo,
-  peerAddr: string,
-  options?: SnatchOptions
-): Promise<FileUploadResult> {
-  console.log(
-    TAG,
-    `snatching blob ${info.blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
-  );
-
-  let blobResult: { data: string; blake3: string; size?: number } | null = null;
-
-  // set up progress channel for tauri IPC
-  const { Channel } = await import("@tauri-apps/api/core");
-  const onProgress = options?.onProgress;
-  const progressChannel = new Channel<{ bytes_downloaded: number }>();
-  progressChannel.onmessage = (msg) => {
-    if (onProgress && info.size > 0) {
-      onProgress(Math.min(msg.bytes_downloaded / info.size, 1.0));
-    }
-  };
-
-  // strategy 1: if blake3 known from doc, use verified+ensure directly
-  if (info.blake3) {
-    try {
-      console.log(
-        TAG,
-        `trying iroh-blobs verified (blake3 known) from ${peerAddr.slice(0, 16)}...`
-      );
-      const verified = await tauriInvoke("p2p_fetch_blob_verified", {
-        peerAddr,
-        blake3Hash: info.blake3,
-        onProgress: progressChannel,
-      });
-      blobResult = { data: verified.data, blake3: info.blake3, size: verified.size };
-    } catch (err) {
-      console.debug(TAG, `iroh-blobs verified (blake3 known) failed:`, err);
-    }
-  }
-
-  // strategy 2: verified by id (computes blake3 on peer, then iroh-blobs download)
-  if (!blobResult) {
-    try {
-      console.log(
-        TAG,
-        `trying iroh-blobs verified (compute blake3) from ${peerAddr.slice(0, 16)}...`
-      );
-      blobResult = await tauriInvoke("p2p_fetch_blob_verified_by_id", {
-        peerAddr,
-        blobId: info.blobId,
-        onProgress: progressChannel,
-      });
-    } catch (err) {
-      console.debug(TAG, `iroh-blobs verified (compute blake3) failed:`, err);
-    }
-  }
-
-  if (!blobResult) {
-    throw new Error("iroh-blobs download failed — no fallback available");
-  }
-
-  if (!blobResult.data) {
-    throw new Error("peer returned empty blob data");
-  }
-
-  console.log(
-    TAG,
-    `downloaded ${blobResult.size ? formatFileSize(blobResult.size) : "unknown size"} from peer, ingesting locally...`
-  );
-
-  if (options?.signal?.aborted) {
-    throw new DOMException("snatch cancelled", "AbortError");
-  }
-
-  // ingest into local grimoire via the upload endpoint
-  const uploadResponse = await tauriInvoke("api_call", {
-    path: "/api/upload/file",
-    body: {
-      data: blobResult.data,
-      filename: info.filename,
-      metadata: JSON.stringify({ source: "snatch", original_blob_id: info.blobId }),
-      wait_for_completion: true,
-    },
-  });
-
-  if (!uploadResponse.success) {
-    const detail = uploadResponse.errors?.[0]?.detail ?? uploadResponse.message ?? "ingest failed";
-    throw new Error(`snatch ingest failed: ${detail}`);
-  }
-
-  const d = uploadResponse.data;
-  if (!d) {
-    throw new Error("snatch ingest returned no data");
-  }
-
-  console.log(TAG, `snatch complete: blob ${d.blob_id?.slice(0, 8)}... domain=${d.domain}`);
-
-  // clear thumbnail cache for this blob so it re-fetches from local
-  const key200 = cacheKey(info.blobId, 200);
-  const key50 = cacheKey(info.blobId, 50);
-  thumbnailCache.delete(key200);
-  thumbnailCache.delete(key50);
-
-  localityCache.set(info.blobId, { locality: "local" });
-
-  return {
-    blobId: d.blob_id,
-    domain: d.domain,
-    jobId: d.job_id ?? null,
-    sha256: d.sha256,
-    blake3: d.blake3 ?? null,
-    size: d.size,
-    mime: d.mime,
-    existing: d.existing ?? false,
-  };
-}
-
-// ---------------------------------------------------------------------------
 // batch snatch
 // ---------------------------------------------------------------------------
 
@@ -1179,9 +1041,7 @@ export async function snatchBlobBatch(
       };
 
       try {
-        const result = isTauriMode()
-          ? await snatchFromTauriPeer(info, bestPeer, snatchOpts)
-          : await snatchFromBrowserPeer(info, bestPeer, snatchOpts);
+        const result = await snatchFromBrowserPeer(info, bestPeer, snatchOpts);
         results[idx] = result;
         completedCount++;
         options?.onBlobComplete?.(idx, result);

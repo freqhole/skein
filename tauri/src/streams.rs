@@ -393,6 +393,85 @@ pub async fn close_stream(
 }
 
 // ---------------------------------------------------------------------------
+// raw framing (no length prefix) — used by the skein/1 protocol where both
+// sides write all bytes then call `finish()` and the receiver reads until
+// eof. this matches midden's `RecvStream::read_to_end` / `SendStream::finish`
+// idiom and is needed for ensure_blob_request, proxy_request, etc.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct RawWriteArgs {
+    pub handle: u64,
+    pub data: String,
+}
+
+/// write all bytes to the stream and immediately finish the send side.
+/// no length prefix; the receiver is expected to read to eof.
+///
+/// after `finish()` we await `stopped()` so that the peer's ack is observed
+/// before we return — otherwise the JS caller would proceed to call
+/// `close_stream`, dropping the underlying iroh `SendStream` while quinn's
+/// internal send buffer is still draining, which the peer would observe as
+/// "connection lost" mid-`read_to_end`.
+pub async fn write_raw_and_finish(
+    args: RawWriteArgs,
+    registry: &StreamRegistry,
+) -> Result<Value, StreamError> {
+    let bytes = B64
+        .decode(args.data.as_bytes())
+        .map_err(|e| StreamError::B64(e.to_string()))?;
+    let send = {
+        let slots = registry.slots.lock().await;
+        let slot = slots
+            .get(&args.handle)
+            .ok_or(StreamError::UnknownHandle(args.handle))?;
+        slot.send.clone()
+    };
+    let mut send = send.lock().await;
+    send.write_all(&bytes)
+        .await
+        .map_err(|e| StreamError::Write(e.to_string()))?;
+    send.finish()
+        .map_err(|e| StreamError::Write(format!("finish: {e}")))?;
+    // wait for the peer to acknowledge our finish before returning. if we
+    // skip this, the JS layer can call `close_stream` (which drops the slot
+    // and therefore the send stream) while quinn is still draining the send
+    // buffer, and the peer's `read_to_end` errors with "connection lost".
+    let _ = send.stopped().await;
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReadToEndArgs {
+    pub handle: u64,
+    /// max bytes to accept. callers should pick a generous-but-bounded limit
+    /// (matches `iroh::endpoint::RecvStream::read_to_end`'s requirement).
+    pub max_size: usize,
+}
+
+/// read until the peer closes (`finish()`) the send side. returns the full
+/// payload as base64. if the stream is already drained returns an empty
+/// payload. matches midden's `BiStream::read_to_end` shape.
+pub async fn read_to_end(
+    args: ReadToEndArgs,
+    registry: &StreamRegistry,
+) -> Result<Value, StreamError> {
+    let recv = {
+        let slots = registry.slots.lock().await;
+        let slot = slots
+            .get(&args.handle)
+            .ok_or(StreamError::UnknownHandle(args.handle))?;
+        slot.recv.clone()
+    };
+    let mut recv = recv.lock().await;
+    let buf = recv
+        .read_to_end(args.max_size)
+        .await
+        .map_err(|e| StreamError::Read(e.to_string()))?;
+    Ok(json!({ "data": B64.encode(&buf) }))
+}
+
+// ---------------------------------------------------------------------------
 // integration tests
 // ---------------------------------------------------------------------------
 //
