@@ -798,10 +798,10 @@ async function snatchFromBrowserPeer(
           };
           const b64 = parsed?.data?.data;
           if (parsed?.success && typeof b64 === "string") {
-            const bin = atob(b64);
-            const out = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-            bytes = out;
+            // base64 decode is delegated to the blob worker for large
+            // payloads (snatched blobs are routinely megabytes).
+            const { base64Decode } = await import("../workers/blob-worker-client");
+            bytes = await base64Decode(b64);
             // mime may have been refined by the responder
             if (typeof parsed.data?.mime === "string" && !info.mime) {
               info = { ...info, mime: parsed.data.mime };
@@ -2226,35 +2226,15 @@ async function fetchThumbnailFromPeers(
 // ---------------------------------------------------------------------------
 
 /**
- * generate a 200px WebP thumbnail data URL from a File object.
- * only works for image files — returns null for non-image types.
- * uses OffscreenCanvas for efficient off-main-thread resizing.
+ * generate a 200px WebP thumbnail data URL from a Blob. delegates to the
+ * blob worker so image decode + resize + WebP encode + base64 happen off
+ * the main thread. returns null for non-image blobs or on failure.
  */
 export async function generateThumbnailDataUrl(blob: Blob, maxSize = 200): Promise<string | null> {
-  // only generate thumbnails for images
   if (!blob.type.startsWith("image/")) return null;
-
   try {
-    const bitmap = await createImageBitmap(blob);
-    const scale = Math.min(maxSize / bitmap.width, maxSize / bitmap.height, 1);
-    const w = Math.round(bitmap.width * scale);
-    const h = Math.round(bitmap.height * scale);
-    const canvas = new OffscreenCanvas(w, h);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      bitmap.close();
-      return null;
-    }
-    ctx.drawImage(bitmap, 0, 0, w, h);
-    bitmap.close();
-
-    const thumbBlob = await canvas.convertToBlob({ type: "image/webp", quality: 0.75 });
-    return new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onloadend = () => resolve(reader.result as string);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(thumbBlob);
-    });
+    const { generateThumbnailDataUrl: gen } = await import("../workers/blob-worker-client");
+    return await gen(blob, maxSize);
   } catch (err) {
     console.warn(TAG, "thumbnail generation failed:", err);
     return null;

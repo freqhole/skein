@@ -196,6 +196,106 @@ async function processBlobBytes(
   };
 }
 
+// ---- thumbnail / image resize -------------------------------------------
+
+export interface ResizeImageOptions {
+  /** maximum output width in pixels (default: 200) */
+  maxWidth?: number;
+  /** maximum output height in pixels (default: 200) */
+  maxHeight?: number;
+  /** WebP quality 0..1 (default: 0.8) */
+  quality?: number;
+  /** if true, center-crop to a square before resizing */
+  cropSquare?: boolean;
+  /** output mime type (default: "image/webp") */
+  mime?: string;
+}
+
+/**
+ * resize an image Blob to a WebP data URL via OffscreenCanvas. all heavy
+ * work (image decode, resize, WebP encode, base64 encode) happens here in
+ * the worker. returns null on any failure.
+ *
+ * the input Blob is structured-cloned across postMessage by reference
+ * (the underlying bytes aren't copied), so this is cheap to call.
+ */
+async function resizeImageToWebpDataUrl(
+  blob: Blob,
+  options?: ResizeImageOptions
+): Promise<string | null> {
+  const maxWidth = options?.maxWidth ?? 200;
+  const maxHeight = options?.maxHeight ?? 200;
+  const quality = options?.quality ?? 0.8;
+  const cropSquare = options?.cropSquare ?? false;
+  const mime = options?.mime ?? "image/webp";
+
+  let bitmap: ImageBitmap | null = null;
+  try {
+    bitmap = await createImageBitmap(blob);
+
+    let sx = 0;
+    let sy = 0;
+    let sw = bitmap.width;
+    let sh = bitmap.height;
+
+    if (cropSquare) {
+      const minDim = Math.min(bitmap.width, bitmap.height);
+      sx = (bitmap.width - minDim) / 2;
+      sy = (bitmap.height - minDim) / 2;
+      sw = minDim;
+      sh = minDim;
+    }
+
+    const sourceAspect = sw / sh;
+    let outW = sw;
+    let outH = sh;
+
+    if (outW > maxWidth) {
+      outW = maxWidth;
+      outH = Math.round(outW / sourceAspect);
+    }
+    if (outH > maxHeight) {
+      outH = maxHeight;
+      outW = Math.round(outH * sourceAspect);
+    }
+
+    outW = Math.max(1, outW);
+    outH = Math.max(1, outH);
+
+    const canvas = new OffscreenCanvas(outW, outH);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+
+    ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, outW, outH);
+
+    const out = await canvas.convertToBlob({ type: mime, quality });
+    const buf = await out.arrayBuffer();
+    const b64 = await base64Encode(buf);
+    return `data:${mime};base64,${b64}`;
+  } catch {
+    return null;
+  } finally {
+    bitmap?.close();
+  }
+}
+
+/**
+ * convenience wrapper that mirrors the legacy `generateThumbnailDataUrl`
+ * signature: skips non-image blobs, fits inside `maxSize` x `maxSize`,
+ * encodes WebP at 0.75 quality.
+ */
+async function generateThumbnailDataUrl(
+  blob: Blob,
+  maxSize = 200
+): Promise<string | null> {
+  if (!blob.type.startsWith("image/")) return null;
+  return resizeImageToWebpDataUrl(blob, {
+    maxWidth: maxSize,
+    maxHeight: maxSize,
+    quality: 0.75,
+  });
+}
+
 const api = {
   hashBlake3,
   hashSha256,
@@ -204,6 +304,8 @@ const api = {
   writeBlobToOpfs,
   readBlobFromOpfs,
   processBlobBytes,
+  resizeImageToWebpDataUrl,
+  generateThumbnailDataUrl,
 };
 
 export type BlobWorkerApi = typeof api;

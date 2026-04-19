@@ -178,3 +178,116 @@ export async function writeBlobToOpfs(blobId: string, buffer: ArrayBuffer): Prom
   // no main-thread fallback — opfs writes from main thread don't have a
   // sync access handle path anyway. silently no-op.
 }
+
+// ---- thumbnail / image resize -------------------------------------------
+
+export interface ResizeImageOptions {
+  maxWidth?: number;
+  maxHeight?: number;
+  quality?: number;
+  cropSquare?: boolean;
+  mime?: string;
+}
+
+/**
+ * resize an image Blob to a (default WebP) data URL inside the worker.
+ * the Blob is structured-cloned by reference so postMessage cost is O(1).
+ * returns null on failure (non-image input, decode failure, etc.).
+ */
+export async function resizeImageToWebpDataUrl(
+  blob: Blob,
+  options?: ResizeImageOptions
+): Promise<string | null> {
+  const worker = await getBlobWorker();
+  if (worker) return worker.resizeImageToWebpDataUrl(blob, options);
+  // main-thread fallback — works on any modern browser.
+  return mainThreadResizeImage(blob, options);
+}
+
+/**
+ * generate a thumbnail data URL (default 200x200 WebP @ q=0.75) for an
+ * image Blob. delegates to the worker.
+ */
+export async function generateThumbnailDataUrl(
+  blob: Blob,
+  maxSize = 200
+): Promise<string | null> {
+  if (!blob.type.startsWith("image/")) return null;
+  return resizeImageToWebpDataUrl(blob, {
+    maxWidth: maxSize,
+    maxHeight: maxSize,
+    quality: 0.75,
+  });
+}
+
+/**
+ * decode a base64 string into a Uint8Array via the worker. for large
+ * payloads (megabyte-scale snatch responses) this avoids blocking the
+ * main thread on a tight `String.charCodeAt` loop.
+ */
+export async function base64Decode(b64: string): Promise<Uint8Array> {
+  const worker = await getBlobWorker();
+  if (worker) return worker.base64Decode(b64);
+  // main-thread fallback
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+// ---- main-thread fallbacks -----------------------------------------------
+
+async function mainThreadResizeImage(
+  blob: Blob,
+  options?: ResizeImageOptions
+): Promise<string | null> {
+  if (typeof OffscreenCanvas === "undefined" || typeof createImageBitmap !== "function") {
+    return null;
+  }
+  const maxWidth = options?.maxWidth ?? 200;
+  const maxHeight = options?.maxHeight ?? 200;
+  const quality = options?.quality ?? 0.8;
+  const cropSquare = options?.cropSquare ?? false;
+  const mime = options?.mime ?? "image/webp";
+
+  let bitmap: ImageBitmap | null = null;
+  try {
+    bitmap = await createImageBitmap(blob);
+    let sx = 0;
+    let sy = 0;
+    let sw = bitmap.width;
+    let sh = bitmap.height;
+    if (cropSquare) {
+      const minDim = Math.min(bitmap.width, bitmap.height);
+      sx = (bitmap.width - minDim) / 2;
+      sy = (bitmap.height - minDim) / 2;
+      sw = minDim;
+      sh = minDim;
+    }
+    const aspect = sw / sh;
+    let outW = sw;
+    let outH = sh;
+    if (outW > maxWidth) {
+      outW = maxWidth;
+      outH = Math.round(outW / aspect);
+    }
+    if (outH > maxHeight) {
+      outH = maxHeight;
+      outW = Math.round(outH * aspect);
+    }
+    outW = Math.max(1, outW);
+    outH = Math.max(1, outH);
+    const canvas = new OffscreenCanvas(outW, outH);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, outW, outH);
+    const out = await canvas.convertToBlob({ type: mime, quality });
+    const buf = await out.arrayBuffer();
+    const b64 = await fallbackBase64Encode(buf);
+    return `data:${mime};base64,${b64}`;
+  } catch {
+    return null;
+  } finally {
+    bitmap?.close();
+  }
+}

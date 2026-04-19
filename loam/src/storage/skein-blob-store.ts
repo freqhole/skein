@@ -453,13 +453,14 @@ export async function getBlobData(blobId: string): Promise<ArrayBuffer | null> {
       | { data: string }
       | null;
     if (!response?.data) return null;
-    const bin = atob(response.data);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    // base64 decode delegated to the blob worker — these payloads are
+    // routinely megabyte-scale (full blob bytes shipped over IPC).
+    const { base64Decode } = await import("../workers/blob-worker-client");
+    const out = await base64Decode(response.data);
     // best-effort: cache the bytes back into OPFS so future reads are local.
     // (no-op on webkit where createWritable is missing.)
-    void tryWriteOpfs(blobId, out.buffer);
-    return out.buffer;
+    void tryWriteOpfs(blobId, out.buffer as ArrayBuffer);
+    return out.buffer as ArrayBuffer;
   } catch (err) {
     console.warn("[skein-blob-store] getBlobData tauri fallback failed for", blobId, err);
     return null;

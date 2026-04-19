@@ -68,86 +68,20 @@ export async function pickImageAsDataUrl(
 /**
  * resize an image File/Blob to a WebP data URL.
  * useful when you already have the file (e.g. from drag-and-drop).
- * returns null on error.
+ *
+ * delegates to the blob worker — image decode, resize, WebP encode,
+ * and base64 conversion all happen off the main thread. returns null
+ * on error.
  */
 export async function resizeImageToDataUrl(
   file: Blob,
   options?: PickImageOptions,
 ): Promise<string | null> {
-  const maxWidth = options?.maxWidth ?? DEFAULT_MAX_WIDTH;
-  const maxHeight = options?.maxHeight ?? DEFAULT_MAX_HEIGHT;
-  const quality = options?.quality ?? DEFAULT_QUALITY;
-  const cropSquare = options?.cropSquare ?? false;
-
-  let bitmap: ImageBitmap | null = null;
-
-  try {
-    bitmap = await createImageBitmap(file);
-
-    // source region defaults to the full image
-    let sx = 0;
-    let sy = 0;
-    let sw = bitmap.width;
-    let sh = bitmap.height;
-
-    if (cropSquare) {
-      // center-crop to a square using the minimum dimension
-      const minDim = Math.min(bitmap.width, bitmap.height);
-      sx = (bitmap.width - minDim) / 2;
-      sy = (bitmap.height - minDim) / 2;
-      sw = minDim;
-      sh = minDim;
-    }
-
-    // fit within maxWidth x maxHeight while preserving aspect ratio
-    const sourceAspect = sw / sh;
-    let outW = sw;
-    let outH = sh;
-
-    if (outW > maxWidth) {
-      outW = maxWidth;
-      outH = Math.round(outW / sourceAspect);
-    }
-
-    if (outH > maxHeight) {
-      outH = maxHeight;
-      outW = Math.round(outH * sourceAspect);
-    }
-
-    // ensure dimensions are at least 1px
-    outW = Math.max(1, outW);
-    outH = Math.max(1, outH);
-
-    const offscreen = new OffscreenCanvas(outW, outH);
-    const offCtx = offscreen.getContext("2d");
-    if (!offCtx) {
-      return null;
-    }
-
-    offCtx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, outW, outH);
-
-    bitmap.close();
-    bitmap = null;
-
-    const blob = await offscreen.convertToBlob({
-      type: "image/webp",
-      quality,
-    });
-
-    // convert blob to data URL via FileReader
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(blob);
-    });
-
-    return dataUrl;
-  } catch {
-    return null;
-  } finally {
-    if (bitmap) {
-      bitmap.close();
-    }
-  }
+  const { resizeImageToWebpDataUrl } = await import("../workers/blob-worker-client");
+  return resizeImageToWebpDataUrl(file, {
+    maxWidth: options?.maxWidth ?? DEFAULT_MAX_WIDTH,
+    maxHeight: options?.maxHeight ?? DEFAULT_MAX_HEIGHT,
+    quality: options?.quality ?? DEFAULT_QUALITY,
+    cropSquare: options?.cropSquare ?? false,
+  });
 }
