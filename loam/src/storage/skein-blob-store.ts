@@ -321,11 +321,12 @@ export async function updateBlake3(blobId: string, blake3: string): Promise<void
 /**
  * retrieve a blob metadata record by its id.
  *
- * returns `null` when the blob does not exist.
+ * returns `null` when the blob does not exist. on tauri, blob ids are
+ * blake3 hashes, so a miss falls back to a rust-side blobz lookup.
  */
 export async function getBlobRecord(blobId: string): Promise<SkeinBlobRecord | null> {
   const db = await openBlobDb();
-  return new Promise((resolve, reject) => {
+  const fromIdb = await new Promise<SkeinBlobRecord | null>((resolve, reject) => {
     const tx = db.transaction(BLOB_STORE, "readonly");
     const store = tx.objectStore(BLOB_STORE);
     const req = store.get(blobId);
@@ -333,6 +334,8 @@ export async function getBlobRecord(blobId: string): Promise<SkeinBlobRecord | n
     req.onerror = () => reject(req.error);
     tx.oncomplete = () => db.close();
   });
+  if (fromIdb) return fromIdb;
+  return tauriBlobRecordByBlake3(blobId);
 }
 
 /**
@@ -362,7 +365,7 @@ export async function getBlobRecordBySha256(sha256: string): Promise<SkeinBlobRe
 export async function getBlobRecordByBlake3(blake3Hash: string): Promise<SkeinBlobRecord | null> {
   if (!blake3Hash) return null;
   const db = await openBlobDb();
-  return new Promise((resolve, reject) => {
+  const fromIdb = await new Promise<SkeinBlobRecord | null>((resolve, reject) => {
     const tx = db.transaction(BLOB_STORE, "readonly");
     const store = tx.objectStore(BLOB_STORE);
     const index = store.index("blake3");
@@ -371,6 +374,56 @@ export async function getBlobRecordByBlake3(blake3Hash: string): Promise<SkeinBl
     req.onerror = () => reject(req.error);
     tx.oncomplete = () => db.close();
   });
+  if (fromIdb) return fromIdb;
+
+  // tauri fallback: rust blobz is keyed by blake3, so try a path lookup.
+  return tauriBlobRecordByBlake3(blake3Hash);
+}
+
+/**
+ * look up a blob record by querying the rust blobz store via IPC. used as
+ * a fallback when the IDB index misses (eg. blobs uploaded directly into
+ * the tauri app never touch IDB). returns null in browser mode.
+ */
+async function tauriBlobRecordByBlake3(blake3Hash: string): Promise<SkeinBlobRecord | null> {
+  try {
+    const { isTauriMode, dispatch } = await import("../p2p/tauri-transport");
+    if (!isTauriMode()) return null;
+    const response = (await dispatch("blob_get_path", { blake3: blake3Hash })) as {
+      path?: string;
+      mime?: string | null;
+      size?: number | null;
+    } | null;
+    if (!response?.path) return null;
+    return synthesizeTauriRecord(blake3Hash, response.mime ?? "", response.size ?? 0);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * build a minimal SkeinBlobRecord from rust-side blobz metadata. rust uses
+ * blake3 as the canonical id, so blob_id and blake3 are the same; sha256 is
+ * not tracked there and stays empty.
+ */
+function synthesizeTauriRecord(
+  blake3Hash: string,
+  mime: string,
+  size: number
+): SkeinBlobRecord {
+  return {
+    blob_id: blake3Hash,
+    sha256: "",
+    blake3: blake3Hash,
+    filename: "",
+    mime: mime || "application/octet-stream",
+    size,
+    domain: classifyDomain(mime || ""),
+    blob_type: "original",
+    parent_blob_id: null,
+    metadata: { source: "tauri" },
+    created_at: Date.now(),
+  };
 }
 
 /**

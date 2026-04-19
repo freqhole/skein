@@ -414,6 +414,27 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
 
   console.log(TAG, `ensure_blob ${blake3_hash.slice(0, 16)}... from ${peerId}...`);
 
+  // tauri short-circuit: the iroh-blobs MemStore path doesn't apply (we have
+  // no midden / no iroh-blobs handler on the rust side). just confirm the
+  // blob exists in rust blobz so the requester knows we have it, then they
+  // fall back to a skein/1 proxy_request for the bytes.
+  try {
+    const { isTauriMode } = await import("./tauri-transport");
+    if (isTauriMode()) {
+      const store = await getBlobStore();
+      const record = await store.getBlobRecordByBlake3(blake3_hash);
+      const available = record !== null;
+      console.log(
+        TAG,
+        `tauri ensure_blob ${blake3_hash.slice(0, 16)}... → ${available ? "available" : "missing"}`
+      );
+      await sendRawResponse(stream, { type: "ensure_blob_response", id, available });
+      return;
+    }
+  } catch (err) {
+    console.warn(TAG, "tauri ensure_blob short-circuit failed, falling through:", err);
+  }
+
   try {
     // check if already in MemStore (avoids expensive OPFS read + bao recomputation)
     const node = await getMiddenNode();

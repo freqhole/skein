@@ -739,6 +739,58 @@ async function snatchFromBrowserPeer(
   }
 
   if (!bytes) {
+    // strategy 3: skein/1 proxy_request fallback. needed when the peer is
+    // a tauri app — its rust backend doesn't accept the iroh-blobs ALPN, so
+    // strategies 1+2 always fail. proxy_request runs over skein/1 which
+    // tauri's frontend ALPN router does accept.
+    if (typeof nodeAny.proxy_request === "function") {
+      try {
+        console.log(
+          TAG,
+          `trying skein/1 proxy_request fallback from ${peerAddr.slice(0, 16)}...`
+        );
+        const resp = await withPeerTimeout(
+          nodeAny.proxy_request(
+            peerAddr,
+            "GET",
+            `/api/blobs/${info.blobId}/data`,
+            null
+          ) as Promise<{ status: number; body: string }>,
+          30000
+        );
+        // proxy_request returns { status, body }; body is the JSON envelope
+        // sent by skein-handler: { success, data: { data, mime } }
+        if (resp?.status !== 200) {
+          console.debug(TAG, `proxy_request returned status ${resp?.status}`);
+        } else {
+          const parsed = JSON.parse(resp.body) as {
+            success?: boolean;
+            data?: { data?: string; mime?: string };
+            message?: string;
+          };
+          const b64 = parsed?.data?.data;
+          if (parsed?.success && typeof b64 === "string") {
+            const bin = atob(b64);
+            const out = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+            bytes = out;
+            // mime may have been refined by the responder
+            if (typeof parsed.data?.mime === "string" && !info.mime) {
+              info = { ...info, mime: parsed.data.mime };
+            }
+            progressFn(1);
+            downloaded = true;
+          } else {
+            console.debug(TAG, "proxy_request not successful:", parsed?.message);
+          }
+        }
+      } catch (err) {
+        console.debug(TAG, "skein/1 proxy_request fallback failed:", err);
+      }
+    }
+  }
+
+  if (!bytes) {
     throw new Error("iroh-blobs download failed — no fallback available");
   }
 
