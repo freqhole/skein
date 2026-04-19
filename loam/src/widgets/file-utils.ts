@@ -358,69 +358,33 @@ export async function checkBlobLocality(
   }
 
   try {
-    const response = await tauriInvoke("api_call", {
-      path: "/api/blob_metadata",
-      body: { id: blobId },
-    });
+    // skein: blobId is the blake3 hex. blob_get_path returns
+    // { path, mime, size } when the blob exists locally, errors otherwise.
+    const meta = (await dispatch("blob_get_path", {
+      blake3: blobId,
+    })) as { path?: string; mime?: string | null; size?: number | null } | null;
 
-    if (!response.success || !response.data) {
-      // blobId not found — try blake3 lookup (the blob may have been uploaded
-      // on a different peer with a different server-assigned UUID, but the
-      // content hash is the same regardless of which peer uploaded it)
-      if (blake3) {
-        try {
-          const blake3Response = await tauriInvoke("api_call", {
-            path: "/api/blob_metadata_by_blake3",
-            body: { blake3 },
-          });
-          if (blake3Response.success && blake3Response.data) {
-            const blob = blake3Response.data;
-            const result: BlobLocalityInfo = {
-              locality: "local",
-              metadata: {
-                id: blob.id,
-                mime: blob.mime ?? undefined,
-                filename: blob.filename ?? undefined,
-                size: blob.size ?? undefined,
-                blake3: blob.blake3 ?? undefined,
-              },
-            };
-            localityCache.set(blobId, result);
-            return result;
-          }
-        } catch (err) {
-          console.debug(TAG, "blake3 fallback lookup failed:", err);
-        }
-      }
+    if (!meta?.path) {
       return { locality: "remote" };
-    }
-
-    const blob = response.data;
-    let blobMetadata: Record<string, unknown> | undefined;
-    if (blob.metadata && typeof blob.metadata === "object") {
-      blobMetadata = blob.metadata as Record<string, unknown>;
-    } else if (typeof blob.metadata === "string") {
-      try {
-        blobMetadata = JSON.parse(blob.metadata);
-      } catch {
-        // not valid JSON — ignore
-      }
     }
 
     const result: BlobLocalityInfo = {
       locality: "local",
       metadata: {
-        id: blob.id,
-        mime: blob.mime ?? undefined,
-        filename: blob.filename ?? undefined,
-        size: blob.size ?? undefined,
-        blake3: blob.blake3 ?? undefined,
-        blobMetadata,
+        id: blobId,
+        mime: meta.mime ?? undefined,
+        size: meta.size ?? undefined,
+        blake3: blobId,
       },
     };
     localityCache.set(blobId, result);
     return result;
   } catch (err) {
+    // dispatch throws on NotFound — that's the "remote" signal in skein
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("not found") || msg.includes("NotFound")) {
+      return { locality: "remote" };
+    }
     console.debug(TAG, "blob locality check failed:", err);
     return { locality: "unknown" };
   }
@@ -1007,28 +971,28 @@ export async function snatchBlobBatch(
       continue;
     }
 
-    // tauri mode with blake3: try a quick local grimoire check
+    // tauri mode with blake3: try a quick local check via blob_get_path.
+    // skein keys blobs by blake3 so blobId === blake3 in most cases; if the
+    // caller passed a different identifier, fall back to the blake3 hash.
     if (isTauriMode() && info.blake3) {
       try {
-        const localCheck = await tauriInvoke("api_call", {
-          path: "/api/blob_metadata_by_blake3",
-          body: { blake3: info.blake3 },
-        });
-        if (localCheck.success && localCheck.data) {
-          const d = localCheck.data;
+        const localCheck = (await dispatch("blob_get_path", {
+          blake3: info.blake3,
+        })) as { path?: string; mime?: string | null; size?: number | null } | null;
+        if (localCheck?.path) {
           console.log(
             TAG,
-            `batch: blob ${i} found locally by blake3 (id=${String(d.id).slice(0, 8)}...)`
+            `batch: blob ${i} found locally by blake3 (${info.blake3.slice(0, 8)}...)`
           );
           localityCache.set(info.blobId, { locality: "local" });
           const result: FileUploadResult = {
-            blobId: d.id ?? d.blob_id ?? info.blobId,
-            domain: d.domain ?? info.domain,
+            blobId: info.blake3,
+            domain: info.domain,
             jobId: null,
-            sha256: d.sha256 ?? "",
-            blake3: d.blake3 ?? info.blake3 ?? null,
-            size: d.size ?? info.size ?? 0,
-            mime: d.mime ?? info.mime,
+            sha256: "",
+            blake3: info.blake3,
+            size: localCheck.size ?? info.size ?? 0,
+            mime: localCheck.mime ?? info.mime,
             existing: true,
           };
           results[i] = result;
@@ -1038,7 +1002,11 @@ export async function snatchBlobBatch(
           continue;
         }
       } catch (err) {
-        console.debug(TAG, `batch: local blake3 check failed for blob ${i}:`, err);
+        // NotFound is the expected "remote" signal — only log unexpected errors
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes("not found") && !msg.includes("NotFound")) {
+          console.debug(TAG, `batch: local blake3 check failed for blob ${i}:`, err);
+        }
       }
     }
 
@@ -1344,22 +1312,13 @@ async function fetchFullBlobLocal(blobId: string): Promise<string | null> {
   }
 
   try {
-    // try getting base64 data from the blob_data endpoint
-    const response = await tauriInvoke("api_call", {
-      path: `/api/blobs/${blobId}/data`,
-      body: {},
-    });
-
-    if (!response.success || !response.data) {
-      return null;
-    }
-
-    const { data, mime } = response.data;
-    if (!data || !mime) {
-      return null;
-    }
-
-    return `data:${mime};base64,${data}`;
+    // skein dispatch action returns { meta: { mime, ... }, data: base64 }
+    const response = (await dispatch("blob_get", {
+      blake3: blobId,
+    })) as { meta?: { mime?: string | null }; data?: string } | null;
+    if (!response?.data) return null;
+    const mime = response.meta?.mime ?? "application/octet-stream";
+    return `data:${mime};base64,${response.data}`;
   } catch (err) {
     return null;
   }
@@ -1498,16 +1457,11 @@ export async function getBlobLocalPath(blobId: string): Promise<string | null> {
   }
 
   try {
-    const response = await tauriInvoke("api_call", {
-      path: `/api/blobs/${blobId}/path`,
-      body: {},
-    });
-
-    if (!response.success || !response.data) {
-      return null;
-    }
-
-    return response.data.path ?? null;
+    // skein dispatch action returns { path, mime, size }
+    const response = (await dispatch("blob_get_path", {
+      blake3: blobId,
+    })) as { path?: string } | null;
+    return response?.path ?? null;
   } catch (err) {
     return null;
   }
@@ -1541,34 +1495,14 @@ export async function getLocalBlobUrl(blobId: string, blake3?: string): Promise<
   );
 
   if (isTauriMode()) {
-    // resolve the effective grimoire blob ID — the blobId in the automerge doc
-    // might be a browser-peer's SHA256 hash that doesn't exist in grimoire.
-    // try direct lookup first, fall back to blake3 to find the real ID.
-    let resolvedId = blobId;
+    // in skein, blobId is already the blake3 hex — no separate UUID lookup
+    // needed (unlike grimoire). try the asset:// path first, fall back to
+    // base64 data URL if path resolution fails.
+    const resolvedId = blobId;
 
-    // try filesystem path → asset:// URL first (avoids base64 for large files)
     try {
       console.debug(TAG, "getLocalBlobUrl: trying getBlobLocalPath for", blobId);
-      let localPath = await getBlobLocalPath(blobId);
-
-      // direct ID failed — try blake3 lookup to find the real grimoire blob ID
-      if (!localPath && blake3) {
-        console.debug(TAG, "getLocalBlobUrl: direct ID miss, trying blake3:", blake3.slice(0, 12));
-        try {
-          const blake3Response = await tauriInvoke("api_call", {
-            path: "/api/blob_metadata_by_blake3",
-            body: { blake3 },
-          });
-          if (blake3Response?.success && blake3Response.data?.id) {
-            resolvedId = blake3Response.data.id;
-            console.debug(TAG, "getLocalBlobUrl: blake3 resolved to:", resolvedId);
-            localPath = await getBlobLocalPath(resolvedId);
-          }
-        } catch (err) {
-          console.debug(TAG, "getLocalBlobUrl: blake3 lookup threw:", err);
-        }
-      }
-
+      const localPath = await getBlobLocalPath(resolvedId);
       console.debug(TAG, "getLocalBlobUrl: getBlobLocalPath returned:", localPath);
       if (localPath) {
         const assetUrl = await convertToAssetUrl(localPath);
@@ -1580,25 +1514,16 @@ export async function getLocalBlobUrl(blobId: string, blake3?: string): Promise<
       // fall through to data URL approach
     }
 
-    // fall back to base64 data URL from blob_data endpoint
+    // fall back to base64 data URL via blob_get dispatch
     try {
-      console.debug(TAG, "getLocalBlobUrl: trying /api/blobs/data fallback for", resolvedId);
-      const response = await tauriInvoke("api_call", {
-        path: `/api/blobs/${resolvedId}/data`,
-        body: {},
-      });
-      console.debug(TAG, "getLocalBlobUrl: /data response:", {
-        success: response?.success,
-        hasData: !!response?.data?.data,
-        hasMime: !!response?.data?.mime,
-      });
-
-      if (response?.success && response.data?.data && response.data?.mime) {
+      console.debug(TAG, "getLocalBlobUrl: trying blob_get fallback for", resolvedId);
+      const dataUrl = await fetchFullBlobLocal(resolvedId);
+      if (dataUrl) {
         console.debug(TAG, "getLocalBlobUrl: returning base64 data URL");
-        return `data:${response.data.mime};base64,${response.data.data}`;
+        return dataUrl;
       }
     } catch (err) {
-      console.debug(TAG, "getLocalBlobUrl: /data fallback threw:", err);
+      console.debug(TAG, "getLocalBlobUrl: blob_get fallback threw:", err);
     }
 
     console.debug(TAG, "getLocalBlobUrl: tauri — all paths failed for", blobId);
@@ -1663,24 +1588,29 @@ export async function getDocumentPages(blobId: string): Promise<DocumentPageInfo
     return [];
   }
 
+  // session cache — pdf rendering is expensive, and the peedeeeff widget
+  // polls this function repeatedly. cache the result by source blake3 so
+  // subsequent polls return immediately.
+  const cached = pdfPagesCache.get(blobId);
+  if (cached) return cached;
+
   try {
-    const response = await tauriInvoke("api_call", {
-      path: `/api/blobs/${blobId}/pages`,
-      body: {},
-    });
+    const pages = (await dispatch("pdf_render_pages", {
+      blake3: blobId,
+    })) as DocumentPageInfo[] | null;
 
-    if (!response.success || !response.data) {
-      return [];
+    const result = Array.isArray(pages) ? pages : [];
+    if (result.length > 0) {
+      pdfPagesCache.set(blobId, result);
     }
-
-    // response.data is a JSON array of page info objects
-    const pages = Array.isArray(response.data) ? response.data : [];
-    return pages as DocumentPageInfo[];
+    return result;
   } catch (err) {
     console.warn(TAG, "getDocumentPages failed:", err);
     return [];
   }
 }
+
+const pdfPagesCache = new Map<string, DocumentPageInfo[]>();
 
 /**
  * convert a local filesystem path to a Tauri asset:// URL.

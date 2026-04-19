@@ -86,10 +86,14 @@ export function createPageCache() {
       let texture: Texture;
       let assetKey: string;
 
-      if (resolvedUrl.startsWith("data:") || resolvedUrl.startsWith("asset:")) {
+      if (resolvedUrl.startsWith("data:")) {
         texture = await Assets.load<Texture>(resolvedUrl);
         assetKey = resolvedUrl;
       } else {
+        // for asset:// (tauri) and blob:/http(s): URLs, bypass the PixiJS
+        // asset loader — it relies on file extensions to pick a parser, and
+        // skein's blob paths are extensionless (`<blob-files>/<prefix>/<rest>`).
+        // fetch + createImageBitmap works regardless of extension/mime sniffing.
         const response = await fetch(resolvedUrl, { signal: abort.signal });
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
@@ -99,7 +103,6 @@ export function createPageCache() {
         if (resolvedUrl.startsWith("blob:")) {
           URL.revokeObjectURL(resolvedUrl);
         }
-        // bypass PixiJS asset loader — it can't determine file type from blob URLs
         const imageBitmap = await createImageBitmap(blob);
         texture = Texture.from(imageBitmap);
         assetKey = ""; // no Assets cache entry — cleanup handled by texture.destroy

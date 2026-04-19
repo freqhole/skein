@@ -58,6 +58,10 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
     category: "media",
     defaultWidth: 480,
     defaultHeight: 640,
+    // pdf rendering requires the native (rust/imagemagick) pipeline. browser
+    // peers can still receive existing peedeeeff widgets via automerge sync,
+    // but they can't add a new one from scratch.
+    tauriOnly: true,
   },
   schema: peedeeeffSchema,
   editableProps: [

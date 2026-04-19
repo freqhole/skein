@@ -253,6 +253,11 @@ async fn dispatch(
             blob_iroh_probe(decode("blob_iroh_probe", payload)?, state).await
         }
 
+        // pdf page rendering (peedeeeff widget)
+        "pdf_render_pages" => {
+            pdf_render_pages(decode("pdf_render_pages", payload)?, state).await
+        }
+
         // hub control
         "hub_start" => hub_start_inner(state).await,
         "hub_stop" => hub_stop_inner(state).await,
@@ -1389,4 +1394,91 @@ fn persist_hub_state(state: &AppState, hub_enabled: bool) {
     if let Err(e) = cfg.save(&state.app_config_path) {
         tracing::warn!(error = %e, path = ?state.app_config_path, "failed to persist hub state");
     }
+}
+
+// ---------------------------------------------------------------------------
+// pdf rendering
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct PdfRenderPagesArgs {
+    /// blake3 hex of the source pdf blob (already inserted via blob_insert).
+    blake3: String,
+}
+
+/// render every page of a pdf to per-page png blobs.
+///
+/// flow:
+/// 1. look up the source pdf bytes by blake3 in `blobz`
+/// 2. shell out to `magick` to render pages to a temp dir
+/// 3. insert each rendered page as its own blob in `blobz`
+/// 4. return a list of `{ page_blob_id, page_number, total_pages, blake3,
+///    size, mime, filename }` matching the existing `DocumentPageInfo` shape
+///
+/// renders are deduped at the blob layer: if the same pdf+pages have already
+/// been rendered, `blobz.insert` returns the existing rows and we don't
+/// re-render. (we do still re-run magick today; future optimization could
+/// cache render results keyed by source blake3 to skip the work entirely.)
+async fn pdf_render_pages(
+    args: PdfRenderPagesArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    let source_blob = state
+        .blobz
+        .get(&args.blake3)
+        .await?
+        .ok_or_else(|| DispatchError::InvalidPayload {
+            action: "pdf_render_pages",
+            source: serde::de::Error::custom(format!(
+                "no blob with blake3 {}",
+                args.blake3
+            )),
+        })?;
+
+    let pdf_bytes =
+        tokio::fs::read(state.blobz.path_for(&source_blob)).await.map_err(|e| {
+            DispatchError::Blob(blobz::BlobError::Io(std::io::Error::new(
+                e.kind(),
+                format!("read pdf bytes: {e}"),
+            )))
+        })?;
+
+    let pages = crate::pdf::render_pdf_pages(&pdf_bytes)
+        .await
+        .map_err(|e| DispatchError::InvalidPayload {
+            action: "pdf_render_pages",
+            source: serde::de::Error::custom(format!("pdf render: {e}")),
+        })?;
+
+    let total_pages = pages.len() as i64;
+    let stem = source_blob
+        .filename
+        .as_deref()
+        .map(|n| n.trim_end_matches(".pdf").trim_end_matches(".PDF").to_string())
+        .unwrap_or_else(|| "document".to_string());
+
+    let mut out = Vec::with_capacity(pages.len());
+    for (idx, png_bytes) in pages.into_iter().enumerate() {
+        let page_number = (idx + 1) as i64;
+        let filename = Some(format!("{stem}_page_{page_number:03}.png"));
+        let mime = Some("image/png".to_string());
+        let blake3_hex = blake3::hash(&png_bytes).to_hex().to_string();
+        let blob = state
+            .blobz
+            .insert(blake3_hex.clone(), filename.clone(), mime.clone(), &png_bytes)
+            .await?;
+        prewarm_fs_store(state, &blob).await;
+
+        out.push(json!({
+            "page_blob_id": blob.blake3,
+            "page_number": page_number,
+            "total_pages": total_pages,
+            "blake3": blob.blake3,
+            "size": blob.size,
+            "mime": blob.mime,
+            "filename": blob.filename,
+        }));
+    }
+
+    Ok(Value::Array(out))
 }

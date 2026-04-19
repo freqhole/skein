@@ -6,6 +6,7 @@
 //! stays up across toggles.
 
 mod commands;
+mod pdf;
 mod streams;
 
 use std::path::PathBuf;

@@ -181,6 +181,11 @@ export interface WidgetMetadata {
   category?: string;
   /** hide this widget from the palette (e.g. programmatically-spawned widgets) */
   hidden?: boolean;
+  /** when true, this widget type is only available in tauri (desktop) mode.
+   *  the flyout hides it for browser-only peers. use for widgets that depend
+   *  on native-only capabilities (e.g. peedeeeff requires the rust pdf
+   *  rendering pipeline). */
+  tauriOnly?: boolean;
   /** singleton widgets have a well-known ID and cannot be deleted via the
    *  frame close button. the flyout hides them when already on the canvas.
    *  use for persistent narthex widgets like profile and friends. */

@@ -4,6 +4,7 @@ import type { SkeinTheme } from "../theme/skein-theme";
 import type { WidgetRegistry } from "../widgets/widget-registry";
 import type { CanvasStore } from "./canvas-store";
 import type { InputRouter } from "./input-router";
+import { isTauriMode } from "../p2p/tauri-transport";
 
 export interface ToolbarOptions {
   /** if true, this toolbar is in the narthex (home screen) */
@@ -207,6 +208,8 @@ export class Toolbar {
 
     const factories = this.registry.all().filter((f) => {
       if (f.metadata.hidden) return false;
+      // hide tauri-only widgets in browser mode
+      if (f.metadata.tauriOnly && !isTauriMode()) return false;
       // hide singleton/unique types that are already placed on the canvas
       if ((f.metadata.singleton || f.metadata.unique) && typesOnCanvas.has(f.type)) return false;
       return true;
