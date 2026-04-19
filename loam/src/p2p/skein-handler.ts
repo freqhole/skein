@@ -95,13 +95,11 @@ async function sendRawResponse(stream: BiStreamLike, msg: PeerMessage): Promise<
   }
 }
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
+// base64 encoding is delegated to the blob worker (off-main-thread).
+// `data` ownership is transferred to the worker — do not reuse after.
+async function arrayBufferToBase64(buffer: ArrayBuffer): Promise<string> {
+  const { base64Encode } = await import("../workers/blob-worker-client");
+  return base64Encode(buffer);
 }
 
 // lazy import to avoid circular deps and keep the module light at load time
@@ -229,7 +227,7 @@ async function handleThumbnailData(
 
   // browser doesn't generate thumbnails — serve the original image data.
   // this is fine for photos; the peer will display the original.
-  const base64 = arrayBufferToBase64(data);
+  const base64 = await arrayBufferToBase64(data);
   await sendRawResponse(stream, {
     type: "proxy_response",
     id,
@@ -268,7 +266,7 @@ async function handleBlobData(stream: BiStreamLike, id: number, blobId: string):
     return;
   }
 
-  const base64 = arrayBufferToBase64(data);
+  const base64 = await arrayBufferToBase64(data);
   await sendRawResponse(stream, {
     type: "proxy_response",
     id,

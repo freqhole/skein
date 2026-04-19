@@ -153,22 +153,9 @@ export async function computeSha256(data: ArrayBuffer): Promise<string> {
   return hex;
 }
 
-/**
- * compute the blake3 hash of data using the midden WASM module.
- * returns empty string if midden is not available (e.g. WASM not loaded yet).
- */
-async function computeBlake3(data: Uint8Array): Promise<string> {
-  try {
-    const midden = (await import("midden")) as any;
-    if (typeof midden.hash_blake3 === "function") {
-      return midden.hash_blake3(data);
-    }
-    return "";
-  } catch {
-    // midden WASM not available — skip blake3 computation
-    return "";
-  }
-}
+// blake3 hashing has moved into the blob worker (see
+// `src/workers/blob-worker-client.ts`); the upload pipeline calls
+// `processBlobBytes` directly so no main-thread wrapper is needed here.
 
 /**
  * classify a MIME type into a domain string.
@@ -182,32 +169,19 @@ export function classifyDomain(mime: string): string {
 }
 
 /**
- * try to write bytes to OPFS using the (writable-stream) api. silently
- * skips when OPFS itself is unavailable, when `createWritable` is not
- * exposed (webkit / tauri webview on main thread), or when the write
- * itself fails. a warning is logged so the failure is visible.
+ * try to write bytes to OPFS via the blob worker (uses
+ * `FileSystemSyncAccessHandle` for max throughput when available, falling
+ * back to the async writable-stream API). silently no-ops when OPFS or
+ * Worker isn't available.
+ *
+ * NOTE: transfers ownership of `data` to the worker — callers must not
+ * use the buffer after this returns. when the buffer is still needed on
+ * the main thread, slice it first.
  */
 async function tryWriteOpfs(blobId: string, data: ArrayBuffer): Promise<void> {
   try {
-    const dir = await getOpfsDir(true);
-    if (!dir) return;
-    const fileHandle = await dir.getFileHandle(blobId, { create: true });
-    // webkit's main-thread OPFS handle has no createWritable()
-    const create = (fileHandle as any).createWritable as
-      | (() => Promise<FileSystemWritableFileStream>)
-      | undefined;
-    if (typeof create !== "function") {
-      console.warn(
-        "[skein-blob-store] createWritable unavailable on this platform — " +
-          "skipping OPFS bytes for " +
-          blobId.slice(0, 16) +
-          "..."
-      );
-      return;
-    }
-    const writable = await create.call(fileHandle);
-    await writable.write(data);
-    await writable.close();
+    const { writeBlobToOpfs } = await import("../workers/blob-worker-client");
+    await writeBlobToOpfs(blobId, data);
   } catch (err) {
     console.warn("[skein-blob-store] tryWriteOpfs failed for", blobId.slice(0, 16), err);
   }
@@ -261,34 +235,55 @@ export async function storeBlob(
  */
 export async function storeBlobFromFile(file: File, domain?: string): Promise<SkeinBlobRecord> {
   const buffer = await file.arrayBuffer();
-  const sha256 = await computeSha256(buffer);
-  const blake3 = await computeBlake3(new Uint8Array(buffer));
-  const blobId = sha256;
+  const mime = file.type || "application/octet-stream";
 
-  // dedup — return existing record if already stored
+  // hand the whole upload pipeline to the blob worker: sha256 + blake3
+  // hashing AND the OPFS write happen off the main thread in a single
+  // round-trip. transfers ownership of `buffer` \u2014 do not use it after.
+  const { processBlobBytes } = await import("../workers/blob-worker-client");
+  const processed = await processBlobBytes(buffer, file.name, mime);
+  const blobId = processed.sha256;
+
+  // dedup \u2014 return existing record if already stored. (the worker has
+  // already written the bytes to OPFS, but that's a no-op overwrite of an
+  // identical content-addressed file.)
   const existing = await getBlobRecord(blobId);
   if (existing) return existing;
 
-  const resolvedDomain = domain ?? classifyDomain(file.type);
+  const resolvedDomain = domain ?? classifyDomain(mime);
 
-  const meta: Omit<SkeinBlobRecord, "created_at"> = {
+  const record: SkeinBlobRecord = {
     blob_id: blobId,
-    sha256,
-    blake3,
+    sha256: processed.sha256,
+    blake3: processed.blake3,
     filename: file.name,
-    mime: file.type || "application/octet-stream",
-    size: buffer.byteLength,
+    mime,
+    size: processed.size,
     domain: resolvedDomain,
     blob_type: "original",
     parent_blob_id: null,
     metadata: {},
+    created_at: Date.now(),
   };
 
-  await storeBlob(blobId, buffer, meta);
+  // bypass storeBlob() because the worker already wrote OPFS bytes \u2014
+  // we just need to persist the IndexedDB metadata record.
+  const db = await openBlobDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(BLOB_STORE, "readwrite");
+    tx.objectStore(BLOB_STORE).put(record);
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error);
+    };
+  });
 
-  // return the full record (with created_at) from the store
-  const record = await getBlobRecord(blobId);
-  return record!;
+  const stored = await getBlobRecord(blobId);
+  return stored!;
 }
 
 /**

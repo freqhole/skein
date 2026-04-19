@@ -8,6 +8,12 @@ const isTauriBuild = !!process.env.VITE_TAURI;
 
 export default defineConfig({
   plugins: [wasm(), topLevelAwait()],
+  // worker bundles need wasm + top-level-await too — the blob worker
+  // pulls in midden (wasm) for blake3 hashing.
+  worker: {
+    format: "es",
+    plugins: () => [wasm(), topLevelAwait()],
+  },
   build: {
     lib: {
       entry: path.resolve(__dirname, "src/index.ts"),
