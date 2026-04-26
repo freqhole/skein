@@ -8,10 +8,6 @@
 //! - [`avatar`]: image processing for profile thumbnails
 //! - `messages`: friendz message dispatch (friend requests, profile, heartbeat)
 //! - `canvas`: canvas invite, update, and gossip digest handling
-//!
-//! **phase-2 status:** ported off grimoire — uses `userz`/`friendz`/`blobz`
-//! stores directly. snatcher integration deferred (see plan in
-//! [`docs/phase-2-port-plan.md`](../../../docs/phase-2-port-plan.md)).
 
 pub mod avatar;
 mod canvas;
@@ -159,12 +155,8 @@ impl HubPeerService {
         tracing::info!(node_id = %node_id_str, "hub peer service starting");
 
         // process avatar (if configured) and persist into blobz + userz.
-        let (profile_avatar_data_url, avatar_blake3) = process_hub_avatar(
-            config.avatar_path.as_deref(),
-            &config.data_dir,
-            &blobz,
-        )
-        .await?;
+        let (profile_avatar_data_url, avatar_blake3) =
+            process_hub_avatar(config.avatar_path.as_deref(), &config.data_dir, &blobz).await?;
 
         // persist hub's own profile so it survives restarts and is queryable
         // alongside remote-peer rows.

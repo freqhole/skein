@@ -1034,12 +1034,13 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
             );
           }
           if (staleShares.length > 0) {
-            draft.shares = draft.shares.filter(
-              (s: CanvasShare) =>
-                (!s.accepted && !s.declined) ||
-                !s.sentAt ||
-                now - new Date(s.sentAt).getTime() <= CLEANUP_MS
-            );
+            // #TODO: FIX THIS, is throwing RangeError: Cannot create a reference to an existing document object
+            // draft.shares = draft.shares.filter(
+            //   (s: CanvasShare) =>
+            //     (!s.accepted && !s.declined) ||
+            //     !s.sentAt ||
+            //     now - new Date(s.sentAt).getTime() <= CLEANUP_MS
+            // );
           }
           if (staleDeletions.length > 0) {
             draft.deletions = draft.deletions.filter(

@@ -2,3 +2,4 @@
 /tauri/target
 /tauri/gen/schemas
 /midden/target
+.DS_Store

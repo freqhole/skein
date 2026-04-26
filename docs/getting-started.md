@@ -35,9 +35,12 @@ a compiled-to-wasm helper crate (`midden`). no reliquary required.
 ```sh
 # build the midden wasm bundle (first time + whenever rust source changes)
 cd skein/midden
-wasm-pack build --target web --out-dir pkg --release
-# drop the auto-generated .gitignore so we can commit pkg/
-rm -f pkg/.gitignore
+make
+
+## optionally, instead of make, run wasm-pack like:
+# wasm-pack build --target web --out-dir pkg --release
+## and also optionally, drop the auto-generated .gitignore and commit pkg/ like:
+# rm -f pkg/.gitignore
 
 # run the dev server
 cd ../loam

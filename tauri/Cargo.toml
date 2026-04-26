@@ -1,15 +1,15 @@
 [package]
-name = "skein-tauri"
+name = "skein"
 version = "0.1.0"
 edition = "2021"
-description = "skein desktop shell (tauri)"
+description = "skein desktop shell"
 
 [lib]
 name = "skein_tauri_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
-name = "skein-tauri"
+name = "skein"
 path = "src/main.rs"
 
 [build-dependencies]
