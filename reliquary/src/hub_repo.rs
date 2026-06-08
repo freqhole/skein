@@ -122,7 +122,7 @@ impl DocHandle {
         F: FnOnce(&automerge::Automerge) -> R,
     {
         let doc = self.doc.blocking_read();
-        f(&*doc)
+        f(&doc)
     }
 
     /// synchronous mutable access for transact operations. blocks the current
@@ -132,7 +132,7 @@ impl DocHandle {
         F: FnOnce(&mut automerge::Automerge) -> R,
     {
         let mut doc = self.doc.blocking_write();
-        f(&mut *doc)
+        f(&mut doc)
     }
 }
 

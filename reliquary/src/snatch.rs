@@ -701,11 +701,11 @@ impl BlobSnatcher {
                         // create the list via transact
                         match doc.transact::<_, _, automerge::AutomergeError>(|tx| {
                             use automerge::transaction::Transactable;
-                            Ok(tx.put_object(
+                            tx.put_object(
                                 automerge::ROOT,
                                 "snatchedBy",
                                 automerge::ObjType::List,
-                            )?)
+                            )
                         }) {
                             Ok(result) => result.result,
                             Err(e) => {
@@ -719,7 +719,7 @@ impl BlobSnatcher {
                 // check if already in the list
                 let len = doc.length(&list_id);
                 for i in 0..len {
-                    if let Ok(Some((v, _))) = doc.get(&list_id, i as usize) {
+                    if let Ok(Some((v, _))) = doc.get(&list_id, i) {
                         if v.to_str() == Some(&local_id) {
                             tracing::debug!(widget_doc_id = %wdoc_id, "already in snatchedBy");
                             return;
@@ -1292,7 +1292,7 @@ fn read_widget_state(
                 doc.get(automerge::ROOT, "snatchedBy")
             {
                 for i in 0..doc.length(&list_id) {
-                    if let Ok(Some((v, _))) = doc.get(&list_id, i as usize) {
+                    if let Ok(Some((v, _))) = doc.get(&list_id, i) {
                         if let Some(s) = v.to_str() {
                             items.push(s.to_string());
                         }
