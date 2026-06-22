@@ -320,7 +320,7 @@ impl Service {
                 message,
             } => {
                 self.userz.touch(&from_node_id).await.ok();
-                self.handle_friendz_message(&from_node_id, message).await?;
+                self.handle_friendz_message(&from_node_id, *message).await?;
             }
         }
         Ok(())
@@ -345,9 +345,7 @@ impl Service {
                     tracing::warn!(error = %e, peer = %from, "failed to send profile response");
                 }
             }
-            FriendzMessage::ProfileResponse {
-                username, ..
-            } => {
+            FriendzMessage::ProfileResponse { username, .. } => {
                 // phase-1: ignore avatar_data_url; userz.avatar_blake3 takes a
                 // blake3 hash, not a data url. avatar transfer comes back later.
                 self.userz

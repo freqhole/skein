@@ -240,32 +240,6 @@ export class MiddenNode {
      */
     fetch_hello_image(peer_addr: string): Promise<HelloImageResult>;
     /**
-     * download a blob into the local iroh-blobs store and pin it with a TempTag,
-     * WITHOUT materializing the bytes into JS memory.
-     *
-     * use this when the browser is relaying a blob between two peers and only
-     * needs to act as a temporary provider. peak JS-heap memory stays O(1);
-     * wasm linear memory grows by the blob size until `release_blob` is called.
-     *
-     * subsequent peers can download this blob from us via verified streaming
-     * as long as the TempTag is held in `active_tags`. call `release_blob`
-     * (or let eviction kick in once `active_tags` exceeds its cap) to drop
-     * the pin so GC can reclaim the bytes.
-     *
-     * returns the blake3 hash as a 64-char hex string (echoes the input on success).
-     *
-     * if the blob is already pinned in `active_tags`, this is a no-op.
-     */
-    fetch_to_store(peer_addr: string, blake3_hash: string): Promise<string>;
-    /**
-     * fetch_to_store with ensure+retry on failure.
-     *
-     * first tries `fetch_to_store` directly; if the source peer's BlobsProtocol
-     * doesn't have the blob in its FsStore yet, calls `ensure_blob` to ask the
-     * source to load it, then retries.
-     */
-    fetch_to_store_with_ensure(peer_addr: string, blake3_hash: string): Promise<string>;
-    /**
      * check whether a blob with the given blake3 hash is currently held in the MemStore
      * via an active TempTag. avoids expensive OPFS read + bao recomputation when the
      * blob is already loaded.
@@ -316,6 +290,11 @@ export class MiddenNode {
      * peer_addr can be plain node_id or full endpoint JSON with relay/IP hints
      */
     proxy_request(peer_addr: string, method: string, path: string, body?: string | null): Promise<any>;
+    /**
+     * get our current home relay url, or null if not yet connected to a relay.
+     * use this to include relay hints in share urls so subscribers can skip pkarr discovery.
+     */
+    relay_url(): string | undefined;
     /**
      * release a blob's TempTag, allowing the store to garbage-collect it.
      * blake3_hash should be the 64-char hex string returned by import_blob.

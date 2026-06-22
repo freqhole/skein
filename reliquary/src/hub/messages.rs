@@ -61,7 +61,7 @@ impl HubPeerService {
                     msg_type = %friendz_msg_type_name(&message),
                     "received friendz message"
                 );
-                self.handle_message(&from_node_id, message).await;
+                self.handle_message(&from_node_id, *message).await;
             }
         }
     }
@@ -148,6 +148,22 @@ impl HubPeerService {
                     username = %from_username,
                     "received friend request"
                 );
+
+                // ensure a userz row exists before writing to friendz —
+                // friendz.friend_node_id has a FK referencing userz(node_id),
+                // so the insert will fail if the peer has never been seen before
+                // (e.g. when the FriendRequest message races ahead of PeerOnline).
+                if let Err(e) = self
+                    .userz
+                    .upsert_profile(from_node_id, Some(&from_username), None, None)
+                    .await
+                {
+                    tracing::warn!(
+                        peer = %from_node_id,
+                        error = %e,
+                        "failed to touch userz row for incoming friend request"
+                    );
+                }
 
                 use crate::friendz::FriendStatus;
                 let existing = self.friendz_store.get(from_node_id).await.ok().flatten();

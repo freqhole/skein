@@ -133,6 +133,7 @@ impl HubPeerService {
     ///
     /// hub_repo receives docs passively when the JS peer syncs them — no
     /// explicit document request is needed.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_canvas_invite(
         &self,
         from_node_id: &str,
@@ -415,6 +416,7 @@ impl HubPeerService {
     ///
     /// if the hub tracks this canvas, untrack it and relay the deletion
     /// to other online friends who are on this canvas.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_canvas_deleted(
         &self,
         from_node_id: &str,

@@ -34,7 +34,7 @@ pub enum FriendzEvent {
     /// a message was received from a peer.
     MessageReceived {
         from_node_id: String,
-        message: FriendzMessage,
+        message: Box<FriendzMessage>,
     },
 }
 
@@ -538,6 +538,6 @@ async fn handle_message(inner: &Inner, from_node_id: &str, msg: FriendzMessage) 
     // always emit MessageReceived for all message types (including heartbeats)
     let _ = inner.event_tx.send(FriendzEvent::MessageReceived {
         from_node_id: from_node_id.to_string(),
-        message: msg,
+        message: Box::new(msg),
     });
 }
