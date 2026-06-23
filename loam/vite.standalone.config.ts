@@ -14,12 +14,17 @@ export default defineConfig({
   // wasm + top-level-await plugins are always needed (automerge uses WASM internally).
   // only midden (iroh P2P transport) is stubbed in tauri builds.
   plugins: [wasm(), topLevelAwait()],
+  // worker bundles need the same plugins — blob-worker imports midden (WASM) for blake3.
+  worker: {
+    format: "es",
+    plugins: () => [wasm(), topLevelAwait()],
+  },
   base: isTauriBuild ? "./" : deployBase || "/",
   build: {
     outDir: "dist",
     rollupOptions: {
       input: {
-        skein: path.resolve(dirname, "skein.html"),
+        skein: path.resolve(dirname, "index.html"),
         ...(isTauriBuild
           ? { settings: path.resolve(dirname, "settings.html") }
           : { gallery: path.resolve(dirname, "widget-gallery.html") }),

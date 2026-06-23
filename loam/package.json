@@ -6,10 +6,9 @@
   "scripts": {
     "dev": "vite --port 5890",
     "build": "vite build",
-    "build:deploy": "vite build --config vite.standalone.config.ts",
-    "build:cloudflare": "VITE_SKEIN_BASE=/skein/ vite build --config vite.standalone.config.ts && mv dist/skein.html dist/index.html",
+    "build:cloudflare": "vite build --config vite.standalone.config.ts",
     "dev:tauri": "VITE_TAURI=1 vite --config vite.standalone.config.ts --port 5891 --strictPort",
-    "build:tauri": "VITE_TAURI=1 vite build --config vite.standalone.config.ts && mv dist/skein.html dist/index.html",
+    "build:tauri": "VITE_TAURI=1 vite build --config vite.standalone.config.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
