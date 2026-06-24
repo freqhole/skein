@@ -1,5 +1,6 @@
 import { Container, Graphics, HTMLText, Text, type TextStyleFontWeight } from "pixi.js";
 import { z } from "zod";
+import { FONT_OPTIONS } from "../src/fonts/font-loader";
 import { createDomOverlay, type DomOverlayHandle } from "../src/widgets/dom-overlay";
 import { colorToCss } from "../src/widgets/format";
 import {
@@ -113,12 +114,12 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
     { key: "codeColor", label: "code color", type: "color" as const, default: 0xe0e0e8 },
     { key: "codeBgColor", label: "code bg", type: "color" as const, default: 0x2a2a3a },
     { key: "fontSize", label: "font size", type: "number" as const, default: 13 },
-    { key: "borderWidth", label: "border width", type: "number" as const, default: 1 },
+    { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 1 },
     {
       key: "fontFamily",
       label: "font",
       type: "select" as const,
-      options: ["system-ui, sans-serif", "Georgia, serif", "Courier New, monospace", "cursive"],
+      options: FONT_OPTIONS,
       default: "system-ui, sans-serif",
     },
   ],
@@ -145,10 +146,13 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
       bg.clear();
       bg.roundRect(0, 0, w, h, 6);
       bg.fill(state.bgColor === -1 ? { color: 0, alpha: 0 } : { color: state.bgColor });
-      bg.stroke({
-        color: isEditing ? BORDER_EDITING_COLOR : 0x2a2a3a,
-        width: isEditing ? 3 : state.borderWidth,
-      });
+      const bw = isEditing ? 3 : state.borderWidth;
+      if (bw > 0) {
+        bg.stroke({
+          color: isEditing ? BORDER_EDITING_COLOR : 0x2a2a3a,
+          width: bw,
+        });
+      }
     };
     drawBg(currentWidth, currentHeight, false);
     container.addChild(bg);

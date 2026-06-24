@@ -156,7 +156,7 @@ export const labelWidget: WidgetFactory<typeof labelSchema> = {
     { key: "bgColor", label: "background", type: "color" as const, default: 0xf8fafc },
     { key: "textColor", label: "text color", type: "color" as const, default: 0x1e293b },
     { key: "borderColor", label: "border", type: "color" as const, default: 0xcbd5e1 },
-    { key: "borderWidth", label: "border width", type: "number" as const, default: 1 },
+    { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 1 },
     {
       key: "fontFamily",
       label: "font",
@@ -198,11 +198,13 @@ export const labelWidget: WidgetFactory<typeof labelSchema> = {
       bg.fill(state.bgColor === -1 ? { color: 0, alpha: 0 } : { color: state.bgColor });
       const strokeColor = isEditing ? BORDER_EDITING_COLOR : state.borderColor;
       const strokeWidth = isEditing ? 3 : state.borderWidth;
-      bg.stroke(
-        strokeColor === -1
-          ? { color: 0, alpha: 0, width: strokeWidth }
-          : { color: strokeColor, width: strokeWidth }
-      );
+      if (strokeWidth > 0) {
+        bg.stroke(
+          strokeColor === -1
+            ? { color: 0, alpha: 0, width: strokeWidth }
+            : { color: strokeColor, width: strokeWidth }
+        );
+      }
     };
     drawBg(currentWidth, currentHeight, false);
     container.addChild(bg);

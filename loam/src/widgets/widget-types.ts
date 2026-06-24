@@ -314,6 +314,10 @@ export interface WidgetPropDef {
   type: "string" | "number" | "boolean" | "color" | "select" | "image";
   options?: string[];
   default?: unknown;
+  /** for number props: minimum allowed value (defaults to 1 if omitted) */
+  min?: number;
+  /** for number props: maximum allowed value (defaults to 100 if omitted) */
+  max?: number;
   /** for image props: maximum output width in pixels */
   imageMaxWidth?: number;
   /** for image props: maximum output height in pixels */

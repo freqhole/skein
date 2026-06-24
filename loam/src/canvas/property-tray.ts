@@ -870,7 +870,9 @@ export class PropertyTray {
 
     const btnWidth = FIELD_HEIGHT;
 
-    const clamp = (n: number) => Math.max(1, Math.min(100, Math.round(n) || 1));
+    const lo = prop.min ?? 1;
+    const hi = prop.max ?? 100;
+    const clamp = (n: number) => Math.max(lo, Math.min(hi, Math.round(n) || lo));
 
     // minus button
     const minusBtn = this.createNumberButton("\u2212");
