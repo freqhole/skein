@@ -1,5 +1,6 @@
 import { WidgetRegistry } from "../src/widgets/widget-registry";
 import { registerBinWidget } from "./bin/index";
+import { audioRecordingWidget } from "./audio-recording";
 import { canvasInfoWidget } from "./canvas-info";
 import { doodleWidget } from "./doodle";
 import { fileWidget } from "./file";
@@ -15,6 +16,7 @@ import { peedeeeffWidget } from "./peedeeeff/index";
  */
 export function createTestRegistry(): WidgetRegistry {
   const registry = new WidgetRegistry();
+  registry.register(audioRecordingWidget);
   registry.register(canvasInfoWidget);
   registry.register(doodleWidget);
   registry.register(fileWidget);
@@ -27,6 +29,8 @@ export function createTestRegistry(): WidgetRegistry {
   return registry;
 }
 
+export { audioRecordingSchema, audioRecordingWidget } from "./audio-recording";
+export type { AudioRecordingState } from "./audio-recording";
 export { binSchema, binWidget, registerBinWidget } from "./bin/index";
 export type { BinState } from "./bin/index";
 
