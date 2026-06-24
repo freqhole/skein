@@ -240,6 +240,25 @@ export class WidgetFrame {
     // set up interaction events
     this.setupHeaderInteraction();
     this.setupBodyDragInteraction();
+
+    // drive multi-select body drag from the edit overlay (on top of content)
+    // when inert the overlay captures pointer events; if multiSelected, start a drag.
+    this.editOverlay.on("pointerdown", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      if (!this._multiSelected) return;
+      this.startDrag(e);
+    });
+    this.editOverlay.on("globalpointermove", (e: FederatedPointerEvent) => {
+      if (this._destroyed || !this.dragging) return;
+      this.updateDrag(e);
+    });
+    this.editOverlay.on("pointerup", () => {
+      if (this.dragging) this.finishDrag();
+    });
+    this.editOverlay.on("pointerupoutside", () => {
+      if (this.dragging) this.finishDrag();
+    });
+
     this.setupButtonInteraction();
 
     // initial draw
@@ -438,18 +457,24 @@ export class WidgetFrame {
     // no edit overlay in maximized mode
     if (this._maximized) {
       this.editOverlay.visible = false;
+      this.editOverlay.eventMode = "none";
       return;
     }
     this.editOverlay.clear();
     const isInert = this._lassoActive || this._multiSelected;
     if (!isInert || this._collapsed) {
       this.editOverlay.visible = false;
+      this.editOverlay.eventMode = "none";
       return;
     }
     const r = this.theme.frameCornerRadius;
     this.editOverlay.roundRect(0, 0, this._width, this._height, r);
     this.editOverlay.fill({ color: 0x000000, alpha: 0.8 });
     this.editOverlay.visible = true;
+    // intercept all pointer events while inert so widget content can't be
+    // interacted with; also serves as the drag surface for multi-select drag
+    this.editOverlay.eventMode = "static";
+    this.editOverlay.cursor = "grab";
   }
 
   /** redraw the content mask to match current dimensions and state. */
@@ -504,12 +529,14 @@ export class WidgetFrame {
     const titleMinWidth = 60;
     const availableForActions = w - titleMinWidth - systemButtonsWidth;
 
-    // walk custom actions left-to-right, measuring which fit
+    // walk custom actions left-to-right, measuring which fit.
+    // marginLeft on an action adds extra visual space to its left (group separator).
     let usedWidth = 0;
     let firstOverflowIndex = this.customActions.length; // assume all fit
 
     for (let i = 0; i < this.customActions.length; i++) {
-      const actionWidth = this.measureActionWidth(this.customActions[i]);
+      const action = this.customActions[i];
+      const actionWidth = this.measureActionWidth(action) + (action.marginLeft ?? 0);
 
       if (usedWidth + actionWidth > availableForActions) {
         firstOverflowIndex = i;
@@ -521,18 +548,25 @@ export class WidgetFrame {
     // set overflow actions
     this.overflowActions = this.customActions.slice(firstOverflowIndex);
 
-    // position fitting action containers from right-to-left, left of collapse button
-    const actionsRightEdge = w - systemButtonsWidth;
+    // position fitting action containers from right-to-left, left of collapse button.
+    // 4px right margin before system buttons, 3px gap between each action button.
+    // action.marginLeft creates extra space to the LEFT of that button (group separator):
+    // the gap between button[i-1] and button[i] = ACTION_GAP + button[i].marginLeft.
+    const ACTION_GAP = 4;
+    const actionsRightEdge = w - systemButtonsWidth - 4;
     let actionX = actionsRightEdge;
 
     // position in reverse so rightmost fitting action is nearest to system buttons
     for (let i = firstOverflowIndex - 1; i >= 0; i--) {
       const container = this.customActionContainers[i];
-      const actionWidth = this.measureActionWidth(this.customActions[i]);
-      actionX -= actionWidth;
+      const action = this.customActions[i];
+      const btnWidth = this.measureActionWidth(action);
+      actionX -= btnWidth;
       container.x = actionX;
       container.y = 4;
       container.visible = true;
+      // gap to next button on the left: base gap + this button's left margin
+      if (i > 0) actionX -= ACTION_GAP + (action.marginLeft ?? 0);
     }
 
     // hide overflow action containers
@@ -554,11 +588,15 @@ export class WidgetFrame {
 
   /** measure the display width of a custom action button */
   private measureActionWidth(action: HeaderAction): number {
-    // measure text width by creating a temporary text, or estimate from label length.
-    // for consistency, use fontSize * charCount * 0.6 + padding as a rough estimate,
-    // then we refine with actual container width if available.
+    if (action.renderIcon) {
+      // icon buttons are square (btnHeight) + 4px padding each side
+      const btnHeight = this.theme.frameHeaderHeight - 8;
+      return btnHeight + 8;
+    }
+    // use shortLabel for sizing when available (icon buttons are narrower)
     const charWidth = this.theme.fontSizeSmall * 0.6;
-    const textWidth = action.label.length * charWidth;
+    const displayLabel = action.shortLabel ?? action.label;
+    const textWidth = displayLabel.length * charWidth;
     const padding = 24; // 12px each side
     return textWidth + padding;
   }
@@ -802,6 +840,7 @@ export class WidgetFrame {
     this.dragStartLocal = { x: this.root.x, y: this.root.y };
     this.headerBg.cursor = "grabbing";
     this.bodyHitArea.cursor = "grabbing";
+    this.editOverlay.cursor = "grabbing";
 
     // notify manager so it can snapshot positions for batch drag
     this.callbacks.onDragStart?.();
@@ -824,6 +863,7 @@ export class WidgetFrame {
     this.dragging = false;
     this.headerBg.cursor = "grab";
     this.bodyHitArea.cursor = this._multiSelected ? "grab" : "default";
+    this.editOverlay.cursor = this._multiSelected ? "grab" : "default";
 
     // snap final position to grid
     const g = this.theme.gridSize;
@@ -909,8 +949,35 @@ export class WidgetFrame {
     const btnHeight = this.theme.frameHeaderHeight - 8;
     const container = new Container();
 
+    if (action.renderIcon) {
+      // icon button: fixed square size, icon drawn via callback
+      const iconSize = btnHeight;
+      const totalWidth = iconSize + 8; // 4px padding each side
+      const iconColor = action.active ? 0xffffff : this.theme.frameHeaderText;
+
+      const bg = new Graphics();
+      bg.roundRect(0, 0, totalWidth, btnHeight, 3);
+      bg.fill({ color: action.active ? this.theme.accent : this.theme.frameBorder });
+      bg.eventMode = "static";
+      bg.cursor = "pointer";
+      bg.on("pointertap", (e: FederatedPointerEvent) => {
+        e.stopPropagation();
+        action.onClick?.();
+      });
+      container.addChild(bg);
+
+      const iconContainer = new Container();
+      iconContainer.eventMode = "none";
+      iconContainer.x = 4;
+      iconContainer.y = 0;
+      action.renderIcon(iconContainer, iconSize, iconColor);
+      container.addChild(iconContainer);
+
+      return container;
+    }
+
     const label = new Text({
-      text: action.label,
+      text: action.shortLabel ?? action.label,
       resolution: this.theme.textResolution,
       style: {
         fontFamily: this.theme.fontFamily,
@@ -935,13 +1002,44 @@ export class WidgetFrame {
 
       const bg = new Graphics();
       bg.roundRect(0, 0, totalWidth, btnHeight, 3);
-      bg.fill({ color: this.theme.frameBorder });
+      bg.fill({ color: action.active ? this.theme.accent : this.theme.frameBorder });
       bg.eventMode = "static";
-      bg.cursor = "pointer";
+      bg.cursor = action.onDrag ? "ew-resize" : "pointer";
       bg.on("pointertap", (e: FederatedPointerEvent) => {
         e.stopPropagation();
         action.onClick?.();
       });
+
+      // drag scrubber support — used for continuously-adjustable values
+      if (action.onDrag) {
+        let dragging = false;
+        let lastDragX = 0;
+        bg.on("pointerdown", (e: FederatedPointerEvent) => {
+          dragging = true;
+          lastDragX = e.globalX;
+        });
+        bg.on("globalpointermove", (e: FederatedPointerEvent) => {
+          if (!dragging) return;
+          const delta = e.globalX - lastDragX;
+          if (Math.abs(delta) >= 1) {
+            lastDragX = e.globalX;
+            action.onDrag!(delta);
+            // update label text in-place so the user sees live value changes
+            // without recreating the button (which would break the drag)
+            const liveText = action.getLiveLabel?.();
+            if (liveText !== undefined) label.text = liveText;
+          }
+        });
+        bg.on("pointerup", () => {
+          dragging = false;
+          action.onDragEnd?.();
+        });
+        bg.on("pointerupoutside", () => {
+          dragging = false;
+          action.onDragEnd?.();
+        });
+      }
+
       container.addChild(bg);
 
       label.x = totalWidth / 2;
@@ -1255,7 +1353,7 @@ export class WidgetFrame {
 
       // content fills the viewport from y=0
       this.contentContainer.y = 0;
-      this.contentContainer.eventMode = "auto";
+      this.contentContainer.eventMode = "passive";
       this.contentContainer.interactiveChildren = true;
       this.bodyHitArea.eventMode = "none";
       // header interactivity only when visible
@@ -1278,8 +1376,6 @@ export class WidgetFrame {
     // restore maximize icon
     const maximizeLabel = this.maximizeBtn.getChildAt(1) as Text;
     maximizeLabel.text = "\u2922"; // ⤢ maximize icon
-
-    const isInert = this._lassoActive || this._multiSelected;
 
     // resize handles: visible only when single-selected and not collapsed
     this.updateHandleVisibility();
@@ -1313,9 +1409,10 @@ export class WidgetFrame {
     // content container position stays at y=0
     this.contentContainer.y = 0;
 
-    // content interactivity: inert when selected, interactive otherwise
-    this.contentContainer.eventMode = isInert ? "none" : "auto";
-    this.contentContainer.interactiveChildren = !isInert;
+    // content interactivity: always passive so pixi descends into children
+    // for hit testing. the editOverlay (on top) intercepts events when inert.
+    this.contentContainer.eventMode = "passive";
+    this.contentContainer.interactiveChildren = true;
 
     // update body hit area for multi-select drag
     this.updateBodyHitArea();

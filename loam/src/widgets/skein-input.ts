@@ -114,7 +114,6 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
     resolution: TEXT_RESOLUTION,
   });
   displayText.eventMode = "none";
-  displayText.x = PAD_H;
   displayText.y = Math.round((height - styleFontSize) / 2);
   displayText.mask = textMask;
   root.addChild(displayText);
@@ -130,10 +129,30 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
     resolution: TEXT_RESOLUTION,
   });
   placeholderText.eventMode = "none";
-  placeholderText.x = PAD_H;
   placeholderText.y = Math.round((height - styleFontSize) / 2);
   placeholderText.mask = textMask;
   root.addChild(placeholderText);
+
+  // position display text and placeholder according to the align option
+  const alignTexts = () => {
+    if (options.align === "center") {
+      displayText.anchor.set(0.5, 0);
+      displayText.x = Math.round(currentWidth / 2);
+      placeholderText.anchor.set(0.5, 0);
+      placeholderText.x = Math.round(currentWidth / 2);
+    } else if (options.align === "right") {
+      displayText.anchor.set(1, 0);
+      displayText.x = currentWidth - PAD_H;
+      placeholderText.anchor.set(1, 0);
+      placeholderText.x = currentWidth - PAD_H;
+    } else {
+      displayText.anchor.set(0, 0);
+      displayText.x = PAD_H;
+      placeholderText.anchor.set(0, 0);
+      placeholderText.x = PAD_H;
+    }
+  };
+  alignTexts();
 
   const syncDisplay = () => {
     displayText.text = currentValue;
@@ -237,6 +256,7 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
       currentWidth = w;
       drawBg(editing);
       drawTextMask();
+      alignTexts();
       syncDisplay();
     },
 

@@ -868,25 +868,9 @@ export class PropertyTray {
     let currentFieldWidth = fieldWidth;
     let currentValue = initialValue;
 
-    // field background
-    const fieldBg = new Graphics();
-    container.addChild(fieldBg);
-
-    // value text centered in the field
-    const valueText = new Text({
-      text: String(currentValue),
-      resolution: this.theme.textResolution,
-      style: {
-        fontFamily: this.theme.fontFamily,
-        fontSize: this.theme.fontSizeSmall,
-        fill: this.theme.frameHeaderText,
-      },
-    });
-    valueText.anchor.set(0.5, 0);
-    valueText.eventMode = "none";
-    container.addChild(valueText);
-
     const btnWidth = FIELD_HEIGHT;
+
+    const clamp = (n: number) => Math.max(1, Math.min(100, Math.round(n) || 1));
 
     // minus button
     const minusBtn = this.createNumberButton("\u2212");
@@ -896,22 +880,49 @@ export class PropertyTray {
     const plusBtn = this.createNumberButton("+");
     container.addChild(plusBtn.container);
 
-    const layout = () => {
-      fieldBg.clear();
-      fieldBg.roundRect(0, fieldY, currentFieldWidth, FIELD_HEIGHT, 4);
-      fieldBg.fill({ color: 0x141414 });
-      fieldBg.stroke({ color: this.theme.frameBorder, width: 1 });
+    // text-editable number field between the buttons
+    const inputWidth = () => currentFieldWidth - btnWidth * 2;
+    const inputHandle = createSkeinInput({
+      canvasElement: this.canvasElement,
+      width: inputWidth(),
+      height: FIELD_HEIGHT,
+      value: String(currentValue),
+      align: "center",
+      fontSize: this.theme.fontSizeSmall,
+      fontFamily: this.theme.fontFamily,
+      textColor: this.theme.frameHeaderText,
+      bgColor: 0x141414,
+      borderColor: this.theme.frameBorder,
+      borderActiveColor: this.theme.accent,
+      cornerRadius: 4,
+      onEnter: (val: string) => {
+        currentValue = clamp(parseFloat(val));
+        inputHandle.value = String(currentValue);
+        onChange(currentValue);
+      },
+      onChange: (val: string) => {
+        // live update only if it's a valid number
+        const n = parseFloat(val);
+        if (!isNaN(n)) {
+          currentValue = clamp(n);
+          onChange(currentValue);
+        }
+      },
+    });
+    container.addChild(inputHandle.input);
 
+    const layout = () => {
       minusBtn.container.x = 0;
       minusBtn.container.y = fieldY;
       minusBtn.setSize(btnWidth, FIELD_HEIGHT);
 
+      inputHandle.input.x = btnWidth;
+      inputHandle.input.y = fieldY;
+      inputHandle.setWidth(inputWidth());
+
       plusBtn.container.x = currentFieldWidth - btnWidth;
       plusBtn.container.y = fieldY;
       plusBtn.setSize(btnWidth, FIELD_HEIGHT);
-
-      valueText.x = Math.round(currentFieldWidth / 2);
-      valueText.y = fieldY + Math.round((FIELD_HEIGHT - valueText.height) / 2);
     };
     layout();
 
@@ -923,8 +934,8 @@ export class PropertyTray {
       let holdStartTime = 0;
 
       const applyDelta = () => {
-        currentValue += delta;
-        valueText.text = String(currentValue);
+        currentValue = clamp(currentValue + delta);
+        inputHandle.value = String(currentValue);
         onChange(currentValue);
       };
 
@@ -971,7 +982,6 @@ export class PropertyTray {
       btn.on("pointerup", stopRepeat);
       btn.on("pointerupoutside", stopRepeat);
       btn.on("pointercancel", stopRepeat);
-      // also stop on pointerleave in case the pointer leaves the button
       btn.on("pointerleave", stopRepeat);
     };
 
@@ -985,14 +995,15 @@ export class PropertyTray {
       height: totalHeight,
       container,
       update(value: unknown) {
-        currentValue = Number(value) || 0;
-        valueText.text = String(currentValue);
+        currentValue = clamp(Number(value) || 1);
+        inputHandle.value = String(currentValue);
       },
       setWidth(fw: number) {
         currentFieldWidth = fw;
         layout();
       },
       destroy() {
+        inputHandle.destroy();
         container.destroy({ children: true });
       },
     };
@@ -1163,6 +1174,9 @@ export class PropertyTray {
 
     // palette popup container (hidden by default)
     let paletteContainer: Container | null = null;
+    // live DOM color input — created when the rainbow swatch is clicked,
+    // lives until the palette closes or a color is picked.
+    let liveColorInput: HTMLInputElement | null = null;
 
     const drawSwatch = () => {
       swatch.clear();
@@ -1200,6 +1214,11 @@ export class PropertyTray {
     drawFieldLayout();
 
     const closePalette = () => {
+      // remove any live color input — this also closes the native picker
+      if (liveColorInput && document.body.contains(liveColorInput)) {
+        document.body.removeChild(liveColorInput);
+      }
+      liveColorInput = null;
       if (paletteContainer) {
         if (paletteContainer.parent) {
           paletteContainer.parent.removeChild(paletteContainer);
@@ -1232,7 +1251,8 @@ export class PropertyTray {
         : COLOR_PALETTE.filter((c) => c !== TRANSPARENT_COLOR);
 
       const palettePad = 6;
-      const rows = Math.ceil(palette.length / PALETTE_COLS);
+      // +1 for the custom "pick any color" swatch appended after the palette loop
+      const rows = Math.ceil((palette.length + 1) / PALETTE_COLS);
       const paletteW = PALETTE_COLS * (SWATCH_SIZE + SWATCH_GAP) - SWATCH_GAP + palettePad * 2;
       const paletteH = rows * (SWATCH_SIZE + SWATCH_GAP) - SWATCH_GAP + palettePad * 2;
 
@@ -1301,6 +1321,115 @@ export class PropertyTray {
         });
 
         paletteContainer.addChild(sw);
+      }
+
+      // ── custom color picker swatch ─────────────────────────────────────────
+      // placed at the next grid position after all palette swatches.
+      // clicking it opens the native system color picker via a hidden <input>.
+      {
+        const customIdx = palette.length;
+        const customCol = customIdx % PALETTE_COLS;
+        const customRow = Math.floor(customIdx / PALETTE_COLS);
+        const sx = palettePad + customCol * (SWATCH_SIZE + SWATCH_GAP);
+        const sy = palettePad + customRow * (SWATCH_SIZE + SWATCH_GAP);
+        const half = Math.floor(SWATCH_SIZE / 2);
+
+        const csw = new Graphics();
+        const drawCustomSwatch = (active: boolean) => {
+          csw.clear();
+          // 4-quadrant rainbow fill to signal "any color"
+          csw.rect(sx, sy, half, half);
+          csw.fill({ color: 0xff5555 });
+          csw.rect(sx + half, sy, SWATCH_SIZE - half, half);
+          csw.fill({ color: 0x55cc55 });
+          csw.rect(sx, sy + half, half, SWATCH_SIZE - half);
+          csw.fill({ color: 0x5588ff });
+          csw.rect(sx + half, sy + half, SWATCH_SIZE - half, SWATCH_SIZE - half);
+          csw.fill({ color: 0xcc55cc });
+          csw.roundRect(sx, sy, SWATCH_SIZE, SWATCH_SIZE, 3);
+          csw.stroke({ color: active ? this.theme.accent : 0x555555, width: active ? 2 : 1 });
+        };
+        drawCustomSwatch(false);
+
+        csw.eventMode = "static";
+        csw.cursor = "pointer";
+        csw.on("pointerover", () => drawCustomSwatch(true));
+        csw.on("pointerout", () => drawCustomSwatch(false));
+
+        csw.on("pointerdown", (e: FederatedPointerEvent) => {
+          e.stopPropagation();
+
+          // remove any previously-created input that didn't get cleaned up
+          if (liveColorInput && document.body.contains(liveColorInput)) {
+            document.body.removeChild(liveColorInput);
+          }
+
+          const input = document.createElement("input");
+          input.type = "color";
+          if (currentColor !== TRANSPARENT_COLOR) {
+            input.value = "#" + (currentColor & 0xffffff).toString(16).padStart(6, "0");
+          }
+
+          // position a real-sized input element over the swatch using the
+          // same getBoundingClientRect approach as dom-overlay / skein-input.
+          // a zero-size or fully-hidden input won't open the native picker
+          // reliably in WKWebView (Tauri), so we give it real dimensions at
+          // the swatch's screen position.
+          const swatchGlobal = csw.toGlobal({ x: sx, y: sy });
+          const canvasRect = this.canvasElement.getBoundingClientRect();
+          const screenX = canvasRect.left + swatchGlobal.x;
+          const screenY = canvasRect.top + swatchGlobal.y;
+
+          input.style.cssText = [
+            "position:fixed",
+            `left:${screenX}px`,
+            `top:${screenY}px`,
+            `width:${SWATCH_SIZE}px`,
+            `height:${SWATCH_SIZE}px`,
+            "opacity:0.001",
+            "border:none",
+            "padding:0",
+            "z-index:10001",
+          ].join(";");
+
+          liveColorInput = input;
+          document.body.appendChild(input);
+
+          // update color on both input and change — macOS WKWebView fires
+          // "change" on every slider interaction (not just on dismissal), so
+          // treating either event as a "final close" signal would close the
+          // picker immediately on slider click.
+          // closure happens entirely through closePalette() which is called
+          // when the user clicks elsewhere (tray root pointerdown handler).
+          const updateColor = () => {
+            const hex = parseInt(input.value.slice(1), 16);
+            currentColor = hex;
+            hexText.text = formatHex(currentColor);
+            drawSwatch();
+            onChange(currentColor);
+          };
+          input.addEventListener("input", updateColor);
+          input.addEventListener("change", updateColor);
+
+          // requestAnimationFrame ensures the input is laid out before we
+          // call showPicker() — without this the first click does nothing
+          // in WKWebView (Tauri) because the element isn't yet in the render tree.
+          requestAnimationFrame(() => {
+            const opened = (input as any).showPicker
+              ? (() => {
+                  try {
+                    (input as any).showPicker();
+                    return true;
+                  } catch {
+                    return false;
+                  }
+                })()
+              : false;
+            if (!opened) input.click();
+          });
+        });
+
+        paletteContainer.addChild(csw);
       }
 
       // position below the field, accounting for the control's offset in the tray
@@ -1788,6 +1917,7 @@ export class PropertyTray {
       },
     });
     deleteText.anchor.set(0.5, 0.5);
+    deleteText.eventMode = "none";
 
     // confirmation elements
     const confirmContainer = new Container();
@@ -1802,6 +1932,7 @@ export class PropertyTray {
         fill: 0xaaaaaa,
       },
     });
+    confirmText.eventMode = "none";
 
     // "yes" button
     const yesBg = new Graphics();
@@ -1815,6 +1946,7 @@ export class PropertyTray {
       },
     });
     yesText.anchor.set(0.5, 0.5);
+    yesText.eventMode = "none";
 
     // "cancel" button
     const cancelBg = new Graphics();
@@ -1828,6 +1960,7 @@ export class PropertyTray {
       },
     });
     cancelText.anchor.set(0.5, 0.5);
+    cancelText.eventMode = "none";
 
     const drawDelete = () => {
       deleteBg.clear();

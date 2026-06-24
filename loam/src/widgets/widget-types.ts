@@ -52,8 +52,55 @@ export interface HeaderAction {
   label: string;
   /** if true, rendered as a non-clickable info badge (e.g. item count) */
   isInfo?: boolean;
+  /** when true, the button background is filled with the accent (magenta) color */
+  active?: boolean;
+  /**
+   * optional compact label used in the header button when space is tight.
+   * the full `label` is still shown in the hamburger overflow flyout.
+   * use for icon characters (e.g. "✕" for eraser) where a short glyph is
+   * more readable than the full word at small button sizes.
+   * ignored when `renderIcon` is provided.
+   */
+  shortLabel?: string;
+  /**
+   * optional icon renderer — when provided, the button displays a drawn icon
+   * instead of text.  the callback receives a Container to add child Graphics
+   * into, the available square size in pixels, and the recommended foreground
+   * color (white when active/magenta, theme text color when inactive).
+   * using a Container allows separate rotation groups (e.g. a rotated eraser
+   * body + non-rotated dashes beneath it).
+   */
+  renderIcon?: (container: Container, size: number, color: number) => void;
+  /**
+   * extra space (px) added to the left of this button in the header.
+   * use to visually separate button groups (e.g. a gap before the opacity scrubber).
+   */
+  marginLeft?: number;
   /** click handler — ignored when isInfo is true */
   onClick?: () => void;
+  /**
+   * optional drag handler — when provided the button becomes a drag scrubber.
+   * called on each pointermove while the button is pressed, with the horizontal
+   * delta in pixels since the last call. use for continuously-adjustable values
+   * like opacity.
+   *
+   * important: do NOT call setHeaderActions() inside onDrag — that destroys and
+   * recreates the button mid-drag, breaking the interaction after a single pixel.
+   * use onDragEnd to refresh the header once the drag is complete.
+   */
+  onDrag?: (deltaX: number) => void;
+  /**
+   * called once when a drag scrubber gesture ends (pointerup / pointerupoutside).
+   * the right place to call setHeaderActions() to update the displayed label.
+   */
+  onDragEnd?: () => void;
+  /**
+   * optional live label provider for drag scrubbers.
+   * called after each onDrag tick to update the button text in real-time
+   * without recreating the button. return the string to display.
+   * if omitted, the label stays fixed during the drag and updates only on onDragEnd.
+   */
+  getLiveLabel?: () => string;
 }
 
 /**

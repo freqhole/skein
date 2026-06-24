@@ -1,6 +1,7 @@
 import { WidgetRegistry } from "../src/widgets/widget-registry";
 import { registerBinWidget } from "./bin/index";
 import { canvasInfoWidget } from "./canvas-info";
+import { doodleWidget } from "./doodle";
 import { fileWidget } from "./file";
 import { imageWidget } from "./image";
 import { labelWidget } from "./label";
@@ -15,6 +16,7 @@ import { peedeeeffWidget } from "./peedeeeff/index";
 export function createTestRegistry(): WidgetRegistry {
   const registry = new WidgetRegistry();
   registry.register(canvasInfoWidget);
+  registry.register(doodleWidget);
   registry.register(fileWidget);
   registry.register(imageWidget);
   registry.register(labelWidget);
@@ -29,6 +31,8 @@ export { binSchema, binWidget, registerBinWidget } from "./bin/index";
 export type { BinState } from "./bin/index";
 
 export { canvasInfoSchema, canvasInfoWidget } from "./canvas-info";
+export { doodleSchema, doodleWidget } from "./doodle";
+export type { DoodleState, DoodleStroke } from "./doodle";
 export type { CanvasInfoState } from "./canvas-info";
 export { fileSchema, fileWidget } from "./file";
 export type { FileState } from "./file";
