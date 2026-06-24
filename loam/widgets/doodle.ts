@@ -514,6 +514,80 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     let isDraggingOpacity = false;
     let isDraggingWidth = false;
 
+    // ── header colour picker (DOM input, lives as long as it's open) ─────────
+    let liveColorInput: HTMLInputElement | null = null;
+    let colorCleanupTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const openHeaderColorPicker = (screenX: number, screenY: number) => {
+      // remove any prior picker
+      if (liveColorInput && document.body.contains(liveColorInput)) {
+        document.body.removeChild(liveColorInput);
+      }
+      if (colorCleanupTimer !== null) {
+        clearTimeout(colorCleanupTimer);
+        colorCleanupTimer = null;
+      }
+
+      const { penColor } = ctx.doc.current;
+      const input = document.createElement("input");
+      input.type = "color";
+      if (!isTransparent(penColor)) {
+        input.value = "#" + (penColor & 0xffffff).toString(16).padStart(6, "0");
+      }
+      const SZ = 24;
+      input.style.cssText = [
+        "position:fixed",
+        `left:${Math.round(screenX)}px`,
+        `top:${Math.round(screenY)}px`,
+        `width:${SZ}px`,
+        `height:${SZ}px`,
+        "opacity:0.001",
+        "border:none",
+        "padding:0",
+        "z-index:10001",
+      ].join(";");
+
+      liveColorInput = input;
+      document.body.appendChild(input);
+
+      // update pen color live; cancel any pending cleanup
+      const updateColor = () => {
+        if (colorCleanupTimer !== null) {
+          clearTimeout(colorCleanupTimer);
+          colorCleanupTimer = null;
+        }
+        const hex = parseInt(input.value.slice(1), 16);
+        ctx.doc.change((d) => {
+          d.penColor = hex;
+        });
+      };
+      input.addEventListener("input", updateColor);
+      input.addEventListener("change", updateColor);
+
+      // cleanup on blur: generous timeout lets "Show Colors…" stay open
+      input.addEventListener("blur", () => {
+        colorCleanupTimer = setTimeout(() => {
+          if (document.body.contains(input)) document.body.removeChild(input);
+          if (liveColorInput === input) liveColorInput = null;
+          colorCleanupTimer = null;
+        }, 3000);
+      });
+
+      requestAnimationFrame(() => {
+        const opened = (input as any).showPicker
+          ? (() => {
+              try {
+                (input as any).showPicker();
+                return true;
+              } catch {
+                return false;
+              }
+            })()
+          : false;
+        if (!opened) input.click();
+      });
+    };
+
     const makeHeaderActions = (): HeaderAction[] => {
       const { activeTool, brushShape, penOpacity, penWidth } = ctx.doc.current;
       const shape = brushShape ?? "circle";
@@ -566,6 +640,44 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
           },
           active: activeTool === "eraser",
           onClick: () => setTool(activeTool === "eraser" ? "pen" : "eraser"),
+        },
+        {
+          id: "penColor",
+          label: "pen color",
+          marginLeft: 4,
+          renderIcon: (parent: Container, size: number, _iconColor: number) => {
+            const pc = ctx.doc.current.penColor;
+            const gfx = new Graphics();
+            const r = Math.round(size * 0.36);
+            const cx = size / 2;
+            const cy = size / 2;
+            if (isTransparent(pc)) {
+              // mini checkerboard for transparent
+              gfx.rect(cx - r, cy - r, r, r);
+              gfx.fill({ color: 0xcccccc });
+              gfx.rect(cx, cy, r, r);
+              gfx.fill({ color: 0xcccccc });
+              gfx.rect(cx, cy - r, r, r);
+              gfx.fill({ color: 0x888888 });
+              gfx.rect(cx - r, cy, r, r);
+              gfx.fill({ color: 0x888888 });
+            } else {
+              gfx.circle(cx, cy, r);
+              gfx.fill({ color: pc });
+            }
+            // ring outline for legibility on any background
+            gfx.circle(cx, cy, r);
+            gfx.stroke({ color: 0x000000, width: 1, alpha: 0.3 });
+            gfx.circle(cx, cy, r + 1);
+            gfx.stroke({ color: 0xffffff, width: 0.8, alpha: 0.2 });
+            parent.addChild(gfx);
+          },
+          onClick: (pos) => {
+            const canvasRect = ctx.canvasElement.getBoundingClientRect();
+            const sx = pos ? canvasRect.left + pos.x : canvasRect.left + 60;
+            const sy = pos ? canvasRect.top + pos.y : canvasRect.top + 40;
+            openHeaderColorPicker(sx, sy);
+          },
         },
         {
           id: "shape-circle",
@@ -687,6 +799,10 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       widgetActions,
       destroy() {
         document.removeEventListener("keydown", handleKeyDown);
+        if (colorCleanupTimer !== null) clearTimeout(colorCleanupTimer);
+        if (liveColorInput && document.body.contains(liveColorInput)) {
+          document.body.removeChild(liveColorInput);
+        }
         unsub();
         container.destroy({ children: true });
       },

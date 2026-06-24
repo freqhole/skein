@@ -76,8 +76,11 @@ export interface HeaderAction {
    * use to visually separate button groups (e.g. a gap before the opacity scrubber).
    */
   marginLeft?: number;
-  /** click handler — ignored when isInfo is true */
-  onClick?: () => void;
+  /** click handler — ignored when isInfo is true.
+   *  receives the tap's global PixiJS stage position so handlers that need
+   *  to open a DOM popup (e.g. a colour picker) can compute screen coords.
+   */
+  onClick?: (globalPos?: { x: number; y: number }) => void;
   /**
    * optional drag handler — when provided the button becomes a drag scrubber.
    * called on each pointermove while the button is pressed, with the horizontal

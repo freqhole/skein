@@ -962,8 +962,9 @@ export class WidgetFrame {
       bg.cursor = "pointer";
       bg.on("pointertap", (e: FederatedPointerEvent) => {
         e.stopPropagation();
-        action.onClick?.();
+        action.onClick?.({ x: e.globalX, y: e.globalY });
       });
+
       container.addChild(bg);
 
       const iconContainer = new Container();
@@ -982,7 +983,7 @@ export class WidgetFrame {
       style: {
         fontFamily: this.theme.fontFamily,
         fontSize: this.theme.fontSizeSmall,
-        fill: action.isInfo ? 0x666666 : this.theme.frameHeaderText,
+        fill: action.isInfo ? 0x666666 : action.active ? 0xffffff : this.theme.frameHeaderText,
       },
     });
     label.anchor.set(0.5);
@@ -1007,7 +1008,7 @@ export class WidgetFrame {
       bg.cursor = action.onDrag ? "ew-resize" : "pointer";
       bg.on("pointertap", (e: FederatedPointerEvent) => {
         e.stopPropagation();
-        action.onClick?.();
+        action.onClick?.({ x: e.globalX, y: e.globalY });
       });
 
       // drag scrubber support — used for continuously-adjustable values
