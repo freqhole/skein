@@ -218,6 +218,13 @@ export interface WidgetController {
   /** optional action buttons shown in the property tray when this widget is selected.
    *  used for widget-specific operations like "tidy" in the bin widget. */
   widgetActions?: WidgetAction[];
+  /**
+   * instance-level editable props override. when present, the property tray
+   * uses these instead of the factory's static `editableProps`. use this
+   * when prop definitions depend on instance state — e.g. a select whose
+   * options are populated at runtime (audio device list, etc.).
+   */
+  editableProps?: WidgetPropDef[];
 }
 
 /**
@@ -312,7 +319,13 @@ export interface WidgetPropDef {
   key: string;
   label: string;
   type: "string" | "number" | "boolean" | "color" | "select" | "image";
-  options?: string[];
+  /**
+   * static option list for "select" props.
+   * may also be a function — called fresh each time the dropdown opens,
+   * so runtime-populated lists (e.g. enumerated audio devices) always reflect
+   * the latest state.
+   */
+  options?: string[] | (() => string[]);
   default?: unknown;
   /** for number props: minimum allowed value (defaults to 1 if omitted) */
   min?: number;

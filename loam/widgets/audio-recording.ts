@@ -2,7 +2,7 @@
 //
 // architecture:
 //   container (root, eventMode=static)
-//     bgGfx    — background fill + hit area
+//     bgGfx    — background fill + border
 //     waveGfx  — waveform visualization (live during recording, static after)
 //     micGfx   — microphone icon (idle state only)
 //     btnGfx   — primary action button (record / stop / play / pause)
@@ -19,22 +19,26 @@
 //   immediate post-record playback uses URL.createObjectURL() on the in-memory blob.
 //   restore-from-doc playback uses getBlobData() which reads OPFS first, then
 //   falls back to the rust-side blob_get dispatch in tauri mode.
+//   waveformSamples are stored in the Automerge doc so collaborators can see
+//   the waveform without playing the audio.
 //
 // device selection:
-//   selected deviceId persisted in localStorage (key: skein-audio-deviceId).
+//   selected deviceId persisted.
 //   device labels are only available after mic permission is granted; we
 //   re-enumerate after the first successful getUserMedia call.
+//   device picker is in the property tray (widgetActions), not the header bar.
 
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { z } from "zod";
 import { getBlobData, storeBlobFromFile } from "../src/storage/skein-blob-store";
-import type {
-  CompactInfo,
-  HeaderAction,
-  WidgetAction,
-  WidgetController,
-  WidgetFactory,
-  WidgetMountContext,
+import {
+  isTransparent,
+  type CompactInfo,
+  type HeaderAction,
+  type WidgetAction,
+  type WidgetController,
+  type WidgetFactory,
+  type WidgetMountContext,
 } from "../src/widgets/widget-types";
 
 // ---------------------------------------------------------------------------
@@ -44,7 +48,7 @@ import type {
 export const audioRecordingSchema = z.object({
   /** sha256 blob ID of the recorded audio; empty = no recording */
   blobId: z.string().default(""),
-  /** original filename (e.g. "recording-2026-06-23T10-00-00.webm") */
+  /** original filename */
   filename: z.string().default(""),
   /** MIME type of the recorded audio */
   mime: z.string().default("audio/webm"),
@@ -52,11 +56,40 @@ export const audioRecordingSchema = z.object({
   size: z.number().default(0),
   /** recording duration in seconds */
   duration: z.number().default(0),
-  /** widget background color */
-  bgColor: z.number().default(0x1a1a2e),
+  /** widget background color; -1 = transparent */
+  bgColor: z.number().default(0x1e1e2e),
+  /** border color; -1 = transparent (no border) */
+  borderColor: z.number().default(-1),
+  /** border width in pixels; 0 = no border */
+  borderWidth: z.number().default(0),
+  /**
+   * downsampled amplitude envelope (0–1 per sample) stored after recording.
+   * lets collaborators see the waveform shape without needing the audio file.
+   */
+  waveformSamples: z.array(z.number()).default([]),
+  /**
+   * preferred audio input device label (human-readable).
+   * stored in the doc so the widget remembers the chosen device.
+   * empty string = system default. matched against enumerateDevices() labels;
+   * if the label isn\'t found on this machine, recording falls back to default.
+   */
+  deviceLabel: z.string().default(""),
 });
 
 export type AudioRecordingState = z.infer<typeof audioRecordingSchema>;
+
+// ---------------------------------------------------------------------------
+// colors
+// ---------------------------------------------------------------------------
+
+const COLOR_RECORD = 0xef4444; // red — record button / live waveform
+const COLOR_RECORD_DIM = 0x7f1d1d; // dimmed red — requesting state
+const COLOR_PRIMARY = 0xd946ef; // magenta — ready state, play button, waveform
+const COLOR_PLAY = 0xa21caf; // deep magenta — played-progress bars during playback
+const COLOR_MUTED = 0x334155; // slate — processing / disabled
+const COLOR_TEXT = 0xf8fafc; // near-white — status text
+const COLOR_MUTED_TEXT = 0x94a3b8; // slate-400 — info / secondary text
+const COLOR_ERROR = 0xf87171; // red-400 — error message
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -125,7 +158,9 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
   },
   schema: audioRecordingSchema,
   editableProps: [
-    { key: "bgColor", label: "background", type: "color" as const, default: 0x1a1a2e },
+    { key: "bgColor", label: "background", type: "color" as const, default: 0x1e1e2e },
+    { key: "borderColor", label: "border", type: "color" as const, default: -1 },
+    { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
   ],
 
   getCompactInfo: (state: AudioRecordingState): CompactInfo => ({
@@ -152,8 +187,11 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     let elapsedSecs = 0;
     /** amplitude samples (0–1) collected during recording */
     let liveSamples: number[] = [];
-    /** downsampled snapshot used for static waveform after recording */
-    let capturedSamples: number[] = [];
+    /**
+     * amplitude snapshot for display — loaded from doc on mount (if present)
+     * and written back to doc after recording.
+     */
+    let capturedSamples: number[] = [...(ctx.doc.current.waveformSamples ?? [])];
     let waveRafId: number | null = null;
 
     // ── transient playback state ─────────────────────────────────────────────
@@ -164,120 +202,36 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     let playRafId: number | null = null;
 
     // ── device selection state ───────────────────────────────────────────────
-    const DEVICE_KEY = "skein-audio-deviceId";
-    let selectedDeviceId: string = (() => {
-      try {
-        return localStorage.getItem(DEVICE_KEY) ?? "";
-      } catch {
-        return "";
-      }
-    })();
-    /** cached list from the last enumerateDevices() call */
+    // cachedDevices is populated by enumerateDevices() — labels are empty until
+    // microphone permission is granted, so we re-enumerate after the first
+    // successful getUserMedia call.
     let cachedDevices: MediaDeviceInfo[] = [];
-    let devicePickerEl: HTMLSelectElement | null = null;
 
     const enumerateDevices = async (): Promise<void> => {
       try {
         const all = await navigator.mediaDevices.enumerateDevices();
         cachedDevices = all.filter((d) => d.kind === "audioinput");
-        // if the stored deviceId no longer appears in the list, clear it
-        if (selectedDeviceId && !cachedDevices.find((d) => d.deviceId === selectedDeviceId)) {
-          selectedDeviceId = "";
-          try {
-            localStorage.removeItem(DEVICE_KEY);
-          } catch {
-            /* */
-          }
-        }
-        ctx.setHeaderActions?.(makeHeaderActions());
       } catch {
-        // enumerateDevices not available (e.g. no HTTPS without localhost)
+        // enumerateDevices may be unavailable without a secure context
       }
     };
 
-    const currentDeviceLabel = (): string => {
-      if (!selectedDeviceId) return "default mic";
-      const found = cachedDevices.find((d) => d.deviceId === selectedDeviceId);
-      if (!found || !found.label) return `mic ${selectedDeviceId.slice(0, 6)}`;
-      // truncate long labels (e.g. "MacBook Pro Microphone (Built-in)")
-      const lbl = found.label;
-      return lbl.length > 22 ? lbl.slice(0, 20) + "…" : lbl;
+    // build the options list for the device select prop.
+    // called fresh each time the property tray opens the dropdown.
+    const DEVICE_DEFAULT = "System default";
+    const deviceOptions = (): string[] => [
+      DEVICE_DEFAULT,
+      ...cachedDevices.map((d) => d.label || `Microphone (${d.deviceId.slice(0, 8)}…)`),
+    ];
+
+    // resolve the deviceId to use for getUserMedia from the stored label.
+    // treats both empty string (legacy) and "System default" as no constraint.
+    const resolveDeviceId = (): string | undefined => {
+      const label = ctx.doc.current.deviceLabel;
+      if (!label || label === DEVICE_DEFAULT) return undefined;
+      return cachedDevices.find((d) => d.label === label)?.deviceId;
     };
 
-    const openDevicePicker = async (screenX: number, screenY: number) => {
-      // tear down any existing picker
-      devicePickerEl?.remove();
-      devicePickerEl = null;
-
-      // always re-enumerate so labels are fresh after permission grant
-      await enumerateDevices();
-      if (cachedDevices.length === 0) return;
-
-      const select = document.createElement("select");
-      // show as a listbox so options are immediately visible (no second click)
-      select.size = Math.min(cachedDevices.length + 1, 8);
-      select.style.cssText = [
-        "position:fixed",
-        `left:${Math.round(screenX)}px`,
-        `top:${Math.round(screenY)}px`,
-        "min-width:200px",
-        "max-width:320px",
-        "background:#1a1a2e",
-        "color:#cccccc",
-        "border:1px solid #444",
-        "border-radius:6px",
-        "padding:2px",
-        "font-size:12px",
-        "font-family:system-ui,sans-serif",
-        "z-index:10002",
-        "cursor:pointer",
-        "outline:none",
-        "box-shadow:0 4px 16px rgba(0,0,0,0.5)",
-      ].join(";");
-
-      // "system default" option
-      const defaultOpt = document.createElement("option");
-      defaultOpt.value = "";
-      defaultOpt.text = "System default";
-      if (!selectedDeviceId) defaultOpt.selected = true;
-      select.appendChild(defaultOpt);
-
-      for (const device of cachedDevices) {
-        const opt = document.createElement("option");
-        opt.value = device.deviceId;
-        opt.text = device.label || `Microphone (${device.deviceId.slice(0, 8)}…)`;
-        if (device.deviceId === selectedDeviceId) opt.selected = true;
-        select.appendChild(opt);
-      }
-
-      devicePickerEl = select;
-      document.body.appendChild(select);
-      select.focus();
-
-      const close = () => {
-        select.remove();
-        if (devicePickerEl === select) devicePickerEl = null;
-      };
-
-      select.addEventListener("change", () => {
-        selectedDeviceId = select.value;
-        try {
-          localStorage.setItem(DEVICE_KEY, selectedDeviceId);
-        } catch {
-          /* */
-        }
-        close();
-        ctx.setHeaderActions?.(makeHeaderActions());
-      });
-
-      // close on blur (click-away or focus lost)
-      select.addEventListener("blur", () => {
-        // small delay so click-on-option fires change before blur teardown
-        setTimeout(close, 150);
-      });
-    };
-
-    // start enumerating immediately (labels will be empty until permission granted)
     void enumerateDevices();
 
     // ── pixi containers ──────────────────────────────────────────────────────
@@ -307,7 +261,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       style: {
         fontFamily: "system-ui, -apple-system, sans-serif",
         fontSize: 13,
-        fill: 0xbbbbbb,
+        fill: COLOR_TEXT,
         align: "center",
       },
       resolution: 2,
@@ -321,7 +275,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       style: {
         fontFamily: "system-ui, -apple-system, sans-serif",
         fontSize: 11,
-        fill: 0x777777,
+        fill: COLOR_MUTED_TEXT,
         align: "center",
       },
       resolution: 2,
@@ -335,7 +289,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       style: {
         fontFamily: "system-ui, -apple-system, sans-serif",
         fontSize: 12,
-        fill: 0xff8888,
+        fill: COLOR_ERROR,
         align: "center",
         wordWrap: true,
         wordWrapWidth: cw - 32,
@@ -352,30 +306,39 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     const STAT_TOP = 12;
     const INFO_TOP = 28;
 
-    // ── helpers: drawing ─────────────────────────────────────────────────────
+    // ── drawing helpers ──────────────────────────────────────────────────────
     const drawBg = () => {
-      const { bgColor } = ctx.doc.current;
+      const { bgColor, borderColor, borderWidth } = ctx.doc.current;
       bgGfx.clear();
-      bgGfx.rect(0, 0, cw, ch);
-      bgGfx.fill({ color: bgColor });
+
+      if (!isTransparent(bgColor)) {
+        bgGfx.rect(0, 0, cw, ch);
+        bgGfx.fill({ color: bgColor });
+      }
+
+      const bw = borderWidth ?? 0;
+      if (bw > 0 && !isTransparent(borderColor ?? -1)) {
+        bgGfx.rect(0, 0, cw, ch);
+        bgGfx.stroke({ color: borderColor, width: bw });
+      }
+
       bgGfx.hitArea = new Rectangle(0, 0, cw, ch);
     };
 
     const drawMic = (visible: boolean) => {
       micGfx.clear();
       if (!visible) return;
-      // microphone icon: capsule + stand + base
       const cx = cw / 2;
       const cy = ch / 2 - 10;
-      const cw2 = 14;
-      const ch2 = 22;
-      const r = cw2 / 2;
-      micGfx.roundRect(cx - cw2 / 2, cy - ch2 / 2, cw2, ch2, r);
-      micGfx.fill({ color: 0xffffff, alpha: 0.3 });
-      micGfx.rect(cx - 1, cy + ch2 / 2, 2, 8);
-      micGfx.fill({ color: 0xffffff, alpha: 0.25 });
-      micGfx.rect(cx - 8, cy + ch2 / 2 + 7, 16, 2);
-      micGfx.fill({ color: 0xffffff, alpha: 0.25 });
+      const mw = 14;
+      const mh = 22;
+      const r = mw / 2;
+      micGfx.roundRect(cx - mw / 2, cy - mh / 2, mw, mh, r);
+      micGfx.fill({ color: COLOR_PRIMARY, alpha: 0.35 });
+      micGfx.rect(cx - 1, cy + mh / 2, 2, 8);
+      micGfx.fill({ color: COLOR_MUTED_TEXT, alpha: 0.4 });
+      micGfx.rect(cx - 8, cy + mh / 2 + 7, 16, 2);
+      micGfx.fill({ color: COLOR_MUTED_TEXT, alpha: 0.4 });
     };
 
     const btnCY = () => ch - BTN_R - BTN_BOT;
@@ -388,20 +351,19 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       switch (recState) {
         case "idle":
           btnGfx.circle(bx, by, BTN_R);
-          btnGfx.fill({ color: 0xdd2222 });
-          // inner record dot
+          btnGfx.fill({ color: COLOR_RECORD });
           btnGfx.circle(bx, by, BTN_R * 0.42);
           btnGfx.fill({ color: 0xffffff, alpha: 0.88 });
           break;
 
         case "requesting":
           btnGfx.circle(bx, by, BTN_R);
-          btnGfx.fill({ color: 0x882222 });
+          btnGfx.fill({ color: COLOR_RECORD_DIM });
           break;
 
         case "recording": {
           btnGfx.circle(bx, by, BTN_R);
-          btnGfx.fill({ color: 0xdd2222 });
+          btnGfx.fill({ color: COLOR_RECORD });
           const sq = BTN_R * 0.4;
           btnGfx.rect(bx - sq, by - sq, sq * 2, sq * 2);
           btnGfx.fill({ color: 0xffffff, alpha: 0.88 });
@@ -410,13 +372,12 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
 
         case "processing":
           btnGfx.circle(bx, by, BTN_R);
-          btnGfx.fill({ color: 0x444444 });
+          btnGfx.fill({ color: COLOR_MUTED });
           break;
 
         case "ready": {
           btnGfx.circle(bx, by, BTN_R);
-          btnGfx.fill({ color: 0x22aa55 });
-          // right-pointing triangle, nudged right for optical centering
+          btnGfx.fill({ color: COLOR_PRIMARY });
           const ox = 3;
           btnGfx.moveTo(bx - BTN_R * 0.3 + ox, by - BTN_R * 0.44);
           btnGfx.lineTo(bx + BTN_R * 0.5 + ox, by);
@@ -428,7 +389,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
 
         case "playing": {
           btnGfx.circle(bx, by, BTN_R);
-          btnGfx.fill({ color: 0x2277cc });
+          btnGfx.fill({ color: COLOR_PLAY });
           const bw = 5;
           const bh = BTN_R * 0.72;
           btnGfx.rect(bx - bw - 3, by - bh / 2, bw, bh);
@@ -440,10 +401,9 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
 
         case "error":
           btnGfx.circle(bx, by, BTN_R);
-          btnGfx.fill({ color: 0x555555 });
-          // small retry icon: clockwise arc + arrowhead
+          btnGfx.fill({ color: COLOR_MUTED });
           btnGfx.circle(bx, by, BTN_R * 0.38);
-          btnGfx.stroke({ color: 0xffffff, width: 2, alpha: 0.75 });
+          btnGfx.stroke({ color: 0xffffff, width: 2, alpha: 0.6 });
           break;
       }
 
@@ -465,11 +425,9 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       const barW = Math.max(1.5, gap - 1.5);
 
       if (samples.length === 0) {
-        // flat center line
-        const flatColor =
-          recState === "recording" ? 0xdd2222 : recState === "playing" ? 0x2277cc : 0x22aa55;
+        const flatColor = recState === "recording" ? COLOR_RECORD : COLOR_PRIMARY;
         waveGfx.rect(16, cx - 1, totalW, 2);
-        waveGfx.fill({ color: flatColor, alpha: 0.3 });
+        waveGfx.fill({ color: flatColor, alpha: 0.25 });
         return;
       }
 
@@ -485,14 +443,14 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
 
         if (progress !== undefined) {
           const played = i / barCount < progress;
-          color = played ? 0x2277cc : 0x22aa55;
-          alpha = played ? 0.88 : 0.42;
+          color = played ? COLOR_PLAY : COLOR_PRIMARY;
+          alpha = played ? 0.9 : 0.35;
         } else if (recState === "recording") {
-          color = 0xdd2222;
-          alpha = 0.65 + amp * 0.35;
+          color = COLOR_RECORD;
+          alpha = 0.6 + amp * 0.4;
         } else {
-          color = 0x22aa55;
-          alpha = 0.55 + amp * 0.4;
+          color = COLOR_PRIMARY;
+          alpha = 0.5 + amp * 0.45;
         }
 
         waveGfx.roundRect(x, y, barW, barH, 1.5);
@@ -590,7 +548,6 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         waveRafId = requestAnimationFrame(tick);
         analyser!.getByteTimeDomainData(dataArr);
 
-        // RMS amplitude 0–1
         let sum = 0;
         for (let i = 0; i < bufLen; i++) {
           const v = (dataArr[i] - 128) / 128;
@@ -598,7 +555,6 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         }
         const rms = Math.sqrt(sum / bufLen);
 
-        // collect a sample every ~4 frames (~66ms at 60fps)
         frameCount++;
         if (frameCount % 4 === 0) liveSamples.push(rms);
 
@@ -644,8 +600,9 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       ctx.setHeaderActions?.(makeHeaderActions());
 
       let stream: MediaStream;
-      const audioConstraints: boolean | MediaTrackConstraints = selectedDeviceId
-        ? { deviceId: { exact: selectedDeviceId } }
+      const deviceId = resolveDeviceId();
+      const audioConstraints: boolean | MediaTrackConstraints = deviceId
+        ? { deviceId: { exact: deviceId } }
         : true;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -683,7 +640,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         void enumerateDevices();
       };
       mediaRecorder.onstop = () => void finishRecording();
-      mediaRecorder.start(100); // 100ms timeslices for incremental data
+      mediaRecorder.start(100);
     };
 
     const stopRecording = () => {
@@ -705,10 +662,8 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       const ts = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
       const filename = `recording-${ts}.${ext}`;
 
-      // Build the blob before clearing the chunk array
       const recordedBlob = new Blob(audioChunks, { type: recMime });
 
-      // Free memory
       audioChunks = [];
       capturedSamples = [...liveSamples];
       liveSamples = [];
@@ -717,11 +672,9 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       audioCtx = null;
       analyser = null;
 
-      // Object URL for immediate playback (revoke previous if any)
       if (playbackUrl) URL.revokeObjectURL(playbackUrl);
       playbackUrl = URL.createObjectURL(recordedBlob);
 
-      // Persist to blob store via storeBlobFromFile
       try {
         const file = new File([recordedBlob], filename, { type: recMime });
         const record = await storeBlobFromFile(file, "audio");
@@ -732,6 +685,17 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           d.mime = recMime;
           d.size = record.size;
           d.duration = durationSecs;
+          // persist waveform — downsample to ≤200 points to keep doc size small
+          const MAX_SAMPLES = 200;
+          if (capturedSamples.length > MAX_SAMPLES) {
+            const step = capturedSamples.length / MAX_SAMPLES;
+            d.waveformSamples = Array.from(
+              { length: MAX_SAMPLES },
+              (_, i) => capturedSamples[Math.floor(i * step)]
+            );
+          } else {
+            d.waveformSamples = [...capturedSamples];
+          }
         });
 
         recState = "ready";
@@ -745,15 +709,12 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     };
 
     // ── playback logic ───────────────────────────────────────────────────────
-
     const getPlaybackUrl = async (): Promise<string | null> => {
-      // if we have a fresh object URL from the recording session, use it
       if (playbackUrl) return playbackUrl;
 
       const { blobId, mime } = ctx.doc.current;
       if (!blobId) return null;
 
-      // restore from blob store (works via OPFS in browser; OPFS then rust fallback in tauri)
       try {
         const buffer = await getBlobData(blobId);
         if (buffer) {
@@ -831,6 +792,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         d.filename = "";
         d.size = 0;
         d.duration = 0;
+        d.waveformSamples = [];
       });
 
       refresh();
@@ -853,79 +815,41 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         case "playing":
           pausePlayback();
           break;
-        // requesting / processing: no-op while waiting
       }
     });
 
-    // ── header actions ───────────────────────────────────────────────────────
+    // ── header actions — only ■ stop while recording ─────────────────────────
     const makeHeaderActions = (): HeaderAction[] => {
-      const actions: HeaderAction[] = [];
-
-      // mic / device selector — always visible (except while recording/processing)
-      if (recState !== "recording" && recState !== "processing") {
-        actions.push({
-          id: "device",
-          label: `🎤 ${currentDeviceLabel()}`,
-          shortLabel: "🎤",
-          onClick: (pos) => {
-            const canvasRect = ctx.canvasElement.getBoundingClientRect();
-            const sx = pos ? canvasRect.left + pos.x : canvasRect.left + 60;
-            const sy = pos ? canvasRect.top + pos.y : canvasRect.top + 40;
-            void openDevicePicker(sx, sy);
-          },
-        });
-      }
-
       if (recState === "recording") {
-        actions.push({
-          id: "stop",
-          label: "■ stop",
-          active: true,
-          onClick: stopRecording,
-        });
+        return [
+          {
+            id: "stop",
+            label: "■ stop",
+            active: true,
+            onClick: stopRecording,
+          },
+        ];
       }
-
-      if (recState === "ready" || recState === "playing") {
-        if (recState === "playing") {
-          actions.push({
-            id: "pause",
-            label: "⏸ pause",
-            marginLeft: 8,
-            onClick: pausePlayback,
-          });
-        } else {
-          actions.push({
-            id: "play",
-            label: "▶ play",
-            marginLeft: 8,
-            onClick: () => void startPlayback(),
-          });
-        }
-        actions.push({
-          id: "delete",
-          label: "delete recording",
-          marginLeft: 4,
-          onClick: deleteRecording,
-        });
-      }
-
-      return actions;
+      return [];
     };
 
     // ── doc subscription ─────────────────────────────────────────────────────
-    // handles remote changes (e.g. collaborative delete from another peer)
     const unsub = ctx.doc.on("change", () => {
-      const { blobId } = ctx.doc.current;
+      const { blobId, waveformSamples } = ctx.doc.current;
 
-      // remote added recording while we're idle
+      // sync capturedSamples from doc (collaborative update)
+      if (waveformSamples && waveformSamples.length > 0 && capturedSamples.length === 0) {
+        capturedSamples = [...waveformSamples];
+      }
+
       if ((recState === "idle" || recState === "error") && blobId) {
+        capturedSamples = [...(ctx.doc.current.waveformSamples ?? [])];
         recState = "ready";
         refresh();
         ctx.setHeaderActions?.(makeHeaderActions());
         return;
       }
 
-      // remote deleted recording while we're in a ready/playing state
       if ((recState === "ready" || recState === "playing") && !blobId) {
         if (recState === "playing") {
           audioEl?.pause();
@@ -939,7 +863,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         return;
       }
 
-      // bgColor change or other prop change
+      // bgColor / border / other prop change
       drawBg();
     });
 
@@ -956,11 +880,21 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       container,
       headerActions: makeHeaderActions(),
       widgetActions,
+      editableProps: [
+        { key: "bgColor", label: "background", type: "color" as const, default: 0x1e1e2e },
+        { key: "borderColor", label: "border", type: "color" as const, default: -1 },
+        { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
+        {
+          key: "deviceLabel",
+          label: "input device",
+          type: "select" as const,
+          options: deviceOptions,
+          default: DEVICE_DEFAULT,
+        },
+      ],
       destroy() {
         stopWaveAnim();
         stopPlayAnim();
-        devicePickerEl?.remove();
-        devicePickerEl = null;
         mediaRecorder?.stop();
         mediaStream?.getTracks().forEach((t) => t.stop());
         void audioCtx?.close();

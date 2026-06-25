@@ -299,7 +299,14 @@ export class PropertyTray {
       return;
     }
 
-    this.show(selectedId, factory, live.widgetDoc, live.entry, live.ctrl.widgetActions);
+    this.show(
+      selectedId,
+      factory,
+      live.widgetDoc,
+      live.entry,
+      live.ctrl.widgetActions,
+      live.ctrl.editableProps
+    );
     this.positionNextTo(live.frame.root.x, live.frame.root.y, live.entry.width);
   }
 
@@ -311,7 +318,8 @@ export class PropertyTray {
     factory: WidgetFactory,
     doc: WidgetDoc<any> | null,
     entry: WidgetEntry,
-    widgetActions?: WidgetAction[]
+    widgetActions?: WidgetAction[],
+    controllerProps?: WidgetPropDef[]
   ): void {
     // tear down any previous tray state
     this.clearControls();
@@ -332,7 +340,7 @@ export class PropertyTray {
     y += this.titleControl.height + ROW_GAP;
 
     // widget-specific prop controls (only if doc exists and factory has editable props)
-    const props = factory.editableProps ?? [];
+    const props = controllerProps ?? factory.editableProps ?? [];
     if (doc && props.length) {
       for (let i = 0; i < props.length; i++) {
         const prop = props[i];
@@ -1488,7 +1496,12 @@ export class PropertyTray {
   ): PropControl {
     const container = new Container();
     container.eventMode = "static";
-    const options = prop.options ?? [];
+
+    // options may be a static array or a function (called fresh on each open)
+    const resolveOptions = (): string[] =>
+      typeof prop.options === "function"
+        ? (prop.options as () => string[])()
+        : (prop.options ?? []);
 
     const label = this.createLabel(prop.label);
     container.addChild(label);
@@ -1566,6 +1579,7 @@ export class PropertyTray {
         this.activeStopEditing = null;
       }
 
+      const options = resolveOptions();
       dropdownContainer = new Container();
       dropdownContainer.eventMode = "static";
       dropdownContainer.zIndex = 100000;
