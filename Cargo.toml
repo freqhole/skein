@@ -18,8 +18,8 @@ tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 
 # p2p + doc sync
-iroh = "0.97"
-iroh-blobs = "0.99"
+iroh = "1.0.1"
+iroh-blobs = "0.103.0"
 automerge = "0.8"
 
 # storage
