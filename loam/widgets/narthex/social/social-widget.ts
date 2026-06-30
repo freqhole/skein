@@ -49,6 +49,7 @@ export const socialWidget: WidgetFactory<typeof socialSchema> = {
     description: "profile, friends, and social settings",
     version: "0.1.0",
     category: "narthex",
+    hidden: true,
     singleton: true,
     singletonId: "skein-social",
     defaultWidth: 280,

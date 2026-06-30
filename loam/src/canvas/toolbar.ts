@@ -1,5 +1,15 @@
 import { ButtonContainer } from "@pixi/ui";
-import { Container, Graphics, Rectangle, Text, type Application } from "pixi.js";
+import {
+  Assets,
+  Container,
+  FillGradient,
+  Graphics,
+  Rectangle,
+  Sprite,
+  Text,
+  Texture,
+  type Application,
+} from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { WidgetRegistry } from "../widgets/widget-registry";
 import type { CanvasStore } from "./canvas-store";
@@ -13,6 +23,12 @@ export interface ToolbarOptions {
   onNavigateHome?: () => void;
   /** callback to share the current canvas — shows a share button when set */
   onShare?: () => void;
+  /** callback for the avatar (social) button — shows the social overlay */
+  onToggleSocial?: () => void;
+  /** callback for the messages button — shows the messagez overlay */
+  onToggleMessages?: () => void;
+  /** if false, the share button is hidden even when onShare is set */
+  hasIdentity?: boolean;
 }
 
 /** a single segment of the breadcrumb trail shown in the toolbar */
@@ -48,6 +64,12 @@ export class Toolbar {
   private breadcrumbContainer: Container;
   private breadcrumbs: BreadcrumbItem[] = [];
   private readonly shareBtn: ButtonContainer | null;
+  private readonly socialBtn: Container | null;
+  private readonly messagesBtn: Container | null;
+  private socialBadge: Container | null = null;
+  private messagesBadge: Container | null = null;
+  private avatarSprite: Sprite | null = null;
+  private avatarMask: Graphics | null = null;
   private readonly options: ToolbarOptions;
 
   // flyout menu state
@@ -120,8 +142,8 @@ export class Toolbar {
     this.breadcrumbContainer.eventMode = "static";
     this.root.addChild(this.breadcrumbContainer);
 
-    // share button — visible when onShare is provided
-    if (this.options.onShare) {
+    // share button — visible when onShare is provided and identity is established
+    if (this.options.onShare && this.options.hasIdentity !== false) {
       const share = this.createButton("share");
       this.shareBtn = share.btn;
       this.shareBtn.onPress.connect(() => {
@@ -130,6 +152,28 @@ export class Toolbar {
       this.root.addChild(this.shareBtn);
     } else {
       this.shareBtn = null;
+    }
+
+    // ── messages button ──────────────────────────────────────────────────────
+    if (this.options.onToggleMessages) {
+      this.messagesBtn = this.createMessagesButton();
+      this.messagesBtn.on("pointertap", () => this.options.onToggleMessages?.());
+      this.messagesBtn.eventMode = "static";
+      this.messagesBtn.cursor = "pointer";
+      this.root.addChild(this.messagesBtn);
+    } else {
+      this.messagesBtn = null;
+    }
+
+    // ── avatar circle button ─────────────────────────────────────────────────
+    if (this.options.onToggleSocial) {
+      this.socialBtn = this.createAvatarButton();
+      this.socialBtn.on("pointertap", () => this.options.onToggleSocial?.());
+      this.socialBtn.eventMode = "static";
+      this.socialBtn.cursor = "pointer";
+      this.root.addChild(this.socialBtn);
+    } else {
+      this.socialBtn = null;
     }
 
     // flyout menu container (hidden by default)
@@ -197,6 +241,182 @@ export class Toolbar {
     btn.cursor = "pointer";
 
     return { btn, bg, text };
+  }
+
+  /** draw the avatar circle button — circle with magenta→purple→orange gradient */
+  private createAvatarButton(): Container {
+    const BTN_SIZE = 28;
+    const radius = BTN_SIZE / 2;
+
+    const c = new Container();
+    // explicit hit area so the container is clickable even when the child
+    // Graphics has eventMode="none"
+    c.hitArea = new Rectangle(0, 0, BTN_SIZE, BTN_SIZE);
+
+    // gradient background (FillGradient coords are normalized 0–1 in local space)
+    const g = new Graphics();
+    const grad = new FillGradient(0, 0, 1, 1); // diagonal, top-left → bottom-right
+    grad.addColorStop(0, 0xd946ef); // magenta
+    grad.addColorStop(0.5, 0x7c3aed); // purple
+    grad.addColorStop(1, 0xf97316); // orange
+    g.circle(radius, radius, radius);
+    g.fill(grad);
+    g.eventMode = "none";
+    c.addChild(g);
+
+    return c;
+  }
+
+  /**
+   * update the avatar circle button to show a profile image.
+   * uses the PixiJS Assets cache so subsequent navigations apply the
+   * texture synchronously — preventing the gradient flash on re-navigation.
+   */
+  setAvatarUrl(url: string | null): void {
+    if (!this.socialBtn) return;
+
+    // always tear down the old sprite first (synchronous)
+    if (this.avatarSprite) {
+      this.socialBtn.removeChild(this.avatarSprite);
+      this.avatarSprite.mask = null;
+      this.avatarSprite.destroy();
+      this.avatarSprite = null;
+    }
+    if (this.avatarMask) {
+      this.socialBtn.removeChild(this.avatarMask);
+      this.avatarMask.destroy();
+      this.avatarMask = null;
+    }
+
+    if (!url) return;
+
+    // check the global Assets cache first — if the texture was loaded during
+    // a previous canvas session it’s available synchronously, so we can apply
+    // it immediately without ever showing the gradient placeholder
+    const cached = Assets.get(url) as Texture | undefined;
+    if (cached instanceof Texture) {
+      this.applyAvatarSprite(cached);
+      return;
+    }
+
+    // not cached yet (first time) — async load, gradient shows briefly
+    Assets.load<Texture>(url)
+      .then((tex) => {
+        this.applyAvatarSprite(tex);
+      })
+      .catch(() => {
+        // failed to load — gradient placeholder stays
+      });
+  }
+
+  private applyAvatarSprite(texture: Texture): void {
+    if (!this.socialBtn) return;
+
+    const BTN_SIZE = 28;
+    const radius = BTN_SIZE / 2;
+
+    const mask = new Graphics();
+    mask.circle(radius, radius, radius);
+    mask.fill({ color: 0xffffff });
+    mask.eventMode = "none";
+    this.socialBtn.addChild(mask);
+
+    const sprite = new Sprite(texture);
+    sprite.anchor.set(0.5, 0.5);
+    sprite.x = radius;
+    sprite.y = radius;
+    sprite.width = BTN_SIZE;
+    sprite.height = BTN_SIZE;
+    sprite.mask = mask;
+    sprite.eventMode = "none";
+    this.socialBtn.addChild(sprite);
+
+    this.avatarSprite = sprite;
+    this.avatarMask = mask;
+  }
+
+  /** draw the messages button — a simple envelope icon */
+  private createMessagesButton(): Container {
+    const BTN_SIZE = 28;
+    const radius = BTN_SIZE / 2;
+
+    const c = new Container();
+
+    // rounded background circle (same size as avatar)
+    const bg = new Graphics();
+    bg.circle(radius, radius, radius);
+    bg.fill({ color: this.theme.frameBorder });
+    c.addChild(bg);
+
+    // envelope icon drawn with graphics
+    const icon = new Graphics();
+    const pad = 7;
+    const w = BTN_SIZE - pad * 2;
+    const h = w * 0.65;
+    const ix = pad;
+    const iy = (BTN_SIZE - h) / 2;
+    // envelope body
+    icon.roundRect(ix, iy, w, h, 2);
+    icon.fill({ color: 0x000000, alpha: 0 }); // transparent fill to define path
+    icon.stroke({ color: 0xffffff, width: 1.5, alpha: 0.9 });
+    // envelope flap V
+    icon.moveTo(ix, iy);
+    icon.lineTo(ix + w / 2, iy + h * 0.55);
+    icon.lineTo(ix + w, iy);
+    icon.stroke({ color: 0xffffff, width: 1.5, alpha: 0.9 });
+    c.addChild(icon);
+
+    return c;
+  }
+
+  /** create or update a notification badge on a button container */
+  private makeBadge(count: number): Container | null {
+    if (count <= 0) return null;
+
+    const badge = new Container();
+    badge.eventMode = "none";
+
+    const r = 8;
+    const bg = new Graphics();
+    bg.circle(r, r, r);
+    bg.fill({ color: 0xef4444 }); // red
+    badge.addChild(bg);
+
+    const label = new Text({
+      text: count > 99 ? "99+" : String(count),
+      resolution: this.theme.textResolution,
+      style: {
+        fontFamily: this.theme.fontFamily,
+        fontSize: 9,
+        fill: 0xffffff,
+        fontWeight: "bold",
+      },
+    });
+    label.anchor.set(0.5, 0.5);
+    label.x = r;
+    label.y = r;
+    badge.addChild(label);
+
+    return badge;
+  }
+
+  private refreshBadge(
+    current: Container | null,
+    count: number,
+    parent: Container,
+    parentW: number
+  ): Container | null {
+    if (current) {
+      parent.removeChild(current);
+      current.destroy({ children: true });
+    }
+    const badge = this.makeBadge(count);
+    if (badge) {
+      badge.x = parentW - 8;
+      badge.y = -8;
+      parent.addChild(badge);
+    }
+    return badge;
   }
 
   // -- flyout ----------------------------------------------------------------
@@ -506,39 +726,63 @@ export class Toolbar {
 
   /** position all visible buttons horizontally and redraw the toolbar background. */
   private layout(): void {
+    const BTN_SIZE = 28; // circle button diameter
     const gap = 6;
     const pad = { h: 8, v: 4 };
+
+    // compute a unified row height that fits both text buttons and circle buttons
+    const textBtnH = this.addBtn.height;
+    const contentH = Math.max(textBtnH, BTN_SIZE);
+    const totalHeight = contentH + pad.v * 2;
+
+    // y offsets that visually center each type within the row
+    const textBtnY = Math.round(pad.v + (contentH - textBtnH) / 2);
+    const circleBtnY = Math.round(pad.v + (contentH - BTN_SIZE) / 2);
+
     let x = pad.h;
 
     // breadcrumb trail (left side)
     if (this.breadcrumbContainer.children.length > 0) {
       this.breadcrumbContainer.x = x;
-      this.breadcrumbContainer.y = pad.v + 3; // vertically center with buttons
-      x += this.breadcrumbContainer.width + gap + 4; // extra spacing before buttons
+      this.breadcrumbContainer.y = textBtnY + 3;
+      x += this.breadcrumbContainer.width + gap + 4;
     }
 
     // share button
     if (this.shareBtn) {
       this.shareBtn.x = x;
-      this.shareBtn.y = pad.v;
+      this.shareBtn.y = textBtnY;
       x += this.shareBtn.width + gap;
     }
 
     // "+" button
     this.addBtn.x = x;
-    this.addBtn.y = pad.v;
+    this.addBtn.y = textBtnY;
     x += this.addBtn.width + gap;
 
     // delete button
     if (this.deleteBtn.visible) {
       this.deleteBtn.x = x;
-      this.deleteBtn.y = pad.v;
+      this.deleteBtn.y = textBtnY;
       x += this.deleteBtn.width + gap;
     }
 
-    // total toolbar size
+    // messages button (circle)
+    if (this.messagesBtn) {
+      this.messagesBtn.x = x;
+      this.messagesBtn.y = circleBtnY;
+      x += BTN_SIZE + gap;
+    }
+
+    // avatar circle button
+    if (this.socialBtn) {
+      this.socialBtn.x = x;
+      this.socialBtn.y = circleBtnY;
+      x += BTN_SIZE + gap;
+    }
+
+    // total toolbar width
     const totalWidth = x - gap + pad.h;
-    const totalHeight = this.addBtn.height + pad.v * 2;
 
     // redraw the toolbar background
     this.background.clear();
@@ -640,45 +884,61 @@ export class Toolbar {
 
   /** truncate breadcrumbs from the left when toolbar is too wide for the screen */
   private truncateBreadcrumbs(): void {
-    // keep at least the last 2 crumbs, prepend "..." for truncated ones
     if (this.breadcrumbs.length <= 2) return;
 
     const truncated: BreadcrumbItem[] = [{ label: "..." }, ...this.breadcrumbs.slice(-2)];
-
-    // temporarily replace and re-render, then re-layout
     const full = this.breadcrumbs;
     this.breadcrumbs = truncated;
     this.renderBreadcrumbs();
 
-    // re-run layout with truncated crumbs (but don't recurse — only call positioning part)
+    // re-run positioning (mirrors layout(), but without recursing into truncateBreadcrumbs)
+    const BTN_SIZE = 28;
     const gap = 6;
     const pad = { h: 8, v: 4 };
+
+    const textBtnH = this.addBtn.height;
+    const contentH = Math.max(textBtnH, BTN_SIZE);
+    const totalHeight = contentH + pad.v * 2;
+    const textBtnY = Math.round(pad.v + (contentH - textBtnH) / 2);
+    const circleBtnY = Math.round(pad.v + (contentH - BTN_SIZE) / 2);
+
     let x = pad.h;
 
     if (this.breadcrumbContainer.children.length > 0) {
       this.breadcrumbContainer.x = x;
-      this.breadcrumbContainer.y = pad.v + 3;
+      this.breadcrumbContainer.y = textBtnY + 3;
       x += this.breadcrumbContainer.width + gap + 4;
     }
 
     if (this.shareBtn) {
       this.shareBtn.x = x;
-      this.shareBtn.y = pad.v;
+      this.shareBtn.y = textBtnY;
       x += this.shareBtn.width + gap;
     }
 
     this.addBtn.x = x;
-    this.addBtn.y = pad.v;
+    this.addBtn.y = textBtnY;
     x += this.addBtn.width + gap;
 
     if (this.deleteBtn.visible) {
       this.deleteBtn.x = x;
-      this.deleteBtn.y = pad.v;
+      this.deleteBtn.y = textBtnY;
       x += this.deleteBtn.width + gap;
     }
 
+    if (this.messagesBtn) {
+      this.messagesBtn.x = x;
+      this.messagesBtn.y = circleBtnY;
+      x += BTN_SIZE + gap;
+    }
+
+    if (this.socialBtn) {
+      this.socialBtn.x = x;
+      this.socialBtn.y = circleBtnY;
+      x += BTN_SIZE + gap;
+    }
+
     const totalWidth = x - gap + pad.h;
-    const totalHeight = this.addBtn.height + pad.v * 2;
 
     this.background.clear();
     this.background.roundRect(0, 0, totalWidth, totalHeight, 6);
@@ -689,7 +949,6 @@ export class Toolbar {
     this.root.x = Math.round(this.app.screen.width - totalWidth - margin);
     this.root.y = margin;
 
-    // restore the full breadcrumb data (truncated is only visual)
     this.breadcrumbs = full;
 
     if (this.flyoutOpen) {
@@ -735,6 +994,20 @@ export class Toolbar {
 
   // -- cleanup ---------------------------------------------------------------
 
+  /** update the notification count badge on the social/avatar button */
+  updateSocialBadge(count: number): void {
+    if (this.socialBtn) {
+      this.socialBadge = this.refreshBadge(this.socialBadge, count, this.socialBtn, 28);
+    }
+  }
+
+  /** update the notification count badge on the messages button */
+  updateMessagesBadge(count: number): void {
+    if (this.messagesBtn) {
+      this.messagesBadge = this.refreshBadge(this.messagesBadge, count, this.messagesBtn, 28);
+    }
+  }
+
   /** unsubscribe from all listeners and remove the toolbar from the stage. */
   destroy(): void {
     this.closeFlyout();
@@ -743,6 +1016,11 @@ export class Toolbar {
       unsub();
     }
     this.unsubs = [];
+    // avatar sprite / mask are children of socialBtn and destroyed with it
+    this.avatarSprite = null;
+    this.avatarMask = null;
+    this.socialBtn?.destroy({ children: true });
+    this.messagesBtn?.destroy({ children: true });
     this.root.destroy({ children: true });
   }
 }

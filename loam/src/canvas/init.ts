@@ -38,6 +38,14 @@ export interface InitCanvasOptions {
   onNavigateHome?: () => void;
   /** callback to share the current canvas — toolbar shows a share button when set */
   onShare?: () => void;
+  /** callback to toggle the social overlay panel — toolbar shows avatar button when set */
+  onToggleSocial?: () => void;
+  /** callback to toggle the messages overlay panel — toolbar shows messages button when set */
+  onToggleMessages?: () => void;
+  /** whether the user has a configured identity — controls share button visibility */
+  hasIdentity?: boolean;
+  /** callback to show the canvas-info overlay — triggered by connection-status pill click */
+  onShowCanvasInfo?: () => void;
   /** optional transport-level connection state source for the status indicator */
   connectionStateSource?: import("./connection-status").ConnectionStateSource | null;
   /** optional per-widget doc overrides — lets callers inject a custom doc (e.g.
@@ -80,6 +88,10 @@ export interface SkeinCanvas {
   repo: Repo;
   /** this peer's unique id (from the automerge repo) */
   peerId: string;
+  /** update the notification badge count on the avatar (social) toolbar button */
+  updateSocialBadge?: (count: number) => void;
+  /** update the notification badge count on the messages toolbar button */
+  updateMessagesBadge?: (count: number) => void;
   /** tear down the canvas (cleanup pixi, widgets, toolbar, viewport, presence, input router) */
   destroy: () => void;
 }
@@ -212,6 +224,9 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     isNarthex: options.isNarthex,
     onNavigateHome: options.onNavigateHome,
     onShare: options.onShare,
+    onToggleSocial: options.onToggleSocial,
+    onToggleMessages: options.onToggleMessages,
+    hasIdentity: options.hasIdentity,
   });
 
   // step 10a: wire toolbar into widget manager for breadcrumb navigation.
@@ -269,7 +284,12 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     // step 13b: create the connection status indicator.
     // lives on app.stage (fixed position, bottom-left) so it doesn't pan/zoom.
     // layout() reads visual viewport internally for correct sizing on mobile safari.
-    connectionStatus = new ConnectionStatus(presenceManager, theme, options.connectionStateSource);
+    connectionStatus = new ConnectionStatus(
+      presenceManager,
+      theme,
+      options.connectionStateSource,
+      options.onShowCanvasInfo
+    );
     app.stage.addChild(connectionStatus.root);
     connectionStatus.layout();
   }
@@ -393,6 +413,8 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     theme,
     repo,
     peerId,
+    updateSocialBadge: (n: number) => (toolbar as any).updateSocialBadge?.(n),
+    updateMessagesBadge: (n: number) => (toolbar as any).updateMessagesBadge?.(n),
     destroy() {
       // best-effort offline broadcast before teardown
       presenceManager.broadcastOffline();

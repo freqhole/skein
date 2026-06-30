@@ -28,6 +28,8 @@ export interface FriendzWiringDeps {
   socialWidgetId: string;
   messagezWidgetId: string;
   socialDoc?: SocialDoc;
+  /** optional pre-resolved messagez doc handle — when provided, skips the store lookup */
+  messagezDocHandle?: import("@automerge/automerge-repo").DocHandle<any>;
 }
 
 export interface FriendzWiringResult {
@@ -39,7 +41,7 @@ export interface FriendzWiringResult {
 }
 
 /** wrap an automerge DocHandle as a SocialDoc (for browser/standalone mode) */
-function docHandleAsSocialDoc(handle: DocHandle<any>): SocialDoc {
+export function docHandleAsSocialDoc(handle: DocHandle<any>): SocialDoc {
   return {
     get current(): SocialState {
       return (handle.doc() ?? {}) as SocialState;
@@ -98,11 +100,15 @@ export async function initFriendzWiring(
     sDoc = docHandleAsSocialDoc(socialHandle);
   }
 
-  const messagezEntry = store.getWidget(messagezWidgetId);
   let messagezHandle: DocHandle<any> | null = null;
 
-  if (messagezEntry) {
-    messagezHandle = await repo.find<any>(messagezEntry.docId as DocumentId);
+  if (deps.messagezDocHandle) {
+    messagezHandle = deps.messagezDocHandle;
+  } else {
+    const messagezEntry = store.getWidget(messagezWidgetId);
+    if (messagezEntry?.docId) {
+      messagezHandle = await repo.find<any>(messagezEntry.docId as DocumentId);
+    }
   }
 
   const profileVisibility = sDoc.current.profileVisibility ?? "friends";
@@ -1000,8 +1006,7 @@ export async function initFriendzWiring(
     // (2) retry profile-request if friend's nodeId entry has no display data
     if (isFriend) {
       const node = friendEntry.nodeIds?.find((n: any) => n.nodeId === peerNodeId);
-      const hasProfile =
-        !!(node?.username || node?.bio || node?.avatarDataUrl);
+      const hasProfile = !!(node?.username || node?.bio || node?.avatarDataUrl);
       if (!hasProfile) {
         console.log(
           "[friendz-wiring] retrying profile-request to:",

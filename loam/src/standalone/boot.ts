@@ -31,16 +31,33 @@ import { resolveFriendDisplay, SqliteSocialDoc } from "../p2p/sqlite-social-doc"
 import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
 import { syncCanvasMetadataToCards, watchCanvasDocsForUpdates } from "./canvas-watchers";
-import { initFriendzWiring } from "./friendz-wiring";
+import { initFriendzWiring, docHandleAsSocialDoc } from "./friendz-wiring";
 import {
   createNarthexWithSeed,
   ensureSingletonWidgets,
   MESSAGEZ_WIDGET_ID,
   SOCIAL_WIDGET_ID,
 } from "./narthex-seed";
+import { socialWidget } from "../../widgets/narthex/social/social-widget";
+import { socialSchema } from "../../widgets/narthex/social/schema";
+import { messagezWidget, messagezSchema } from "../../widgets/narthex/messagez-widget";
+import type { MessagezState } from "../../widgets/narthex/messagez-widget";
+import { canvasInfoWidget, canvasInfoSchema } from "../../widgets/canvas-info";
+import {
+  WidgetOverlay,
+  SOCIAL_OVERLAY_W,
+  SOCIAL_OVERLAY_H,
+  MESSAGES_OVERLAY_W,
+  MESSAGES_OVERLAY_H,
+  CANVAS_INFO_OVERLAY_W,
+  CANVAS_INFO_OVERLAY_H,
+} from "../canvas/widget-overlay";
+import type { WidgetDoc, WidgetMountContext } from "../widgets/widget-types";
 
 // indexeddb key for the well-known narthex document id
 const NARTHEX_DOC_KEY = "skein-narthex-doc-id";
+const MESSAGEZ_DOC_KEY = "skein-messagez-doc-id";
+const SOCIAL_DOC_KEY = "skein-social-doc-id"; // browser mode only
 
 // ---------------------------------------------------------------------------
 // router — manages navigation between the narthex and individual canvases
@@ -65,6 +82,10 @@ class SkeinRouter {
   private canvasWatcherUnsubs: Array<() => void> = [];
   private localNodeId: string = "";
   private flushCanvasUpdates: (() => void) | null = null;
+  private currentSocialOverlay: WidgetOverlay | null = null;
+  private currentMessagesOverlay: WidgetOverlay | null = null;
+  private currentCanvasInfoOverlay: WidgetOverlay | null = null;
+  private badgeUnsubs: Array<() => void> = [];
 
   /** adapter connection state source for the ConnectionStatus widget */
   private readonly connectionStateSource: ConnectionStateSource;
@@ -107,6 +128,98 @@ class SkeinRouter {
       console.log("[skein] found existing narthex doc:", this.narthexDocId);
       await ensureSingletonWidgets(this.repo, this.narthexDocId as DocumentId);
     }
+
+    // resolve local node ID early so hasIdentity is available at canvas init time
+    if (!this.localNodeId) {
+      try {
+        if (isTauriMode()) {
+          const node = await TauriStreamNode.create();
+          this.localNodeId = node.node_id();
+        } else {
+          const identity = await getStoredIdentity();
+          this.localNodeId = identity?.node_id ?? "";
+        }
+      } catch {
+        // identity not ready yet
+      }
+    }
+
+    // create SqliteSocialDoc early (tauri mode) so it's available for overlays
+    // on any canvas — not just the narthex
+    if (isTauriMode() && !this.socialDoc) {
+      try {
+        this.socialDoc = await SqliteSocialDoc.create();
+      } catch (err) {
+        console.warn("[skein] failed to create SqliteSocialDoc:", err);
+      }
+    }
+
+    // create or find standalone social doc (browser mode only)
+    if (!isTauriMode() && !this.socialDoc) {
+      const socialDocId = await getMetaValue(SOCIAL_DOC_KEY);
+      if (socialDocId) {
+        try {
+          const handle = await this.repo.find<any>(socialDocId as DocumentId);
+          this.socialDoc = docHandleAsSocialDoc(handle);
+        } catch {
+          // not available yet — will retry
+        }
+      }
+      if (!this.socialDoc) {
+        const handle = this.repo.create<any>({
+          profile: { username: "", bio: "", avatarDataUrl: "", accentColor: 0xd946ef, nodeId: "" },
+          friends: [],
+          groups: [],
+          pendingRequests: [],
+          outboundRequests: [],
+          profileVisibility: "friends",
+          friendRequestsFrom: "everyone",
+        });
+        await setMetaValue(SOCIAL_DOC_KEY, handle.documentId);
+        this.socialDoc = docHandleAsSocialDoc(handle);
+      }
+    }
+
+    // create or find standalone messagez doc
+    if (!this.messagezDocHandle) {
+      const messagezDocId = await getMetaValue(MESSAGEZ_DOC_KEY);
+      if (messagezDocId) {
+        try {
+          this.messagezDocHandle = await this.repo.find<any>(messagezDocId as DocumentId);
+        } catch {
+          // not synced yet
+        }
+      }
+      if (!this.messagezDocHandle) {
+        this.messagezDocHandle = this.repo.create<any>({
+          invites: [],
+          shares: [],
+          deletions: [],
+          canvasInvitesFrom: "everyone",
+        });
+        await setMetaValue(MESSAGEZ_DOC_KEY, this.messagezDocHandle.documentId);
+      }
+    }
+
+    // initialize friendz protocol early — works regardless of which canvas is shown.
+    // safe to call before navigateToNarthex because initFriendzProtocol now opens
+    // the narthex store itself when this.currentCanvas is null.
+    this.initFriendzProtocol().catch((err) => {
+      console.warn("[skein] failed to initialize friendz protocol:", err);
+    });
+
+    // retry protocol init when the user generates an identity for the first time.
+    // this must be global (not per-canvas) so it fires even when the user creates
+    // an identity while viewing a non-narthex canvas.
+    const unsubIdentity = onIdentityChange((identity) => {
+      if (identity && !this.friendzProtocol) {
+        console.log("[skein] identity created — retrying protocol init");
+        this.initFriendzProtocol().catch((err) => {
+          console.warn("[skein] deferred protocol init failed:", err);
+        });
+      }
+    });
+    this.friendzDocUnsubs.push(unsubIdentity);
 
     // register skein/1 ALPN handler early so the browser can serve blobs
     // to peers regardless of friendz protocol initialization state.
@@ -239,6 +352,15 @@ class SkeinRouter {
 
   /** tear down the current canvas if any */
   private destroyCurrent(): void {
+    // tear down per-canvas badge subscriptions and overlay panels
+    for (const unsub of this.badgeUnsubs) unsub();
+    this.badgeUnsubs = [];
+    this.currentSocialOverlay?.destroy();
+    this.currentSocialOverlay = null;
+    this.currentMessagesOverlay?.destroy();
+    this.currentMessagesOverlay = null;
+    this.currentCanvasInfoOverlay?.destroy();
+    this.currentCanvasInfoOverlay = null;
     for (const unsub of this.transportPresenceUnsubs) unsub();
     this.transportPresenceUnsubs = [];
     for (const unsub of this.canvasWatcherUnsubs) unsub();
@@ -270,43 +392,30 @@ class SkeinRouter {
 
       console.log("[skein] navigating to narthex, doc:", this.narthexDocId);
 
-      // resolve local node ID for canvas attribution
-      if (!this.localNodeId) {
-        try {
-          if (isTauriMode()) {
-            const node = await TauriStreamNode.create();
-            this.localNodeId = node.node_id();
-          } else {
-            const identity = await getStoredIdentity();
-            this.localNodeId = identity?.node_id ?? "";
-          }
-        } catch {
-          // identity not ready
-        }
-      }
-
-      // in tauri mode, create the sqlite-backed social doc early so it can
-      // be shared between the social widget and the friendz protocol.
-      if (isTauriMode() && !this.socialDoc) {
-        try {
-          this.socialDoc = await SqliteSocialDoc.create();
-        } catch (err) {
-          console.warn("[skein] failed to create SqliteSocialDoc:", err);
-        }
-      }
-
       const canvas = await initCanvas({
         mountElement: this.mountElement,
         canvasDocId: this.narthexDocId,
         registry: createNarthexRegistry(),
         repo: this.repo,
         isNarthex: true,
-        docOverrides: this.socialDoc
-          ? new Map([[SOCIAL_WIDGET_ID, this.socialDoc as any]])
-          : undefined,
+        hasIdentity: !!this.localNodeId,
+        onToggleSocial: () => {
+          const sw = window.visualViewport?.width ?? window.innerWidth;
+          this.currentMessagesOverlay?.close();
+          this.currentSocialOverlay?.toggle(sw);
+        },
+        onToggleMessages: () => {
+          const sw = window.visualViewport?.width ?? window.innerWidth;
+          this.currentSocialOverlay?.close();
+          this.currentMessagesOverlay?.toggle(sw);
+        },
       });
 
       this.currentCanvas = canvas;
+      // mount overlay panels and wire badge counts
+      this.currentSocialOverlay = this.mountSocialOverlay(canvas);
+      this.currentMessagesOverlay = this.mountMessagesOverlay(canvas);
+      this.wireBadges(canvas);
       canvas.store.setLocalNodeId(this.localNodeId);
       if (this.localNodeId) {
         canvas.presenceManager.setLocalNodeId(this.localNodeId);
@@ -351,25 +460,6 @@ class SkeinRouter {
         }
       });
 
-      // initialize the friends protocol (reads social widget doc).
-      // if no identity exists yet (first boot), the init will silently
-      // no-op. we listen for identity creation and retry in that case.
-      this.initFriendzProtocol().catch((err) => {
-        console.warn("[skein] failed to initialize friendz protocol:", err);
-      });
-
-      // retry protocol init when the user generates an identity for the
-      // first time — without this, all P2P features stay dead until reload.
-      const unsubIdentity = onIdentityChange((identity) => {
-        if (identity && !this.friendzProtocol) {
-          console.log("[skein] identity created — retrying protocol init");
-          this.initFriendzProtocol().catch((err) => {
-            console.warn("[skein] deferred protocol init failed:", err);
-          });
-        }
-      });
-      this.friendzDocUnsubs.push(unsubIdentity);
-
       // narthex share helper isn't applicable but clear any stale one
       (window as any).__skein.share = () => {
         console.log("[skein] share is only available when viewing a canvas (not the narthex)");
@@ -411,32 +501,38 @@ class SkeinRouter {
    */
   private async initFriendzProtocol(): Promise<void> {
     if (this.friendzProtocol) return;
+    if (!this.narthexDocId) return;
 
-    const store = this.currentCanvas?.store;
-    if (!store || !this.narthexDocId) return;
+    // use the current canvas store if on the narthex, otherwise open narthex store directly.
+    // this allows initFriendzProtocol to be called from boot() before any canvas is mounted.
+    let store = this.currentCanvas?.store;
+    if (!store) {
+      try {
+        store = await CanvasStore.open(this.repo, this.narthexDocId as DocumentId);
+      } catch (err) {
+        console.warn("[skein] failed to open narthex store for friendz protocol:", err);
+        return;
+      }
+    }
 
-    // in tauri mode, reuse the sqlite-backed social doc created during narthex init.
-    // in browser mode, friendz-wiring will create its own from the automerge handle.
-    const socialDoc: SocialDoc | undefined = isTauriMode()
-      ? (this.socialDoc ?? undefined)
-      : undefined;
+    const socialDoc = this.socialDoc ?? undefined;
 
     const result = await initFriendzWiring({
       repo: this.repo,
       irohAdapter: this.irohAdapter,
       store,
       narthexDocId: this.narthexDocId,
-
       socialWidgetId: SOCIAL_WIDGET_ID,
       messagezWidgetId: MESSAGEZ_WIDGET_ID,
+      messagezDocHandle: this.messagezDocHandle ?? undefined,
       socialDoc,
     });
 
     if (!result) return;
 
     this.friendzProtocol = result.protocol;
-    this.socialDoc = result.socialDoc;
-    this.messagezDocHandle = result.messagezDocHandle;
+    if (result.socialDoc) this.socialDoc = result.socialDoc;
+    if (result.messagezDocHandle) this.messagezDocHandle = result.messagezDocHandle;
     this.friendzDocUnsubs.push(...result.unsubs);
     this.flushCanvasUpdates = result.flushCanvasUpdates;
   }
@@ -720,9 +816,37 @@ class SkeinRouter {
             },
           });
         },
+        hasIdentity: !!this.localNodeId,
+        onToggleSocial: () => {
+          const sw = window.visualViewport?.width ?? window.innerWidth;
+          this.currentMessagesOverlay?.close();
+          this.currentSocialOverlay?.toggle(sw);
+        },
+        onToggleMessages: () => {
+          const sw = window.visualViewport?.width ?? window.innerWidth;
+          this.currentSocialOverlay?.close();
+          this.currentMessagesOverlay?.toggle(sw);
+        },
+        onShowCanvasInfo: () => {
+          const vv = window.visualViewport;
+          const sw = vv ? vv.width : window.innerWidth;
+          const sh = vv ? vv.height : window.innerHeight;
+          // open above the connection-status pill (bottom-left, 8px margin)
+          // pill is ~26px tall; overlay sits 8px above it
+          const margin = 8;
+          const pillH = 26;
+          const x = margin;
+          const y = Math.round(sh - CANVAS_INFO_OVERLAY_H - pillH - margin * 2);
+          this.currentCanvasInfoOverlay?.toggle(sw, x, y);
+        },
       });
 
       this.currentCanvas = canvas;
+      // mount overlay panels and wire badge counts
+      this.currentSocialOverlay = this.mountSocialOverlay(canvas);
+      this.currentMessagesOverlay = this.mountMessagesOverlay(canvas);
+      this.currentCanvasInfoOverlay = this.mountCanvasInfoOverlay(canvas);
+      this.wireBadges(canvas);
       canvas.store.setLocalNodeId(this.localNodeId);
       if (this.localNodeId) {
         canvas.presenceManager.setLocalNodeId(this.localNodeId);
@@ -1090,25 +1214,10 @@ class SkeinRouter {
   }): Promise<void> {
     if (!this.currentCanvas || !this.narthexDocId) return;
 
-    // read the profile username for the canvas author
+    // read author name from the standalone social doc (always available after boot)
     let authorName = "";
     if (this.socialDoc) {
       authorName = this.socialDoc.current.profile?.username ?? "";
-    } else {
-      // protocol not initialized yet — try reading automerge doc directly
-      try {
-        const socialEntry = this.currentCanvas?.store.getWidget(SOCIAL_WIDGET_ID);
-        if (socialEntry?.docId) {
-          const socialHandle = await this.repo.find(socialEntry.docId as DocumentId);
-          await socialHandle.whenReady();
-          const socialDoc = socialHandle.doc() as Record<string, any> | undefined;
-          if (socialDoc?.profile?.username && typeof socialDoc.profile.username === "string") {
-            authorName = socialDoc.profile.username;
-          }
-        }
-      } catch {
-        console.warn("[skein] failed to read profile for canvas author");
-      }
     }
 
     // create a new empty canvas document in the shared repo
@@ -1192,6 +1301,167 @@ class SkeinRouter {
 
     // navigate to the new canvas
     window.location.hash = newDocId;
+  }
+
+  private mountSocialOverlay(canvas: SkeinCanvas): WidgetOverlay | null {
+    if (!this.socialDoc) return null;
+
+    const ctx: WidgetMountContext<typeof socialSchema> = {
+      doc: this.socialDoc as any,
+      width: SOCIAL_OVERLAY_W,
+      height: SOCIAL_OVERLAY_H,
+      keyboard: canvas.keyboard,
+      widgetId: SOCIAL_WIDGET_ID,
+      canvasElement: canvas.app.canvas as HTMLCanvasElement,
+      setHeaderActions: () => {}, // header actions not used in overlay context
+    };
+
+    try {
+      const ctrl = socialWidget.create(ctx);
+      return new WidgetOverlay(canvas.app, ctrl, SOCIAL_OVERLAY_W, SOCIAL_OVERLAY_H, canvas.theme);
+    } catch (err) {
+      console.warn("[skein] failed to mount social overlay:", err);
+      return null;
+    }
+  }
+
+  private mountMessagesOverlay(canvas: SkeinCanvas): WidgetOverlay | null {
+    if (!this.messagezDocHandle) return null;
+
+    const handle = this.messagezDocHandle;
+    const doc: WidgetDoc<typeof messagezSchema> = {
+      get current(): MessagezState {
+        return (handle.doc() ?? {
+          invites: [],
+          shares: [],
+          deletions: [],
+          canvasInvitesFrom: "everyone",
+        }) as MessagezState;
+      },
+      change(fn: (draft: MessagezState) => void): void {
+        handle.change(fn as any);
+      },
+      on(_event: "change", handler: (state: MessagezState) => void): () => void {
+        const cb = () => {
+          handler(
+            (handle.doc() ?? {
+              invites: [],
+              shares: [],
+              deletions: [],
+              canvasInvitesFrom: "everyone",
+            }) as MessagezState
+          );
+        };
+        handle.on("change", cb);
+        return () => handle.off("change", cb);
+      },
+    };
+
+    const ctx: WidgetMountContext<typeof messagezSchema> = {
+      doc,
+      width: MESSAGES_OVERLAY_W,
+      height: MESSAGES_OVERLAY_H,
+      keyboard: canvas.keyboard,
+      widgetId: MESSAGEZ_WIDGET_ID,
+      canvasElement: canvas.app.canvas as HTMLCanvasElement,
+    };
+
+    try {
+      const ctrl = messagezWidget.create(ctx);
+      return new WidgetOverlay(
+        canvas.app,
+        ctrl,
+        MESSAGES_OVERLAY_W,
+        MESSAGES_OVERLAY_H,
+        canvas.theme
+      );
+    } catch (err) {
+      console.warn("[skein] failed to mount messages overlay:", err);
+      return null;
+    }
+  }
+
+  private mountCanvasInfoOverlay(canvas: SkeinCanvas): WidgetOverlay | null {
+    // canvas-info needs a canvasStore — only available on non-narthex canvases
+    if (!canvas.store) return null;
+
+    // ephemeral in-memory doc for the canvas-info widget's activeTab state
+    let activeTab: "details" | "history" = "details";
+    const tabListeners = new Set<(state: { activeTab: "details" | "history" }) => void>();
+    const doc: WidgetDoc<typeof canvasInfoSchema> = {
+      get current(): { activeTab: "details" | "history" } {
+        return { activeTab };
+      },
+      change(fn: (draft: { activeTab: "details" | "history" }) => void): void {
+        const draft = { activeTab };
+        fn(draft);
+        activeTab = draft.activeTab;
+        tabListeners.forEach((h) => h({ activeTab }));
+      },
+      on(
+        _event: "change",
+        handler: (state: { activeTab: "details" | "history" }) => void
+      ): () => void {
+        tabListeners.add(handler);
+        return () => tabListeners.delete(handler);
+      },
+    };
+
+    const ctx: WidgetMountContext<typeof canvasInfoSchema> = {
+      doc,
+      width: CANVAS_INFO_OVERLAY_W,
+      height: CANVAS_INFO_OVERLAY_H,
+      keyboard: canvas.keyboard,
+      widgetId: "canvas-info-overlay",
+      canvasElement: canvas.app.canvas as HTMLCanvasElement,
+      canvasStore: canvas.store,
+    };
+
+    try {
+      const ctrl = canvasInfoWidget.create(ctx);
+      return new WidgetOverlay(
+        canvas.app,
+        ctrl,
+        CANVAS_INFO_OVERLAY_W,
+        CANVAS_INFO_OVERLAY_H,
+        canvas.theme
+      );
+    } catch (err) {
+      console.warn("[skein] failed to mount canvas-info overlay:", err);
+      return null;
+    }
+  }
+
+  private wireBadges(canvas: SkeinCanvas): void {
+    // social badge: count pending friend requests
+    // also update avatar URL whenever the profile changes
+    if (this.socialDoc) {
+      const updateSocial = () => {
+        const count = (this.socialDoc?.current.pendingRequests ?? []).filter(
+          (r: any) => r.status === "pending"
+        ).length;
+        canvas.toolbar.updateSocialBadge(count);
+        // sync avatar image into the toolbar button
+        const avatarUrl = this.socialDoc?.current.profile?.avatarDataUrl ?? null;
+        canvas.toolbar.setAvatarUrl(avatarUrl || null);
+      };
+      const unsub = this.socialDoc.on("change", updateSocial);
+      this.badgeUnsubs.push(unsub);
+      updateSocial();
+    }
+
+    // messages badge: pending invites + unread deletion notifications
+    if (this.messagezDocHandle) {
+      const updateMessages = () => {
+        const doc = this.messagezDocHandle?.doc() as any;
+        const invites = (doc?.invites ?? []).filter((i: any) => i.status === "pending").length;
+        const deletions = (doc?.deletions ?? []).filter((d: any) => d.status === "unread").length;
+        canvas.toolbar.updateMessagesBadge(invites + deletions);
+      };
+      this.messagezDocHandle.on("change", updateMessages);
+      this.badgeUnsubs.push(() => this.messagezDocHandle?.off("change", updateMessages));
+      updateMessages();
+    }
   }
 
   /** tear down the router — destroys canvas, friendz protocol, and bridge. */

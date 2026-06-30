@@ -130,6 +130,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
     description: "canvas invites and share activity",
     version: "0.1.0",
     category: "narthex",
+    hidden: true,
     singleton: true,
     singletonId: "skein-messagez",
     defaultWidth: 560,

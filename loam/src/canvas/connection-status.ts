@@ -37,6 +37,7 @@ export class ConnectionStatus {
   private readonly presenceManager: PresenceManager;
   private readonly connectionState: ConnectionStateSource | null;
   private readonly theme: SkeinTheme;
+  private readonly onCanvasInfoClick: (() => void) | null;
 
   private readonly background: Graphics;
   private readonly dot: Graphics;
@@ -50,11 +51,13 @@ export class ConnectionStatus {
   constructor(
     presenceManager: PresenceManager,
     theme: SkeinTheme,
-    connectionState?: ConnectionStateSource | null
+    connectionState?: ConnectionStateSource | null,
+    onCanvasInfoClick?: () => void
   ) {
     this.presenceManager = presenceManager;
     this.connectionState = connectionState ?? null;
     this.theme = theme;
+    this.onCanvasInfoClick = onCanvasInfoClick ?? null;
 
     this.root = new Container();
     this.root.zIndex = 10000;
@@ -89,11 +92,13 @@ export class ConnectionStatus {
       this.unsubs.push(this.connectionState.onStateChange(() => this.refresh()));
     }
 
-    // handle click (only active in error state)
+    // handle click — retry on error, otherwise open canvas info
     this.root.on("pointertap", () => {
       if (this.isErrorState && this.connectionState) {
         console.log("[skein:connection-status] retrying failed connections");
         this.connectionState.retryFailed();
+      } else {
+        this.onCanvasInfoClick?.();
       }
     });
 
@@ -191,8 +196,8 @@ export class ConnectionStatus {
 
     this.isErrorState = interactive;
     this.root.eventMode = "static"; // always interactive for hover tooltip
-    this.root.interactiveChildren = interactive;
-    this.root.cursor = interactive ? "pointer" : "default";
+    this.root.interactiveChildren = true;
+    this.root.cursor = "pointer";
 
     this.drawDot(dotColor);
     this.label.text = labelText;

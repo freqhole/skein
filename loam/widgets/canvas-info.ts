@@ -72,6 +72,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
     description: "view and edit canvas metadata, see document stats",
     version: "0.1.0",
     category: "canvas",
+    hidden: true,
     singleton: true,
     defaultWidth: 280,
     defaultHeight: 340,
