@@ -84,7 +84,7 @@ export const doodleSchema = z.object({
   /** active drawing tool: "pen" | "eraser" */
   activeTool: z.string().default("pen"),
   /** pen color (0xRRGGBB) */
-  penColor: z.number().default(() => randomDoodleColor()),
+  penColor: z.number().default(0xd946ef),
   /** pen width in pixels */
   penWidth: z.number().default(3),
   /** brush shape: "circle" | "rect" | "diamond" */
@@ -92,9 +92,12 @@ export const doodleSchema = z.object({
   /** pen opacity 1–100; 100 = fully opaque */
   penOpacity: z.number().default(100),
   /** border color; -1 = transparent (no border) */
-  borderColor: z.number().default(() => randomDoodleColor()),
+  borderColor: z.number().default(0xa855f7),
   /** border width in pixels; 0 = no border */
   borderWidth: z.number().default(1),
+  /** true once random pen/border colors have been written to the doc.
+   *  ensures colors are chosen once per widget (not on every schema parse). */
+  colorsSeeded: z.boolean().default(false),
 });
 
 export type DoodleState = z.infer<typeof doodleSchema>;
@@ -226,7 +229,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       options: ["pen", "eraser"],
       default: "pen",
     },
-    { key: "penColor", label: "pen color", type: "color" as const, default: 0xffffff },
+    { key: "penColor", label: "pen color", type: "color" as const, default: 0xd946ef },
     { key: "penWidth", label: "pen width", type: "number" as const, default: 3 },
     {
       key: "brushShape",
@@ -248,6 +251,18 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
   create(ctx: WidgetMountContext<typeof doodleSchema>): WidgetController {
     let cw = ctx.width;
     let ch = ctx.height;
+
+    // ── seed random colors once ──────────────────────────────────────────────
+    // schema defaults are stable fixed values; we write random colors to the
+    // doc on first mount so they're stored and never re-computed.  this also
+    // migrates pre-existing widgets that were created before these fields.
+    if (!ctx.doc.current.colorsSeeded) {
+      ctx.doc.change((draft) => {
+        draft.penColor = randomDoodleColor();
+        draft.borderColor = randomDoodleColor();
+        draft.colorsSeeded = true;
+      });
+    }
 
     // ── root container ──────────────────────────────────────────────────────
     const container = new Container();
