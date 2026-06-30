@@ -30,6 +30,19 @@ import {
 } from "../src/widgets/widget-types";
 
 // ---------------------------------------------------------------------------
+// helpers (schema-level)
+// ---------------------------------------------------------------------------
+
+/** pick a random vivid color from a broad palette — used for border + pen defaults */
+function randomDoodleColor(): number {
+  const palette = [
+    0xf472b6, 0xec4899, 0xd946ef, 0xa855f7, 0x8b5cf6, 0x6366f1, 0x3b82f6, 0x06b6d4, 0x14b8a6,
+    0x22c55e, 0x84cc16, 0xeab308, 0xf97316, 0xef4444, 0xfbbf24, 0x4ade80, 0x38bdf8, 0xc084fc,
+  ];
+  return palette[Math.floor(Math.random() * palette.length)];
+}
+
+// ---------------------------------------------------------------------------
 // schema
 // ---------------------------------------------------------------------------
 
@@ -71,13 +84,17 @@ export const doodleSchema = z.object({
   /** active drawing tool: "pen" | "eraser" */
   activeTool: z.string().default("pen"),
   /** pen color (0xRRGGBB) */
-  penColor: z.number().default(0xffffff),
+  penColor: z.number().default(() => randomDoodleColor()),
   /** pen width in pixels */
   penWidth: z.number().default(3),
   /** brush shape: "circle" | "rect" | "diamond" */
   brushShape: z.string().default("circle"),
   /** pen opacity 1–100; 100 = fully opaque */
   penOpacity: z.number().default(100),
+  /** border color; -1 = transparent (no border) */
+  borderColor: z.number().default(() => randomDoodleColor()),
+  /** border width in pixels; 0 = no border */
+  borderWidth: z.number().default(1),
 });
 
 export type DoodleState = z.infer<typeof doodleSchema>;
@@ -194,12 +211,14 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     description: "freehand drawing with pen and eraser",
     version: "0.1.0",
     category: "basics",
-    defaultWidth: 440,
+    defaultWidth: 480,
     defaultHeight: 340,
   },
   schema: doodleSchema,
   editableProps: [
     { key: "bgColor", label: "background", type: "color" as const, default: -1 },
+    { key: "borderColor", label: "border", type: "color" as const, default: -1 },
+    { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 1 },
     {
       key: "activeTool",
       label: "tool",
@@ -245,11 +264,16 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     container.addChild(bgGfx);
 
     const drawBackground = () => {
-      const { bgColor } = ctx.doc.current;
+      const { bgColor, borderColor, borderWidth } = ctx.doc.current;
       bgGfx.clear();
       if (!isTransparent(bgColor)) {
         bgGfx.rect(0, 0, cw, ch);
         bgGfx.fill({ color: bgColor });
+      }
+      const bw = borderWidth ?? 0;
+      if (bw > 0 && !isTransparent(borderColor ?? -1)) {
+        bgGfx.rect(0, 0, cw, ch);
+        bgGfx.stroke({ color: borderColor, width: bw });
       }
       // always re-stamp the hitArea after clear() in case PixiJS resets it
       bgGfx.hitArea = new Rectangle(0, 0, cw, ch);
@@ -768,6 +792,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     // is being dragged — calling setHeaderActions mid-drag destroys the button
     // (and its pointer capture), so the drag breaks after a single pixel.
     const unsub = ctx.doc.on("change", (state) => {
+      drawBackground();
       syncStrokes(state);
       if (!isDraggingOpacity && !isDraggingWidth) {
         ctx.setHeaderActions?.(makeHeaderActions());
