@@ -41,7 +41,7 @@ export function createNarthexWithSeed(repo: Repo): CanvasStore {
     id: crypto.randomUUID(),
     type: "markdown",
     x: 80,
-    y: 560,
+    y: 210,
     width: 560,
     height: 560,
     zIndex: 1,
