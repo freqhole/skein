@@ -408,6 +408,15 @@ export class LassoTool {
       return true;
     }
 
+    // check inverse containment: lasso is drawn inside a large widget.
+    // if any lasso point falls within the widget rect the lasso "touches" it
+    // even though no edges cross and the widget center is outside the lasso.
+    for (const pt of this.lassoPoints) {
+      if (pt.x >= rect.x && pt.x <= rect.x + rect.w && pt.y >= rect.y && pt.y <= rect.y + rect.h) {
+        return true;
+      }
+    }
+
     return false;
   }
 

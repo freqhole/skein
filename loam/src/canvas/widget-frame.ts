@@ -2,6 +2,7 @@ import { Container, Graphics, Rectangle, Text, type FederatedPointerEvent } from
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { HeaderAction } from "../widgets/widget-types";
 import type { WidgetEntry } from "./canvas-doc";
+import { isTouchDevice } from "./touch-device";
 
 /** snap a value to the nearest grid line */
 function snapToGrid(value: number, gridSize: number): number {
@@ -141,8 +142,13 @@ export class WidgetFrame {
     this.root.eventMode = "static";
     this.root.sortableChildren = true;
 
-    // track hover state for chrome visibility
+    // track hover state for chrome visibility.
+    // on touch-primary devices hover isn't meaningful — skip entirely so
+    // chrome only shows/hides via selection state (which already works for
+    // tap-to-select + tap-empty-canvas-to-deselect).
+    const touch = isTouchDevice();
     this.root.on("pointerenter", () => {
+      if (touch) return; // touch: ignore hover, rely on selection
       if (this._hoverGraceTimer !== null) {
         clearTimeout(this._hoverGraceTimer);
         this._hoverGraceTimer = null;
@@ -153,6 +159,7 @@ export class WidgetFrame {
     });
 
     this.root.on("pointerleave", () => {
+      if (touch) return; // touch: ignore hover
       // if selected or collapsed, chrome stays — no grace timer needed
       if (this._selected || this._multiSelected || this._collapsed) {
         return;
