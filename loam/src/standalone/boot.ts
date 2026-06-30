@@ -1,6 +1,7 @@
 import { Repo, type DocHandle, type DocumentId } from "@automerge/automerge-repo";
 import { BroadcastChannelNetworkAdapter } from "@automerge/automerge-repo-network-broadcastchannel";
 import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb";
+import { registerEndpointAdapter } from "../p2p/endpoint-control";
 import { createTestRegistry } from "../../widgets/index";
 import { createNarthexRegistry } from "../../widgets/narthex/index";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
@@ -104,6 +105,9 @@ class SkeinRouter {
     this.irohAdapter = new IrohNetworkAdapter(getMidden);
     const network = [new BroadcastChannelNetworkAdapter(), this.irohAdapter];
     this.repo = new Repo({ storage, network });
+
+    // register adapter for module-level endpoint toggle (settings tab)
+    registerEndpointAdapter(this.irohAdapter);
 
     // wrap the adapter's connection state API for the ConnectionStatus widget
     this.connectionStateSource = {
@@ -399,6 +403,11 @@ class SkeinRouter {
         repo: this.repo,
         isNarthex: true,
         hasIdentity: !!this.localNodeId,
+        avatarUrl: this.socialDoc?.current.profile?.avatarDataUrl || null,
+        endpointStateSource: {
+          getState: () => this.irohAdapter.getEndpointState(),
+          onStateChange: (h) => this.irohAdapter.onEndpointStateChange(h),
+        },
         onToggleSocial: () => {
           const sw = window.visualViewport?.width ?? window.innerWidth;
           this.currentMessagesOverlay?.close();
@@ -817,6 +826,11 @@ class SkeinRouter {
           });
         },
         hasIdentity: !!this.localNodeId,
+        avatarUrl: this.socialDoc?.current.profile?.avatarDataUrl || null,
+        endpointStateSource: {
+          getState: () => this.irohAdapter.getEndpointState(),
+          onStateChange: (h) => this.irohAdapter.onEndpointStateChange(h),
+        },
         onToggleSocial: () => {
           const sw = window.visualViewport?.width ?? window.innerWidth;
           this.currentMessagesOverlay?.close();

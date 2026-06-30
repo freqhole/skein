@@ -44,6 +44,13 @@ export interface InitCanvasOptions {
   onToggleMessages?: () => void;
   /** whether the user has a configured identity — controls share button visibility */
   hasIdentity?: boolean;
+  /** pre-seeded avatar URL — shown immediately if cached, avoiding the gradient flash */
+  avatarUrl?: string | null;
+  /** iroh endpoint state source — drives the status dot on the avatar toolbar button */
+  endpointStateSource?: {
+    getState(): "off" | "starting" | "online" | "error";
+    onStateChange(h: (state: "off" | "starting" | "online" | "error") => void): () => void;
+  };
   /** callback to show the canvas-info overlay — triggered by connection-status pill click */
   onShowCanvasInfo?: () => void;
   /** optional transport-level connection state source for the status indicator */
@@ -227,6 +234,8 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     onToggleSocial: options.onToggleSocial,
     onToggleMessages: options.onToggleMessages,
     hasIdentity: options.hasIdentity,
+    avatarUrl: options.avatarUrl,
+    endpointStateSource: options.endpointStateSource,
   });
 
   // step 10a: wire toolbar into widget manager for breadcrumb navigation.

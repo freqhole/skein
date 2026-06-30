@@ -29,6 +29,13 @@ export interface ToolbarOptions {
   onToggleMessages?: () => void;
   /** if false, the share button is hidden even when onShare is set */
   hasIdentity?: boolean;
+  /** pre-seeded avatar URL — if cached, applies immediately (no gradient flash on re-navigation) */
+  avatarUrl?: string | null;
+  /** iroh endpoint state source — drives the small status dot on the avatar button */
+  endpointStateSource?: {
+    getState(): "off" | "starting" | "online" | "error";
+    onStateChange(h: (state: "off" | "starting" | "online" | "error") => void): () => void;
+  };
 }
 
 /** a single segment of the breadcrumb trail shown in the toolbar */
@@ -70,6 +77,7 @@ export class Toolbar {
   private messagesBadge: Container | null = null;
   private avatarSprite: Sprite | null = null;
   private avatarMask: Graphics | null = null;
+  private endpointDot: Graphics | null = null;
   private readonly options: ToolbarOptions;
 
   // flyout menu state
@@ -172,6 +180,20 @@ export class Toolbar {
       this.socialBtn.eventMode = "static";
       this.socialBtn.cursor = "pointer";
       this.root.addChild(this.socialBtn);
+
+      // apply cached avatar immediately if available
+      if (this.options.avatarUrl) {
+        this.setAvatarUrl(this.options.avatarUrl);
+      }
+
+      // endpoint state dot (bottom-right corner of avatar circle)
+      if (this.options.endpointStateSource) {
+        const src = this.options.endpointStateSource;
+        this.endpointDot = new Graphics();
+        this.socialBtn.addChild(this.endpointDot);
+        this.drawEndpointDot(src.getState());
+        this.unsubs.push(src.onStateChange((s) => this.drawEndpointDot(s)));
+      }
     } else {
       this.socialBtn = null;
     }
@@ -333,9 +355,37 @@ export class Toolbar {
 
     this.avatarSprite = sprite;
     this.avatarMask = mask;
+
+    // endpoint dot must stay as the last (top-most) child after the sprite
+    if (this.endpointDot) {
+      this.socialBtn.removeChild(this.endpointDot);
+      this.socialBtn.addChild(this.endpointDot);
+    }
   }
 
-  /** draw the messages button — a simple envelope icon */
+  /** draw the 8px endpoint status dot at the bottom-right of the avatar circle */
+  private drawEndpointDot(state: "off" | "starting" | "online" | "error"): void {
+    if (!this.endpointDot) return;
+    const DOT_R = 4;
+    const BTN_SIZE = 28;
+    const cx = BTN_SIZE - DOT_R - 1;
+    const cy = BTN_SIZE - DOT_R - 1;
+    const color =
+      state === "online"
+        ? 0x22c55e
+        : state === "starting"
+          ? 0xeab308
+          : state === "error"
+            ? 0xef4444
+            : 0x6b7280;
+    this.endpointDot.clear();
+    // dark border ring so the dot pops against both gradient and avatar image
+    this.endpointDot.circle(cx, cy, DOT_R + 1.5);
+    this.endpointDot.fill({ color: 0x0d0d1a, alpha: 0.75 });
+    // colored fill
+    this.endpointDot.circle(cx, cy, DOT_R);
+    this.endpointDot.fill({ color });
+  }
   private createMessagesButton(): Container {
     const BTN_SIZE = 28;
     const radius = BTN_SIZE / 2;

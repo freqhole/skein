@@ -291,11 +291,6 @@ export class MiddenNode {
      */
     proxy_request(peer_addr: string, method: string, path: string, body?: string | null): Promise<any>;
     /**
-     * get our current home relay url, or null if not yet connected to a relay.
-     * use this to include relay hints in share urls so subscribers can skip pkarr discovery.
-     */
-    relay_url(): string | undefined;
-    /**
      * release a blob's TempTag, allowing the store to garbage-collect it.
      * blake3_hash should be the 64-char hex string returned by import_blob.
      */

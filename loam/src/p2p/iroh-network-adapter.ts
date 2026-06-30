@@ -48,6 +48,9 @@ export const SYNC_ALPN = "iroh/automerge-repo/1";
 /** ALPN protocol identifier for friend requests, profile sharing, and presence heartbeat. */
 export const FRIENDZ_ALPN = "skein-friendz/1";
 
+/** the iroh endpoint's lifecycle state for UI display */
+export type EndpointState = "off" | "starting" | "online" | "error";
+
 /** summary of the adapter's connection state for UI display */
 export interface ConnectionSummary {
   /** number of peers we're actively connected to (stream is open) */
@@ -140,6 +143,10 @@ export class IrohNetworkAdapter extends NetworkAdapter {
   /** listeners notified when a peer stream is removed */
   private peerDisconnectListeners: Array<(peerId: string) => void> = [];
 
+  private _stopped = false;
+  private _endpointState: EndpointState = "off";
+  private endpointStateListeners: Array<(state: EndpointState) => void> = [];
+
   constructor(getMidden: () => Promise<MiddenStreamNode>) {
     super();
     this.getMidden = getMidden;
@@ -231,12 +238,14 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     this.connectionStateListeners.length = 0;
     this.peerConnectListeners.length = 0;
     this.peerDisconnectListeners.length = 0;
+    this.endpointStateListeners.length = 0;
 
     if (this.identityUnsub) {
       this.identityUnsub();
       this.identityUnsub = null;
     }
 
+    this.setEndpointState("off");
     this.emit("close");
   }
 
@@ -261,6 +270,9 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
     // clear any pending reconnection state — this is a fresh attempt
     this.clearReconnectState(nodeId);
+
+    // remember the peer but don't connect while stopped
+    if (this._stopped) return;
 
     // skip if already connected
     if (this.streams.has(nodeId)) {
@@ -367,6 +379,67 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     this.emitConnectionStateChange();
   }
 
+  /** get the current iroh endpoint state for UI display */
+  getEndpointState(): EndpointState {
+    return this._endpointState;
+  }
+
+  /** subscribe to endpoint state changes; returns an unsubscribe function */
+  onEndpointStateChange(handler: (state: EndpointState) => void): () => void {
+    this.endpointStateListeners.push(handler);
+    return () => {
+      const idx = this.endpointStateListeners.indexOf(handler);
+      if (idx >= 0) this.endpointStateListeners.splice(idx, 1);
+    };
+  }
+
+  /**
+   * stop all P2P transport gracefully.
+   * closes all peer streams and cancels reconnections, but preserves
+   * intendedPeers so restart() can reconnect them.
+   * the midden node is nulled so restart() creates a fresh endpoint.
+   */
+  stop(): void {
+    if (this._stopped || this._disconnected) return;
+    this._stopped = true;
+
+    for (const [peerId, stream] of this.streams) {
+      stream.close();
+      this.emit("peer-disconnected", { peerId: peerId as PeerId });
+    }
+    this.streams.clear();
+    this.readLoops.clear();
+    this.failedPeers.clear();
+
+    for (const [, state] of this.reconnectState) {
+      if (state.timer !== null) clearTimeout(state.timer);
+    }
+    this.reconnectState.clear();
+
+    // null midden so restart() gets a fresh node via getMidden()
+    this.midden = null;
+
+    this.setEndpointState("off");
+    this.emitConnectionStateChange();
+  }
+
+  /**
+   * restart the P2P transport after stop().
+   * re-initializes the midden node and reconnects all remembered peers.
+   */
+  async restart(): Promise<void> {
+    if (!this._stopped || this._disconnected) return;
+    this._stopped = false;
+
+    await this.initialize();
+
+    for (const peerId of this.intendedPeers) {
+      this.addPeer(peerId).catch((err) => {
+        console.warn(TAG, "restart: failed to re-add peer:", peerId.slice(0, 16) + "...", err);
+      });
+    }
+  }
+
   /**
    * register a handler for incoming streams with a specific ALPN.
    * the accept loop will dispatch matching streams to this handler
@@ -411,12 +484,14 @@ export class IrohNetworkAdapter extends NetworkAdapter {
   }
 
   private async initialize(): Promise<void> {
+    this.setEndpointState("starting");
     try {
       await this.ensureMidden();
-      // start accepting incoming connections
       this.startAcceptLoop();
+      this.setEndpointState("online");
     } catch (err) {
       console.error(TAG, "failed to initialize midden:", err);
+      this.setEndpointState("error");
       throw err;
     }
   }
@@ -434,7 +509,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     const loop_ = async () => {
       const midden = await this.ensureMidden();
 
-      while (!this._disconnected) {
+      while (!this._disconnected && !this._stopped) {
         try {
           const stream = await midden.accept();
 
@@ -469,7 +544,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
             }
           }
         } catch (err) {
-          if (this._disconnected) break;
+          if (this._disconnected || this._stopped) break;
           console.error(TAG, "accept loop error:", err);
           // brief pause before retrying to avoid tight error loops
           await new Promise((r) => setTimeout(r, 1000));
@@ -518,7 +593,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     this.readLoops.set(peerId, true);
 
     const loop_ = async () => {
-      while (this.readLoops.get(peerId) && !this._disconnected) {
+      while (this.readLoops.get(peerId) && !this._disconnected && !this._stopped) {
         try {
           const data = await stream.read_message();
 
@@ -536,7 +611,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
           this.emit("message", message);
         } catch (err) {
-          if (this._disconnected) break;
+          if (this._disconnected || this._stopped) break;
           console.error(TAG, "read error from peer:", peerId.slice(0, 16) + "...", err);
           break;
         }
@@ -572,7 +647,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
     this.readLoops.delete(peerId);
 
-    if (!this._disconnected) {
+    if (!this._disconnected && !this._stopped) {
       this.emit("peer-disconnected", { peerId: peerId as PeerId });
 
       // if this was an intended peer, schedule a reconnection attempt
@@ -589,7 +664,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
    * with random jitter.
    */
   private scheduleReconnect(peerId: string): void {
-    if (this._disconnected) return;
+    if (this._disconnected || this._stopped) return;
 
     // already reconnected while we were setting up
     if (this.streams.has(peerId)) return;
@@ -647,7 +722,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
    * scheduleReconnect(). on failure, schedules the next attempt.
    */
   private async attemptReconnect(peerId: string): Promise<void> {
-    if (this._disconnected) return;
+    if (this._disconnected || this._stopped) return;
 
     // already reconnected (e.g. peer connected to us via accept loop)
     if (this.streams.has(peerId)) {
@@ -680,6 +755,12 @@ export class IrohNetworkAdapter extends NetworkAdapter {
    * clear reconnection state and cancel any pending timer for a peer.
    */
   /** notify all connection state listeners */
+  private setEndpointState(state: EndpointState): void {
+    if (this._endpointState === state) return;
+    this._endpointState = state;
+    for (const h of this.endpointStateListeners) h(state);
+  }
+
   private emitConnectionStateChange(): void {
     for (const handler of this.connectionStateListeners) {
       handler();

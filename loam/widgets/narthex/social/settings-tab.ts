@@ -7,6 +7,13 @@ import {
   setFriendRequestsFrom as bridgeSetFriendRequestsFrom,
   setProfileVisibility as bridgeSetProfileVisibility,
 } from "../../../src/p2p/friendz-bridge";
+import {
+  getEndpointState,
+  onEndpointStateChange,
+  restartEndpoint,
+  stopEndpoint,
+  type EndpointState,
+} from "../../../src/p2p/endpoint-control";
 import { exportIdentityBundle } from "../../../src/p2p/identity";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
 import {
@@ -225,6 +232,111 @@ export function createSettingsTab(ctx: TabContext): TabController {
     }
 
     let offsetY = 0;
+
+    // 0. p2p endpoint toggle
+    {
+      const state: EndpointState = getEndpointState();
+      const dotColor =
+        state === "online"
+          ? 0x22c55e
+          : state === "starting"
+            ? 0xeab308
+            : state === "error"
+              ? 0xef4444
+              : 0x6b7280;
+      const stateLabel =
+        state === "online"
+          ? "online"
+          : state === "starting"
+            ? "connecting..."
+            : state === "error"
+              ? "error"
+              : "off";
+
+      // section label
+      const rowLabel = new Text({
+        text: "p2p endpoint",
+        style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
+        resolution: RESOLUTION,
+      });
+      rowLabel.eventMode = "none";
+      rowLabel.x = 0;
+      rowLabel.y = offsetY;
+      container.addChild(rowLabel);
+      offsetY += LABEL_SIZE + 8;
+
+      // status dot
+      const DOT_R = 4;
+      const dot = new Graphics();
+      dot.circle(DOT_R, DOT_R, DOT_R);
+      dot.fill({ color: dotColor });
+      dot.eventMode = "none";
+      dot.x = 0;
+      dot.y = offsetY + (OPTION_PILL_HEIGHT - DOT_R * 2) / 2;
+      container.addChild(dot);
+
+      // state text
+      const stateText = new Text({
+        text: stateLabel,
+        style: { fontFamily: FONT, fontSize: OPTION_FONT_SIZE, fill: MUTED_TEXT },
+        resolution: RESOLUTION,
+      });
+      stateText.eventMode = "none";
+      stateText.x = DOT_R * 2 + 6;
+      stateText.y = offsetY + (OPTION_PILL_HEIGHT - OPTION_FONT_SIZE) / 2;
+      container.addChild(stateText);
+
+      // toggle button
+      const canToggle = state !== "starting";
+      const btnLabel = state === "online" ? "stop" : "start";
+      const btnW = Math.max(50, btnLabel.length * (OPTION_FONT_SIZE * 0.65) + 20);
+      const btn = new Container();
+      btn.eventMode = canToggle ? "static" : "none";
+      btn.cursor = canToggle ? "pointer" : "default";
+      btn.hitArea = new Rectangle(0, 0, btnW, OPTION_PILL_HEIGHT);
+      btn.x = 120;
+      btn.y = offsetY;
+
+      const btnBg = new Graphics();
+      btnBg.roundRect(0, 0, btnW, OPTION_PILL_HEIGHT, OPTION_PILL_RADIUS);
+      if (state === "online") {
+        btnBg.fill({ color: REJECT_COLOR });
+      } else if (state === "error") {
+        btnBg.fill({ color: ACCENT });
+      } else {
+        btnBg.fill({ color: canToggle ? ACCENT : FIELD_BG });
+        if (!canToggle) btnBg.stroke({ color: FIELD_BORDER, width: 1 });
+      }
+      btn.addChild(btnBg);
+
+      const btnText = new Text({
+        text: btnLabel,
+        style: {
+          fontFamily: FONT,
+          fontSize: OPTION_FONT_SIZE,
+          fill: canToggle ? 0xffffff : MUTED_TEXT,
+        },
+        resolution: RESOLUTION,
+      });
+      btnText.eventMode = "none";
+      btnText.x = (btnW - btnText.width) / 2;
+      btnText.y = (OPTION_PILL_HEIGHT - OPTION_FONT_SIZE) / 2;
+      btn.addChild(btnText);
+
+      btn.on("pointertap", (e) => {
+        e.stopPropagation();
+        if (state === "online") {
+          stopEndpoint();
+        } else if (state !== "starting") {
+          restartEndpoint().catch((err) =>
+            console.error("[skein:settings] endpoint restart failed:", err)
+          );
+        }
+      });
+
+      container.addChild(btn);
+      offsetY += OPTION_PILL_HEIGHT + SETTINGS_ROW_HEIGHT;
+    }
 
     // 1. profile visibility — friends | everyone | nobody
     offsetY += buildPillRow<"friends" | "everyone" | "nobody">(container, offsetY, {
@@ -557,6 +669,8 @@ export function createSettingsTab(ctx: TabContext): TabController {
   const unsub = ctx.doc.on("change", () => {
     rebuild();
   });
+  // re-render when the iroh endpoint state changes
+  const unsubEndpoint = onEndpointStateChange(() => rebuild());
 
   // -----------------------------------------------------------
   // TabController interface
@@ -572,6 +686,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
 
     destroy() {
       unsub();
+      unsubEndpoint();
       if (exportCopyTimer) clearTimeout(exportCopyTimer);
       if (exportInputHandle) exportInputHandle.destroy();
       container.destroy({ children: true });
