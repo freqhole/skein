@@ -190,7 +190,7 @@ describe("encodeMessage / decodeMessage", () => {
       canvasPreviewUrl: "data:image/png;base64,abc123",
       originNodeId: "a".repeat(64),
       originUsername: "alice",
-      role: "editor",
+      role: "member",
       targets: ["b".repeat(64), "c".repeat(64)],
       acked: ["b".repeat(64)],
     };
@@ -244,7 +244,7 @@ describe("encodeMessage / decodeMessage", () => {
       canvasDocId: "doc-456",
       canvasTitle: "my canvas",
       targetNodeId: "b".repeat(64),
-      newRole: "editor",
+      newRole: "member",
       changedBy: "a".repeat(64),
       changedByUsername: "alice",
     };
@@ -585,7 +585,7 @@ describe("FriendzProtocol", () => {
         canvasTitle: "cool canvas",
         originNodeId: peerId,
         originUsername: "bob",
-        role: "editor",
+        role: "member",
         targets: ["a".repeat(64)],
         acked: [],
       };
@@ -619,7 +619,7 @@ describe("FriendzProtocol", () => {
         canvasTitle: "cool canvas",
         originNodeId: peerId,
         originUsername: "bob",
-        role: "editor",
+        role: "member",
         targets: ["a".repeat(64)],
         acked: [],
       };
@@ -689,7 +689,7 @@ describe("FriendzProtocol", () => {
         canvasTitle: "cool canvas",
         originNodeId: friendId,
         originUsername: "bob",
-        role: "editor",
+        role: "member",
         targets: ["a".repeat(64)],
         acked: [],
       };
@@ -823,7 +823,7 @@ describe("FriendzProtocol", () => {
         canvasTitle: "cool canvas",
         originNodeId: "a".repeat(64),
         originUsername: "alice",
-        role: "editor",
+        role: "member",
         targets: [targetId],
         acked: [],
       });
@@ -837,7 +837,7 @@ describe("FriendzProtocol", () => {
       expect(msg.inviteId).toBe("inv-1");
       expect(msg.canvasDocId).toBe("doc-1");
       expect(msg.canvasTitle).toBe("cool canvas");
-      expect(msg.role).toBe("editor");
+      expect(msg.role).toBe("member");
     });
 
     it("sendCanvasInviteAck sends the correct message", async () => {
@@ -1564,7 +1564,7 @@ describe("FriendzProtocol", () => {
             canvasPreviewUrl: "",
             invitedBy: peerId,
             invitedByUsername: "bob",
-            role: "editor",
+            role: "member",
             invitedAt: "2025-01-01T00:00:00Z",
           },
         ],

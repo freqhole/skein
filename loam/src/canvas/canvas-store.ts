@@ -1,6 +1,13 @@
 import type { DocHandle, DocumentId, PeerId, Repo } from "@automerge/automerge-repo";
-import type { CanvasDocument, CanvasPeer, PendingCanvasInvite, WidgetEntry } from "./canvas-doc";
-import { emptyCanvasDoc } from "./canvas-doc";
+import type {
+  CanvasDocument,
+  CanvasPeer,
+  CanvasRole,
+  InvitableRole,
+  PendingCanvasInvite,
+  WidgetEntry,
+} from "./canvas-doc";
+import { canvasRoleSchema, emptyCanvasDoc } from "./canvas-doc";
 
 /** handler signature for ephemeral message listeners */
 export type EphemeralHandler = (senderId: string, data: Uint8Array) => void;
@@ -151,16 +158,20 @@ export class CanvasStore {
   // -- access control ----------------------------------------------------------
 
   /**
-   * mark a node id as the owner of this canvas. call once, at creation time
-   * (see `CanvasStore.create()`). idempotent — a no-op if an owner is
+   * mark a node id as the admin of this canvas. call once, at creation time
+   * (see `CanvasStore.create()`). idempotent — a no-op if an admin is
    * already recorded, so it's safe to call defensively.
+   *
+   * role names (admin/member/viewer) match tomb/'s role model — renamed
+   * 2026-07-01 from owner/editor/viewer. admin is the only role that can
+   * invite/share (see share-dialog.ts gating).
    */
-  stampOwner(nodeId: string): void {
+  stampAdmin(nodeId: string): void {
     this.handle.change((doc) => {
       if (!doc.acl) doc.acl = {};
-      const hasOwner = Object.values(doc.acl).some((entry) => entry.role === "owner");
-      if (!hasOwner) {
-        doc.acl[nodeId] = { role: "owner" };
+      const hasAdmin = Object.values(doc.acl).some((entry) => entry.role === "admin");
+      if (!hasAdmin) {
+        doc.acl[nodeId] = { role: "admin" };
       }
     });
   }
@@ -170,14 +181,14 @@ export class CanvasStore {
    * is sent (role chosen at invite time) and later, to change an
    * already-invited peer's role.
    *
-   * does not touch the owner's own entry — callers should not be able to
-   * demote the owner via this path (there is currently exactly one owner
-   * per canvas, stamped once via `stampOwner()`).
+   * does not touch an admin's own entry — callers should not be able to
+   * demote an admin via this path (there is currently exactly one admin
+   * per canvas, stamped once via `stampAdmin()`).
    */
-  setRole(nodeId: string, role: "editor" | "viewer"): void {
+  setRole(nodeId: string, role: InvitableRole): void {
     this.handle.change((doc) => {
       if (!doc.acl) doc.acl = {};
-      if (doc.acl[nodeId]?.role === "owner") return;
+      if (doc.acl[nodeId]?.role === "admin") return;
       doc.acl[nodeId] = { role };
     });
   }
@@ -185,21 +196,38 @@ export class CanvasStore {
   /**
    * effective role for a node id on this canvas.
    *
-   * a missing `.acl` entry defaults to `"editor"` — this is a backward-
+   * a missing `.acl` entry defaults to `"member"` — this is a backward-
    * compatibility default for canvases created before ACL roles existed
    * (and for the common case of a peer who's connected but hasn't been
    * explicitly assigned a role yet). the local node querying its own
    * unrecorded role is treated the same way; there is no implicit
    * "stranger" state at this layer — that's gated separately by
    * `sharePolicy` / invite flow, not by `.acl`.
+   *
+   * **validates the raw value through `canvasRoleSchema` before trusting
+   * it** — `.acl` is regular automerge doc data, synced from other peers
+   * with no server-side validation. a stale peer running pre-rename code
+   * (or a buggy/malicious one) could write an unrecognized role string;
+   * this falls back to the safe default rather than propagating garbage as
+   * if it were a valid role. see canvas-doc.ts's centralized role schemas
+   * for why this matters — this is the one place in the ACL model that
+   * reads untrusted synced data as a security-relevant value.
    */
-  getRole(nodeId: string): "owner" | "editor" | "viewer" {
-    return this.doc().acl?.[nodeId]?.role ?? "editor";
+  getRole(nodeId: string): CanvasRole {
+    const raw = this.doc().acl?.[nodeId]?.role;
+    const parsed = canvasRoleSchema.safeParse(raw);
+    return parsed.success ? parsed.data : "member";
   }
 
   /** convenience: true if `nodeId` has view-only access to this canvas. */
   isViewer(nodeId: string): boolean {
     return this.getRole(nodeId) === "viewer";
+  }
+
+  /** convenience: true if `nodeId` is an admin on this canvas — only admins
+   *  can invite/share (see share-dialog.ts gating). */
+  isAdmin(nodeId: string): boolean {
+    return this.getRole(nodeId) === "admin";
   }
 
   // -- metadata --------------------------------------------------------------

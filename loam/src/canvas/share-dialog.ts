@@ -10,6 +10,7 @@
 
 import { ButtonContainer, Dialog, FancyButton } from "@pixi/ui";
 import { Container, Graphics, Text, type Application } from "pixi.js";
+import type { CanvasRole, InvitableRole } from "./canvas-doc";
 import type { SkeinTheme } from "../theme/skein-theme";
 import { log } from "../utils/log";
 
@@ -33,17 +34,17 @@ export interface ShareDialogOptions {
   shareString: string;
   shareUrl: string;
   /** list of peer node IDs this canvas is shared with (from canvas doc) */
-  peers?: Array<{ nodeId: string; joinedAt: string; role?: "owner" | "editor" | "viewer" }>;
+  peers?: Array<{ nodeId: string; joinedAt: string; role?: CanvasRole }>;
   /** called when user clicks "remove" on a peer */
   onRemovePeer?: (nodeId: string) => void;
   /** called when user clicks "add friend" on a peer — sends a friend request */
   onAddFriend?: (nodeId: string) => void | Promise<void>;
   /** called when the user changes an already-invited peer's role via the role toggle */
-  onChangeRole?: (nodeId: string, role: "editor" | "viewer") => void;
+  onChangeRole?: (nodeId: string, role: InvitableRole) => void;
   /** list of friends who haven't been invited to this canvas yet */
   friends?: FriendInfo[];
   /** called when user clicks "invite" on a friend row — sends canvas-invite with the chosen role */
-  onInviteFriend?: (friend: FriendInfo, role: "editor" | "viewer") => void | Promise<void>;
+  onInviteFriend?: (friend: FriendInfo, role: InvitableRole) => void | Promise<void>;
   onClose?: () => void;
   /** optional map of nodeId -> display name for resolving peer names from friends list */
   peerDisplayNames?: Map<string, string>;
@@ -189,12 +190,12 @@ function wireCopy(
 // helpers — role toggle
 // ---------------------------------------------------------------------------
 
-/** small pill button showing the current role — click cycles editor <-> viewer. */
+/** small pill button showing the current role — click cycles member <-> viewer. */
 function buildRoleToggle(
   theme: SkeinTheme,
-  initialRole: "editor" | "viewer",
-  onChange: (role: "editor" | "viewer") => void
-): { container: Container; width: number; height: number; setRole: (role: "editor" | "viewer") => void } {
+  initialRole: InvitableRole,
+  onChange: (role: InvitableRole) => void
+): { container: Container; width: number; height: number; setRole: (role: InvitableRole) => void } {
   let currentRole = initialRole;
 
   const text = new Text({
@@ -231,14 +232,14 @@ function buildRoleToggle(
 
   const { w: width, h: height } = draw();
 
-  const setRole = (role: "editor" | "viewer") => {
+  const setRole = (role: InvitableRole) => {
     currentRole = role;
     text.text = currentRole;
     draw();
   };
 
   btn.onPress.connect(() => {
-    setRole(currentRole === "editor" ? "viewer" : "editor");
+    setRole(currentRole === "member" ? "viewer" : "member");
     onChange(currentRole);
   });
 
@@ -259,8 +260,8 @@ function buildPeerRow(
   onRemovePeer?: (nodeId: string) => void,
   onAddFriend?: (nodeId: string) => void | Promise<void>,
   displayName?: string,
-  role?: "owner" | "editor" | "viewer",
-  onChangeRole?: (nodeId: string, role: "editor" | "viewer") => void
+  role?: CanvasRole,
+  onChangeRole?: (nodeId: string, role: InvitableRole) => void
 ): Container {
   const row = new Container();
 
@@ -303,11 +304,11 @@ function buildPeerRow(
     subIdText.y = (copyBtnH - subIdText.height) / 2;
     row.addChild(subIdText);
   }
-  // role toggle — shown for non-owner peers when a change handler is
+  // role toggle — shown for non-admin peers when a change handler is
   // provided. sits between the "friend" button and the copy button.
-  const showRoleToggle = !!onChangeRole && role !== "owner";
+  const showRoleToggle = !!onChangeRole && role !== "admin";
   if (showRoleToggle) {
-    const toggle = buildRoleToggle(theme, role === "viewer" ? "viewer" : "editor", (newRole) => {
+    const toggle = buildRoleToggle(theme, role === "viewer" ? "viewer" : "member", (newRole) => {
       onChangeRole!(safeNodeId, newRole);
     });
     let roleRightOffset = 8;
@@ -316,9 +317,9 @@ function buildPeerRow(
     toggle.container.x = scrollBoxWidth - toggle.width - roleRightOffset;
     toggle.container.y = (copyBtnH - toggle.height) / 2;
     row.addChild(toggle.container);
-  } else if (role === "owner") {
-    const ownerText = new Text({
-      text: "owner",
+  } else if (role === "admin") {
+    const adminText = new Text({
+      text: "admin",
       style: {
         fontFamily: theme.fontFamily,
         fontSize: theme.fontSizeSmall,
@@ -326,13 +327,13 @@ function buildPeerRow(
       },
       resolution: theme.textResolution,
     });
-    ownerText.eventMode = "none";
+    adminText.eventMode = "none";
     let roleRightOffset = 8;
     if (onRemovePeer) roleRightOffset += 70;
     if (onAddFriend) roleRightOffset += 70;
-    ownerText.x = scrollBoxWidth - ownerText.width - roleRightOffset;
-    ownerText.y = (copyBtnH - ownerText.height) / 2;
-    row.addChild(ownerText);
+    adminText.x = scrollBoxWidth - adminText.width - roleRightOffset;
+    adminText.y = (copyBtnH - adminText.height) / 2;
+    row.addChild(adminText);
   }
 
   // copy button — copies full node ID
@@ -340,7 +341,7 @@ function buildPeerRow(
   let rightOffset = 8;
   if (onRemovePeer) rightOffset += 70;
   if (onAddFriend) rightOffset += 70;
-  if (showRoleToggle || role === "owner") rightOffset += 70;
+  if (showRoleToggle || role === "admin") rightOffset += 70;
   copyBtn.btn.x = scrollBoxWidth - copyBtn.width - rightOffset;
   copyBtn.btn.y = 0;
   row.addChild(copyBtn.btn);
@@ -461,7 +462,7 @@ function buildFriendInviteRow(
   scrollBoxWidth: number,
   rowHeight: number,
   isRemoved: () => boolean,
-  onInvite?: (friend: FriendInfo, role: "editor" | "viewer") => void | Promise<void>
+  onInvite?: (friend: FriendInfo, role: InvitableRole) => void | Promise<void>
 ): Container {
   const row = new Container();
 
@@ -518,8 +519,8 @@ function buildFriendInviteRow(
   nameText.y = (rowHeight - nameText.height) / 2;
   row.addChild(nameText);
 
-  // role toggle — chooses editor (default) or viewer before inviting.
-  let selectedRole: "editor" | "viewer" = "editor";
+  // role toggle — chooses member (default) or viewer before inviting.
+  let selectedRole: InvitableRole = "member";
   const roleToggle = buildRoleToggle(theme, selectedRole, (role) => {
     selectedRole = role;
   });

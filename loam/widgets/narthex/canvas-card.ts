@@ -1,5 +1,6 @@
 import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
+import { canvasRoleSchema } from "../../src/canvas/canvas-doc";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import { formatRelativeTime, formatShortDate } from "../../src/widgets/format";
 import {
@@ -24,7 +25,7 @@ export const canvasCardSchema = z.object({
   isRemote: z.boolean().default(false),
   ownerNodeId: z.string().default(""),
   ownerUsername: z.string().default(""),
-  role: z.enum(["owner", "editor", "viewer"]).default("owner"),
+  role: canvasRoleSchema.default("admin"),
   accessRevoked: z.boolean().default(false),
   lastVisitedAt: z.string().default(""),
   hasUpdates: z.boolean().default(false),
@@ -69,7 +70,7 @@ const ICON_COLOR = 0x444460;
 // remote card theme colors
 const REMOTE_BORDER_COLOR = 0x3a7ca5;
 const REMOTE_BORDER_HOVER_COLOR = 0x5a9cc5;
-const ROLE_EDITOR_COLOR = 0x22c55e;
+const ROLE_MEMBER_COLOR = 0x22c55e;
 const ROLE_VIEWER_COLOR = 0xf59e0b;
 const REVOKED_OVERLAY_ALPHA = 0.7;
 const REVOKED_TEXT_COLOR = 0xff6b6b;
@@ -646,13 +647,13 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
     };
 
     const drawRolePill = (state: CanvasCardState, pillX: number, pillY: number): number => {
-      if (!state.isRemote || state.role === "owner") {
+      if (!state.isRemote || state.role === "admin") {
         rolePill.visible = false;
         rolePillText.visible = false;
         return 0;
       }
 
-      const pillColor = state.role === "editor" ? ROLE_EDITOR_COLOR : ROLE_VIEWER_COLOR;
+      const pillColor = state.role === "member" ? ROLE_MEMBER_COLOR : ROLE_VIEWER_COLOR;
       rolePillText.text = state.role;
       rolePillText.style.fill = pillColor;
 

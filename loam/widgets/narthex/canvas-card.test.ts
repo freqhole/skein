@@ -16,7 +16,7 @@ describe("canvasCardSchema", () => {
       isRemote: false,
       ownerNodeId: "",
       ownerUsername: "",
-      role: "owner",
+      role: "admin",
       accessRevoked: false,
       lastVisitedAt: "",
       hasUpdates: false,
@@ -142,14 +142,14 @@ describe("remote canvas card schema", () => {
       isRemote: true,
       ownerNodeId: "node-abc123def456",
       ownerUsername: "alice",
-      role: "editor",
+      role: "member",
       accessRevoked: false,
       lastVisitedAt: "2025-06-01T12:00:00Z",
     });
     expect(result.isRemote).toBe(true);
     expect(result.ownerNodeId).toBe("node-abc123def456");
     expect(result.ownerUsername).toBe("alice");
-    expect(result.role).toBe("editor");
+    expect(result.role).toBe("member");
     expect(result.accessRevoked).toBe(false);
     expect(result.lastVisitedAt).toBe("2025-06-01T12:00:00Z");
   });
@@ -159,13 +159,16 @@ describe("remote canvas card schema", () => {
     expect(result.isRemote).toBe(false);
     expect(result.ownerNodeId).toBe("");
     expect(result.ownerUsername).toBe("");
-    expect(result.role).toBe("owner");
+    expect(result.role).toBe("admin");
     expect(result.accessRevoked).toBe(false);
     expect(result.lastVisitedAt).toBe("");
   });
 
   it("rejects invalid role values", () => {
-    expect(() => canvasCardSchema.parse({ role: "admin" })).toThrow();
+    // "owner" was the pre-rename role name (admin/member/viewer replaced
+    // owner/editor/viewer) — confirms old values are properly rejected, not
+    // silently accepted.
+    expect(() => canvasCardSchema.parse({ role: "owner" })).toThrow();
     expect(() => canvasCardSchema.parse({ role: 42 })).toThrow();
   });
 
@@ -190,7 +193,7 @@ describe("remote canvas card schema", () => {
     expect(result.isRemote).toBe(false);
     expect(result.ownerNodeId).toBe("");
     expect(result.ownerUsername).toBe("");
-    expect(result.role).toBe("owner");
+    expect(result.role).toBe("admin");
     expect(result.accessRevoked).toBe(false);
     expect(result.lastVisitedAt).toBe("");
   });

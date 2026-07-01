@@ -5,7 +5,7 @@ import { registerEndpointAdapter } from "../p2p/endpoint-control";
 import { createTestRegistry } from "../../widgets/index";
 import { createNarthexRegistry } from "../../widgets/narthex/index";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
-import type { CanvasDocument } from "../canvas/canvas-doc";
+import type { CanvasDocument, InvitableRole } from "../canvas/canvas-doc";
 import { CanvasStore } from "../canvas/canvas-store";
 import type { ConnectionStateSource } from "../canvas/connection-status";
 import { initCanvas, type SkeinCanvas } from "../canvas/init";
@@ -780,7 +780,7 @@ class SkeinRouter {
               this.irohAdapter.forgetPeer(nodeId);
               log.debug(TAG, "revoked access for peer:", nodeId.slice(0, 16) + "...");
             },
-            onChangeRole: (nodeId: string, role: "editor" | "viewer") => {
+            onChangeRole: (nodeId: string, role: InvitableRole) => {
               this.currentCanvas?.store.setRole(nodeId, role);
               log.debug(TAG, "changed role for peer:", nodeId.slice(0, 16) + "...", "->", role);
             },
@@ -793,7 +793,7 @@ class SkeinRouter {
               }
             },
             friends: friendsForInvite,
-            onInviteFriend: async (friend: FriendInfo, role: "editor" | "viewer") => {
+            onInviteFriend: async (friend: FriendInfo, role: InvitableRole) => {
               if (!this.friendzProtocol || !this.currentCanvas) return;
               const localIdentity = await getStoredIdentity();
               if (!localIdentity) return;
@@ -1135,14 +1135,14 @@ class SkeinRouter {
             // NOTE: this is a cosmetic display field on the *local* narthex
             // canvas-card only — it is NOT the actual access control. the
             // real ACL lives in the shared canvas doc's `.acl` map (see
-            // CanvasStore.setRole/getRole), which the owner already writes
+            // CanvasStore.setRole/getRole), which an admin already writes
             // at invite-send time and which syncs to this peer automatically
             // once they join the canvas. this field is hardcoded to
-            // "editor" because the invite-accept event (see
+            // "member" because the invite-accept event (see
             // messagez-widget.ts's `canvasInviteSchema`) doesn't currently
             // carry the actual chosen role through to this point — a
             // cosmetic-only gap, tracked as a follow-up, not a security gap.
-            role: "editor",
+            role: "member",
             accessRevoked: false,
             lastVisitedAt: "",
           },
@@ -1339,7 +1339,7 @@ class SkeinRouter {
     // access control section) — skipped if no identity exists yet (anonymous
     // creator); nothing to stamp in that case.
     if (this.localNodeId) {
-      newStore.stampOwner(this.localNodeId);
+      newStore.stampAdmin(this.localNodeId);
     }
 
     const title = detail?.title || "untitled canvas";

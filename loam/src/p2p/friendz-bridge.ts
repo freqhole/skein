@@ -13,6 +13,7 @@
 // ---------------------------------------------------------------------------
 
 import type { FriendzProtocol } from "./friends-protocol";
+import type { CanvasRoleOrRemoved, InvitableRole } from "../canvas/canvas-doc";
 
 // ---------------------------------------------------------------------------
 // module state
@@ -196,7 +197,7 @@ export async function sendCanvasInvite(
     canvasPreviewUrl?: string;
     originNodeId: string;
     originUsername: string;
-    role: "editor" | "viewer";
+    role: InvitableRole;
     targets: string[];
     acked: string[];
   }
@@ -247,7 +248,7 @@ export async function sendAclChange(
     canvasDocId: string;
     canvasTitle: string;
     targetNodeId: string;
-    newRole: "editor" | "viewer" | "removed";
+    newRole: CanvasRoleOrRemoved;
     changedBy: string;
     changedByUsername: string;
   }

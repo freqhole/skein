@@ -8,6 +8,7 @@
 
 import type { BiStreamLike, MiddenStreamNode } from "./iroh-network-adapter";
 import { FRIENDZ_ALPN } from "./iroh-network-adapter";
+import type { CanvasRoleOrRemoved, InvitableRole } from "../canvas/canvas-doc";
 import { log } from "../utils/log";
 
 // ---------------------------------------------------------------------------
@@ -94,7 +95,7 @@ export interface CanvasInviteMessage {
   canvasPreviewUrl?: string;
   originNodeId: string;
   originUsername: string;
-  role: "editor" | "viewer";
+  role: InvitableRole;
   targets: string[];
   acked: string[];
 }
@@ -129,7 +130,7 @@ export interface AclChangeMessage {
   canvasDocId: string;
   canvasTitle: string;
   targetNodeId: string;
-  newRole: "editor" | "viewer" | "removed";
+  newRole: CanvasRoleOrRemoved;
   changedBy: string;
   changedByUsername: string;
 }
@@ -178,7 +179,7 @@ export interface GossipDigestPendingInvite {
   canvasPreviewUrl: string;
   invitedBy: string;
   invitedByUsername: string;
-  role: "editor" | "viewer";
+  role: InvitableRole;
   invitedAt: string;
 }
 
