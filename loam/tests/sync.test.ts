@@ -151,12 +151,17 @@ test("widget internal state syncs via zod-validated doc API", async ({ canvasPag
   const peerA = await canvasPage();
   const peerB = await canvasPage({ canvasDocId: peerA.canvasDocId, context: peerA.context });
 
-  // peerA adds a counter widget (stateful — gets its own per-widget doc)
+  // peerA adds a notepad widget (stateful — gets its own per-widget doc).
+  // a previous version of this test used a "counter" widget type that no
+  // longer exists in the registry (removed from
+  // client/skein/widgets/counter.ts during a later refactor without
+  // updating this test), so widgetDoc never became ready and this test
+  // always timed out waiting for it.
   await peerA.page.evaluate(() => {
     const skein = (window as any).__skein;
     skein.store.addWidget({
       id: "sync-counter-1",
-      type: "counter",
+      type: "notepad",
       x: 50,
       y: 50,
       width: 200,
@@ -193,12 +198,16 @@ test("widget internal state syncs via zod-validated doc API", async ({ canvasPag
     )
     .toBe(true);
 
-  // peerA changes the counter's internal state via the zod-validated doc facade
+  // peerA changes the widget's internal state via the zod-validated doc
+  // facade. mutate a real schema field (notepad's `fontSize`) rather than an
+  // arbitrary key — `widgetDoc.current` re-validates through `schema.parse()`
+  // on read (see widget-doc.ts), which strips any key not declared in the
+  // zod schema, so an undeclared field like `count` would silently vanish.
   await peerA.page.evaluate(() => {
     const live = (window as any).__skein.widgetManager.getLiveWidgets();
     const w = live.get("sync-counter-1");
     w.widgetDoc.change((d: any) => {
-      d.count = 42;
+      d.fontSize = 42;
     });
   });
 
@@ -215,7 +224,7 @@ test("widget internal state syncs via zod-validated doc API", async ({ canvasPag
     )
     .toBe(true);
 
-  // poll peerB for the synced counter value
+  // poll peerB for the synced fontSize value
   await expect
     .poll(
       () =>
@@ -223,7 +232,7 @@ test("widget internal state syncs via zod-validated doc API", async ({ canvasPag
           const live = (window as any).__skein.widgetManager.getLiveWidgets();
           const w = live.get("sync-counter-1");
           if (!w || !w.widgetDoc) return null;
-          return w.widgetDoc.current.count;
+          return w.widgetDoc.current.fontSize;
         }),
       { timeout: 5000 }
     )

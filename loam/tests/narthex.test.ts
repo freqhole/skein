@@ -96,33 +96,14 @@ async function getCanvasCards(
 
 test.describe("narthex navigation", () => {
   test.beforeEach(async ({ page }) => {
-    // explicitly clear IndexedDB state for a clean slate — each test should
-    // be independent even though playwright gives us a fresh context.
-    await page.goto("/");
-
-    await page.evaluate(async () => {
-      const dbs = await indexedDB.databases();
-      await Promise.all(
-        dbs.map(
-          (db) =>
-            new Promise<void>((resolve) => {
-              if (!db.name) {
-                resolve();
-                return;
-              }
-              const req = indexedDB.deleteDatabase(db.name);
-              req.onsuccess = () => resolve();
-              req.onerror = () => resolve();
-              req.onblocked = () => resolve();
-            })
-        )
-      );
-    });
-
-    // small delay to let IDB deletions settle before reload
-    await page.waitForTimeout(200);
-
-    // reload after clearing so we start from true first-boot state
+    // playwright already gives each test a fresh browser context (and
+    // therefore fresh IndexedDB) — no manual clearing needed. a previous
+    // version of this hook called `indexedDB.deleteDatabase()` on all
+    // databases right after the first goto(), which raced with automerge's
+    // own storage connection (deletion silently no-ops via `onblocked` while
+    // the connection is still open, then actually completes later during
+    // the reload) — corrupting the just-created narthex document and
+    // causing intermittent "Document ... is unavailable" boot failures.
     await page.goto("/");
     await waitForNarthex(page);
   });

@@ -457,18 +457,22 @@ class SkeinRouter {
       // so the object must exist before mountSocialOverlay() runs.
       if (import.meta.env.DEV) {
         const t: Record<string, unknown> = ((window as any).__skeinTest ??= {});
-        const self = this;
-        t.social = {
-          get doc() {
-            return self.socialDoc;
-          },
+        // build with arrow functions (not object-literal shorthand methods) so
+        // `this` stays lexically bound to the router instance — avoids the
+        // `const self = this` alias eslint flags (@typescript-eslint/no-this-alias).
+        const social: Record<string, unknown> = {
           ensureIdentity,
-          toggleOverlay() {
+          toggleOverlay: () => {
             const sw = window.visualViewport?.width ?? window.innerWidth;
-            self.currentSocialOverlay?.toggle(sw);
+            this.currentSocialOverlay?.toggle(sw);
           },
           // pickAvatar is added by profile-tab.ts during socialWidget.create()
         };
+        Object.defineProperty(social, "doc", {
+          enumerable: true,
+          get: () => this.socialDoc,
+        });
+        t.social = social;
       }
       // mount overlay panels and wire badge counts
       this.currentSocialOverlay = this.mountSocialOverlay(canvas);

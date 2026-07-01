@@ -104,22 +104,31 @@ test("property tray hides when widget is deselected", async ({ canvasPage }) => 
   expect(visibleAfter).toBe(false);
 });
 
-test("property tray does not appear for stateless widgets (hello-world)", async ({
+test("property tray shows only the title control for stateless widgets (canvas-info)", async ({
   canvasPage,
 }) => {
   const { page } = await canvasPage();
 
+  // canvas-info is a real registered widget with no editableProps (see
+  // widgets/canvas-info.test.ts: "has no editableProps"). a previous version
+  // of this test used a bogus "hello-world" type, which isn't registered in
+  // createTestRegistry() at all — it mounted as a crashed placeholder, which
+  // intentionally *does* get a minimal property tray (title + delete button,
+  // see property-tray.ts), so the old assertion (tray fully hidden) was
+  // testing the wrong thing. the tray's title field is always shown for any
+  // selected, registered widget — only widget-specific prop controls are
+  // conditional on `factory.editableProps`.
   await page.evaluate(() => {
     const skein = (window as any).__skein;
     skein.store.addWidget({
-      id: "hw1",
-      type: "hello-world",
+      id: "ci1",
+      type: "canvas-info",
       x: 50,
       y: 50,
       width: 200,
       height: 100,
       zIndex: 1,
-      props: {},
+      props: { activeTab: "details" },
       collapsed: false,
       docId: null,
       parentId: null,
@@ -128,15 +137,20 @@ test("property tray does not appear for stateless widgets (hello-world)", async 
   await page.waitForTimeout(300);
 
   await page.evaluate(() => {
-    (window as any).__skein.inputRouter.selectWidget("hw1");
+    (window as any).__skein.inputRouter.selectWidget("ci1");
   });
   await page.waitForTimeout(100);
 
-  const visible = await page.evaluate(() => {
-    return (window as any).__skein.propertyTray.root.visible;
+  const result = await page.evaluate(() => {
+    const propertyTray = (window as any).__skein.propertyTray;
+    return {
+      visible: propertyTray.root.visible,
+      controlCount: propertyTray.controls.length,
+    };
   });
 
-  expect(visible).toBe(false);
+  expect(result.visible).toBe(true);
+  expect(result.controlCount).toBe(0);
 });
 
 test("property tray is positioned to the right of the selected widget", async ({ canvasPage }) => {
@@ -259,12 +273,22 @@ test("property tray shows the widget name in the header", async ({ canvasPage })
 test("property tray renders controls for each editable prop", async ({ canvasPage }) => {
   const { page } = await canvasPage();
 
-  // use counter widget which has 2 editableProps: label (string) and step (number)
+  // "notepad" has 5 editableProps (bgColor, textColor, borderColor, fontSize,
+  // fontFamily) plus the always-shown title control and a delete button = 7 total.
+  //
+  // a previous version of this test used a "counter" widget type that no
+  // longer exists in the registry (removed from
+  // client/skein/widgets/counter.ts during a later refactor). since it's
+  // unregistered, it mounts as a *crashed* placeholder, whose tray always
+  // has exactly 2 children (title + delete button, see `showCrashed` in
+  // property-tray.ts) — which coincidentally matched this test's expected
+  // count of 2, making it a false-positive pass that wasn't actually
+  // testing editableProps rendering at all.
   await page.evaluate(() => {
     const skein = (window as any).__skein;
     skein.store.addWidget({
-      id: "c1",
-      type: "counter",
+      id: "n1",
+      type: "notepad",
       x: 50,
       y: 50,
       width: 200,
@@ -279,7 +303,7 @@ test("property tray renders controls for each editable prop", async ({ canvasPag
   await page.waitForTimeout(300);
 
   await page.evaluate(() => {
-    (window as any).__skein.inputRouter.selectWidget("c1");
+    (window as any).__skein.inputRouter.selectWidget("n1");
   });
   await page.waitForTimeout(100);
 
@@ -294,8 +318,8 @@ test("property tray renders controls for each editable prop", async ({ canvasPag
   });
 
   expect(result.visible).toBe(true);
-  // counter has 2 editableProps: label and step
-  expect(result.controlCount).toBe(2);
+  // title control + 5 editableProps (bgColor, textColor, borderColor, fontSize, fontFamily) + delete button
+  expect(result.controlCount).toBe(7);
 });
 
 test("property tray switches when selecting a different widget", async ({ canvasPage }) => {
@@ -398,11 +422,19 @@ test("property tray hides when the selected widget is removed", async ({ canvasP
 test("number control +/- buttons change the widget doc value", async ({ canvasPage }) => {
   const { page } = await canvasPage();
 
+  // "notepad" is a real registered widget with a plain (non-conditional,
+  // static-default) numeric editableProp ("fontSize", default 13). a previous
+  // version of this test used a "counter" widget type that no longer exists
+  // in the registry (removed from client/skein/widgets/counter.ts during a
+  // later refactor without updating this test), so widgetDoc was always null.
+  // note: "label" widget's borderWidth looks similar but its zod default is
+  // randomized (see widgets/label.ts: `getCachedRandom().borderWidth`), so
+  // it's not usable for a deterministic initial-value assertion.
   await page.evaluate(() => {
     const skein = (window as any).__skein;
     skein.store.addWidget({
-      id: "c1",
-      type: "counter",
+      id: "n1",
+      type: "notepad",
       x: 50,
       y: 50,
       width: 200,
@@ -417,37 +449,38 @@ test("number control +/- buttons change the widget doc value", async ({ canvasPa
   await page.waitForTimeout(300);
 
   await page.evaluate(() => {
-    (window as any).__skein.inputRouter.selectWidget("c1");
+    (window as any).__skein.inputRouter.selectWidget("n1");
   });
   await page.waitForTimeout(100);
 
-  // read the initial step value from the widget doc
-  const initialStep = await page.evaluate(() => {
-    const live = (window as any).__skein.widgetManager.getLiveWidgets().get("c1");
-    return live?.widgetDoc?.current?.step ?? null;
+  // read the initial fontSize value from the widget doc
+  const initialFontSize = await page.evaluate(() => {
+    const live = (window as any).__skein.widgetManager.getLiveWidgets().get("n1");
+    return live?.widgetDoc?.current?.fontSize ?? null;
   });
-  expect(initialStep).toBe(1);
+  expect(initialFontSize).toBe(13);
 
-  // find the step control's plus button and click it.
-  // the step control is the second control in the contentContainer.
-  // each number control has: label, fieldBg, valueText, minusBtn, plusBtn
-  // the plusBtn is the last child of the control container.
+  // find the fontSize control's plus button and click it.
+  // contentContainer children (see editableProps order in widgets/notepad.ts):
+  // [0] title, [1] bgColor, [2] textColor, [3] borderColor, [4] fontSize.
+  // each number control's own children are [label, minusBtn, plusBtn, input]
+  // (see createNumberControl in property-tray.ts) — plusBtn is index 2, not
+  // the last child (the editable input field is added after the buttons).
   await page.evaluate(() => {
     const tray = (window as any).__skein.propertyTray;
     const content = tray.root.children[2]; // contentContainer
-    const stepControl = content.children[1]; // second control (step)
-    // plus button is the last child of the step control container
-    const plusBtn = stepControl.children[stepControl.children.length - 1];
+    const fontSizeControl = content.children[4];
+    const plusBtn = fontSizeControl.children[2];
     // simulate a pointerdown event
     plusBtn.emit("pointerdown", { stopPropagation: () => {} });
   });
   await page.waitForTimeout(100);
 
-  const newStep = await page.evaluate(() => {
-    const live = (window as any).__skein.widgetManager.getLiveWidgets().get("c1");
-    return live?.widgetDoc?.current?.step ?? null;
+  const newFontSize = await page.evaluate(() => {
+    const live = (window as any).__skein.widgetManager.getLiveWidgets().get("n1");
+    return live?.widgetDoc?.current?.fontSize ?? null;
   });
-  expect(newStep).toBe(2);
+  expect(newFontSize).toBe(14);
 });
 
 test("property tray has very high zIndex in the world container", async ({ canvasPage }) => {

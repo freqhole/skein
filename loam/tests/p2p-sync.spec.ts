@@ -14,7 +14,13 @@
  */
 
 import { test, expect } from "./fixtures/p2p-page";
-import { addPeer, getEndpointState, getWidgetCount, waitForWidgetCount } from "./helpers/skein-bridge";
+import {
+  addPeer,
+  getEndpointState,
+  getWidgetCount,
+  joinCanvas,
+  waitForWidgetCount,
+} from "./helpers/skein-bridge";
 
 // ---------------------------------------------------------------------------
 // smoke: two endpoints come online
@@ -50,13 +56,19 @@ test("peers can dial each other by node ID @p2p", async ({ p2pPage }) => {
   // wait for automerge-repo to see at least one peer on each side
   // (this confirms the iroh QUIC stream is established and the automerge
   //  handshake completed)
+  //
+  // note: `repo.peers` is a getter property (see automerge-repo's Repo.js:
+  // `get peers() { return this.synchronizer.peers; }`), not a method — an
+  // earlier version of this test called it as `repo.peers?.()`, which threw
+  // "repo.peers is not a function" and masked whatever this test was meant
+  // to verify.
   await Promise.all([
     peerA.page.waitForFunction(
-      () => ((window as any).__skeinTest.canvas.repo.peers?.() ?? []).length >= 1,
+      () => ((window as any).__skeinTest.canvas.repo.peers ?? []).length >= 1,
       { timeout: 60_000 }
     ),
     peerB.page.waitForFunction(
-      () => ((window as any).__skeinTest.canvas.repo.peers?.() ?? []).length >= 1,
+      () => ((window as any).__skeinTest.canvas.repo.peers ?? []).length >= 1,
       { timeout: 60_000 }
     ),
   ]);
@@ -69,9 +81,14 @@ test("peers can dial each other by node ID @p2p", async ({ p2pPage }) => {
 test("widget added by peer A syncs to peer B @p2p", async ({ p2pPage }) => {
   test.setTimeout(240_000);
 
-  // peerA creates the canvas; peerB joins it by document ID
+  // peerA creates the canvas. peerB starts with its own (throwaway) canvas —
+  // it must NOT open peerA's doc id yet: `repo.find()` has no connected peer
+  // to sync from at this point, so it would mark the document unavailable
+  // (a real bug this test used to hit, since it previously passed
+  // `canvasDocId` to the p2pPage() fixture *before* the peers had dialed
+  // each other). connect first, then join via `joinCanvas()`.
   const peerA = await p2pPage();
-  const peerB = await p2pPage({ canvasDocId: peerA.canvasDocId });
+  const peerB = await p2pPage();
 
   // establish bidirectional iroh connection
   await Promise.all([
@@ -79,26 +96,44 @@ test("widget added by peer A syncs to peer B @p2p", async ({ p2pPage }) => {
     addPeer(peerB.page, peerA.nodeId),
   ]);
 
-  // wait for the repo handshake on both sides
+  // wait for the repo handshake on both sides.
+  // note: `repo.peers` is a getter property, not a method (see
+  // automerge-repo's Repo.js: `get peers() { return this.synchronizer.peers; }`).
   await Promise.all([
     peerA.page.waitForFunction(
-      () => ((window as any).__skeinTest.canvas.repo.peers?.() ?? []).length >= 1,
+      () => ((window as any).__skeinTest.canvas.repo.peers ?? []).length >= 1,
       { timeout: 60_000 }
     ),
     peerB.page.waitForFunction(
-      () => ((window as any).__skeinTest.canvas.repo.peers?.() ?? []).length >= 1,
+      () => ((window as any).__skeinTest.canvas.repo.peers ?? []).length >= 1,
       { timeout: 60_000 }
     ),
   ]);
 
+  // now that peerB is connected to peerA, it can safely open peerA's canvas doc
+  await joinCanvas(peerB.page, peerA.canvasDocId);
+
   // peer A adds a widget
   const initialCount = await getWidgetCount(peerA.page);
   await peerA.page.evaluate(() => {
-    (window as any).__skeinTest.canvas.store.addWidget("label", {
+    // CanvasStore.addWidget() takes a single WidgetEntry object, not a
+    // (type, options) pair — a previous version of this test called it as
+    // `addWidget("label", { x, y, width, height })`, which silently passed
+    // the string "label" as the entry (missing id/type/etc.) instead of
+    // throwing, so the widget count assertions below never actually saw a
+    // new widget appear.
+    (window as any).__skeinTest.canvas.store.addWidget({
+      id: crypto.randomUUID(),
+      type: "label",
       x: 100,
       y: 100,
       width: 200,
       height: 60,
+      zIndex: 1,
+      props: {},
+      collapsed: false,
+      docId: null,
+      parentId: null,
     });
   });
 

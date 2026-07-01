@@ -5,6 +5,11 @@
 import { expect, test } from "@playwright/test";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+
+// this file is ESM ("type": "module" in package.json) so __dirname isn't
+// defined — derive it from import.meta.url instead.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function waitForNarthex(page: import("@playwright/test").Page): Promise<void> {
   await page.waitForFunction(() => (window as any).__skein != null, { timeout: 30_000 });
@@ -52,29 +57,14 @@ async function navigateBackToNarthex(page: import("@playwright/test").Page): Pro
 
 test.describe("texture lifecycle — property tray shared asset unload", () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto("/");
-
-    // clear all IndexedDB state for a clean first-boot
-    await page.evaluate(async () => {
-      const dbs = await indexedDB.databases();
-      await Promise.all(
-        dbs.map(
-          (db) =>
-            new Promise<void>((resolve) => {
-              if (!db.name) {
-                resolve();
-                return;
-              }
-              const req = indexedDB.deleteDatabase(db.name);
-              req.onsuccess = () => resolve();
-              req.onerror = () => resolve();
-              req.onblocked = () => resolve();
-            })
-        )
-      );
-    });
-    await page.waitForTimeout(200);
-
+    // playwright already gives each test a fresh browser context (and
+    // therefore fresh IndexedDB) — no manual clearing needed. a previous
+    // version of this hook called `indexedDB.deleteDatabase()` on all
+    // databases right after goto(), which raced with automerge's own
+    // storage connection (deletion silently no-ops via `onblocked` while the
+    // connection is still open, then actually completes later during a
+    // reload) — corrupting the just-created narthex document and causing
+    // intermittent "Document ... is unavailable" boot failures.
     await page.goto("/");
     await waitForNarthex(page);
   });

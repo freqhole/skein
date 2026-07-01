@@ -49,11 +49,22 @@ export async function addWidget(
   return page.evaluate(
     ([t, o]) => {
       const store = (window as any).__skeinTest.canvas.store;
-      return store.addWidget(t, {
+      // CanvasStore.addWidget() takes a single WidgetEntry object, not a
+      // (type, options) pair — it previously called
+      // `store.addWidget(t, {x,y,width,height})`, silently passing the type
+      // string as the entry (missing id/props/etc.) instead of throwing.
+      return store.addWidget({
+        id: crypto.randomUUID(),
+        type: t,
         x: o.x ?? 100,
         y: o.y ?? 100,
         width: o.width ?? 300,
         height: o.height ?? 200,
+        zIndex: 1,
+        props: {},
+        collapsed: false,
+        docId: null,
+        parentId: null,
       });
     },
     [type, opts] as const
@@ -102,7 +113,8 @@ export async function getEndpointState(page: Page): Promise<string> {
 /**
  * wait until the peer count from automerge's perspective reaches expected,
  * i.e. at least `expected` peers have synced.
- * checks (window as any).__skeinTest.canvas.repo.peers()
+ * checks (window as any).__skeinTest.canvas.repo.peers (a getter property,
+ * not a method — see automerge-repo's Repo.js: `get peers()`).
  */
 export async function waitForPeerCount(
   page: Page,
@@ -110,9 +122,26 @@ export async function waitForPeerCount(
   timeoutMs = 60_000
 ): Promise<void> {
   await page.waitForFunction(
-    (n) => ((window as any).__skeinTest.canvas.repo.peers?.() ?? []).length >= n,
+    (n) => ((window as any).__skeinTest.canvas.repo.peers ?? []).length >= n,
     expected,
     { timeout: timeoutMs }
+  );
+}
+
+/**
+ * open a canvas doc that lives on an already-connected peer.
+ *
+ * call this only *after* dialing the owning peer via `addPeer()` — opening a
+ * shared doc before any peer connection exists means `repo.find()` has
+ * nothing to sync from and the document is marked unavailable (a real bug
+ * that used to bite `p2p-sync.spec.ts`: it passed `canvasDocId` to the
+ * p2pPage() fixture at peer-creation time, before the peers had dialed each
+ * other). only works on pages loaded from test-harness-p2p.html.
+ */
+export async function joinCanvas(page: Page, docId: string): Promise<string> {
+  return page.evaluate(
+    (id) => (window as any).__joinCanvasForTest(id).then((r: { canvasDocId: string }) => r.canvasDocId),
+    docId
   );
 }
 
