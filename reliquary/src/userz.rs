@@ -64,7 +64,7 @@ impl Directory {
         accent_color: Option<i64>,
     ) -> Result<(), UserError> {
         let now = now_secs();
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO userz (node_id, display_name, alias, bio, avatar_blake3, accent_color, first_seen_at, last_seen_at, is_self)
             VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, 0), ?7, ?7, 1)
@@ -77,14 +77,14 @@ impl Directory {
                 last_seen_at  = excluded.last_seen_at,
                 is_self       = 1
             "#,
+            node_id,
+            display_name,
+            alias,
+            bio,
+            avatar_blake3,
+            accent_color,
+            now,
         )
-        .bind(node_id)
-        .bind(display_name)
-        .bind(alias)
-        .bind(bio)
-        .bind(avatar_blake3)
-        .bind(accent_color)
-        .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -93,15 +93,15 @@ impl Directory {
     /// update `last_seen_at` for a peer (and insert a minimal row if new).
     pub async fn touch(&self, node_id: &str) -> Result<(), UserError> {
         let now = now_secs();
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO userz (node_id, first_seen_at, last_seen_at, is_self)
             VALUES (?1, ?2, ?2, 0)
             ON CONFLICT(node_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
             "#,
+            node_id,
+            now,
         )
-        .bind(node_id)
-        .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -117,7 +117,7 @@ impl Directory {
         avatar_blake3: Option<&str>,
     ) -> Result<(), UserError> {
         let now = now_secs();
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO userz (node_id, display_name, bio, avatar_blake3, first_seen_at, last_seen_at, is_self)
             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0)
@@ -127,12 +127,12 @@ impl Directory {
                 avatar_blake3 = COALESCE(excluded.avatar_blake3, userz.avatar_blake3),
                 last_seen_at  = excluded.last_seen_at
             "#,
+            node_id,
+            display_name,
+            bio,
+            avatar_blake3,
+            now,
         )
-        .bind(node_id)
-        .bind(display_name)
-        .bind(bio)
-        .bind(avatar_blake3)
-        .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -141,22 +141,27 @@ impl Directory {
     /// set the local user's free-form alias for a peer (or for self).
     /// the row must already exist (caller should `touch` first).
     pub async fn set_alias(&self, node_id: &str, alias: Option<&str>) -> Result<(), UserError> {
-        sqlx::query("UPDATE userz SET alias = ?1 WHERE node_id = ?2")
-            .bind(alias)
-            .bind(node_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query!(
+            "UPDATE userz SET alias = ?1 WHERE node_id = ?2",
+            alias,
+            node_id
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     pub async fn get(&self, node_id: &str) -> Result<Option<PeerRecord>, UserError> {
-        let row = sqlx::query_as::<_, PeerRow>(
+        let row = sqlx::query_as!(
+            PeerRow,
             r#"
-            SELECT node_id, display_name, alias, bio, avatar_blake3, accent_color, first_seen_at, last_seen_at, is_self
+            SELECT node_id as "node_id!", display_name, alias, bio, avatar_blake3,
+                   accent_color as "accent_color!", first_seen_at as "first_seen_at!",
+                   last_seen_at as "last_seen_at!", is_self as "is_self!"
             FROM userz WHERE node_id = ?1
             "#,
+            node_id,
         )
-        .bind(node_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(Into::into))
@@ -164,9 +169,12 @@ impl Directory {
 
     /// fetch the local self row (the one with is_self = 1), if any.
     pub async fn get_self(&self) -> Result<Option<PeerRecord>, UserError> {
-        let row = sqlx::query_as::<_, PeerRow>(
+        let row = sqlx::query_as!(
+            PeerRow,
             r#"
-            SELECT node_id, display_name, alias, bio, avatar_blake3, accent_color, first_seen_at, last_seen_at, is_self
+            SELECT node_id as "node_id!", display_name, alias, bio, avatar_blake3,
+                   accent_color as "accent_color!", first_seen_at as "first_seen_at!",
+                   last_seen_at as "last_seen_at!", is_self as "is_self!"
             FROM userz WHERE is_self = 1 LIMIT 1
             "#,
         )
@@ -176,7 +184,6 @@ impl Directory {
     }
 }
 
-#[derive(sqlx::FromRow)]
 struct PeerRow {
     node_id: String,
     display_name: Option<String>,

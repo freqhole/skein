@@ -76,6 +76,7 @@ mod tests {
         let pool = open(tmp.path()).await.expect("open db");
 
         // confirm at least one of the expected tables exists by querying it.
+        // (test-only code, left as sqlx::query_as per this refactor's scope.)
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blobz")
             .fetch_one(&pool)
             .await
@@ -90,6 +91,8 @@ mod tests {
     async fn in_memory_helper_runs_migrations() {
         let pool = open_in_memory().await;
         // expect every migrated table to be queryable.
+        // table name is interpolated at runtime, so this can't be a query_as!
+        // macro call (the macro requires a literal SQL string).
         for table in ["blobz", "userz", "friendz", "docz", "doc_deltaz"] {
             let q = format!("SELECT COUNT(*) FROM {table}");
             let (c,): (i64,) = sqlx::query_as(&q)

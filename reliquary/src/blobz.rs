@@ -87,20 +87,20 @@ impl Store {
         // above) must not surface a unique-constraint error to either
         // caller — the loser's insert silently no-ops and both callers read
         // back the same canonical row below.
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO blobz (blake3, iroh_hash, filename, mime, size, path, external, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
             ON CONFLICT (blake3) DO NOTHING
             "#,
+            blake3,
+            iroh_hash,
+            filename,
+            mime,
+            size,
+            rel_path,
+            created_at,
         )
-        .bind(&blake3)
-        .bind(&iroh_hash)
-        .bind(&filename)
-        .bind(&mime)
-        .bind(size)
-        .bind(&rel_path)
-        .bind(created_at)
         .execute(&self.pool)
         .await?;
 
@@ -158,20 +158,20 @@ impl Store {
         let iroh_hash = blake3_hex.clone();
         let created_at = now_secs();
 
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO blobz (blake3, iroh_hash, filename, mime, size, path, external, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
             ON CONFLICT (blake3) DO NOTHING
             "#,
+            blake3_hex,
+            iroh_hash,
+            filename,
+            mime,
+            size,
+            path_str,
+            created_at,
         )
-        .bind(&blake3_hex)
-        .bind(&iroh_hash)
-        .bind(&filename)
-        .bind(&mime)
-        .bind(size)
-        .bind(&path_str)
-        .bind(created_at)
         .execute(&self.pool)
         .await?;
 
@@ -183,13 +183,15 @@ impl Store {
     }
 
     pub async fn get(&self, blake3: &str) -> Result<Option<BlobRef>, BlobError> {
-        let row = sqlx::query_as::<_, BlobRow>(
+        let row = sqlx::query_as!(
+            BlobRow,
             r#"
-            SELECT blake3, iroh_hash, filename, mime, size, path, external, created_at
+            SELECT blake3 as "blake3!", iroh_hash as "iroh_hash!", filename, mime,
+                   size as "size!", path as "path!", external as "external!", created_at as "created_at!"
             FROM blobz WHERE blake3 = ?1
             "#,
+            blake3,
         )
-        .bind(blake3)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -197,13 +199,15 @@ impl Store {
     }
 
     pub async fn get_by_iroh_hash(&self, iroh_hash: &str) -> Result<Option<BlobRef>, BlobError> {
-        let row = sqlx::query_as::<_, BlobRow>(
+        let row = sqlx::query_as!(
+            BlobRow,
             r#"
-            SELECT blake3, iroh_hash, filename, mime, size, path, external, created_at
+            SELECT blake3 as "blake3!", iroh_hash as "iroh_hash!", filename, mime,
+                   size as "size!", path as "path!", external as "external!", created_at as "created_at!"
             FROM blobz WHERE iroh_hash = ?1
             "#,
+            iroh_hash,
         )
-        .bind(iroh_hash)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -227,16 +231,18 @@ impl Store {
     }
 
     pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<BlobRef>, BlobError> {
-        let rows = sqlx::query_as::<_, BlobRow>(
+        let rows = sqlx::query_as!(
+            BlobRow,
             r#"
-            SELECT blake3, iroh_hash, filename, mime, size, path, external, created_at
+            SELECT blake3 as "blake3!", iroh_hash as "iroh_hash!", filename, mime,
+                   size as "size!", path as "path!", external as "external!", created_at as "created_at!"
             FROM blobz
             ORDER BY created_at DESC
             LIMIT ?1 OFFSET ?2
             "#,
+            limit,
+            offset,
         )
-        .bind(limit)
-        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
@@ -251,15 +257,14 @@ impl Store {
                 let _ = tokio::fs::remove_file(&path).await;
             }
         }
-        sqlx::query("DELETE FROM blobz WHERE blake3 = ?1")
-            .bind(blake3)
+        sqlx::query!("DELETE FROM blobz WHERE blake3 = ?1", blake3)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Debug)]
 struct BlobRow {
     blake3: String,
     iroh_hash: String,

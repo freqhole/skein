@@ -123,7 +123,9 @@ impl Store {
         narthex_doc_id: Option<&str>,
     ) -> Result<Friend, FriendError> {
         let now = now_secs();
-        sqlx::query(
+        let status_str = status.as_str();
+        let direction_str = direction.map(|d| d.as_str());
+        sqlx::query!(
             r#"
             INSERT INTO friendz (friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
@@ -135,14 +137,14 @@ impl Store {
                 narthex_doc_id = COALESCE(excluded.narthex_doc_id, friendz.narthex_doc_id),
                 updated_at     = excluded.updated_at
             "#,
+            friend_node_id,
+            status_str,
+            direction_str,
+            alias,
+            group_name,
+            narthex_doc_id,
+            now,
         )
-        .bind(friend_node_id)
-        .bind(status.as_str())
-        .bind(direction.map(|d| d.as_str()))
-        .bind(alias)
-        .bind(group_name)
-        .bind(narthex_doc_id)
-        .bind(now)
         .execute(&self.pool)
         .await?;
 
@@ -152,13 +154,15 @@ impl Store {
     }
 
     pub async fn get(&self, friend_node_id: &str) -> Result<Option<Friend>, FriendError> {
-        let row = sqlx::query_as::<_, FriendRow>(
+        let row = sqlx::query_as!(
+            FriendRow,
             r#"
-            SELECT friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at
+            SELECT friend_node_id as "friend_node_id!", status as "status!", direction, alias,
+                   group_name, narthex_doc_id, created_at as "created_at!", updated_at as "updated_at!"
             FROM friendz WHERE friend_node_id = ?1
             "#,
+            friend_node_id,
         )
-        .bind(friend_node_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -166,14 +170,25 @@ impl Store {
     }
 
     pub async fn list(&self, only_accepted: bool) -> Result<Vec<Friend>, FriendError> {
-        let sql = if only_accepted {
-            r#"SELECT friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at
-               FROM friendz WHERE status = 'accepted' ORDER BY created_at ASC"#
+        let rows: Vec<FriendRow> = if only_accepted {
+            sqlx::query_as!(
+                FriendRow,
+                r#"SELECT friend_node_id as "friend_node_id!", status as "status!", direction, alias,
+                          group_name, narthex_doc_id, created_at as "created_at!", updated_at as "updated_at!"
+                   FROM friendz WHERE status = 'accepted' ORDER BY created_at ASC"#,
+            )
+            .fetch_all(&self.pool)
+            .await?
         } else {
-            r#"SELECT friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at
-               FROM friendz ORDER BY created_at ASC"#
+            sqlx::query_as!(
+                FriendRow,
+                r#"SELECT friend_node_id as "friend_node_id!", status as "status!", direction, alias,
+                          group_name, narthex_doc_id, created_at as "created_at!", updated_at as "updated_at!"
+                   FROM friendz ORDER BY created_at ASC"#,
+            )
+            .fetch_all(&self.pool)
+            .await?
         };
-        let rows: Vec<FriendRow> = sqlx::query_as(sql).fetch_all(&self.pool).await?;
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
@@ -185,18 +200,23 @@ impl Store {
     ) -> Result<Vec<Friend>, FriendError> {
         let rows: Vec<FriendRow> = match direction {
             Some(d) => {
-                sqlx::query_as(
-                    r#"SELECT friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at
+                let d = d.as_str();
+                sqlx::query_as!(
+                    FriendRow,
+                    r#"SELECT friend_node_id as "friend_node_id!", status as "status!", direction, alias,
+                              group_name, narthex_doc_id, created_at as "created_at!", updated_at as "updated_at!"
                        FROM friendz WHERE status = 'pending' AND direction = ?1
                        ORDER BY created_at ASC"#,
+                    d,
                 )
-                .bind(d.as_str())
                 .fetch_all(&self.pool)
                 .await?
             }
             None => {
-                sqlx::query_as(
-                    r#"SELECT friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at
+                sqlx::query_as!(
+                    FriendRow,
+                    r#"SELECT friend_node_id as "friend_node_id!", status as "status!", direction, alias,
+                              group_name, narthex_doc_id, created_at as "created_at!", updated_at as "updated_at!"
                        FROM friendz WHERE status = 'pending'
                        ORDER BY created_at ASC"#,
                 )
@@ -208,10 +228,12 @@ impl Store {
     }
 
     pub async fn delete(&self, friend_node_id: &str) -> Result<(), FriendError> {
-        sqlx::query("DELETE FROM friendz WHERE friend_node_id = ?1")
-            .bind(friend_node_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query!(
+            "DELETE FROM friendz WHERE friend_node_id = ?1",
+            friend_node_id
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -243,7 +265,7 @@ impl Store {
     }
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Debug)]
 struct FriendRow {
     friend_node_id: String,
     status: String,

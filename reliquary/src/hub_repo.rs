@@ -162,6 +162,16 @@ impl HubDocStorage {
     /// create a new storage instance backed by the given sqlite database file.
     ///
     /// creates the database and `hub_docs` table if they don't already exist.
+    ///
+    /// note: every query in this impl uses the runtime-checked `sqlx::query`/
+    /// `sqlx::query_scalar` api rather than the `!` macros. `HubDocStorage`
+    /// opens its own separate sqlite file (`db_path`, typically
+    /// `<data_dir>/skein-docs.db` - see `service.rs`) and creates its own
+    /// `hub_docs`/`hub_canvas_ids` tables here at runtime; these tables are
+    /// not part of `reliquary/migrationz/` or the main `skein-hub.db` schema
+    /// that our compile-time `DATABASE_URL` (workspace-root
+    /// `.cargo/config.toml`) points at, so the macros have no schema to
+    /// validate these queries against.
     pub async fn new(db_path: &Path) -> Result<Self, sqlx::Error> {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(db_path)
@@ -195,6 +205,8 @@ impl HubDocStorage {
     }
 
     /// load raw automerge bytes for a document.
+    ///
+    /// not macro-checkable: see `new()`.
     pub async fn load_doc(&self, doc_id: &str) -> Option<Vec<u8>> {
         sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM hub_docs WHERE doc_id = ?")
             .bind(doc_id)
@@ -205,6 +217,8 @@ impl HubDocStorage {
     }
 
     /// persist raw automerge bytes for a document (insert or replace).
+    ///
+    /// not macro-checkable: see `new()`.
     pub async fn save_doc(&self, doc_id: &str, data: &[u8]) {
         if let Err(e) =
             sqlx::query("INSERT OR REPLACE INTO hub_docs (doc_id, data, updated_at) VALUES (?, ?, datetime('now'))")
@@ -218,6 +232,8 @@ impl HubDocStorage {
     }
 
     /// load all known document IDs (used on startup to reload persisted docs).
+    ///
+    /// not macro-checkable: see `new()`.
     pub async fn load_all_doc_ids(&self) -> Vec<String> {
         sqlx::query_scalar::<_, String>("SELECT doc_id FROM hub_docs")
             .fetch_all(&self.pool)
@@ -226,6 +242,8 @@ impl HubDocStorage {
     }
 
     /// load all persisted canvas doc IDs.
+    ///
+    /// not macro-checkable: see `new()`.
     pub async fn load_canvas_ids(&self) -> Vec<String> {
         sqlx::query_scalar::<_, String>("SELECT canvas_doc_id FROM hub_canvas_ids")
             .fetch_all(&self.pool)
@@ -234,6 +252,8 @@ impl HubDocStorage {
     }
 
     /// persist a canvas doc ID (idempotent — ignores duplicates).
+    ///
+    /// not macro-checkable: see `new()`.
     pub async fn save_canvas_id(&self, canvas_doc_id: &str) {
         if let Err(e) =
             sqlx::query("INSERT OR IGNORE INTO hub_canvas_ids (canvas_doc_id) VALUES (?)")
@@ -246,6 +266,8 @@ impl HubDocStorage {
     }
 
     /// remove a canvas doc ID from persistence (e.g. when hub is removed from the canvas).
+    ///
+    /// not macro-checkable: see `new()`.
     pub async fn remove_canvas_id(&self, canvas_doc_id: &str) {
         if let Err(e) = sqlx::query("DELETE FROM hub_canvas_ids WHERE canvas_doc_id = ?")
             .bind(canvas_doc_id)

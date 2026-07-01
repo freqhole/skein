@@ -44,15 +44,15 @@ impl Store {
     /// already-admin peer again is a no-op that returns the existing row.
     pub async fn allow(&self, node_id: &str) -> Result<Admin, AdminError> {
         let now = now_secs();
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO hub_adminz (node_id, created_at)
             VALUES (?1, ?2)
             ON CONFLICT(node_id) DO NOTHING
             "#,
+            node_id,
+            now,
         )
-        .bind(node_id)
-        .bind(now)
         .execute(&self.pool)
         .await?;
 
@@ -62,13 +62,15 @@ impl Store {
     }
 
     pub async fn get(&self, node_id: &str) -> Result<Option<Admin>, AdminError> {
-        let row = sqlx::query_as::<_, AdminRow>(
-            "SELECT node_id, created_at FROM hub_adminz WHERE node_id = ?1",
+        sqlx::query_as!(
+            Admin,
+            r#"SELECT node_id as "node_id!", created_at as "created_at!"
+               FROM hub_adminz WHERE node_id = ?1"#,
+            node_id,
         )
-        .bind(node_id)
         .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(Into::into))
+        .await
+        .map_err(AdminError::from)
     }
 
     /// check whether `node_id` is a hub admin. returns `false` (and logs) on
@@ -86,34 +88,21 @@ impl Store {
     }
 
     pub async fn list(&self) -> Result<Vec<Admin>, AdminError> {
-        let rows: Vec<AdminRow> =
-            sqlx::query_as("SELECT node_id, created_at FROM hub_adminz ORDER BY created_at ASC")
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        sqlx::query_as!(
+            Admin,
+            r#"SELECT node_id as "node_id!", created_at as "created_at!"
+               FROM hub_adminz ORDER BY created_at ASC"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AdminError::from)
     }
 
     pub async fn remove(&self, node_id: &str) -> Result<(), AdminError> {
-        sqlx::query("DELETE FROM hub_adminz WHERE node_id = ?1")
-            .bind(node_id)
+        sqlx::query!("DELETE FROM hub_adminz WHERE node_id = ?1", node_id)
             .execute(&self.pool)
             .await?;
         Ok(())
-    }
-}
-
-#[derive(sqlx::FromRow)]
-struct AdminRow {
-    node_id: String,
-    created_at: i64,
-}
-
-impl From<AdminRow> for Admin {
-    fn from(r: AdminRow) -> Self {
-        Self {
-            node_id: r.node_id,
-            created_at: r.created_at,
-        }
     }
 }
 

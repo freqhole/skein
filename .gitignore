@@ -3,3 +3,6 @@
 /tauri/gen/schemas
 /midden/target
 .DS_Store
+
+# local sqlx compile-time-check dev db (see .cargo/config.toml)
+/reliquary/dev-data/

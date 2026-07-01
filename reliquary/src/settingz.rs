@@ -23,23 +23,21 @@ impl Store {
     }
 
     pub async fn get(&self, key: &str) -> Result<Option<String>, SettingsError> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM settingz WHERE key = ?1")
-                .bind(key)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(v,)| v))
+        sqlx::query_scalar!("SELECT value FROM settingz WHERE key = ?1", key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(SettingsError::from)
     }
 
     pub async fn set(&self, key: &str, value: &str) -> Result<(), SettingsError> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO settingz (key, value) VALUES (?1, ?2)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             "#,
+            key,
+            value,
         )
-        .bind(key)
-        .bind(value)
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -32,56 +32,46 @@ impl Store {
     /// idempotent: insert if missing, update color if present.
     pub async fn upsert(&self, name: &str, color: i64) -> Result<Group, GroupError> {
         let now = now_secs();
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO friend_groupz (name, color, created_at)
             VALUES (?1, ?2, ?3)
             ON CONFLICT(name) DO UPDATE SET color = excluded.color
             "#,
+            name,
+            color,
+            now,
         )
-        .bind(name)
-        .bind(color)
-        .bind(now)
         .execute(&self.pool)
         .await?;
-        Ok(self
-            .get(name)
-            .await?
-            .expect("group present after upsert"))
+        Ok(self.get(name).await?.expect("group present after upsert"))
     }
 
     pub async fn get(&self, name: &str) -> Result<Option<Group>, GroupError> {
-        let row: Option<(String, i64, i64)> =
-            sqlx::query_as("SELECT name, color, created_at FROM friend_groupz WHERE name = ?1")
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(name, color, created_at)| Group {
+        sqlx::query_as!(
+            Group,
+            r#"SELECT name as "name!", color as "color!", created_at as "created_at!"
+               FROM friend_groupz WHERE name = ?1"#,
             name,
-            color,
-            created_at,
-        }))
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(GroupError::from)
     }
 
     pub async fn list(&self) -> Result<Vec<Group>, GroupError> {
-        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
-            "SELECT name, color, created_at FROM friend_groupz ORDER BY created_at ASC",
+        sqlx::query_as!(
+            Group,
+            r#"SELECT name as "name!", color as "color!", created_at as "created_at!"
+               FROM friend_groupz ORDER BY created_at ASC"#,
         )
         .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(name, color, created_at)| Group {
-                name,
-                color,
-                created_at,
-            })
-            .collect())
+        .await
+        .map_err(GroupError::from)
     }
 
     pub async fn delete(&self, name: &str) -> Result<(), GroupError> {
-        sqlx::query("DELETE FROM friend_groupz WHERE name = ?1")
-            .bind(name)
+        sqlx::query!("DELETE FROM friend_groupz WHERE name = ?1", name)
             .execute(&self.pool)
             .await?;
         Ok(())
