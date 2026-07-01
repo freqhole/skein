@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import { Assets, Circle, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
+import { registerSocialBridge } from "../../../src/dev/test-bridge-registry";
 import {
   ensureIdentity,
   getStoredIdentity,
@@ -260,12 +261,10 @@ export function createProfileTab(ctx: TabContext): TabController {
       });
     }
   };
-  // in dev builds, attach pickAvatar to the social test bridge that boot.ts
-  // created — profile-tab owns the closure so it sets it here.
-  if (import.meta.env.DEV) {
-    const s = (((window as any).__skeinTest ??= {}).social ??= {});
-    (s as Record<string, unknown>).pickAvatar = pickAvatarFile;
-  }
+  // register pickAvatar onto the social test bridge (test-bridge-registry.ts
+  // owns the window.__skeinTest shape and DEV guard — this widget doesn't
+  // touch `window` directly).
+  registerSocialBridge({ pickAvatar: pickAvatarFile });
 
   // -------------------------------------------------------------------------
   // text fields

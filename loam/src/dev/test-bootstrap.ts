@@ -1,9 +1,9 @@
-import { BroadcastChannelNetworkAdapter } from "@automerge/automerge-repo-network-broadcastchannel";
 import { z } from "zod";
 import { createTestRegistry } from "../../widgets/index";
 import type { SkeinCanvas } from "../canvas/init";
 import type { SkeinTestBridge } from "./test-bridge";
 import { initCanvas } from "../canvas/init";
+import { createSkeinHarness } from "../harness/skein-harness";
 import { PresenceManager } from "../canvas/presence-manager";
 import { Viewport } from "../canvas/viewport";
 import { createWidgetDoc } from "../widgets/widget-doc";
@@ -36,11 +36,16 @@ interface TestInitResult {
  * via page.evaluate(), and window.__skein for test assertions.
  */
 async function initSkeinForTest(options: TestInitOptions = {}): Promise<TestInitResult> {
+  // build the repo + canvas doc via the harness (see harness/skein-harness.ts —
+  // phase 2 step 1 of the SkeinHarness extraction) instead of hand-rolling a
+  // BroadcastChannelNetworkAdapter + Repo here.
+  const harness = await createSkeinHarness({ canvasDocId: options.canvasDocId ?? null });
+
   const canvas: SkeinCanvas = await initCanvas({
     mountElement: document.getElementById("canvas-root")!,
-    canvasDocId: options.canvasDocId ?? null,
+    canvasDocId: harness.store.handle.documentId,
     registry: createTestRegistry(),
-    networkAdapter: new BroadcastChannelNetworkAdapter(),
+    repo: harness.repo,
   });
 
   (window as any).__skein = canvas;

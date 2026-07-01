@@ -10,6 +10,8 @@ import { CanvasStore } from "../canvas/canvas-store";
 import type { ConnectionStateSource } from "../canvas/connection-status";
 import { initCanvas, type SkeinCanvas } from "../canvas/init";
 import { showShareDialog, type FriendInfo } from "../canvas/share-dialog";
+import { registerSocialBridge } from "../dev/test-bridge-registry";
+import type { SkeinTestBridgeSocial } from "../dev/test-bridge";
 import { preloadFonts } from "../fonts/font-loader";
 import { handleSkeinStream } from "../p2p/skein-handler";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
@@ -453,10 +455,11 @@ class SkeinRouter {
 
       this.currentCanvas = canvas;
       // in dev builds, initialise __skeinTest.social BEFORE mounting the social
-      // overlay — profile-tab.ts adds pickAvatar to this object during create(),
-      // so the object must exist before mountSocialOverlay() runs.
+      // overlay — profile-tab.ts registers pickAvatar onto this object during
+      // create(), so the object must exist before mountSocialOverlay() runs.
+      // goes through registerSocialBridge() (test-bridge-registry.ts) rather
+      // than touching window.__skeinTest directly — see that file for why.
       if (import.meta.env.DEV) {
-        const t: Record<string, unknown> = ((window as any).__skeinTest ??= {});
         // build with arrow functions (not object-literal shorthand methods) so
         // `this` stays lexically bound to the router instance — avoids the
         // `const self = this` alias eslint flags (@typescript-eslint/no-this-alias).
@@ -466,13 +469,19 @@ class SkeinRouter {
             const sw = window.visualViewport?.width ?? window.innerWidth;
             this.currentSocialOverlay?.toggle(sw);
           },
-          // pickAvatar is added by profile-tab.ts during socialWidget.create()
+          // pickAvatar is registered by profile-tab.ts during socialWidget.create()
         };
         Object.defineProperty(social, "doc", {
           enumerable: true,
+          // configurable: true — navigateToNarthex() re-registers this bridge
+          // every time the narthex is re-entered (navigate-back, reload), and
+          // registerSocialBridge() merges into the *same* existing social
+          // object rather than replacing it. without `configurable: true`,
+          // the second registration throws "Cannot redefine property: doc".
+          configurable: true,
           get: () => this.socialDoc,
         });
-        t.social = social;
+        registerSocialBridge(social as unknown as Partial<SkeinTestBridgeSocial>);
       }
       // mount overlay panels and wire badge counts
       this.currentSocialOverlay = this.mountSocialOverlay(canvas);
