@@ -300,3 +300,15 @@ const api = {
 export type BlobWorkerApi = typeof api;
 
 Comlink.expose(api);
+
+// signal readiness *after* Comlink has registered its message listener.
+//
+// without this, a Comlink RPC call sent right after `new Worker()` can race
+// the worker's own startup (fetching + instantiating the ~19MB midden wasm
+// takes a couple of seconds). if the browser dispatches the postMessage'd
+// call before Comlink.expose() above has added its "message" listener, the
+// event fires with no listener attached and is silently dropped forever —
+// the caller's promise never resolves. see `getBlobWorker()` in
+// blob-worker-client.ts, which waits for this signal before handing out
+// the worker proxy.
+postMessage("skein-blob-worker-ready");

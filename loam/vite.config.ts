@@ -44,6 +44,14 @@ export default defineConfig({
     fs: {
       allow: [".."],
     },
+    // cross-origin isolation headers — required for the blob worker's WASM
+    // (midden) init to complete reliably. without these, the worker's
+    // midden init can hang indefinitely in some browsers (see
+    // docs/skein-runtime-plan.md: "blob worker in tests").
+    headers: {
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
+    },
   },
   // exclude midden from esbuild pre-bundling — it contains a .wasm file that
   // esbuild can't handle; vite-plugin-wasm takes care of it instead.

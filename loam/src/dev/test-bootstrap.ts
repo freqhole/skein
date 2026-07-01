@@ -7,6 +7,7 @@ import { initCanvas } from "../canvas/init";
 import { PresenceManager } from "../canvas/presence-manager";
 import { Viewport } from "../canvas/viewport";
 import { createWidgetDoc } from "../widgets/widget-doc";
+import { getBlobWorker, processBlobBytes } from "../workers/blob-worker-client";
 
 /**
  * a simple zod schema used by playwright tests to exercise createWidgetDoc.
@@ -54,4 +55,14 @@ async function initSkeinForTest(options: TestInitOptions = {}): Promise<TestInit
 (window as any).__initSkeinForTest = initSkeinForTest;
 
 // expose internals for detailed playwright tests
-(window as any).__skeinHelpers = { createWidgetDoc, testWidgetSchema, Viewport, PresenceManager };
+(window as any).__skeinHelpers = {
+  createWidgetDoc,
+  testWidgetSchema,
+  Viewport,
+  PresenceManager,
+  // blob worker — exposed so tests can exercise the real worker path
+  // (blake3 hash + OPFS write) directly, without going through a widget's
+  // file-picker UI.
+  getBlobWorker,
+  processBlobBytes,
+};

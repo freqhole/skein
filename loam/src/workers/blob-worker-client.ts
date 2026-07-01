@@ -14,6 +14,13 @@ import * as middenWasm from "midden";
 
 let workerProxy: Comlink.Remote<BlobWorkerApi> | null = null;
 let workerInstance: Worker | null = null;
+let workerReadyPromise: Promise<Comlink.Remote<BlobWorkerApi> | null> | null = null;
+
+const WORKER_READY_MESSAGE = "skein-blob-worker-ready";
+// generous — the worker's top-level module loads midden's wasm binary
+// (~19MB) before it can register its Comlink message listener. slow CI
+// runners / cold caches can take a few seconds for this.
+const WORKER_READY_TIMEOUT_MS = 20_000;
 
 function canSpawnWorker(): boolean {
   return typeof Worker !== "undefined";
@@ -22,22 +29,60 @@ function canSpawnWorker(): boolean {
 /**
  * get (and lazily spawn) the comlink-wrapped blob worker proxy.
  *
- * returns null if Worker isn't available — callers should branch and use
+ * returns null if Worker isn't available, or if the worker doesn't signal
+ * readiness within `WORKER_READY_TIMEOUT_MS` — callers should branch and use
  * a main-thread fallback (see `getBlobWorkerOrFallback()` for the common
  * path).
+ *
+ * waits for an explicit "ready" postMessage from the worker before handing
+ * out the Comlink proxy. this avoids a real race: the worker's module top
+ * level awaits midden's wasm instantiation before calling `Comlink.expose()`
+ * (which registers the "message" listener). an RPC call sent before that
+ * listener exists fires with no listener attached and is silently dropped —
+ * the caller's promise then never resolves. waiting for the ready signal
+ * (sent immediately after `Comlink.expose()` in blob-worker.ts) guarantees
+ * the listener is registered before any real RPC call goes out.
  */
 export async function getBlobWorker(): Promise<Comlink.Remote<BlobWorkerApi> | null> {
   if (workerProxy) return workerProxy;
   if (!canSpawnWorker()) return null;
+  if (workerReadyPromise) return workerReadyPromise;
 
-  // vite ?worker import: returns a constructor for a module-format worker.
-  // the wasm + topLevelAwait plugins are applied to worker bundles via
-  // vite.config.ts `worker.plugins`.
+  workerReadyPromise = (async () => {
+    // vite ?worker import: returns a constructor for a module-format worker.
+    // the wasm + topLevelAwait plugins are applied to worker bundles via
+    // vite.config.ts `worker.plugins`.
+    const WorkerCtor = (await import("./blob-worker?worker")).default;
+    const worker = new WorkerCtor();
 
-  const WorkerCtor = (await import("./blob-worker?worker")).default;
-  workerInstance = new WorkerCtor();
-  workerProxy = Comlink.wrap<BlobWorkerApi>(workerInstance);
-  return workerProxy;
+    const ready = await new Promise<boolean>((resolve) => {
+      const timeout = setTimeout(() => {
+        worker.removeEventListener("message", onMessage);
+        resolve(false);
+      }, WORKER_READY_TIMEOUT_MS);
+      const onMessage = (e: MessageEvent): void => {
+        if (e.data !== WORKER_READY_MESSAGE) return;
+        clearTimeout(timeout);
+        worker.removeEventListener("message", onMessage);
+        resolve(true);
+      };
+      worker.addEventListener("message", onMessage);
+    });
+
+    if (!ready) {
+      worker.terminate();
+      // allow a future call to retry (e.g. a one-off slow load) instead of
+      // permanently caching this failure.
+      workerReadyPromise = null;
+      return null;
+    }
+
+    workerInstance = worker;
+    workerProxy = Comlink.wrap<BlobWorkerApi>(worker);
+    return workerProxy;
+  })();
+
+  return workerReadyPromise;
 }
 
 /**
@@ -50,6 +95,7 @@ export function shutdownBlobWorker(): void {
     workerInstance = null;
     workerProxy = null;
   }
+  workerReadyPromise = null;
 }
 
 // ---- main-thread fallbacks -----------------------------------------------
@@ -190,22 +236,18 @@ export interface ResizeImageOptions {
 
 /**
  * resize an image Blob to a (default WebP) data URL.
- * prefers the main-thread OffscreenCanvas path which is fast for typical
- * image sizes (avatars, thumbnails) and doesn't depend on worker init.
- * falls back to the blob worker only if OffscreenCanvas is unavailable.
- * returns null on failure (non-image input, decode failure, etc.).
+ * prefers the blob worker (keeps the decode/encode work off the main
+ * thread); falls back to a main-thread `OffscreenCanvas` path if the
+ * worker isn't available. returns null on failure (non-image input,
+ * decode failure, etc.).
  */
 export async function resizeImageToWebpDataUrl(
   blob: Blob,
   options?: ResizeImageOptions
 ): Promise<string | null> {
-  // main-thread path first — avoids any worker startup / wasm-init delay
-  const mainResult = await mainThreadResizeImage(blob, options);
-  if (mainResult !== null) return mainResult;
-  // fall back to worker only if OffscreenCanvas is unavailable (very old browsers)
   const worker = await getBlobWorker();
   if (worker) return worker.resizeImageToWebpDataUrl(blob, options);
-  return null;
+  return mainThreadResizeImage(blob, options);
 }
 
 /**
