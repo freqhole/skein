@@ -178,6 +178,11 @@ export class WidgetManager {
         live.frame.setSelected(ids.has(id));
         live.frame.setMultiSelected(isMulti && ids.has(id));
       }
+      // on touch, clear any active touch-hover toolbar when everything is deselected
+      // (e.g. user tapped empty canvas or pressed Escape)
+      if (ids.size === 0) {
+        WidgetFrame.clearTouchHover();
+      }
     });
     this.unsubs.push(unsubMultiSelection);
 

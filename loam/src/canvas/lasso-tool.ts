@@ -208,8 +208,17 @@ export class LassoTool {
   // --- pointer event handlers ---
 
   private onPointerDown(e: FederatedPointerEvent): void {
-    // avoid multi-touch conflicts
-    if (this.activePointerId !== null) return;
+    // avoid multi-touch conflicts.
+    // if a *different* pointer comes in while a lasso is active (e.g. a palm
+    // contact while drawing with Apple Pencil), cancel the stuck lasso so
+    // the new pointer can start a fresh interaction.
+    if (this.activePointerId !== null) {
+      if (this.activePointerId !== e.pointerId) {
+        this.endLasso();
+      } else {
+        return; // same pointer re-firing, ignore
+      }
+    }
     this.activePointerId = e.pointerId;
 
     const worldPos = e.getLocalPosition(this.world);
@@ -413,6 +422,22 @@ export class LassoTool {
     // even though no edges cross and the widget center is outside the lasso.
     for (const pt of this.lassoPoints) {
       if (pt.x >= rect.x && pt.x <= rect.x + rect.w && pt.y >= rect.y && pt.y <= rect.y + rect.h) {
+        return true;
+      }
+    }
+
+    // check if any widget corner falls inside the lasso polygon.
+    // catches cases where the lasso loops around a widget but touch sampling
+    // is sparse enough that no lasso segment crosses a widget edge, and the
+    // widget center escapes the polygon (e.g. irregular or concave lasso).
+    const corners: Point[] = [
+      { x: rect.x, y: rect.y },
+      { x: rect.x + rect.w, y: rect.y },
+      { x: rect.x + rect.w, y: rect.y + rect.h },
+      { x: rect.x, y: rect.y + rect.h },
+    ];
+    for (const corner of corners) {
+      if (pointInPolygon(corner.x, corner.y, this.lassoPoints)) {
         return true;
       }
     }

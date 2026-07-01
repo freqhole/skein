@@ -63,6 +63,13 @@ type HandlePosition = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 export class WidgetFrame {
   private static readonly HOVER_GRACE_MS = 450;
 
+  /**
+   * on touch devices, at most one frame shows the touch-hover toolbar at a
+   * time. tracked here so switching widgets auto-clears the previous one
+   * without needing to go through the selection system.
+   */
+  private static _activeTouchFrame: WidgetFrame | null = null;
+
   readonly root: Container;
   readonly contentContainer: Container;
 
@@ -172,6 +179,30 @@ export class WidgetFrame {
         this.draw();
       }, WidgetFrame.HOVER_GRACE_MS);
     });
+
+    // on touch devices, a pointerdown on the widget acts as hover — shows
+    // the toolbar (equivalent of mouse cursor entering the widget on desktop).
+    // only the header is shown; resize handles and selection ring are NOT
+    // triggered (onSelect is not called).
+    //
+    // must use capture phase so the handler fires even when widget content
+    // (e.g. doodle bgGfx) calls stopPropagation on the same event.
+    if (touch) {
+      this.root.addEventListener(
+        "pointerdown",
+        () => {
+          // already showing toolbar — nothing to change
+          if (this._hovered) return;
+          // clear whatever widget was previously touch-hovered
+          WidgetFrame._activeTouchFrame?._clearTouchHover();
+          WidgetFrame._activeTouchFrame = this;
+          this._hovered = true;
+          this.updateVisualState();
+          this.draw();
+        },
+        { capture: true }
+      );
+    }
 
     // border/selection overlay (drawn behind everything)
     this.border = new Graphics();
@@ -379,8 +410,29 @@ export class WidgetFrame {
       clearTimeout(this._hoverGraceTimer);
       this._hoverGraceTimer = null;
     }
+    // release static touch-hover reference if it points to this frame
+    if (WidgetFrame._activeTouchFrame === this) {
+      WidgetFrame._activeTouchFrame = null;
+    }
     this.hideHamburgerFlyout();
     this.root.destroy({ children: true });
+  }
+
+  /**
+   * clear the touch-hover toolbar on whichever widget currently has it.
+   * called by widget-manager when the canvas is tapped on empty space.
+   */
+  static clearTouchHover(): void {
+    WidgetFrame._activeTouchFrame?._clearTouchHover();
+    WidgetFrame._activeTouchFrame = null;
+  }
+
+  /** clear this frame's touch-hover state and redraw */
+  private _clearTouchHover(): void {
+    if (!this._hovered) return;
+    this._hovered = false;
+    this.updateVisualState();
+    this.draw();
   }
 
   // --- drawing ---
@@ -1316,7 +1368,9 @@ export class WidgetFrame {
 
   private updateVisualState(): void {
     if (this._maximized) {
-      const showHeader = this._hovered;
+      // on touch devices, treat selection as hover so the header is accessible
+      // (there's no cursor to trigger pointerenter on touch)
+      const showHeader = this._hovered || (isTouchDevice() && this._selected);
 
       // explicit hitArea so hover events fire even when widget content
       // has no interactive pixi elements (e.g., image widget, label)
