@@ -282,9 +282,48 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     }
 
     const midden = await this.ensureMidden();
-    const stream = await midden.open_bi(nodeId, SYNC_ALPN);
+    const stream = await this.openBiWithRetry(midden, nodeId);
 
     this.registerStream(nodeId, stream);
+  }
+
+  /**
+   * dial a peer with a short retry loop for the initial connection attempt.
+   *
+   * iroh's discovery (relay-assisted address exchange) can lag a peer's
+   * node-id registration by a second or so right after both endpoints come
+   * online — dialing during that window fails with "No addressing
+   * information available" even though the peer is reachable moments later
+   * (seen intermittently in the p2p e2e tests, where two fresh endpoints
+   * dial each other immediately after coming online). retry a handful of
+   * times with a short fixed delay before giving up; this is a much
+   * tighter loop than the general reconnect backoff below, which is for
+   * peers that were connected and then dropped.
+   */
+  private async openBiWithRetry(
+    midden: MiddenStreamNode,
+    nodeId: string,
+    maxAttempts = 4,
+    delayMs = 750
+  ): Promise<BiStreamLike> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await midden.open_bi(nodeId, SYNC_ALPN);
+      } catch (err) {
+        lastErr = err;
+        log.debug(
+          TAG,
+          `open_bi attempt ${attempt}/${maxAttempts} failed for`,
+          nodeId.slice(0, 16) + "...",
+          err
+        );
+        if (attempt < maxAttempts) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+    }
+    throw lastErr;
   }
 
   /**
