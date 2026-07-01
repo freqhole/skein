@@ -142,13 +142,17 @@ test("registry contains the expected widget types", async ({ canvasPage }) => {
     return (window as any).__skein.registry.types();
   });
 
-  expect(types).toContain("hello-world");
-  expect(types).toContain("counter");
   expect(types).toContain("label");
   expect(types).toContain("notepad");
   expect(types).toContain("image");
   expect(types).toContain("markdown");
-  expect(types).toHaveLength(6);
+  expect(types).toContain("doodle");
+  expect(types).toContain("audio-recording");
+  expect(types).toContain("file");
+  expect(types).toContain("peedeeeff");
+  expect(types).toContain("bin");
+  expect(types).toContain("canvas-info");
+  expect(types).toHaveLength(10);
 });
 
 test("canvas persists widgets across sessions via IndexedDB", async ({ browser }) => {

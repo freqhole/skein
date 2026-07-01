@@ -33,7 +33,7 @@ export async function getBlobWorker(): Promise<Comlink.Remote<BlobWorkerApi> | n
   // vite ?worker import: returns a constructor for a module-format worker.
   // the wasm + topLevelAwait plugins are applied to worker bundles via
   // vite.config.ts `worker.plugins`.
-  // eslint-disable-next-line no-restricted-syntax -- vite ?worker suffix requires dynamic import
+   
   const WorkerCtor = (await import("./blob-worker?worker")).default;
   workerInstance = new WorkerCtor();
   workerProxy = Comlink.wrap<BlobWorkerApi>(workerInstance);

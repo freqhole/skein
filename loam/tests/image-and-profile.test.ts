@@ -1,64 +1,18 @@
 // E2E tests for social widget features, canvas author auto-population,
 // and image upload flows.
+//
+// the social widget lives in a toolbar overlay panel (not in the narthex
+// widgetManager). its state doc is the standalone social doc exposed via
+// window.__skeinSocialDoc. all tests access social state through that.
 
 import { expect, test } from "@playwright/test";
 import path from "path";
 
-/**
- * get the screen coordinates of the profile avatar circle by querying
- * the PixiJS display tree. this is much more reliable than guessing
- * pixel offsets from the widget entry's world-space position.
- */
-async function getAvatarScreenCoords(
-  page: import("@playwright/test").Page
-): Promise<{ x: number; y: number } | null> {
-  return page.evaluate(() => {
-    const skein = (window as any).__skein;
-    if (!skein) return null;
-    const live = skein.widgetManager.getLiveWidgets();
-    const widget = live.get("skein-social");
-    if (!widget) return null;
-
-    // the avatar container is the child of the widget's container that
-    // has the circle hitArea. walk the display tree to find it.
-    const ctrl = widget.ctrl;
-    if (!ctrl?.container) return null;
-
-    // the social widget exposes the avatar center position indirectly —
-    // the avatarContainer has a hitArea (Circle) whose center gives us
-    // the local coords. fall back to a heuristic if we can't find it.
-    const container = ctrl.container;
-
-    // look for a child container that has a Circle hitArea
-    for (let i = 0; i < container.children.length; i++) {
-      const child = container.children[i] as any;
-      if (child.hitArea && typeof child.hitArea.radius === "number") {
-        const cx = child.hitArea.x ?? 0;
-        const cy = child.hitArea.y ?? 0;
-        // convert local coords within the child to global (screen) coords
-        const global = child.toGlobal({ x: cx, y: cy });
-        const canvas = skein.app.canvas as HTMLCanvasElement;
-        const rect = canvas.getBoundingClientRect();
-        return { x: rect.left + global.x, y: rect.top + global.y };
-      }
-    }
-
-    // fallback: use the widget entry position + heuristic offset
-    const entry = (widget as any).entry;
-    const frame = widget.frame;
-    if (frame?.root) {
-      const globalPos = frame.contentContainer.toGlobal({ x: entry.width / 2, y: 95 });
-      const canvas = skein.app.canvas as HTMLCanvasElement;
-      const rect = canvas.getBoundingClientRect();
-      return { x: rect.left + globalPos.x, y: rect.top + globalPos.y };
-    }
-
-    return null;
-  });
-}
+// resolve fixture paths relative to the project root (cwd when playwright runs)
+const fixturesDir = path.resolve("tests/fixtures");
 
 // ---------------------------------------------------------------------------
-// helpers (same pattern as narthex.test.ts)
+// helpers
 // ---------------------------------------------------------------------------
 
 async function waitForNarthex(page: import("@playwright/test").Page): Promise<void> {
@@ -68,20 +22,18 @@ async function waitForNarthex(page: import("@playwright/test").Page): Promise<vo
       const skein = (window as any).__skein;
       return skein?.widgetManager?.getLiveWidgets()?.size > 0;
     },
-    { timeout: 15_000 }
+    { timeout: 30_000 }
   );
 }
 
-/** read the social widget's profile sub-object from the per-widget doc state */
+/** read the social widget's profile sub-object from the standalone social doc */
 async function getProfileState(
   page: import("@playwright/test").Page
 ): Promise<Record<string, unknown> | null> {
   return page.evaluate(() => {
-    const skein = (window as any).__skein;
-    const live = skein.widgetManager.getLiveWidgets();
-    const widget = live.get("skein-social");
-    if (!widget?.widgetDoc) return null;
-    return widget.widgetDoc.current?.profile ?? null;
+    const socialDoc = (window as any).__skeinSocialDoc;
+    if (!socialDoc) return null;
+    return (socialDoc.current?.profile as Record<string, unknown>) ?? null;
   });
 }
 
@@ -125,19 +77,14 @@ async function navigateBackToNarthex(page: import("@playwright/test").Page): Pro
 // ---------------------------------------------------------------------------
 
 test.describe("profile and image features", () => {
+  // run serially to avoid resource contention (midden wasm + iroh startup is heavy).
+  // each test gets a fresh browser context with empty IDB from playwright —
+  // no manual IDB clearing needed.
+  test.describe.configure({ mode: "serial" });
+  test.setTimeout(120_000);
+
   test.beforeEach(async ({ page }) => {
-    await page.goto("/skein.html");
-
-    // clear all IndexedDB state for a clean first-boot
-    await page.evaluate(async () => {
-      const dbs = await indexedDB.databases();
-      for (const db of dbs) {
-        if (db.name) indexedDB.deleteDatabase(db.name);
-      }
-    });
-    await page.waitForTimeout(200);
-
-    await page.goto("/skein.html");
+    await page.goto("/");
     await waitForNarthex(page);
   });
 
@@ -145,42 +92,73 @@ test.describe("profile and image features", () => {
   // profile node ID
   // -------------------------------------------------------------------------
 
-  test("social widget generates a 64-char hex node ID on first boot", async ({ page }) => {
-    // settle time for the social widget to mount and generate the nodeId
-    await page.waitForTimeout(1500);
+  test("social widget stores a 64-char hex node ID after the user generates an identity", async ({
+    page,
+  }) => {
+    // node IDs are NOT auto-generated on first boot. the user must explicitly
+    // click "generate identity" in the social widget profile tab.
+    // here we simulate that via window.__skeinEnsureIdentity.
+    await page.evaluate(async () => {
+      await (window as any).__skeinEnsureIdentity();
+    });
+
+    // profile-tab.ts registers an onIdentityChange listener that calls
+    // syncNodeIdToDoc, writing the nodeId into the standalone social doc
+    await page.waitForFunction(
+      () => {
+        const socialDoc = (window as any).__skeinSocialDoc;
+        const nodeId = socialDoc?.current?.profile?.nodeId;
+        return typeof nodeId === "string" && nodeId.length === 64;
+      },
+      { timeout: 30_000 }
+    );
 
     const state = await getProfileState(page);
-
     expect(state).not.toBeNull();
-    expect(state!.nodeId).toBeTruthy();
-    expect(typeof state!.nodeId).toBe("string");
-    expect((state!.nodeId as string).length).toBe(64);
-    // should be valid hex
     expect(state!.nodeId).toMatch(/^[0-9a-f]{64}$/);
   });
 
   test("social widget node ID persists across page reload", async ({ page }) => {
-    await page.waitForTimeout(1500);
-
-    const nodeIdBefore = await page.evaluate(() => {
-      const skein = (window as any).__skein;
-      const live = skein.widgetManager.getLiveWidgets();
-      const widget = live.get("skein-social");
-      return widget?.widgetDoc?.current?.profile?.nodeId ?? "";
+    // generate identity first
+    await page.evaluate(async () => {
+      await (window as any).__skeinEnsureIdentity();
     });
 
+    // wait for nodeId to appear in the social doc
+    await page.waitForFunction(
+      () => {
+        const socialDoc = (window as any).__skeinSocialDoc;
+        const nodeId = socialDoc?.current?.profile?.nodeId;
+        return typeof nodeId === "string" && nodeId.length === 64;
+      },
+      { timeout: 30_000 }
+    );
+
+    const nodeIdBefore = await page.evaluate(() => {
+      return (window as any).__skeinSocialDoc?.current?.profile?.nodeId ?? "";
+    });
     expect(nodeIdBefore).toBeTruthy();
 
-    // reload the page
+    // give automerge a moment to flush the doc change to IDB
+    await page.waitForTimeout(800);
+
+    // reload — same browser context keeps IDB alive
     await page.reload();
     await waitForNarthex(page);
-    await page.waitForTimeout(1500);
+
+    // profile-tab.ts calls getStoredIdentity() on mount and writes nodeId
+    // into the doc, so it should be restored from IDB
+    await page.waitForFunction(
+      () => {
+        const socialDoc = (window as any).__skeinSocialDoc;
+        const nodeId = socialDoc?.current?.profile?.nodeId;
+        return typeof nodeId === "string" && nodeId.length === 64;
+      },
+      { timeout: 30_000 }
+    );
 
     const nodeIdAfter = await page.evaluate(() => {
-      const skein = (window as any).__skein;
-      const live = skein.widgetManager.getLiveWidgets();
-      const widget = live.get("skein-social");
-      return widget?.widgetDoc?.current?.profile?.nodeId ?? "";
+      return (window as any).__skeinSocialDoc?.current?.profile?.nodeId ?? "";
     });
 
     expect(nodeIdAfter).toBe(nodeIdBefore);
@@ -191,19 +169,18 @@ test.describe("profile and image features", () => {
   // -------------------------------------------------------------------------
 
   test("canvas author is auto-populated from social widget username", async ({ page }) => {
-    // set a username on the social widget
+    // set a username on the standalone social doc
+    // createCanvasFromNarthex reads authorName from this doc directly
     await page.evaluate(() => {
-      const skein = (window as any).__skein;
-      const live = skein.widgetManager.getLiveWidgets();
-      const widget = live.get("skein-social");
-      if (widget?.widgetDoc) {
-        widget.widgetDoc.change((d: any) => {
+      const socialDoc = (window as any).__skeinSocialDoc;
+      if (socialDoc) {
+        socialDoc.change((d: any) => {
           if (!d.profile) d.profile = {};
           d.profile.username = "alice";
         });
       }
     });
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(200);
 
     // create a canvas
     await createCanvasAndWaitForNavigation(page, {
@@ -214,7 +191,7 @@ test.describe("profile and image features", () => {
     // navigate back to the narthex
     await navigateBackToNarthex(page);
 
-    // find the canvas-card and check its authorName
+    // find the canvas-card and check its authorName (stored in the per-widget doc)
     const authorName = await page.evaluate(() => {
       const skein = (window as any).__skein;
       const live = skein.widgetManager.getLiveWidgets();
@@ -222,19 +199,19 @@ test.describe("profile and image features", () => {
         const entry = (widget as any).entry;
         if (entry?.type === "canvas-card") {
           const doc = (widget as any).widgetDoc;
-          if (doc?.current?.authorName) {
+          if (doc?.current?.authorName !== undefined) {
             return doc.current.authorName;
           }
         }
       }
-      return "";
+      return "__no_card__";
     });
 
     expect(authorName).toBe("alice");
   });
 
   test("canvas author falls back to empty when social widget has no username", async ({ page }) => {
-    // don't set a username — leave it blank
+    // username is already blank on a fresh boot
 
     await createCanvasAndWaitForNavigation(page, {
       title: "no-author test canvas",
@@ -264,91 +241,74 @@ test.describe("profile and image features", () => {
   // -------------------------------------------------------------------------
 
   test("social widget avatar upload via file chooser stores a WebP data URL", async ({ page }) => {
-    await page.waitForTimeout(1500);
+    // open the social overlay so the profile tab mounts and registers __skeinPickAvatar
+    await page.evaluate(() => (window as any).__skeinToggleSocial?.());
+    await page.waitForTimeout(300);
 
-    // get the avatar circle's screen coordinates from the PixiJS display tree
-    const coords = await getAvatarScreenCoords(page);
-    expect(coords).not.toBeNull();
+    // set up file chooser listener BEFORE triggering the pick
+    const fileChooserPromise = page.waitForEvent("filechooser", { timeout: 8_000 });
 
-    // set up file chooser listener BEFORE clicking
-    const fileChooserPromise = page.waitForEvent("filechooser", { timeout: 5000 });
-
-    await page.mouse.click(coords!.x, coords!.y);
+    // fire pickAvatarFile without awaiting — input.click() happens synchronously
+    // so the filechooser event fires before page.evaluate returns
+    await page.evaluate(() => {
+      (window as any).__skeinPickAvatar?.();
+    });
 
     const fileChooser = await fileChooserPromise;
     await fileChooser.setFiles(path.join(__dirname, "fixtures", "freqhole.png"));
 
-    // wait for the image to be processed (resize + WebP encode + Automerge write)
-    // poll instead of fixed timeout for more reliable detection
+    // wait for the image to be processed (resize + WebP encode + doc write)
     await page.waitForFunction(
       () => {
-        const skein = (window as any).__skein;
-        const live = skein?.widgetManager?.getLiveWidgets();
-        const widget = live?.get("skein-social");
-        const url = widget?.widgetDoc?.current?.profile?.avatarDataUrl ?? "";
+        const url = (window as any).__skeinSocialDoc?.current?.profile?.avatarDataUrl ?? "";
         return url.startsWith("data:image/");
       },
-      { timeout: 10_000 }
+      { timeout: 15_000 }
     );
 
-    // verify the avatar data URL was set
-    const avatarDataUrl = await page.evaluate(() => {
-      const skein = (window as any).__skein;
-      const live = skein.widgetManager.getLiveWidgets();
-      const widget = live.get("skein-social");
-      return widget?.widgetDoc?.current?.profile?.avatarDataUrl ?? "";
-    });
+    const avatarDataUrl = await page.evaluate(
+      () => (window as any).__skeinSocialDoc?.current?.profile?.avatarDataUrl ?? ""
+    );
 
     expect(avatarDataUrl).toBeTruthy();
     expect(avatarDataUrl).toMatch(/^data:image\/webp;base64,/);
   });
 
   test("social widget avatar persists across page reload", async ({ page }) => {
-    await page.waitForTimeout(1500);
+    // open the social overlay and upload an avatar
+    await page.evaluate(() => (window as any).__skeinToggleSocial?.());
+    await page.waitForTimeout(300);
 
-    // get the avatar circle's screen coordinates from the PixiJS display tree
-    const coords = await getAvatarScreenCoords(page);
-    expect(coords).not.toBeNull();
-
-    // upload an avatar
-    const fileChooserPromise = page.waitForEvent("filechooser", { timeout: 5000 });
-    await page.mouse.click(coords!.x, coords!.y);
+    const fileChooserPromise = page.waitForEvent("filechooser", { timeout: 8_000 });
+    await page.evaluate(() => {
+      (window as any).__skeinPickAvatar?.();
+    });
     const fileChooser = await fileChooserPromise;
     await fileChooser.setFiles(path.join(__dirname, "fixtures", "freqhole.png"));
 
-    // poll until the avatar is stored
+    // wait until stored
     await page.waitForFunction(
       () => {
-        const skein = (window as any).__skein;
-        const live = skein?.widgetManager?.getLiveWidgets();
-        const widget = live?.get("skein-social");
-        const url = widget?.widgetDoc?.current?.profile?.avatarDataUrl ?? "";
+        const url = (window as any).__skeinSocialDoc?.current?.profile?.avatarDataUrl ?? "";
         return url.startsWith("data:image/");
       },
-      { timeout: 10_000 }
+      { timeout: 15_000 }
     );
 
-    // capture the data URL before reload
-    const avatarBefore = await page.evaluate(() => {
-      const skein = (window as any).__skein;
-      const live = skein.widgetManager.getLiveWidgets();
-      const widget = live.get("skein-social");
-      return widget?.widgetDoc?.current?.profile?.avatarDataUrl ?? "";
-    });
+    const avatarBefore = await page.evaluate(
+      () => (window as any).__skeinSocialDoc?.current?.profile?.avatarDataUrl ?? ""
+    );
     expect(avatarBefore).toMatch(/^data:image\/webp;base64,/);
 
-    // reload
+    // flush IDB then reload
+    await page.waitForTimeout(800);
     await page.reload();
     await waitForNarthex(page);
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(500);
 
-    // verify avatar persisted
-    const avatarAfter = await page.evaluate(() => {
-      const skein = (window as any).__skein;
-      const live = skein.widgetManager.getLiveWidgets();
-      const widget = live.get("skein-social");
-      return widget?.widgetDoc?.current?.profile?.avatarDataUrl ?? "";
-    });
+    const avatarAfter = await page.evaluate(
+      () => (window as any).__skeinSocialDoc?.current?.profile?.avatarDataUrl ?? ""
+    );
 
     expect(avatarAfter).toBe(avatarBefore);
   });
@@ -357,7 +317,7 @@ test.describe("profile and image features", () => {
   // profile singleton behavior
   // -------------------------------------------------------------------------
 
-  test("social widget is a singleton and not crashed after navigate-back", async ({ page }) => {
+  test("social overlay survives canvas navigate-back", async ({ page }) => {
     // create a canvas and navigate there
     await createCanvasAndWaitForNavigation(page, {
       title: "singleton test canvas",
@@ -367,20 +327,15 @@ test.describe("profile and image features", () => {
     // navigate back to the narthex
     await navigateBackToNarthex(page);
 
-    // verify the social widget is present and not crashed
+    // verify the social doc and toggle are still accessible after re-mount
     const result = await page.evaluate(() => {
-      const skein = (window as any).__skein;
-      const live = skein.widgetManager.getLiveWidgets();
-      const widget = live.get("skein-social");
-      if (!widget) return { found: false, crashed: false };
-      return {
-        found: true,
-        crashed: (widget as any).crashed,
-      };
+      const hasSocialDoc = !!(window as any).__skeinSocialDoc?.current;
+      const hasToggle = typeof (window as any).__skeinToggleSocial === "function";
+      return { hasSocialDoc, hasToggle };
     });
 
-    expect(result.found).toBe(true);
-    expect(result.crashed).toBe(false);
+    expect(result.hasSocialDoc).toBe(true);
+    expect(result.hasToggle).toBe(true);
   });
 
   // -------------------------------------------------------------------------
@@ -396,7 +351,6 @@ test.describe("profile and image features", () => {
     await navigateBackToNarthex(page);
 
     // directly set a previewUrl on the canvas-card via its widgetDoc
-    // (simulates what the property tray image upload would do)
     const fs = await import("fs");
     const imgBuffer = fs.readFileSync(path.join(__dirname, "fixtures", "freqhole.png"));
     const base64 = imgBuffer.toString("base64");

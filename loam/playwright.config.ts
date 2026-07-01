@@ -12,21 +12,23 @@ export default defineConfig({
   use: {
     baseURL: "http://localhost:5897",
     trace: "on-first-retry",
-    // generous timeouts: pixi init + automerge sync can be slow in CI
-    actionTimeout: 10_000,
-    navigationTimeout: 15_000,
+    // generous timeouts: pixi init + automerge sync + midden wasm can be slow
+    actionTimeout: 15_000,
+    navigationTimeout: 20_000,
   },
   expect: {
-    // default assertion timeout — most canvas assertions are fast (JS state checks)
+    // default assertion timeout
     timeout: 5_000,
   },
-  // default per-test timeout. @p2p tests call test.setTimeout() to override.
-  timeout: 30_000,
+  // default per-test timeout.
+  // narthex/image tests boot the full app (midden wasm + iroh) so need more.
+  timeout: 60_000,
   projects: [
     {
       name: "chromium",
       use: {
         ...devices["Desktop Chrome"],
+        viewport: { width: 1280, height: 800 },
         // required for wasm + SharedArrayBuffer
         launchOptions: {
           args: ["--enable-features=SharedArrayBuffer"],

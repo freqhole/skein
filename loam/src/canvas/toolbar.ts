@@ -693,14 +693,17 @@ export class Toolbar {
 
     // bottom edge: root.y + y + flyoutH <= screenH - margin
     const maxY = screenH - margin - this.root.y - flyoutH;
+    // minimum y to keep top edge within viewport
+    const minY = margin - this.root.y;
     if (y > maxY) {
       // try flipping above the toolbar instead of below
       const aboveY = -flyoutH - 4;
       if (this.root.y + aboveY >= margin) {
         y = aboveY;
       } else {
-        // just clamp to the max
-        y = Math.max(0, maxY);
+        // not enough room above or below — anchor to viewport top,
+        // accept bottom overflow only if flyout is genuinely taller than viewport
+        y = Math.max(minY, maxY);
       }
     }
 

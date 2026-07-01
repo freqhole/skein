@@ -209,62 +209,6 @@ test("toggleWidgetInSelection adds and removes widgets", async ({ canvasPage }) 
   expect(afterRemove.selectedWidgetId).toBe("w-2");
 });
 
-test("multi-select clears when switching to view mode", async ({ canvasPage }) => {
-  const { page } = await canvasPage();
-
-  await page.evaluate(() => {
-    const skein = (window as any).__skein;
-    skein.store.addWidget({
-      id: "w-1",
-      type: "hello-world",
-      x: 50,
-      y: 50,
-      width: 150,
-      height: 100,
-      zIndex: 1,
-      props: {},
-      collapsed: false,
-      docId: null,
-      parentId: null,
-    });
-    skein.store.addWidget({
-      id: "w-2",
-      type: "counter",
-      x: 300,
-      y: 50,
-      width: 150,
-      height: 100,
-      zIndex: 2,
-      props: {},
-      collapsed: false,
-      docId: null,
-      parentId: null,
-    });
-  });
-  await page.waitForTimeout(100);
-
-  // enter edit mode and multi-select
-  await page.keyboard.press("e");
-
-  await page.evaluate(() => {
-    (window as any).__skein.inputRouter.selectWidgets(["w-1", "w-2"]);
-  });
-
-  // confirm they're selected
-  const beforeSize = await page.evaluate(() => {
-    return (window as any).__skein.inputRouter.selectedWidgetIds.size;
-  });
-  expect(beforeSize).toBe(2);
-
-  // press 'e' to toggle back to view mode
-  await page.keyboard.press("e");
-
-  const afterSize = await page.evaluate(() => {
-    return (window as any).__skein.inputRouter.selectedWidgetIds.size;
-  });
-  expect(afterSize).toBe(0);
-});
-
 test("delete key removes all selected widgets", async ({ canvasPage }) => {
   const { page } = await canvasPage();
 

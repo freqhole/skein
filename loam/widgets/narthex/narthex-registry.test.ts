@@ -37,9 +37,9 @@ describe("createNarthexRegistry", () => {
     expect(registry.get("label")!.metadata.hidden).toBeFalsy();
   });
 
-  it("social is not hidden", () => {
+  it("social is hidden (accessed via toolbar avatar button)", () => {
     const registry = createNarthexRegistry();
-    expect(registry.get("social")!.metadata.hidden).toBeFalsy();
+    expect(registry.get("social")!.metadata.hidden).toBe(true);
   });
 
   it("join-canvas is not hidden", () => {
@@ -58,23 +58,24 @@ describe("createNarthexRegistry", () => {
     expect(registry.get("messagez")!.metadata.singletonId).toBe("skein-messagez");
   });
 
-  it("messagez is not hidden", () => {
+  it("messagez is hidden (accessed via toolbar messages button)", () => {
     const registry = createNarthexRegistry();
-    expect(registry.get("messagez")!.metadata.hidden).toBeFalsy();
+    expect(registry.get("messagez")!.metadata.hidden).toBe(true);
   });
 
   it("non-hidden widgets for palette", () => {
     const registry = createNarthexRegistry();
     const visible = registry.all().filter((f) => !f.metadata.hidden);
-    expect(visible.length).toBe(8);
+    expect(visible.length).toBe(6);
     const types = visible.map((f) => f.type);
     expect(types).toContain("canvas-wizard");
-    expect(types).toContain("social");
     expect(types).toContain("label");
     expect(types).toContain("join-canvas");
-    expect(types).toContain("messagez");
     expect(types).toContain("bin");
     expect(types).toContain("markdown");
     expect(types).toContain("trash");
+    // social + messagez are hidden — they live in the toolbar as icon buttons
+    expect(types).not.toContain("social");
+    expect(types).not.toContain("messagez");
   });
 });

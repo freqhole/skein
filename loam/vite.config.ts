@@ -13,7 +13,10 @@ export default defineConfig({
     format: "es",
     plugins: () => [wasm()],
   },
+  // target esnext — the app requires modern browsers (wasm, top-level await, etc.)
+  // this removes the need for vite-plugin-top-level-await.
   build: {
+    target: "esnext",
     lib: {
       entry: path.resolve(__dirname, "src/index.ts"),
       formats: ["es"],
@@ -34,9 +37,18 @@ export default defineConfig({
         },
       }
     : {}),
-  // dev server serves test-harness.html for playwright tests
+  // dev server serves test-harness.html for playwright tests.
+  // allow serving the midden package which lives at ../midden/pkg (outside project root).
   server: {
     port: 5897,
+    fs: {
+      allow: [".."],
+    },
+  },
+  // exclude midden from esbuild pre-bundling — it contains a .wasm file that
+  // esbuild can't handle; vite-plugin-wasm takes care of it instead.
+  optimizeDeps: {
+    exclude: ["midden"],
   },
   test: {
     globals: true,

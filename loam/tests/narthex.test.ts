@@ -1,14 +1,8 @@
 // narthex navigation E2E tests
 //
-// these tests exercise the full skein router (skein.html) and verify that
+// these tests exercise the full skein router (index.html) and verify that
 // canvas-card widgets on the narthex survive navigate-away / navigate-back
-// cycles. the underlying bug: destroyAll() calls unmountWidget() which
-// deletes per-widget automerge docs from the repo. on navigate-back the
-// canvas-card entry still has its docId but the doc is gone, so repo.find()
-// fails and the card renders as "crashed."
-//
-// we expect these tests to FAIL until the bug is fixed. they document the
-// desired behavior so we can verify the fix.
+// cycles.
 
 import { expect, test } from "@playwright/test";
 
@@ -104,20 +98,32 @@ test.describe("narthex navigation", () => {
   test.beforeEach(async ({ page }) => {
     // explicitly clear IndexedDB state for a clean slate — each test should
     // be independent even though playwright gives us a fresh context.
-    await page.goto("/skein.html");
+    await page.goto("/");
 
     await page.evaluate(async () => {
       const dbs = await indexedDB.databases();
-      for (const db of dbs) {
-        if (db.name) indexedDB.deleteDatabase(db.name);
-      }
+      await Promise.all(
+        dbs.map(
+          (db) =>
+            new Promise<void>((resolve) => {
+              if (!db.name) {
+                resolve();
+                return;
+              }
+              const req = indexedDB.deleteDatabase(db.name);
+              req.onsuccess = () => resolve();
+              req.onerror = () => resolve();
+              req.onblocked = () => resolve();
+            })
+        )
+      );
     });
 
     // small delay to let IDB deletions settle before reload
     await page.waitForTimeout(200);
 
     // reload after clearing so we start from true first-boot state
-    await page.goto("/skein.html");
+    await page.goto("/");
     await waitForNarthex(page);
   });
 

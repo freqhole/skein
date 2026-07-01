@@ -348,17 +348,6 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
       }
     };
     const unsubSyncOverlay = store.onChange(() => removeSyncOverlay());
-
-    // also set the connection status to syncing
-    if (connectionStatus) {
-      connectionStatus.setSyncing(true);
-      // clear syncing state when widgets appear
-      store.onChange(() => {
-        if (store.widgetCount() > 0) {
-          connectionStatus?.setSyncing(false);
-        }
-      });
-    }
   }
 
   // step 13c: create the property tray for editing widget props.

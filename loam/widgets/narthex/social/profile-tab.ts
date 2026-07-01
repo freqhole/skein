@@ -264,6 +264,9 @@ export function createProfileTab(ctx: TabContext): TabController {
       });
     }
   };
+  // expose for e2e test access so tests can trigger a file pick without
+  // needing to locate and click the avatar circle
+  (window as any).__skeinPickAvatar = pickAvatarFile;
 
   // -------------------------------------------------------------------------
   // text fields

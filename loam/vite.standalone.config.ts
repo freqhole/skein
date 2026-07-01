@@ -20,7 +20,9 @@ export default defineConfig({
     plugins: () => [wasm()],
   },
   base: isTauriBuild ? "./" : deployBase || "/",
+  // target esnext — the app requires modern browsers (wasm, top-level await, etc.)
   build: {
+    target: "esnext",
     outDir: "dist",
     rollupOptions: {
       input: {
@@ -42,4 +44,9 @@ export default defineConfig({
         },
       }
     : {}),
+  // exclude midden from esbuild pre-bundling — it contains a .wasm file that
+  // esbuild can't handle; vite-plugin-wasm takes care of it instead.
+  optimizeDeps: {
+    exclude: ["midden"],
+  },
 });

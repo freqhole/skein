@@ -20,12 +20,14 @@ export default [
       "@typescript-eslint": tseslint,
     },
     rules: {
-      // ban dynamic imports — use static imports
+      // ban dynamic imports — the one legitimate exception is the vite
+      // ?worker suffix which only works as a dynamic import
       "no-restricted-syntax": [
         "error",
         {
-          selector: "ImportExpression",
-          message: "dynamic import() is banned — use static imports",
+          selector: "ImportExpression:not([source.value=/\\?worker$/])",
+          message:
+            "dynamic import() is banned — use static imports (exception: ?worker vite suffix)",
         },
       ],
 

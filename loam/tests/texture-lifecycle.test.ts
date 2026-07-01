@@ -52,18 +52,30 @@ async function navigateBackToNarthex(page: import("@playwright/test").Page): Pro
 
 test.describe("texture lifecycle — property tray shared asset unload", () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto("/skein.html");
+    await page.goto("/");
 
     // clear all IndexedDB state for a clean first-boot
     await page.evaluate(async () => {
       const dbs = await indexedDB.databases();
-      for (const db of dbs) {
-        if (db.name) indexedDB.deleteDatabase(db.name);
-      }
+      await Promise.all(
+        dbs.map(
+          (db) =>
+            new Promise<void>((resolve) => {
+              if (!db.name) {
+                resolve();
+                return;
+              }
+              const req = indexedDB.deleteDatabase(db.name);
+              req.onsuccess = () => resolve();
+              req.onerror = () => resolve();
+              req.onblocked = () => resolve();
+            })
+        )
+      );
     });
     await page.waitForTimeout(200);
 
-    await page.goto("/skein.html");
+    await page.goto("/");
     await waitForNarthex(page);
   });
 

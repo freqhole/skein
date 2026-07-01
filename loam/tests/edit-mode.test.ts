@@ -92,8 +92,8 @@ test("flyout menu stays within the viewport bounds", async ({ canvasPage }) => {
 test("flyout menu stays within bounds on a small viewport", async ({ canvasPage }) => {
   const { page } = await canvasPage();
 
-  // shrink the viewport to force tight constraints
-  await page.setViewportSize({ width: 400, height: 300 });
+  // shrink to a narrow mobile viewport — tests flyout clamping on small screens
+  await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(200);
 
   // open the flyout
@@ -284,7 +284,7 @@ test("selecting a widget makes header and buttons visible", async ({ canvasPage 
     const frame = w.frame;
     return {
       collapseBtnVisible: frame.collapseBtn?.visible ?? false,
-      closeBtnVisible: frame.closeBtn?.visible ?? false,
+      closeBtnVisible: frame.hamburgerBtn?.visible ?? false,
       headerVisible: frame.header?.visible,
     };
   });
@@ -303,7 +303,7 @@ test("selecting a widget makes header and buttons visible", async ({ canvasPage 
     const frame = w.frame;
     return {
       collapseBtnVisible: frame.collapseBtn?.visible ?? false,
-      closeBtnVisible: frame.closeBtn?.visible ?? false,
+      closeBtnVisible: frame.hamburgerBtn?.visible ?? false,
       headerVisible: frame.header?.visible,
     };
   });

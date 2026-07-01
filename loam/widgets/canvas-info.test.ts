@@ -35,8 +35,8 @@ describe("canvasInfoWidget metadata", () => {
     expect(canvasInfoWidget.metadata.singleton).toBe(true);
   });
 
-  it("is not hidden from palette", () => {
-    expect(canvasInfoWidget.metadata.hidden).toBeFalsy();
+  it("is hidden from palette (accessed via toolbar button)", () => {
+    expect(canvasInfoWidget.metadata.hidden).toBe(true);
   });
 
   it("has default dimensions", () => {

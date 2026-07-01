@@ -218,7 +218,35 @@ class SkeinRouter {
     // this must be global (not per-canvas) so it fires even when the user creates
     // an identity while viewing a non-narthex canvas.
     const unsubIdentity = onIdentityChange((identity) => {
-      if (identity && !this.friendzProtocol) {
+      if (!identity) return;
+
+      // update localNodeId so subsequent canvas inits get the right value
+      if (!this.localNodeId) {
+        this.localNodeId = identity.node_id;
+        // propagate to the current canvas if it's already up
+        if (this.currentCanvas) {
+          this.currentCanvas.store.setLocalNodeId(identity.node_id);
+          this.currentCanvas.presenceManager.setLocalNodeId(identity.node_id);
+        }
+        // write nodeId into the standalone social doc so the social widget
+        // reflects the correct identity even before the user opens it
+        if (!isTauriMode() && this.socialDoc) {
+          try {
+            const handle = (this.socialDoc as any)._handle;
+            if (handle) {
+              handle.change((doc: any) => {
+                if (doc.profile && !doc.profile.nodeId) {
+                  doc.profile.nodeId = identity.node_id;
+                }
+              });
+            }
+          } catch {
+            // social doc not ready yet — nodeId will be set by the social widget on mount
+          }
+        }
+      }
+
+      if (!this.friendzProtocol) {
         log.debug(TAG, "identity created — retrying protocol init");
         this.initFriendzProtocol().catch((err) => {
           log.warn(TAG, "deferred protocol init failed:", err);
@@ -433,6 +461,15 @@ class SkeinRouter {
         canvas.presenceManager.setLocalNodeId(this.localNodeId);
       }
       (window as any).__skein = canvas;
+      // expose test helpers in browser mode so e2e tests can inspect social state
+      // without full UI simulation
+      if (!isTauriMode()) {
+        (window as any).__skeinSocialDoc = this.socialDoc;
+        (window as any).__skeinToggleSocial = () => {
+          const sw = window.visualViewport?.width ?? window.innerWidth;
+          this.currentSocialOverlay?.toggle(sw);
+        };
+      }
 
       // when a canvas-card is deleted from the narthex, clean up the linked
       // canvas document and all its per-widget docs from IndexedDB.
@@ -1533,6 +1570,11 @@ async function boot(): Promise<void> {
 
   const router = new SkeinRouter(mountElement);
   (window as any).__skeinRouter = router;
+  // expose test utilities in browser mode so e2e tests can trigger identity
+  // generation without simulating full UI interaction
+  if (!isTauriMode()) {
+    (window as any).__skeinEnsureIdentity = ensureIdentity;
+  }
   await router.boot();
 }
 
