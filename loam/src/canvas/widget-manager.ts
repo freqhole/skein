@@ -188,6 +188,7 @@ export class WidgetManager {
 
     // wire up the delete handler on the input router
     this.inputRouter.setDeleteHandler((id) => {
+      if (this.store.isLocalViewer()) return;
       this.store.removeWidget(id);
     });
 
@@ -571,6 +572,11 @@ export class WidgetManager {
    * used by the property tray delete button and internal close logic.
    */
   closeWidget(widgetId: string): void {
+    // viewers cannot delete widgets — this is the single funnel point for
+    // delete (toolbar delete button, property tray, keyboard shortcut all
+    // route through here).
+    if (this.store.isLocalViewer()) return;
+
     if (this.inputRouter.selectedWidgetIds.has(widgetId)) {
       this.inputRouter.selectWidget(null);
     }
@@ -613,6 +619,7 @@ export class WidgetManager {
    */
   private createFrameCallbacks(widgetId: string, widgetType?: string) {
     return {
+      isReadOnly: () => this.store.isLocalViewer(),
       onSelect: () => {
         this.inputRouter.selectWidget(widgetId);
       },
@@ -620,10 +627,12 @@ export class WidgetManager {
         this.inputRouter.toggleWidgetInSelection(widgetId);
       },
       onMove: (x: number, y: number) => {
+        if (this.store.isLocalViewer()) return;
         this.store.moveWidget(widgetId, x, y);
         this.updateStageBounds();
       },
       onResize: (width: number, height: number) => {
+        if (this.store.isLocalViewer()) return;
         this.store.resizeWidget(widgetId, width, height);
         // also call ctrl.resize() on the live widget
         const live = this.liveWidgets.get(widgetId);

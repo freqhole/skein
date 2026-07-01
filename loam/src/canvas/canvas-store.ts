@@ -230,6 +230,28 @@ export class CanvasStore {
     return this.getRole(nodeId) === "admin";
   }
 
+  /**
+   * effective role for the local peer (via `setLocalNodeId()`). returns
+   * `"member"` if the local node id hasn't been set yet — same default as
+   * `getRole()` for an unrecorded node, so callers don't need a separate
+   * "not ready yet" branch.
+   */
+  localRole(): CanvasRole {
+    return this.getRole(this._localNodeId);
+  }
+
+  /** convenience: true if the local peer has view-only access to this
+   *  canvas — the UI-gating chokepoint for toolbar/property-tray/widget-manager. */
+  isLocalViewer(): boolean {
+    return this.localRole() === "viewer";
+  }
+
+  /** convenience: true if the local peer is an admin on this canvas — the
+   *  UI-gating chokepoint for the share dialog (only admins can invite/share). */
+  isLocalAdmin(): boolean {
+    return this.localRole() === "admin";
+  }
+
   // -- metadata --------------------------------------------------------------
 
   /** get the canvas metadata (title, description, timestamps, color, preview). */

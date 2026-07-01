@@ -218,12 +218,18 @@ export class Toolbar {
     this.unsubs.push(
       this.inputRouter.onMultiSelectionChange(() => {
         this.deleteBtn.visible = this.inputRouter.selectedWidgetIds.size > 0;
+        this.applyRoleGating();
         this.layout();
       })
     );
+    // ACL role can change while the canvas is open (an admin changes
+    // someone's role, or the local peer's own role changes) — re-apply
+    // gating whenever the doc changes. cheap no-op most of the time.
+    this.unsubs.push(this.store.onChange(() => this.applyRoleGating()));
 
     // set initial state then lay out
     this.updateSelection(this.inputRouter.selectedWidgetId);
+    this.applyRoleGating();
     this.layout();
   }
 
@@ -1012,7 +1018,38 @@ export class Toolbar {
   // -- state updates ---------------------------------------------------------
 
   private updateSelection(_id: string | null): void {
-    this.deleteBtn.visible = this.inputRouter.selectedWidgetIds.size > 0;
+    this.deleteBtn.visible = !this.store.isLocalViewer() && this.inputRouter.selectedWidgetIds.size > 0;
+    this.layout();
+  }
+
+  /**
+   * hide/disable UI affordances the local peer's role doesn't permit.
+   * viewers cannot add or delete widgets; only admins can share/invite.
+   * called at construction, whenever the canvas doc changes (role could
+   * change while the canvas is open), and can be called externally via
+   * `refreshRoleGating()` — needed because `store.setLocalNodeId()` is
+   * called by `boot.ts` *after* the toolbar is constructed, so the local
+   * node id (and therefore the effective role) isn't known yet at
+   * construction time.
+   */
+  private applyRoleGating(): void {
+    const isViewer = this.store.isLocalViewer();
+    this.addBtn.visible = !isViewer;
+    if (isViewer && this.flyoutOpen) {
+      this.toggleFlyout();
+    }
+    this.deleteBtn.visible = !isViewer && this.inputRouter.selectedWidgetIds.size > 0;
+
+    if (this.shareBtn) {
+      this.shareBtn.visible = this.store.isLocalAdmin();
+    }
+  }
+
+  /** re-apply role gating — call after `store.setLocalNodeId()` runs, since
+   *  the toolbar may have been constructed before the local node id (and
+   *  therefore the effective role) was known. */
+  refreshRoleGating(): void {
+    this.applyRoleGating();
     this.layout();
   }
 

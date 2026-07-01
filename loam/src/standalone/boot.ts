@@ -229,6 +229,7 @@ class SkeinRouter {
         if (this.currentCanvas) {
           this.currentCanvas.store.setLocalNodeId(identity.node_id);
           this.currentCanvas.presenceManager.setLocalNodeId(identity.node_id);
+          this.currentCanvas.toolbar.refreshRoleGating();
         }
         // write nodeId into the standalone social doc so the social widget
         // reflects the correct identity even before the user opens it
@@ -491,6 +492,7 @@ class SkeinRouter {
       if (this.localNodeId) {
         canvas.presenceManager.setLocalNodeId(this.localNodeId);
       }
+      canvas.toolbar.refreshRoleGating();
       (window as any).__skein = canvas;
 
       // when a canvas-card is deleted from the narthex, clean up the linked
@@ -643,6 +645,14 @@ class SkeinRouter {
         },
         onShare: async () => {
           if (!this.currentCanvas) return;
+          // defense in depth: the toolbar already hides the share button for
+          // non-admins (see Toolbar.applyRoleGating()), but guard the actual
+          // handler too in case gating hasn't refreshed yet (e.g. a role
+          // change just landed via sync).
+          if (!this.currentCanvas.store.isLocalAdmin()) {
+            log.debug(TAG, "share blocked — local peer is not an admin on this canvas");
+            return;
+          }
           const identity = await getStoredIdentity();
           if (!identity) {
             log.debug(TAG, "no identity — generate one first (profile widget)");
@@ -946,6 +956,7 @@ class SkeinRouter {
       if (this.localNodeId) {
         canvas.presenceManager.setLocalNodeId(this.localNodeId);
       }
+      canvas.toolbar.refreshRoleGating();
 
       // update lastVisitedAt on the canvas card
       if (this.narthexDocId) {
@@ -1274,6 +1285,7 @@ class SkeinRouter {
     // to determine which canvases have updates since we last saw them
     canvas.store.setLocalNodeId(identity.node_id);
     canvas.store.stampLastSeen();
+    canvas.toolbar.refreshRoleGating();
 
     // wire transport-level connectivity into the canvas store so widgets
     // can check which peers are online for smarter snatch peer selection

@@ -532,6 +532,44 @@ test("isAdmin reflects the admin role", async ({ canvasPage }) => {
   expect(results.unknown).toBe(false); // defaults to member, not admin
 });
 
+test("localRole/isLocalViewer/isLocalAdmin reflect the local peer's role", async ({
+  canvasPage,
+}) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    store.stampAdmin("local-node-id");
+    store.setLocalNodeId("local-node-id");
+  });
+
+  const asAdmin = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    return {
+      role: store.localRole(),
+      isViewer: store.isLocalViewer(),
+      isAdmin: store.isLocalAdmin(),
+    };
+  });
+  expect(asAdmin).toEqual({ role: "admin", isViewer: false, isAdmin: true });
+
+  await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    store.setRole("viewer-node-id", "viewer");
+    store.setLocalNodeId("viewer-node-id");
+  });
+
+  const asViewer = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    return {
+      role: store.localRole(),
+      isViewer: store.isLocalViewer(),
+      isAdmin: store.isLocalAdmin(),
+    };
+  });
+  expect(asViewer).toEqual({ role: "viewer", isViewer: true, isAdmin: false });
+});
+
 test("getRole safely falls back to member for an invalid/corrupted role value", async ({
   canvasPage,
 }) => {

@@ -38,6 +38,10 @@ export interface WidgetFrameCallbacks {
   onDragDelta?: (dx: number, dy: number) => void;
   /** batch drag: emitted when the drag finishes */
   onDragEnd?: () => void;
+  /** true if the local peer has view-only access — disables drag/resize
+   *  entirely (not just the persisted mutation) so there's no visual
+   *  desync between the frame and the store. */
+  isReadOnly?: () => boolean;
 }
 
 /**
@@ -679,6 +683,7 @@ export class WidgetFrame {
       // interaction
       handle.on("pointerdown", (e: FederatedPointerEvent) => {
         if (!this._selected) return;
+        if (this.callbacks.isReadOnly?.()) return;
         e.stopPropagation();
         this.resizing = true;
         this.resizeHandle = pos;
@@ -894,6 +899,7 @@ export class WidgetFrame {
 
   private startDrag(e: FederatedPointerEvent): void {
     if (this._destroyed) return;
+    if (this.callbacks.isReadOnly?.()) return;
     this.dragging = true;
     this.dragStartGlobal = { x: e.global.x, y: e.global.y };
     this.dragStartLocal = { x: this.root.x, y: this.root.y };

@@ -275,6 +275,14 @@ export class PropertyTray {
       return;
     }
 
+    // viewers get no property tray at all — there's nothing they're allowed
+    // to edit (title, prop fields, delete). this is a UI convention, not a
+    // security boundary — see skein-runtime-plan.md's ACL trust-model notes.
+    if (this.store.isLocalViewer()) {
+      this.hide();
+      return;
+    }
+
     // if the same widget is still selected, don't rebuild
     if (selectedId === this.currentWidgetId && this.root.visible) {
       return;
@@ -547,6 +555,14 @@ export class PropertyTray {
 
   private repositionIfNeeded(): void {
     if (!this.currentWidgetId || !this.root.visible) return;
+
+    // role can change while the tray is open (an admin downgrades the local
+    // peer to viewer) — hide immediately rather than waiting for the next
+    // selection change.
+    if (this.store.isLocalViewer()) {
+      this.hide();
+      return;
+    }
 
     const live = this.widgetManager.getLiveWidgets().get(this.currentWidgetId);
     if (!live) {
