@@ -1,36 +1,48 @@
 // SkeinHarness — the non-presentation half of a skein canvas.
 //
-// phase 2, step 1 of the harness extraction (see
-// docs/skein-runtime-plan.md § "proposed: SkeinHarness" and
-// § "migration path — phase 2"). owns exactly the pieces that
-// `test-bootstrap.ts` and `sync-test-bootstrap.ts` currently hand-build
-// themselves: an automerge `Repo` and a `CanvasStore` opened/created on it.
+// phase 2 of the harness extraction (see docs/skein-runtime-plan.md
+// § "proposed: SkeinHarness" and § "migration path — phase 2"). step 1
+// (done) covered the pieces `test-bootstrap.ts` and `sync-test-bootstrap.ts`
+// hand-built themselves: an automerge `Repo` and a `CanvasStore`
+// opened/created on it. step 4 (this revision) adds real iroh p2p
+// networking, mirroring what `p2p-test-bootstrap.ts` used to hand-build.
 //
-// deliberately does NOT yet own `PresenceManager`, `identity`, `blobs`, or
-// `iroh` — those get pulled in as later steps once `initCanvas()` is updated
-// to accept a harness and stop constructing its own `PresenceManager`
-// (adding presence here first would risk two independent `PresenceManager`
-// instances fighting over the same ephemeral channel — see the plan doc).
+// deliberately does NOT yet own `PresenceManager`, `identity` (as a general
+// seam — iroh's own identity is wired up internally), or `blobs` — those get
+// pulled in as later steps once `initCanvas()` is updated to accept a
+// harness and stop constructing its own `PresenceManager` (adding presence
+// here first would risk two independent `PresenceManager` instances
+// fighting over the same ephemeral channel — see the plan doc).
 
 import type { DocumentId, NetworkAdapter } from "@automerge/automerge-repo";
 import { Repo } from "@automerge/automerge-repo";
 import { BroadcastChannelNetworkAdapter } from "@automerge/automerge-repo-network-broadcastchannel";
 import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb";
 import { CanvasStore } from "../canvas/canvas-store";
+import { ensureIdentity, getMiddenNode } from "../p2p/identity";
+import { IrohNetworkAdapter, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
 
 export interface SkeinHarnessOptions {
   /**
-   * network adapters to use. "broadcast" (default) is same-browser-context
-   * only — good for unit-ish harness tests and cross-tab sync. "none" skips
-   * network entirely (rare — a fully offline single-peer harness).
+   * network adapters to use:
+   * - "broadcast" (default) — same-browser-context only, good for unit-ish
+   *   harness tests and cross-tab sync.
+   * - "iroh" — real p2p over iroh QUIC only. ensures a P2P identity exists
+   *   (`ensureIdentity()`) and builds an `IrohNetworkAdapter`.
+   * - "both" — broadcast + iroh together (this is what the real app and
+   *   the p2p test bootstrap both want: same-tab sync stays instant while
+   *   iroh handles cross-process/cross-browser peers).
+   * - "none" — skip network entirely (rare — a fully offline single-peer
+   *   harness).
    *
    * ignored if `networkAdapter` or `repo` is provided.
    */
-  network?: "broadcast" | "none";
+  network?: "broadcast" | "iroh" | "both" | "none";
   /**
    * escape hatch for callers that need a network adapter this module doesn't
-   * know how to construct (e.g. `IrohNetworkAdapter` — real p2p networking
-   * isn't wired into the harness yet, see plan doc phase 2 step 4).
+   * know how to construct. when provided, `network` is ignored and
+   * `harness.iroh` stays `null` (this module didn't build the adapter, so it
+   * has nothing typed to hand back).
    */
   networkAdapter?: NetworkAdapter;
   /**
@@ -46,7 +58,7 @@ export interface SkeinHarnessOptions {
    * escape hatch for callers that already have a fully-built `Repo` (e.g.
    * the real app in `boot.ts`, which shares one repo across the narthex and
    * every canvas). when provided, `network`/`networkAdapter`/`ephemeralStorage`
-   * are ignored.
+   * are ignored, and `harness.iroh` stays `null`.
    */
   repo?: Repo;
 }
@@ -56,34 +68,58 @@ export interface SkeinHarness {
   readonly repo: Repo;
   /** the canvas automerge doc, wrapped with typed mutation methods. */
   readonly store: CanvasStore;
-  /** tear down the harness. currently a no-op placeholder — `Repo` and
-   *  `CanvasStore` don't own any resources that need explicit cleanup today,
-   *  but callers should still call this so future harness members
-   *  (presence, iroh, blobs) have a single place to add teardown logic. */
+  /**
+   * the iroh network adapter, when `network` was `"iroh"` or `"both"`.
+   * `null` for broadcast-only/none harnesses, or when a pre-built `repo` /
+   * `networkAdapter` escape hatch was used instead.
+   */
+  readonly iroh: IrohNetworkAdapter | null;
+  /** tear down the harness. disconnects `iroh` (if present) — `Repo` and
+   *  `CanvasStore` don't own any other resources that need explicit cleanup
+   *  today, but callers should still call this so future harness members
+   *  (presence, blobs) have a single place to add teardown logic. */
   destroy(): void;
 }
 
 /**
  * build the non-presentation half of a skein canvas: a `Repo` (storage +
- * network) and a `CanvasStore` opened or created on it.
+ * network), a `CanvasStore` opened or created on it, and (optionally) an
+ * `IrohNetworkAdapter` for real p2p networking.
  *
- * this is a straight extraction of what `test-bootstrap.ts` and
- * `sync-test-bootstrap.ts` each currently build by hand — see those files
- * for the code this is meant to replace.
+ * this is a straight extraction of what `test-bootstrap.ts`,
+ * `sync-test-bootstrap.ts`, and `p2p-test-bootstrap.ts` each used to build
+ * by hand — see those files for the code this is meant to replace.
  */
 export async function createSkeinHarness(
   options: SkeinHarnessOptions = {}
 ): Promise<SkeinHarness> {
   let repo: Repo;
+  let iroh: IrohNetworkAdapter | null = null;
 
   if (options.repo) {
     repo = options.repo;
+  } else if (options.networkAdapter) {
+    repo = new Repo({
+      storage: options.ephemeralStorage ? undefined : new IndexedDBStorageAdapter(),
+      network: [options.networkAdapter],
+    });
   } else {
-    const network: NetworkAdapter[] = options.networkAdapter
-      ? [options.networkAdapter]
-      : options.network === "none"
-        ? []
-        : [new BroadcastChannelNetworkAdapter()];
+    const mode = options.network ?? "broadcast";
+    const network: NetworkAdapter[] = [];
+
+    if (mode === "broadcast" || mode === "both") {
+      network.push(new BroadcastChannelNetworkAdapter());
+    }
+
+    if (mode === "iroh" || mode === "both") {
+      // ensure a P2P identity exists — creates one the first time, restores
+      // on subsequent calls (identity is persisted in IndexedDB).
+      await ensureIdentity();
+      const getMidden = async (): Promise<MiddenStreamNode> =>
+        (await getMiddenNode()) as unknown as MiddenStreamNode;
+      iroh = new IrohNetworkAdapter(getMidden);
+      network.push(iroh);
+    }
 
     repo = new Repo({
       storage: options.ephemeralStorage ? undefined : new IndexedDBStorageAdapter(),
@@ -98,8 +134,9 @@ export async function createSkeinHarness(
   return {
     repo,
     store,
+    iroh,
     destroy() {
-      // nothing to tear down yet — placeholder for future harness members.
+      iroh?.disconnect();
     },
   };
 }

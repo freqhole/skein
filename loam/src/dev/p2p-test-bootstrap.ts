@@ -12,16 +12,13 @@
  *   );
  */
 
-import { Repo } from "@automerge/automerge-repo";
-import { BroadcastChannelNetworkAdapter } from "@automerge/automerge-repo-network-broadcastchannel";
-import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb";
+import type { Repo } from "@automerge/automerge-repo";
 import { z } from "zod";
 import { createTestRegistry } from "../../widgets/index";
 import { initCanvas } from "../canvas/init";
 import { PresenceManager } from "../canvas/presence-manager";
 import { Viewport } from "../canvas/viewport";
-import { ensureIdentity, getMiddenNode } from "../p2p/identity";
-import { IrohNetworkAdapter, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
+import { createSkeinHarness } from "../harness/skein-harness";
 import { createWidgetDoc } from "../widgets/widget-doc";
 import { buildP2PBridge } from "./test-bridge";
 
@@ -57,31 +54,27 @@ let sharedMountElement: HTMLElement | null = null;
  * skein-bridge.ts), then use `joinCanvas()` below to open the shared doc.
  */
 async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2PTestInitResult> {
-  // ensure a P2P identity exists — creates one the first time, restores on
-  // subsequent calls (identity is persisted in the browser context's IndexedDB).
-  await ensureIdentity();
-
-  // build a repo that combines BroadcastChannel (for same-browser-context tabs)
-  // and iroh QUIC (for real cross-process / cross-browser networking).
-  const storage = new IndexedDBStorageAdapter();
-  const getMidden = async (): Promise<MiddenStreamNode> =>
-    (await getMiddenNode()) as unknown as MiddenStreamNode;
-  const irohAdapter = new IrohNetworkAdapter(getMidden);
-  const repo = new Repo({
-    storage,
-    network: [new BroadcastChannelNetworkAdapter(), irohAdapter],
+  // build the repo (broadcast + iroh) and canvas doc via the harness (see
+  // harness/skein-harness.ts — phase 2 step 4 of the SkeinHarness
+  // extraction) instead of hand-rolling ensureIdentity/IrohNetworkAdapter/
+  // Repo here. "both" mirrors what this file built by hand before: iroh for
+  // real cross-process peers, broadcast for same-browser-context tabs.
+  const harness = await createSkeinHarness({
+    network: "both",
+    canvasDocId: options.canvasDocId ?? null,
   });
-  sharedRepo = repo;
+  sharedRepo = harness.repo;
   sharedMountElement = document.getElementById("canvas-root")!;
 
-  // pass the pre-built repo so initCanvas does not create its own
+  // pass the already-resolved doc id so initCanvas does not create its own
   const canvas = await initCanvas({
     mountElement: sharedMountElement,
-    canvasDocId: options.canvasDocId ?? null,
+    canvasDocId: harness.store.handle.documentId,
     registry: createTestRegistry(),
-    repo,
+    repo: harness.repo,
   });
 
+  const irohAdapter = harness.iroh!;
   const p2pBridge = buildP2PBridge(irohAdapter);
 
   // wait for iroh to come online (the adapter starts async in the background
