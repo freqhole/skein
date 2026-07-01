@@ -667,7 +667,11 @@ class SkeinRouter {
               }
               return p.nodeId !== identity.node_id;
             })
-            .map((p) => ({ nodeId: String(p.nodeId), joinedAt: String(p.joinedAt ?? "") }));
+            .map((p) => ({
+              nodeId: String(p.nodeId),
+              joinedAt: String(p.joinedAt ?? ""),
+              role: this.currentCanvas!.store.getRole(String(p.nodeId)),
+            }));
 
           // build friends list for invite picker — exclude already shared
           const peerNodeIds = new Set(peerList.map((p) => p.nodeId));
@@ -676,15 +680,20 @@ class SkeinRouter {
           if (this.socialDoc) {
             const friendsState = this.socialDoc.current;
 
-            // get already-invited node IDs from messagez outbox
+            // get already-invited node IDs from messagez outbox.
+            // excludes declined shares — a friend who declined should be
+            // re-invitable, not permanently stuck off the invite list (a
+            // real bug: previously this checked canvasDocId only, so a
+            // declined invite blocked re-inviting that friend forever, even
+            // though the "declined" section below shows them as declined).
             const alreadyInvited = new Set<string>();
             if (this.messagezDocHandle) {
               const inboxDoc = this.messagezDocHandle.doc() as
-                | { shares?: Array<{ canvasDocId: string; toNodeId: string }> }
+                | { shares?: Array<{ canvasDocId: string; toNodeId: string; declined?: boolean }> }
                 | undefined;
               if (inboxDoc?.shares) {
                 for (const share of inboxDoc.shares) {
-                  if (share.canvasDocId === docId) {
+                  if (share.canvasDocId === docId && !share.declined) {
                     alreadyInvited.add(share.toNodeId);
                   }
                 }
@@ -771,6 +780,10 @@ class SkeinRouter {
               this.irohAdapter.forgetPeer(nodeId);
               log.debug(TAG, "revoked access for peer:", nodeId.slice(0, 16) + "...");
             },
+            onChangeRole: (nodeId: string, role: "editor" | "viewer") => {
+              this.currentCanvas?.store.setRole(nodeId, role);
+              log.debug(TAG, "changed role for peer:", nodeId.slice(0, 16) + "...", "->", role);
+            },
             onAddFriend: async (nodeId: string) => {
               try {
                 await sendFriendRequest(nodeId);
@@ -780,7 +793,7 @@ class SkeinRouter {
               }
             },
             friends: friendsForInvite,
-            onInviteFriend: async (friend: FriendInfo) => {
+            onInviteFriend: async (friend: FriendInfo, role: "editor" | "viewer") => {
               if (!this.friendzProtocol || !this.currentCanvas) return;
               const localIdentity = await getStoredIdentity();
               if (!localIdentity) return;
@@ -850,9 +863,14 @@ class SkeinRouter {
                 this.currentCanvas.store.addPendingInvite(friend.nodeId, {
                   invitedBy: localIdentity.node_id,
                   invitedByUsername: this.friendzProtocol?.getLocalUsername() ?? "",
-                  role: "editor",
+                  role,
                   invitedAt: new Date().toISOString(),
                 });
+                // record the chosen role in the canvas's ACL immediately —
+                // gates UI affordances (and, once AclFilteringNetworkAdapter
+                // lands, actual sync enforcement) as soon as this peer
+                // connects, independent of whether they've "accepted" yet.
+                this.currentCanvas.store.setRole(friend.nodeId, role);
               }
 
               // attempt direct send — best effort, gossip relay handles offline peers
@@ -866,7 +884,7 @@ class SkeinRouter {
                   canvasPreviewUrl,
                   originNodeId: localIdentity.node_id,
                   originUsername: this.friendzProtocol?.getLocalUsername() ?? "",
-                  role: "editor",
+                  role,
                   targets: allTargets,
                   acked: [],
                 });
@@ -1114,7 +1132,17 @@ class SkeinRouter {
             isRemote: true,
             ownerNodeId: detail.fromNodeId,
             ownerUsername: detail.fromUsername || "",
-            role: "editor", // invited users default to editor
+            // NOTE: this is a cosmetic display field on the *local* narthex
+            // canvas-card only — it is NOT the actual access control. the
+            // real ACL lives in the shared canvas doc's `.acl` map (see
+            // CanvasStore.setRole/getRole), which the owner already writes
+            // at invite-send time and which syncs to this peer automatically
+            // once they join the canvas. this field is hardcoded to
+            // "editor" because the invite-accept event (see
+            // messagez-widget.ts's `canvasInviteSchema`) doesn't currently
+            // carry the actual chosen role through to this point — a
+            // cosmetic-only gap, tracked as a follow-up, not a security gap.
+            role: "editor",
             accessRevoked: false,
             lastVisitedAt: "",
           },
@@ -1306,6 +1334,13 @@ class SkeinRouter {
     // create a new empty canvas document in the shared repo
     const newStore = CanvasStore.create(this.repo);
     const newDocId = newStore.handle.documentId;
+
+    // record the creator as owner in the canvas's ACL (see canvas-store.ts's
+    // access control section) — skipped if no identity exists yet (anonymous
+    // creator); nothing to stamp in that case.
+    if (this.localNodeId) {
+      newStore.stampOwner(this.localNodeId);
+    }
 
     const title = detail?.title || "untitled canvas";
     const now = new Date().toISOString();

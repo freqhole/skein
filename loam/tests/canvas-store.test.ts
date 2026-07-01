@@ -400,6 +400,90 @@ test("pendingInvites returns empty object on a fresh canvas", async ({ canvasPag
 });
 
 // ---------------------------------------------------------------------------
+// access control (ACL)
+// ---------------------------------------------------------------------------
+
+test("getRole defaults to editor when no acl entry exists", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  const role = await page.evaluate(() => (window as any).__skein.store.getRole("unknown-node"));
+  expect(role).toBe("editor");
+});
+
+test("stampOwner records the owner role", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => (window as any).__skein.store.stampOwner("owner-node"));
+
+  const role = await page.evaluate(() => (window as any).__skein.store.getRole("owner-node"));
+  expect(role).toBe("owner");
+});
+
+test("stampOwner is a no-op if an owner is already recorded", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => (window as any).__skein.store.stampOwner("first-owner"));
+  await page.evaluate(() => (window as any).__skein.store.stampOwner("second-owner"));
+
+  const roles = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    return { first: store.getRole("first-owner"), second: store.getRole("second-owner") };
+  });
+  expect(roles.first).toBe("owner");
+  expect(roles.second).toBe("editor"); // unaffected — default, no acl entry written
+});
+
+test("setRole assigns editor or viewer to a peer", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => (window as any).__skein.store.setRole("peer-1", "viewer"));
+  await page.evaluate(() => (window as any).__skein.store.setRole("peer-2", "editor"));
+
+  const roles = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    return { peer1: store.getRole("peer-1"), peer2: store.getRole("peer-2") };
+  });
+  expect(roles.peer1).toBe("viewer");
+  expect(roles.peer2).toBe("editor");
+});
+
+test("setRole can change an already-assigned peer's role", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => (window as any).__skein.store.setRole("peer-1", "editor"));
+  await page.evaluate(() => (window as any).__skein.store.setRole("peer-1", "viewer"));
+
+  const role = await page.evaluate(() => (window as any).__skein.store.getRole("peer-1"));
+  expect(role).toBe("viewer");
+});
+
+test("setRole cannot demote the owner", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => (window as any).__skein.store.stampOwner("owner-node"));
+  await page.evaluate(() => (window as any).__skein.store.setRole("owner-node", "viewer"));
+
+  const role = await page.evaluate(() => (window as any).__skein.store.getRole("owner-node"));
+  expect(role).toBe("owner");
+});
+
+test("isViewer reflects the viewer role", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => (window as any).__skein.store.setRole("viewer-node", "viewer"));
+
+  const results = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    return {
+      viewer: store.isViewer("viewer-node"),
+      unknown: store.isViewer("unknown-node"),
+    };
+  });
+  expect(results.viewer).toBe(true);
+  expect(results.unknown).toBe(false); // defaults to editor, not viewer
+});
+
+// ---------------------------------------------------------------------------
 // canvas deletion lifecycle
 // ---------------------------------------------------------------------------
 

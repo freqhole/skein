@@ -131,6 +131,60 @@ export class CanvasStore {
     });
   }
 
+  // -- access control ----------------------------------------------------------
+
+  /**
+   * mark a node id as the owner of this canvas. call once, at creation time
+   * (see `CanvasStore.create()`). idempotent — a no-op if an owner is
+   * already recorded, so it's safe to call defensively.
+   */
+  stampOwner(nodeId: string): void {
+    this.handle.change((doc) => {
+      if (!doc.acl) doc.acl = {};
+      const hasOwner = Object.values(doc.acl).some((entry) => entry.role === "owner");
+      if (!hasOwner) {
+        doc.acl[nodeId] = { role: "owner" };
+      }
+    });
+  }
+
+  /**
+   * set (or change) a peer's role on this canvas. used both when an invite
+   * is sent (role chosen at invite time) and later, to change an
+   * already-invited peer's role.
+   *
+   * does not touch the owner's own entry — callers should not be able to
+   * demote the owner via this path (there is currently exactly one owner
+   * per canvas, stamped once via `stampOwner()`).
+   */
+  setRole(nodeId: string, role: "editor" | "viewer"): void {
+    this.handle.change((doc) => {
+      if (!doc.acl) doc.acl = {};
+      if (doc.acl[nodeId]?.role === "owner") return;
+      doc.acl[nodeId] = { role };
+    });
+  }
+
+  /**
+   * effective role for a node id on this canvas.
+   *
+   * a missing `.acl` entry defaults to `"editor"` — this is a backward-
+   * compatibility default for canvases created before ACL roles existed
+   * (and for the common case of a peer who's connected but hasn't been
+   * explicitly assigned a role yet). the local node querying its own
+   * unrecorded role is treated the same way; there is no implicit
+   * "stranger" state at this layer — that's gated separately by
+   * `sharePolicy` / invite flow, not by `.acl`.
+   */
+  getRole(nodeId: string): "owner" | "editor" | "viewer" {
+    return this.doc().acl?.[nodeId]?.role ?? "editor";
+  }
+
+  /** convenience: true if `nodeId` has view-only access to this canvas. */
+  isViewer(nodeId: string): boolean {
+    return this.getRole(nodeId) === "viewer";
+  }
+
   // -- metadata --------------------------------------------------------------
 
   /** get the canvas metadata (title, description, timestamps, color, preview). */

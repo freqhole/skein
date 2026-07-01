@@ -33,15 +33,17 @@ export interface ShareDialogOptions {
   shareString: string;
   shareUrl: string;
   /** list of peer node IDs this canvas is shared with (from canvas doc) */
-  peers?: Array<{ nodeId: string; joinedAt: string }>;
+  peers?: Array<{ nodeId: string; joinedAt: string; role?: "owner" | "editor" | "viewer" }>;
   /** called when user clicks "remove" on a peer */
   onRemovePeer?: (nodeId: string) => void;
   /** called when user clicks "add friend" on a peer — sends a friend request */
   onAddFriend?: (nodeId: string) => void | Promise<void>;
+  /** called when the user changes an already-invited peer's role via the role toggle */
+  onChangeRole?: (nodeId: string, role: "editor" | "viewer") => void;
   /** list of friends who haven't been invited to this canvas yet */
   friends?: FriendInfo[];
-  /** called when user clicks "invite" on a friend row — sends canvas-invite */
-  onInviteFriend?: (friend: FriendInfo) => void | Promise<void>;
+  /** called when user clicks "invite" on a friend row — sends canvas-invite with the chosen role */
+  onInviteFriend?: (friend: FriendInfo, role: "editor" | "viewer") => void | Promise<void>;
   onClose?: () => void;
   /** optional map of nodeId -> display name for resolving peer names from friends list */
   peerDisplayNames?: Map<string, string>;
@@ -180,6 +182,66 @@ function wireCopy(
 }
 
 // ---------------------------------------------------------------------------
+// helpers — role toggle
+// ---------------------------------------------------------------------------
+
+/** small pill button showing the current role — click cycles editor <-> viewer. */
+function buildRoleToggle(
+  theme: SkeinTheme,
+  initialRole: "editor" | "viewer",
+  onChange: (role: "editor" | "viewer") => void
+): { container: Container; width: number; height: number; setRole: (role: "editor" | "viewer") => void } {
+  let currentRole = initialRole;
+
+  const text = new Text({
+    text: currentRole,
+    style: {
+      fontFamily: theme.fontFamily,
+      fontSize: theme.fontSizeSmall,
+      fill: 0xcbd5e1,
+    },
+    resolution: theme.textResolution,
+  });
+  text.eventMode = "none";
+
+  const bg = new Graphics();
+
+  const draw = () => {
+    const w = Math.max(text.width, 44) + BUTTON_PAD_H * 2;
+    const h = text.height + BUTTON_PAD_V * 2;
+    bg.clear();
+    bg.roundRect(0, 0, w, h, 4);
+    bg.fill({ color: 0x27272a });
+    bg.stroke({ color: 0x3f3f46, width: 1 });
+    text.x = (w - text.width) / 2;
+    text.y = BUTTON_PAD_V;
+    return { w, h };
+  };
+
+  const view = new Container();
+  view.addChild(bg);
+  view.addChild(text);
+
+  const btn = new ButtonContainer(view);
+  btn.cursor = "pointer";
+
+  const { w: width, h: height } = draw();
+
+  const setRole = (role: "editor" | "viewer") => {
+    currentRole = role;
+    text.text = currentRole;
+    draw();
+  };
+
+  btn.onPress.connect(() => {
+    setRole(currentRole === "editor" ? "viewer" : "editor");
+    onChange(currentRole);
+  });
+
+  return { container: btn, width, height, setRole };
+}
+
+// ---------------------------------------------------------------------------
 // helpers — peer row
 // ---------------------------------------------------------------------------
 
@@ -192,7 +254,9 @@ function buildPeerRow(
   isRemoved: () => boolean,
   onRemovePeer?: (nodeId: string) => void,
   onAddFriend?: (nodeId: string) => void | Promise<void>,
-  displayName?: string
+  displayName?: string,
+  role?: "owner" | "editor" | "viewer",
+  onChangeRole?: (nodeId: string, role: "editor" | "viewer") => void
 ): Container {
   const row = new Container();
 
@@ -235,11 +299,44 @@ function buildPeerRow(
     subIdText.y = (copyBtnH - subIdText.height) / 2;
     row.addChild(subIdText);
   }
+  // role toggle — shown for non-owner peers when a change handler is
+  // provided. sits between the "friend" button and the copy button.
+  const showRoleToggle = !!onChangeRole && role !== "owner";
+  if (showRoleToggle) {
+    const toggle = buildRoleToggle(theme, role === "viewer" ? "viewer" : "editor", (newRole) => {
+      onChangeRole!(safeNodeId, newRole);
+    });
+    let roleRightOffset = 8;
+    if (onRemovePeer) roleRightOffset += 70;
+    if (onAddFriend) roleRightOffset += 70;
+    toggle.container.x = scrollBoxWidth - toggle.width - roleRightOffset;
+    toggle.container.y = (copyBtnH - toggle.height) / 2;
+    row.addChild(toggle.container);
+  } else if (role === "owner") {
+    const ownerText = new Text({
+      text: "owner",
+      style: {
+        fontFamily: theme.fontFamily,
+        fontSize: theme.fontSizeSmall,
+        fill: 0x6b7280,
+      },
+      resolution: theme.textResolution,
+    });
+    ownerText.eventMode = "none";
+    let roleRightOffset = 8;
+    if (onRemovePeer) roleRightOffset += 70;
+    if (onAddFriend) roleRightOffset += 70;
+    ownerText.x = scrollBoxWidth - ownerText.width - roleRightOffset;
+    ownerText.y = (copyBtnH - ownerText.height) / 2;
+    row.addChild(ownerText);
+  }
+
   // copy button — copies full node ID
   const copyBtn = makeCopyButton(theme);
   let rightOffset = 8;
   if (onRemovePeer) rightOffset += 70;
   if (onAddFriend) rightOffset += 70;
+  if (showRoleToggle || role === "owner") rightOffset += 70;
   copyBtn.btn.x = scrollBoxWidth - copyBtn.width - rightOffset;
   copyBtn.btn.y = 0;
   row.addChild(copyBtn.btn);
@@ -360,7 +457,7 @@ function buildFriendInviteRow(
   scrollBoxWidth: number,
   rowHeight: number,
   isRemoved: () => boolean,
-  onInvite?: (friend: FriendInfo) => void | Promise<void>
+  onInvite?: (friend: FriendInfo, role: "editor" | "viewer") => void | Promise<void>
 ): Container {
   const row = new Container();
 
@@ -417,7 +514,13 @@ function buildFriendInviteRow(
   nameText.y = (rowHeight - nameText.height) / 2;
   row.addChild(nameText);
 
-  // invite button — right-aligned
+  // role toggle — chooses editor (default) or viewer before inviting.
+  let selectedRole: "editor" | "viewer" = "editor";
+  const roleToggle = buildRoleToggle(theme, selectedRole, (role) => {
+    selectedRole = role;
+  });
+
+  // invite button — right-aligned, role toggle sits just to its left
   const inviteBtnText = new Text({
     text: "invite",
     style: {
@@ -447,6 +550,10 @@ function buildFriendInviteRow(
   inviteBtn.y = (rowHeight - inviteH) / 2;
   row.addChild(inviteBtn);
 
+  roleToggle.container.x = inviteBtn.x - roleToggle.width - 8;
+  roleToggle.container.y = (rowHeight - roleToggle.height) / 2;
+  row.addChild(roleToggle.container);
+
   inviteBtn.onPress.connect(async () => {
     // show sending feedback
     inviteBtnText.text = "sending...";
@@ -457,7 +564,7 @@ function buildFriendInviteRow(
     inviteBtnBg.fill({ color: 0x1e1b4b });
 
     try {
-      await onInvite?.(friend);
+      await onInvite?.(friend, selectedRole);
       if (isRemoved()) return;
       // success state
       inviteBtnText.text = "sent!";
@@ -788,7 +895,9 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
         isRemoved,
         options.onRemovePeer,
         options.onAddFriend,
-        nameMap?.get(peer.nodeId)
+        nameMap?.get(peer.nodeId),
+        peer.role,
+        options.onChangeRole
       );
       peerRow.y = peerY;
       peerSection.addChild(peerRow);
