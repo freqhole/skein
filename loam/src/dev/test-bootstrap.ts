@@ -2,6 +2,7 @@ import { BroadcastChannelNetworkAdapter } from "@automerge/automerge-repo-networ
 import { z } from "zod";
 import { createTestRegistry } from "../../widgets/index";
 import type { SkeinCanvas } from "../canvas/init";
+import type { SkeinTestBridge } from "./test-bridge";
 import { initCanvas } from "../canvas/init";
 import { PresenceManager } from "../canvas/presence-manager";
 import { Viewport } from "../canvas/viewport";
@@ -42,6 +43,7 @@ async function initSkeinForTest(options: TestInitOptions = {}): Promise<TestInit
   });
 
   (window as any).__skein = canvas;
+  (window as any).__skeinTest = { canvas, p2p: null } satisfies SkeinTestBridge;
 
   return {
     canvasDocId: canvas.store.handle.documentId,

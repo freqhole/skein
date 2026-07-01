@@ -16,6 +16,8 @@
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
+    "test:e2e:p2p": "playwright test --grep @p2p",
+    "test:e2e:fast": "playwright test --grep-invert @p2p",
     "test:all": "npm run test:coverage && npm run test:e2e",
     "test:report": "open coverage/html/index.html",
     "lint": "eslint src widgets --ext .ts",
