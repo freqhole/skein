@@ -1,6 +1,6 @@
 import { test as base, expect, type BrowserContext, type Page } from "@playwright/test";
 
-interface CanvasTestHandle {
+export interface CanvasTestHandle {
   page: Page;
   context: BrowserContext;
   canvasDocId: string;
@@ -11,6 +11,12 @@ type CanvasPageFactory = (options?: {
   canvasDocId?: string;
   /** pass an existing browser context so pages share BroadcastChannel */
   context?: BrowserContext;
+  /**
+   * skip PixiJS initialisation — load the sync-only harness instead.
+   * use for background peers in multi-peer tests where rendering is not
+   * needed. window.__skein.store is still available for assertions.
+   */
+  syncOnly?: boolean;
 }) => Promise<CanvasTestHandle>;
 
 /**
@@ -47,7 +53,8 @@ export const test = base.extend<{
       }
 
       const page = await context.newPage();
-      await page.goto("/test-harness.html");
+      const harness = options?.syncOnly ? "/test-harness-sync.html" : "/test-harness.html";
+      await page.goto(harness);
 
       // wait for the bootstrap module to load and expose the init function
       await page.waitForFunction(() => typeof (window as any).__initSkeinForTest === "function", {
