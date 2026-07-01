@@ -131,6 +131,23 @@ export class CanvasStore {
     });
   }
 
+  /**
+   * mark a pending invite as accepted (the owner received an accept
+   * message) without removing it — the target hasn't necessarily connected
+   * yet. the entry is removed later, once the target actually shows up in
+   * `peers` (see boot.ts's join/navigate flow), not at accept time. see
+   * `PendingCanvasInvite` for the full lifecycle rationale.
+   */
+  markInviteAccepted(targetNodeId: string): void {
+    this.handle.change((doc) => {
+      const invite = doc.pendingInvites?.[targetNodeId];
+      if (invite) {
+        invite.accepted = true;
+        invite.acceptedAt = new Date().toISOString();
+      }
+    });
+  }
+
   // -- access control ----------------------------------------------------------
 
   /**

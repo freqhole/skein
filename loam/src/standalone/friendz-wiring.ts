@@ -560,14 +560,22 @@ export async function initFriendzWiring(
       }
     });
 
-    // clean up pendingInvites on the canvas doc — this peer has accepted
+    // mark the pending invite as accepted — do NOT remove it here. the
+    // accepter hasn't necessarily connected yet (they still need to dial in
+    // via iroh and write themselves into the canvas doc's `peers` map); if
+    // we delete the invite now, it vanishes from the share dialog with no
+    // "accepted, connecting…" state to show in the meantime. it gets
+    // removed for real once the accepter shows up in `peers` (see
+    // boot.ts's join/navigate flow, which already does this cleanup).
     try {
       const accepterId = msg.accepterNodeId || fromNodeId;
       const canvasHandle = repo.handles[msg.canvasDocId as any];
       if (canvasHandle) {
         canvasHandle.change((draft: any) => {
-          if (draft.pendingInvites?.[accepterId]) {
-            delete draft.pendingInvites[accepterId];
+          const invite = draft.pendingInvites?.[accepterId];
+          if (invite) {
+            invite.accepted = true;
+            invite.acceptedAt = new Date().toISOString();
           }
         });
       }

@@ -55,6 +55,10 @@ export interface ShareDialogOptions {
       invitedByUsername: string;
       role: string;
       invitedAt: string;
+      /** true once the owner received an accept message — target hasn't
+       *  necessarily connected yet, see PendingCanvasInvite in canvas-doc.ts */
+      accepted?: boolean;
+      acceptedAt?: string;
     };
   }>;
   /** callback when user cancels a pending invite */
@@ -604,7 +608,14 @@ function buildFriendInviteRow(
 
 function buildPendingInviteRow(
   targetNodeId: string,
-  invite: { invitedBy: string; invitedByUsername: string; role: string; invitedAt: string },
+  invite: {
+    invitedBy: string;
+    invitedByUsername: string;
+    role: string;
+    invitedAt: string;
+    accepted?: boolean;
+    acceptedAt?: string;
+  },
   theme: SkeinTheme,
   scrollBoxWidth: number,
   rowHeight: number,
@@ -631,14 +642,22 @@ function buildPendingInviteRow(
   nameText.y = (rowHeight - nameText.height) / 2;
   row.addChild(nameText);
 
-  // "invited [date]" subtitle
+  // status subtitle — "accepted, connecting…" once the owner has received
+  // an accept message, otherwise "invited [date]". this entry is only
+  // removed once the peer actually shows up in `peers` (real connection),
+  // not merely on accept — see PendingCanvasInvite in canvas-doc.ts.
   const invitedDate = invite.invitedAt ? new Date(invite.invitedAt).toLocaleDateString() : "";
+  const statusText = invite.accepted
+    ? "accepted, connecting…"
+    : invitedDate
+      ? `invited ${invitedDate}`
+      : "invited";
   const dateText = new Text({
-    text: invitedDate ? `invited ${invitedDate}` : "invited",
+    text: statusText,
     style: {
       fontFamily: theme.fontFamily,
       fontSize: theme.fontSizeSmall - 1,
-      fill: 0x6b7280,
+      fill: invite.accepted ? 0x4ade80 : 0x6b7280,
     },
     resolution: theme.textResolution,
   });

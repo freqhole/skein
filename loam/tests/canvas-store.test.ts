@@ -392,6 +392,39 @@ test("removePendingInvite removes the entry", async ({ canvasPage }) => {
   expect(invites["invite-target"]).toBeUndefined();
 });
 
+test("markInviteAccepted sets accepted + acceptedAt without removing the entry", async ({
+  canvasPage,
+}) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => {
+    (window as any).__skein.store.addPendingInvite("accepter-node", {
+      invitedBy: "owner",
+      invitedByUsername: "bob",
+      role: "editor",
+      invitedAt: "2024-06-01T00:00:00.000Z",
+    });
+  });
+
+  await page.evaluate(() => (window as any).__skein.store.markInviteAccepted("accepter-node"));
+
+  const invite = await page.evaluate(
+    () => (window as any).__skein.store.pendingInvites()["accepter-node"]
+  );
+  expect(invite).toBeDefined();
+  expect(invite.accepted).toBe(true);
+  expect(invite.acceptedAt).toBeTruthy();
+});
+
+test("markInviteAccepted is a no-op for a nonexistent invite", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => (window as any).__skein.store.markInviteAccepted("no-such-node"));
+
+  const invites = await page.evaluate(() => (window as any).__skein.store.pendingInvites());
+  expect(invites["no-such-node"]).toBeUndefined();
+});
+
 test("pendingInvites returns empty object on a fresh canvas", async ({ canvasPage }) => {
   const { page } = await canvasPage();
 

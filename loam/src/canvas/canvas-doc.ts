@@ -35,7 +35,21 @@ export interface CanvasPeer {
   lastSeenAt?: string;
 }
 
-/** a pending canvas invite that hasn't been accepted yet. */
+/**
+ * a canvas invite awaiting the target peer's response, or accepted but not
+ * yet connected. tracked in the canvas doc (not just the messagez outbox)
+ * so any peer on the canvas can see and relay it — see `pendingInvites` on
+ * `CanvasDocument`.
+ *
+ * lifecycle: created on invite → `accepted`/`acceptedAt` set when the owner
+ * receives the target's accept message (still present in this map — the
+ * target hasn't necessarily connected yet) → removed once the target
+ * actually shows up in `peers` (see boot.ts's join/navigate flow) or the
+ * invite is cancelled/declined. **do not delete this entry purely because
+ * an accept message arrived** — that was the old, buggy behavior (accepted
+ * invites vanished from the UI before the peer ever connected, with no
+ * "connecting…" state to show in the meantime).
+ */
 export interface PendingCanvasInvite {
   /** node ID of the peer who created the invite. */
   invitedBy: string;
@@ -45,6 +59,10 @@ export interface PendingCanvasInvite {
   role: "editor" | "viewer";
   /** ISO timestamp when the invite was created. */
   invitedAt: string;
+  /** true once the owner has received an accept message from the target. */
+  accepted?: boolean;
+  /** ISO timestamp of when the accept message was received. */
+  acceptedAt?: string;
 }
 
 /**
