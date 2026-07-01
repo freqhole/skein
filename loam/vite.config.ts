@@ -1,18 +1,17 @@
 /// <reference types="vitest/config" />
 import path from "path";
 import { defineConfig } from "vite";
-import topLevelAwait from "vite-plugin-top-level-await";
+
 import wasm from "vite-plugin-wasm";
 
 const isTauriBuild = !!process.env.VITE_TAURI;
 
 export default defineConfig({
-  plugins: [wasm(), topLevelAwait()],
-  // worker bundles need wasm + top-level-await too — the blob worker
-  // pulls in midden (wasm) for blake3 hashing.
+  plugins: [wasm()],
+  // worker bundles need wasm too — the blob worker pulls in midden (wasm) for blake3.
   worker: {
     format: "es",
-    plugins: () => [wasm(), topLevelAwait()],
+    plugins: () => [wasm()],
   },
   build: {
     lib: {

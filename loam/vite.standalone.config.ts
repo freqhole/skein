@@ -1,7 +1,7 @@
 import path from "path";
 import { fileURLToPath } from "url";
 import { defineConfig } from "vite";
-import topLevelAwait from "vite-plugin-top-level-await";
+
 import wasm from "vite-plugin-wasm";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -11,13 +11,13 @@ const isTauriBuild = !!process.env.VITE_TAURI;
 const deployBase = process.env.VITE_SKEIN_BASE;
 
 export default defineConfig({
-  // wasm + top-level-await plugins are always needed (automerge uses WASM internally).
+  // wasm plugin is needed (automerge uses WASM internally).
   // only midden (iroh P2P transport) is stubbed in tauri builds.
-  plugins: [wasm(), topLevelAwait()],
-  // worker bundles need the same plugins — blob-worker imports midden (WASM) for blake3.
+  plugins: [wasm()],
+  // worker bundles need the same plugin — blob-worker imports midden (WASM) for blake3.
   worker: {
     format: "es",
-    plugins: () => [wasm(), topLevelAwait()],
+    plugins: () => [wasm()],
   },
   base: isTauriBuild ? "./" : deployBase || "/",
   build: {
