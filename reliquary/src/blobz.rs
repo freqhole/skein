@@ -61,6 +61,11 @@ impl Store {
     ) -> Result<BlobRef, BlobError> {
         let blake3 = blake3::hash(bytes).to_hex().to_string();
 
+        // fast path: avoid the disk write below if we already have this
+        // content. this is only an optimization, not a correctness
+        // guarantee — two callers can both miss here and race into the
+        // insert below, which is why the insert itself must be safe against
+        // a concurrent duplicate (see the `ON CONFLICT` note there).
         if let Some(existing) = self.get(&blake3).await? {
             return Ok(existing);
         }
@@ -69,16 +74,24 @@ impl Store {
         let dir = self.blob_dir.join(prefix);
         tokio::fs::create_dir_all(&dir).await?;
         let abs_path = dir.join(rest);
+        // same content -> same bytes at the same content-addressed path, so
+        // a second concurrent writer clobbering this file is harmless.
         tokio::fs::write(&abs_path, bytes).await?;
 
         let rel_path = format!("{prefix}/{rest}");
         let size = bytes.len() as i64;
         let created_at = now_secs();
 
+        // `ON CONFLICT DO NOTHING`: blake3 is the primary key, so two tasks
+        // racing to insert the same content (both having missed the check
+        // above) must not surface a unique-constraint error to either
+        // caller — the loser's insert silently no-ops and both callers read
+        // back the same canonical row below.
         sqlx::query(
             r#"
             INSERT INTO blobz (blake3, iroh_hash, filename, mime, size, path, external, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
+            ON CONFLICT (blake3) DO NOTHING
             "#,
         )
         .bind(&blake3)
@@ -91,16 +104,11 @@ impl Store {
         .execute(&self.pool)
         .await?;
 
-        Ok(BlobRef {
-            blake3,
-            iroh_hash,
-            filename,
-            mime,
-            size,
-            path: rel_path,
-            external: false,
-            created_at,
-        })
+        let stored = self
+            .get(&blake3)
+            .await?
+            .expect("row must exist immediately after insert-or-ignore");
+        Ok(stored)
     }
 
     /// register an existing on-disk file as a blob without copying its bytes.
@@ -140,6 +148,8 @@ impl Store {
         drop(file);
         let blake3_hex = hasher.finalize().to_hex().to_string();
 
+        // see `insert()` for why a racing duplicate here is expected and
+        // must not surface as an error — same reasoning applies.
         if let Some(existing) = self.get(&blake3_hex).await? {
             return Ok(existing);
         }
@@ -152,6 +162,7 @@ impl Store {
             r#"
             INSERT INTO blobz (blake3, iroh_hash, filename, mime, size, path, external, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
+            ON CONFLICT (blake3) DO NOTHING
             "#,
         )
         .bind(&blake3_hex)
@@ -164,16 +175,11 @@ impl Store {
         .execute(&self.pool)
         .await?;
 
-        Ok(BlobRef {
-            blake3: blake3_hex,
-            iroh_hash,
-            filename,
-            mime,
-            size,
-            path: path_str,
-            external: true,
-            created_at,
-        })
+        let stored = self
+            .get(&blake3_hex)
+            .await?
+            .expect("row must exist immediately after insert-or-ignore");
+        Ok(stored)
     }
 
     pub async fn get(&self, blake3: &str) -> Result<Option<BlobRef>, BlobError> {
@@ -428,5 +434,41 @@ mod tests {
         assert_eq!(parent.to_string_lossy().len(), 2);
         let fname = path.file_name().unwrap().to_string_lossy();
         assert_eq!(fname, blob.blake3[2..]);
+    }
+
+    /// concurrent inserts of the *same content* (same blake3) from different
+    /// tasks must never surface a duplicate-key error to the caller — the
+    /// store's job is to dedupe, not to leak a database-level race. this
+    /// uses a real file-backed pool (multiple connections, like production's
+    /// `db::open`) and a multi-thread runtime so the check-then-insert
+    /// window in `insert()` can actually be hit by concurrent tasks, unlike
+    /// `open_in_memory()`'s single-connection pool used by the rest of this
+    /// module's tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_inserts_of_same_content_never_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open(tmp.path()).await.expect("open db");
+        let store = Store::new(pool, tmp.path());
+        let bytes = b"racing bytes, same content every time";
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                store.insert(format!("ihash-{i}"), None, None, bytes).await
+            }));
+        }
+
+        let mut blake3s = std::collections::HashSet::new();
+        for h in handles {
+            let result = h.await.expect("task panicked");
+            let blob = result.expect("insert must not error on a content race");
+            blake3s.insert(blob.blake3);
+        }
+
+        // all 8 racing inserts must have resolved to the same canonical row.
+        assert_eq!(blake3s.len(), 1);
+        let rows = store.list(100, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }

@@ -12,20 +12,20 @@
  * tag: @hub
  * run with: npx playwright test --grep @hub
  *
- * important finding (see final report / PROGRESS.md consolidation): the
- * hub's `iroh/automerge-repo/1` ALPN handler (`reliquary/src/sync.rs`,
- * `IrohRepo::accept`) accepts every inbound connection unconditionally —
- * it does not consult the friendz allow-list at all. authorization
- * (`is_friend()`) is only checked in the *separate* `skein-friendz/1`
- * protocol's canvas-invite handler (`reliquary/src/hub/canvas.rs`,
- * `handle_canvas_invite`), which the browser has no client for yet (see
- * `loam/src/p2p/` — there is no `skein-friendz/1` sender). so today,
- * "authorized peer" vs "unauthorized peer" cannot produce a different
- * *connectivity* outcome: both connect at the transport layer. the second
- * test below exercises and documents this directly. building the real
- * "hub syncs only for friends" test needs a browser-side friendz protocol
- * client first (production code change, out of scope here per the task's
- * instructions not to touch loam/src).
+ * note (2026-07-01): `reliquary/src/sync.rs`'s `IrohRepo::accept` now
+ * rejects peers that aren't friends (`friendz::Store::is_friend`) before
+ * ever accepting the bidirectional stream — see reliquary/src/sync.rs and
+ * its unit tests for the server-side authorization check itself. checking
+ * `repo.peers` on the *client* side is not a reliable signal for whether
+ * the server accepted or rejected the connection, though: automerge-repo's
+ * `IrohNetworkAdapter` fires its local `peer-candidate` event as soon as
+ * *its own* `open_bi()` call resolves (a QUIC stream opening locally), which
+ * happens independently of — and can race — the server's protocol-handler
+ * task actually running and deciding to reject. the second test below
+ * instead asserts on the hub's own log for a deterministic signal: an
+ * authorized peer's connection produces a "created new doc for incoming
+ * sync" line (real doc sync happened), an unauthorized peer's does not
+ * (and produces a "rejected unauthorized peer" line instead).
  */
 
 import { test, expect } from "./fixtures/p2p-page";
@@ -47,9 +47,10 @@ test.describe("reliquary hub connectivity @hub", () => {
 
     const peer = await p2pPage();
 
-    // pre-approve the browser peer as a friend before dialing. this doesn't
-    // currently change the connectivity outcome (see file header), but it's
-    // the intended real-world sequencing and exercises `friendAllow()`.
+    // pre-approve the browser peer as a friend before dialing — the
+    // intended real-world sequencing, and now load-bearing: an
+    // unauthorized peer's connection gets rejected server-side (see file
+    // header and the second test below).
     await hub.friendAllow(peer.nodeId);
 
     await addPeer(peer.page, hub.nodeId);
@@ -65,9 +66,15 @@ test.describe("reliquary hub connectivity @hub", () => {
       () => (window as any).__skeinTest.canvas.repo.peers ?? []
     );
     expect(peers).toContain(hub.nodeId);
+
+    // the deterministic, server-side signal: an authorized peer's canvas
+    // doc actually gets synced and a doc entry created hub-side.
+    await expect
+      .poll(() => hub!.getLog(), { timeout: 15_000 })
+      .toContain("created new doc for incoming sync");
   });
 
-  test("hub accepts automerge-repo connections even without friend allow-list approval @hub", async ({
+  test("hub rejects an unauthorized peer's automerge-repo connection @hub", async ({
     p2pPage,
   }) => {
     test.setTimeout(90_000);
@@ -79,15 +86,15 @@ test.describe("reliquary hub connectivity @hub", () => {
     // deliberately skip hub.friendAllow() — this peer is unknown to the hub.
     await addPeer(peer.page, hub.nodeId);
 
-    // the connection still succeeds: the automerge-repo ALPN handler has no
-    // authorization check today (see file header comment). this test exists
-    // to document that fact so it isn't rediscovered by surprise later —
-    // it is not asserting desired behavior, only current behavior.
-    await waitForPeerCount(peer.page, 1, 30_000);
+    // the hub's `IrohRepo::accept` rejects before ever accepting the
+    // bidirectional stream, logging this line instead of ever reaching
+    // "accepted inbound connection" / doc sync — see reliquary/src/sync.rs.
+    await expect
+      .poll(() => hub!.getLog(), { timeout: 15_000 })
+      .toContain("rejected unauthorized peer");
 
-    const peers: string[] = await peer.page.evaluate(
-      () => (window as any).__skeinTest.canvas.repo.peers ?? []
-    );
-    expect(peers).toContain(hub.nodeId);
+    // and, the flip side of the authorized-peer test above: no doc sync
+    // ever happens for this peer, no matter how long we wait.
+    expect(hub.getLog()).not.toContain("created new doc for incoming sync");
   });
 });

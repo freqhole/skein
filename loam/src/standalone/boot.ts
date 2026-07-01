@@ -29,6 +29,8 @@ import {
   onIdentityChange,
 } from "../p2p/identity";
 import { IrohNetworkAdapter, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
+import { AclFilteringNetworkAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
+import type { RoleResolver } from "../p2p/acl-filtering-network-adapter";
 import { decodeShareString, encodeShareString } from "../p2p/share-string";
 import { resolveFriendDisplay, SqliteSocialDoc } from "../p2p/sqlite-social-doc";
 import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
@@ -107,8 +109,32 @@ class SkeinRouter {
       ? async () => (await TauriStreamNode.create()) as MiddenStreamNode
       : async () => (await getMiddenNode()) as unknown as MiddenStreamNode;
     this.irohAdapter = new IrohNetworkAdapter(getMidden);
-    const network = [new BroadcastChannelNetworkAdapter(), this.irohAdapter];
+
+    // ACL enforcement: wrap the iroh adapter so viewer-role peers' pushed
+    // changes get stripped before automerge-repo ever sees them. the
+    // roleResolver needs a `Repo` to read cached ACL data from, but the
+    // `Repo` doesn't exist until after this adapter is constructed —
+    // `repoBox` breaks that cycle: the resolver closure reads
+    // `repoBox.repo` lazily, and it gets filled in right after `new Repo()`
+    // below, before any sync traffic can possibly flow. same pattern as
+    // src/dev/acl-test-bootstrap.ts.
+    const repoBox: { repo?: Repo } = {};
+    const roleResolver: RoleResolver = (documentId, senderId) => {
+      if (!repoBox.repo) return "member";
+      return createRepoRoleResolver(repoBox.repo)(documentId, senderId);
+    };
+    const aclAdapter = new AclFilteringNetworkAdapter(this.irohAdapter, roleResolver);
+
+    // note: only one Repo is constructed for the whole app — narthex and
+    // every canvas document share it. the ACL role model is per-canvas
+    // (CanvasDocument.acl), so filtering here also covers narthex/social/
+    // messagez docs, but those doc shapes have no `.acl` field at all —
+    // createRepoRoleResolver()'s lookup falls through to the "member"
+    // default (read/write, same as today's unfiltered behavior) for them,
+    // so this is a no-op for non-canvas docs.
+    const network = [new BroadcastChannelNetworkAdapter(), aclAdapter];
     this.repo = new Repo({ storage, network });
+    repoBox.repo = this.repo;
 
     // register adapter for module-level endpoint toggle (settings tab)
     registerEndpointAdapter(this.irohAdapter);

@@ -35,7 +35,6 @@ export const BUTTON_GAP = 8;
 // typography
 export const LABEL_SIZE = 10;
 export const TEXT_SIZE = 12;
-export const HEADER_SIZE = 14;
 export const FONT = "system-ui, sans-serif";
 export const RESOLUTION = 3;
 
@@ -69,7 +68,6 @@ export const DROP_ZONE_BORDER = 0x4a4a6a;
 export const DROP_ZONE_FONT_SIZE = 11;
 
 // group header drop target highlight
-export const GROUP_DROP_HIGHLIGHT = 0x2e2e4a;
 export const GROUP_LINE_WIDTH = 3;
 export const GROUP_LINE_INSET = 2;
 export const HEADER_HOLD_MS = 400;

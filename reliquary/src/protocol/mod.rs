@@ -6,4 +6,5 @@
 pub mod blob_proxy;
 pub mod codec;
 pub mod handler;
+pub mod hub_admin;
 pub mod messages;

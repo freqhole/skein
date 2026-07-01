@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use iroh::SecretKey;
-use reliquary::{db, friendz, identity, userz};
+use reliquary::{adminz, db, friendz, identity, userz};
 
 #[derive(Parser, Debug)]
 #[command(name = "reliquary", version, about = "skein hub peer")]
@@ -35,6 +35,11 @@ enum Command {
     /// manage the friendz allow-list (operator-controlled access to the hub)
     #[command(subcommand)]
     Friend(FriendCommand),
+
+    /// manage hub admins (node ids allowed to administer the friendz
+    /// allow-list remotely, over the `iroh/skein-hub-admin/1` protocol)
+    #[command(subcommand)]
+    Admin(AdminCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -47,6 +52,22 @@ enum FriendCommand {
     /// list every peer the hub knows about, with status
     List,
     /// remove a peer from the friendz table entirely (revokes any prior approval)
+    Remove {
+        /// the peer's iroh node id (hex public key)
+        node_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AdminCommand {
+    /// grant a peer admin rights over this hub's friendz allow-list
+    Allow {
+        /// the peer's iroh node id (hex public key)
+        node_id: String,
+    },
+    /// list every admin node id
+    List,
+    /// revoke a peer's admin rights
     Remove {
         /// the peer's iroh node id (hex public key)
         node_id: String,
@@ -115,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Serve => serve(data_dir, cli.port).await,
         Command::Friend(cmd) => friend(data_dir, cmd).await,
+        Command::Admin(cmd) => admin(data_dir, cmd).await,
     }
 }
 
@@ -215,6 +237,43 @@ async fn friend(data_dir: PathBuf, cmd: FriendCommand) -> anyhow::Result<()> {
             }
             store.delete(node_id).await?;
             println!("removed {node_id}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn admin(data_dir: PathBuf, cmd: AdminCommand) -> anyhow::Result<()> {
+    let pool = db::open(&data_dir).await?;
+    let store = adminz::Store::new(pool);
+
+    match cmd {
+        AdminCommand::Allow { node_id } => {
+            let node_id = node_id.trim();
+            if node_id.is_empty() {
+                anyhow::bail!("node_id cannot be empty");
+            }
+            let admin = store.allow(node_id).await?;
+            println!("granted admin rights to {}", admin.node_id);
+        }
+        AdminCommand::List => {
+            let admins = store.list().await?;
+            if admins.is_empty() {
+                println!("(no hub admins)");
+                return Ok(());
+            }
+            println!("{:<64}  created_at", "node_id");
+            for a in admins {
+                println!("{:<64}  {}", a.node_id, a.created_at);
+            }
+        }
+        AdminCommand::Remove { node_id } => {
+            let node_id = node_id.trim();
+            if node_id.is_empty() {
+                anyhow::bail!("node_id cannot be empty");
+            }
+            store.remove(node_id).await?;
+            println!("revoked admin rights from {node_id}");
         }
     }
 

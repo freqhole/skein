@@ -214,6 +214,33 @@ impl Store {
             .await?;
         Ok(())
     }
+
+    /// check whether `friend_node_id` counts as a friend for connection-
+    /// authorization purposes: status `Accepted` or `Allowed` (allowed peers
+    /// haven't completed the handshake but the operator has pre-approved
+    /// them). used to gate both the `iroh/automerge-repo/1` sync ALPN
+    /// (`sync::IrohRepo::accept`) and `skein-friendz/1`'s canvas invite
+    /// handling (`hub::HubPeerService::is_friend`).
+    ///
+    /// returns `false` (and logs) on a missing row or store error rather
+    /// than propagating, since callers use this as a yes/no gate on a hot
+    /// connection path.
+    pub async fn is_friend(&self, friend_node_id: &str) -> bool {
+        match self.get(friend_node_id).await {
+            Ok(Some(friend)) => matches!(
+                friend.status,
+                FriendStatus::Accepted | FriendStatus::Allowed
+            ),
+            Ok(None) => {
+                tracing::debug!(peer = %friend_node_id, "is_friend: no friendz row");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(peer = %friend_node_id, error = %e, "is_friend: friendz store error");
+                false
+            }
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]

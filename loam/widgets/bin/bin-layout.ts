@@ -1,5 +1,4 @@
 import {
-  BIN_PADDING,
   CRATE_GAP,
   CRATE_SLOT_H,
   CRATE_SLOT_W,
@@ -251,23 +250,7 @@ export function contentDimensions(
   };
 }
 
-/**
- * compute the ideal widget frame size for the bin given the current layout.
- * includes header height and padding.
- */
-export function idealBinSize(
-  mode: BinMode,
-  cols: number,
-  rows: number,
-  contentWidth: number,
-  options?: SlotSizeOptions
-): { width: number; height: number } {
-  const content = contentDimensions(mode, cols, rows, contentWidth, options);
-  return {
-    width: content.width + BIN_PADDING * 2,
-    height: content.height + BIN_PADDING * 2,
-  };
-}
+
 
 /** resolve a SlotScale name to its numeric multiplier */
 export function resolveScale(scaleName?: SlotScale | string): number {

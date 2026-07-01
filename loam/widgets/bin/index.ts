@@ -30,7 +30,6 @@ import { BinMediaController } from "./bin-media";
 import { BinRenderer, type CardInteractionCallbacks } from "./bin-renderer";
 
 import { binSchema, type BinState } from "./bin-schema";
-export { binSchema, type BinState };
 
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2;

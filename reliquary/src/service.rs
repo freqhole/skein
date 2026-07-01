@@ -184,7 +184,7 @@ impl Service {
         let hub_repo = HubRepo::new(node_id_str.clone(), &config.data_dir.join("skein-docs.db"))
             .await
             .map_err(|e| ServiceError::HubRepo(format!("{e}")))?;
-        let iroh_repo = IrohRepo::new(endpoint.clone(), hub_repo.clone());
+        let iroh_repo = IrohRepo::new(endpoint.clone(), hub_repo.clone(), friendz_store.clone());
 
         // friendz presence
         let (friendz_handler, friendz_events) = FriendzHandler::new(
@@ -481,6 +481,7 @@ pub async fn start_hub(
     let userz = userz::Directory::new(pool.clone());
     let blobz = blobz::Store::new(pool.clone(), &config.data_dir);
     let friendz_store = friendz::Store::new(pool.clone());
+    let adminz_store = crate::adminz::Store::new(pool.clone());
 
     // automerge sync — hub_repo owns its own sqlite db for the doc graph
     let hub_repo = HubRepo::new(node_id_str.clone(), &config.data_dir.join("skein-docs.db"))
@@ -504,6 +505,7 @@ pub async fn start_hub(
         userz,
         friendz_store,
         blobz,
+        adminz_store,
         hub_config,
     )
     .await

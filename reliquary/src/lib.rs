@@ -8,6 +8,7 @@
 //! `friendz`) provide direct sqlx access; the hub layer (`hub`, `hub_repo`,
 //! `snatch`) talks to those stores plus iroh-blobs `FsStore` directly.
 
+pub mod adminz;
 pub mod blobz;
 pub mod db;
 pub mod documents;

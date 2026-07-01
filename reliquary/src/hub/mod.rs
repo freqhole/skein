@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::blobz;
-use crate::friendz::{self, FriendStatus};
+use crate::friendz;
 use crate::hub_repo::HubRepo;
 use crate::protocol::blob_proxy::{BlobProxyHandler, SKEIN_ALPN};
 use crate::protocol::handler::{FriendzEvent, FriendzHandler};
@@ -131,6 +131,11 @@ pub struct HubPeerService {
     pub(crate) userz: userz::Directory,
     pub(crate) friendz_store: friendz::Store,
     pub(crate) blobz: blobz::Store,
+    /// kept on the service for future accessor use (e.g. a `ServiceHandle`-
+    /// style admin surface); the running `iroh/skein-hub-admin/1` handler
+    /// already holds its own clone, constructed in `start` below.
+    #[allow(dead_code)]
+    pub(crate) adminz_store: crate::adminz::Store,
 }
 
 impl HubPeerService {
@@ -149,6 +154,7 @@ impl HubPeerService {
         userz: userz::Directory,
         friendz_store: friendz::Store,
         blobz: blobz::Store,
+        adminz_store: crate::adminz::Store,
         config: HubPeerConfig,
     ) -> Result<Self, HubError> {
         let node_id_str = endpoint.id().to_string();
@@ -175,7 +181,7 @@ impl HubPeerService {
         );
 
         // wire automerge sync over iroh
-        let iroh_repo = IrohRepo::new(endpoint.clone(), hub_repo.clone());
+        let iroh_repo = IrohRepo::new(endpoint.clone(), hub_repo.clone(), friendz_store.clone());
 
         // friendz protocol handler (presence + messaging)
         let (friendz, friendz_events) = FriendzHandler::new(
@@ -188,14 +194,24 @@ impl HubPeerService {
         let blobs_protocol = BlobsProtocol::new(fs_store, None);
         let blob_proxy = BlobProxyHandler::new(fs_store, blobz.clone());
 
+        // remote hub administration: lets a privileged remote peer manage
+        // this hub's friendz allow-list over the network (see
+        // `protocol::hub_admin`), instead of requiring local CLI access.
+        let hub_admin = crate::protocol::hub_admin::HubAdminHandler::new(
+            adminz_store.clone(),
+            friendz_store.clone(),
+            userz.clone(),
+        );
+
         let router = iroh::protocol::Router::builder(endpoint.clone())
             .accept(AUTOMERGE_REPO_ALPN, iroh_repo.clone())
             .accept(FRIENDZ_ALPN, friendz.clone())
             .accept(SKEIN_ALPN, blob_proxy)
             .accept(iroh_blobs::ALPN, blobs_protocol)
+            .accept(crate::protocol::hub_admin::HUB_ADMIN_ALPN, hub_admin)
             .spawn();
         tracing::info!(
-            "iroh router started: automerge-repo + friendz + skein-blob-proxy + iroh-blobs"
+            "iroh router started: automerge-repo + friendz + skein-blob-proxy + iroh-blobs + skein-hub-admin"
         );
 
         // resume tracking canvases from previous runs
@@ -250,6 +266,7 @@ impl HubPeerService {
             userz,
             friendz_store,
             blobz,
+            adminz_store,
         })
     }
 
@@ -369,22 +386,11 @@ impl HubPeerService {
     /// in skein, friendship lives in a single `friendz` row keyed by node_id.
     /// status `Accepted` and `Allowed` both count as friends for runtime
     /// purposes (allowed peers haven't completed the handshake but the
-    /// operator has pre-approved them).
+    /// operator has pre-approved them). delegates to `friendz::Store::is_friend`,
+    /// the same check `sync::IrohRepo::accept` uses to gate the automerge
+    /// sync ALPN.
     pub(crate) async fn is_friend(&self, node_id: &str) -> bool {
-        match self.friendz_store.get(node_id).await {
-            Ok(Some(friend)) => matches!(
-                friend.status,
-                FriendStatus::Accepted | FriendStatus::Allowed
-            ),
-            Ok(None) => {
-                tracing::debug!(peer = %node_id, "is_friend: no friendz row");
-                false
-            }
-            Err(e) => {
-                tracing::warn!(peer = %node_id, error = %e, "is_friend: friendz store error");
-                false
-            }
-        }
+        self.friendz_store.is_friend(node_id).await
     }
 
     /// gracefully shut down the hub peer service.

@@ -5,49 +5,6 @@
 import { Graphics } from "pixi.js";
 
 /**
- * draw a snatch/download icon — downward arrow into a tray.
- * represents "grab this file from peers".
- */
-export function drawSnatchIcon(
-  g: Graphics,
-  x: number,
-  y: number,
-  size: number,
-  color = 0xffffff,
-  alpha = 0.9
-): void {
-  const strokeW = Math.max(1.2, size * 0.12);
-  const cx = x + size / 2;
-  const top = y + size * 0.1;
-  const mid = y + size * 0.55;
-  const bottom = y + size * 0.7;
-  const headW = size * 0.25;
-
-  // arrow shaft (vertical line going down)
-  g.moveTo(cx, top);
-  g.lineTo(cx, mid);
-  g.stroke({ width: strokeW, color, alpha });
-
-  // arrowhead (V shape pointing down)
-  g.moveTo(cx - headW, mid - headW);
-  g.lineTo(cx, mid);
-  g.lineTo(cx + headW, mid - headW);
-  g.stroke({ width: strokeW, color, alpha });
-
-  // tray/platform (horizontal line with short uprights at edges)
-  const trayL = x + size * 0.2;
-  const trayR = x + size * 0.8;
-  // left upright
-  g.moveTo(trayL, bottom - size * 0.15);
-  g.lineTo(trayL, bottom);
-  // bottom bar
-  g.lineTo(trayR, bottom);
-  // right upright
-  g.lineTo(trayR, bottom - size * 0.15);
-  g.stroke({ width: strokeW, color, alpha });
-}
-
-/**
  * draw a save/floppy disk icon.
  * represents "save to disk" (browser mode).
  */

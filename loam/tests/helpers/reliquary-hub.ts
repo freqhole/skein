@@ -68,6 +68,12 @@ export interface ReliquaryHubHandle {
    * concurrent access from a second short-lived process fine).
    */
   friendAllow: (peerNodeId: string) => Promise<void>;
+  /**
+   * the hub's accumulated stdout/stderr for its entire lifetime (ANSI
+   * stripped), useful for debugging why an expected background operation
+   * (e.g. a blob snatch) didn't happen.
+   */
+  getLog: () => string;
   /** kill the child process and remove the temp data dir. */
   stop: () => Promise<void>;
 }
@@ -97,17 +103,24 @@ export async function startReliquaryHub(options?: {
   let nodeId: string | null = null;
   let output = "";
 
-  const ready = new Promise<void>((resolve, reject) => {
-    const onData = (chunk: Buffer) => {
-      output += stripAnsi(chunk.toString());
-
-      if (!nodeId) {
-        const match = output.match(NODE_ID_LOG_PATTERN);
-        if (match) {
-          nodeId = match[1];
-        }
+  // accumulate stdout/stderr for the process's entire lifetime (not just
+  // until ready) so callers can inspect what the hub did afterward (e.g.
+  // whether the blob snatcher ever fired) — the readiness promise below
+  // only decides *when* to resolve/reject, it doesn't own log collection.
+  const onOutput = (chunk: Buffer) => {
+    output += stripAnsi(chunk.toString());
+    if (!nodeId) {
+      const match = output.match(NODE_ID_LOG_PATTERN);
+      if (match) {
+        nodeId = match[1];
       }
+    }
+  };
+  child.stdout.on("data", onOutput);
+  child.stderr.on("data", onOutput);
 
+  const ready = new Promise<void>((resolve, reject) => {
+    const checkReady = () => {
       if (output.includes(READY_LOG_MARKER)) {
         cleanup();
         resolve();
@@ -134,13 +147,13 @@ export async function startReliquaryHub(options?: {
 
     const cleanup = () => {
       clearTimeout(timer);
-      child.stdout.off("data", onData);
-      child.stderr.off("data", onData);
+      child.stdout.off("data", checkReady);
+      child.stderr.off("data", checkReady);
       child.off("exit", onExit);
     };
 
-    child.stdout.on("data", onData);
-    child.stderr.on("data", onData);
+    child.stdout.on("data", checkReady);
+    child.stderr.on("data", checkReady);
     child.on("exit", onExit);
   });
 
@@ -177,6 +190,7 @@ export async function startReliquaryHub(options?: {
     nodeId: resolvedNodeId,
     dataDir,
     friendAllow,
+    getLog: () => output,
     stop,
   };
 }

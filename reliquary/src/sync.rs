@@ -15,6 +15,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// ALPN protocol identifier for automerge-repo sync over iroh.
 pub const AUTOMERGE_REPO_ALPN: &[u8] = b"iroh/automerge-repo/1";
 
+/// returned (wrapped in `AcceptError::from_err`) when a peer without an
+/// `Accepted`/`Allowed` friendz row dials the automerge-repo ALPN.
+#[derive(Debug, thiserror::Error)]
+#[error("peer is not an authorized friend")]
+struct NotAuthorizedError;
+
 // ---------------------------------------------------------------------------
 // LoggingIo — transparent AsyncRead + AsyncWrite wrapper that logs all I/O
 // ---------------------------------------------------------------------------
@@ -132,12 +138,21 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for LoggingIo<T> {
 ///
 /// implements `ProtocolHandler` to accept inbound connections from other iroh
 /// peers and routes them to `hub_repo` for automerge-repo v2.x sync.
+///
+/// gated by the friendz allow-list: only peers with a `friendz` row in
+/// `Accepted` or `Allowed` status (see `friendz::Store::is_friend`) may sync
+/// documents through this handler. this is the actual canvas-doc CRDT sync
+/// path, so it's the most security-sensitive ALPN the hub registers — every
+/// other authorization gate in this codebase (`skein-friendz/1`'s canvas
+/// invite handling, `HubPeerService::is_friend`) exists downstream of this
+/// same check.
 #[derive(Clone)]
 pub struct IrohRepo {
     /// kept for future outbound dialing (hub-to-hub sync).
     #[allow(dead_code)]
     endpoint: Endpoint,
     hub_repo: crate::hub_repo::HubRepo,
+    friendz_store: crate::friendz::Store,
 }
 
 impl std::fmt::Debug for IrohRepo {
@@ -148,8 +163,19 @@ impl std::fmt::Debug for IrohRepo {
 
 impl IrohRepo {
     /// create an iroh protocol handler backed by a hub_repo sync handler.
-    pub fn new(endpoint: Endpoint, hub_repo: crate::hub_repo::HubRepo) -> Self {
-        Self { endpoint, hub_repo }
+    ///
+    /// `friendz_store` is consulted on every inbound connection to reject
+    /// peers that aren't friends before any sync traffic is processed.
+    pub fn new(
+        endpoint: Endpoint,
+        hub_repo: crate::hub_repo::HubRepo,
+        friendz_store: crate::friendz::Store,
+    ) -> Self {
+        Self {
+            endpoint,
+            hub_repo,
+            friendz_store,
+        }
     }
 
     /// access the hub_repo.
@@ -161,6 +187,13 @@ impl IrohRepo {
 impl ProtocolHandler for IrohRepo {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer_id = connection.remote_id();
+        let peer_id_str = peer_id.to_string();
+
+        if !self.friendz_store.is_friend(&peer_id_str).await {
+            tracing::info!(peer = %peer_id, "automerge-repo: rejected unauthorized peer");
+            return Err(AcceptError::from_err(NotAuthorizedError));
+        }
+
         tracing::info!(peer = %peer_id, "automerge-repo: accepted inbound connection");
 
         let (send, recv) = connection.accept_bi().await.map_err(|e| {
@@ -172,7 +205,6 @@ impl ProtocolHandler for IrohRepo {
         let label = format!("accept:{}", &peer_id.to_string()[..16]);
         let logged = LoggingIo::new(joined, label);
 
-        let peer_id_str = peer_id.to_string();
         let hub_repo = self.hub_repo.clone();
         tokio::spawn(async move {
             hub_repo.handle_connection(peer_id_str, logged).await;
@@ -183,5 +215,65 @@ impl ProtocolHandler for IrohRepo {
 
     async fn shutdown(&self) {
         tracing::debug!("automerge-repo: shutting down");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{db, friendz, friendz::FriendStatus, userz};
+
+    /// seed a fresh in-memory friendz store with one peer in each relevant
+    /// status. these tests exercise the exact check `IrohRepo::accept`
+    /// performs before doing anything else — `friendz_store.is_friend(..)`
+    /// — without needing a live iroh `Connection`. spinning up two real
+    /// connected iroh endpoints for a true network-level round trip isn't
+    /// something any existing reliquary unit test does (that's covered at
+    /// the e2e layer, e.g. `loam/tests/reliquary-hub.spec.ts`), so this is
+    /// deliberately unit-level rather than an end-to-end network test.
+    async fn make_repo() -> friendz::Store {
+        let pool = db::open_in_memory().await;
+        let friendz_store = friendz::Store::new(pool.clone());
+        let users = userz::Directory::new(pool);
+        // friendz.friend_node_id has an FK on userz.node_id — touch first.
+        for peer in ["friend-accepted", "friend-allowed", "friend-blocked"] {
+            users.touch(peer).await.unwrap();
+        }
+        friendz_store
+            .upsert("friend-accepted", FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+        friendz_store
+            .upsert("friend-allowed", FriendStatus::Allowed, None)
+            .await
+            .unwrap();
+        friendz_store
+            .upsert("friend-blocked", FriendStatus::Blocked, None)
+            .await
+            .unwrap();
+        friendz_store
+    }
+
+    #[tokio::test]
+    async fn accepted_friend_is_authorized() {
+        let friendz_store = make_repo().await;
+        assert!(friendz_store.is_friend("friend-accepted").await);
+    }
+
+    #[tokio::test]
+    async fn allowed_friend_is_authorized() {
+        let friendz_store = make_repo().await;
+        assert!(friendz_store.is_friend("friend-allowed").await);
+    }
+
+    #[tokio::test]
+    async fn stranger_with_no_friendz_row_is_rejected() {
+        let friendz_store = make_repo().await;
+        assert!(!friendz_store.is_friend("total-stranger").await);
+    }
+
+    #[tokio::test]
+    async fn blocked_peer_is_rejected() {
+        let friendz_store = make_repo().await;
+        assert!(!friendz_store.is_friend("friend-blocked").await);
     }
 }

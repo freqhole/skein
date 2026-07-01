@@ -153,5 +153,3 @@ export function createPageCache() {
 
   return { loadPageTexture, destroySlot, get, clear, destroy, entries };
 }
-
-export type PageCacheHandle = ReturnType<typeof createPageCache>;

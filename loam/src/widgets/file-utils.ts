@@ -269,11 +269,6 @@ function cacheKey(blobId: string, size: number): string {
   return `${blobId}:${size}`;
 }
 
-/** clear the entire thumbnail cache (e.g. on disconnect) */
-export function clearThumbnailCache(): void {
-  thumbnailCache.clear();
-}
-
 // ---------------------------------------------------------------------------
 // blob locality check
 // ---------------------------------------------------------------------------
@@ -1598,21 +1593,8 @@ export async function convertToAssetUrl(localPath: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// pickFile
+// pickFiles
 // ---------------------------------------------------------------------------
-
-/**
- * open a file picker dialog.
- * in Tauri mode, uses the native dialog plugin to get a file path.
- * in browser mode, uses a hidden `<input type="file">` to get a File object.
- * returns null if the user cancels.
- */
-export async function pickFile(): Promise<PickedFile | null> {
-  if (isTauriMode()) {
-    return pickFileTauri();
-  }
-  return pickFileBrowser();
-}
 
 /**
  * pick multiple files via the native file picker.
@@ -1703,36 +1685,6 @@ async function pickPdfFileBrowser(): Promise<PickedFile | null> {
   }
 }
 
-/** Tauri-mode file picker — uses @tauri-apps/plugin-dialog */
-async function pickFileTauri(): Promise<PickedFile | null> {
-  try {
-    const result = await open({ multiple: false });
-
-    if (result === null) {
-      return null;
-    }
-
-    // open() returns string | string[] | null — normalize to a single path
-    const filePath = Array.isArray(result) ? result[0] : result;
-    if (!filePath) {
-      return null;
-    }
-
-    // extract filename from the full path (handle both / and \ separators)
-    const filename = filePath.split(/[\\/]/).pop() ?? filePath;
-
-    return {
-      path: filePath,
-      filename,
-      size: 0, // unknown until the file is uploaded
-      file: null,
-    };
-  } catch (err) {
-    log.error(TAG, "native file picker failed:", err);
-    return null;
-  }
-}
-
 /** Tauri-mode multi-file picker — uses @tauri-apps/plugin-dialog with multiple: true */
 async function pickFilesTauri(): Promise<PickedFile[]> {
   try {
@@ -1755,50 +1707,6 @@ async function pickFilesTauri(): Promise<PickedFile[]> {
   } catch (err) {
     log.error(TAG, "native multi-file picker failed:", err);
     return [];
-  }
-}
-
-/** browser-mode file picker — uses a hidden <input type="file"> */
-async function pickFileBrowser(): Promise<PickedFile | null> {
-  const input = document.createElement("input");
-  input.type = "file";
-  input.style.display = "none";
-
-  document.body.appendChild(input);
-
-  try {
-    input.click();
-
-    const file = await new Promise<File | null>((resolve) => {
-      input.addEventListener("change", () => {
-        resolve(input.files?.[0] ?? null);
-      });
-
-      // detect cancellation — the input element fires no event on cancel,
-      // but a focus event on the window fires shortly after the picker closes.
-      const onFocus = () => {
-        window.removeEventListener("focus", onFocus);
-        // small delay so "change" fires first if a file was picked
-        setTimeout(() => resolve(null), 300);
-      };
-      window.addEventListener("focus", onFocus);
-    });
-
-    if (!file) {
-      return null;
-    }
-
-    return {
-      path: null,
-      filename: file.name,
-      size: file.size,
-      file,
-    };
-  } catch (err) {
-    log.error(TAG, "browser file picker failed:", err);
-    return null;
-  } finally {
-    input.remove();
   }
 }
 

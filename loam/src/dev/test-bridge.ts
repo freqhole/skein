@@ -17,6 +17,14 @@ export interface SkeinP2PBridge {
    * default timeout: 30 000 ms.
    */
   waitForOnline(timeoutMs?: number): Promise<void>;
+  /**
+   * import raw bytes into this peer's midden iroh-blobs store so they're
+   * servable to other peers (mirrors what `widgets/file.ts` does on
+   * upload). returns the blake3 hex hash — use this as the canonical
+   * `blake3` field on a file widget's state doc for tests that need a
+   * peer to actually have a blob available for snatch/download.
+   */
+  importBlob(data: Uint8Array): Promise<string>;
 }
 
 /**
@@ -93,6 +101,16 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
         }
         await new Promise<void>((r) => setTimeout(r, 250));
       }
+    },
+
+    async importBlob(data: Uint8Array): Promise<string> {
+      const node = await adapter.getNode();
+      // the MiddenStreamNode type only declares the transport-adjacent
+      // methods this adapter needs; the underlying wasm node also exposes
+      // iroh-blobs helpers like `import_blob`, used here to make test blobs
+      // servable without depending on the full upload/widget UI flow.
+      const nodeAny = node as unknown as { import_blob(data: Uint8Array): Promise<string> };
+      return nodeAny.import_blob(data);
     },
   };
 }
