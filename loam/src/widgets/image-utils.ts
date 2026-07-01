@@ -43,14 +43,17 @@ export async function pickImageAsDataUrl(options?: PickImageOptions): Promise<st
         resolve(input.files?.[0] ?? null);
       });
 
-      // detect cancellation — the input element fires no event on cancel,
-      // but a focus event on the window fires shortly after the picker closes.
-      const onFocus = () => {
-        window.removeEventListener("focus", onFocus);
-        // small delay so "change" fires first if a file was picked
-        setTimeout(() => resolve(null), 300);
-      };
-      window.addEventListener("focus", onFocus);
+      // the `cancel` event is the standard way to detect picker dismissal.
+      // it is supported in Chrome 113+ and Firefox 113+.
+      // older browsers that don't fire `cancel` will leave this promise pending
+      // until the page navigates — acceptable because `pickImageAsDataUrl` is
+      // always called in a fire-and-forget context and callers re-enable the
+      // trigger on each interaction.
+      input.addEventListener("cancel", () => resolve(null));
+
+      // the old window.focus-based cancel detection (setTimeout 300ms) is
+      // intentionally removed: it races with Playwright's setFiles() CDP call
+      // and causes false cancellations in the e2e test environment.
     });
 
     if (!file) {

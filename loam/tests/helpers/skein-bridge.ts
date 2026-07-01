@@ -11,20 +11,22 @@ import type { Page } from "@playwright/test";
 
 /** number of live widgets on the canvas */
 export async function getWidgetCount(page: Page): Promise<number> {
-  return page.evaluate(() =>
-    (window as any).__skeinTest.canvas.widgetManager.getLiveWidgets().size
+  return page.evaluate(
+    () => (window as any).__skeinTest.canvas.widgetManager.getLiveWidgets().size
   );
 }
 
 /** all live widget entries as plain objects */
-export async function getWidgets(page: Page): Promise<Array<{
-  id: string;
-  type: string;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}>> {
+export async function getWidgets(page: Page): Promise<
+  Array<{
+    id: string;
+    type: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }>
+> {
   return page.evaluate(() => {
     const live = (window as any).__skeinTest.canvas.widgetManager.getLiveWidgets();
     return [...live.entries()].map(([id, w]: [string, any]) => ({
@@ -47,7 +49,12 @@ export async function addWidget(
   return page.evaluate(
     ([t, o]) => {
       const store = (window as any).__skeinTest.canvas.store;
-      return store.addWidget(t, { x: o.x ?? 100, y: o.y ?? 100, width: o.width ?? 300, height: o.height ?? 200 });
+      return store.addWidget(t, {
+        x: o.x ?? 100,
+        y: o.y ?? 100,
+        width: o.width ?? 300,
+        height: o.height ?? 200,
+      });
     },
     [type, opts] as const
   );
@@ -114,4 +121,64 @@ export async function waitForPeerCount(
 /** the raw automerge doc snapshot (snapshot, not live) */
 export async function getCanvasDoc(page: Page): Promise<Record<string, unknown>> {
   return page.evaluate(() => (window as any).__skeinTest.canvas.store.doc());
+}
+
+// --- social ---
+// these helpers require the full boot router (index.html), not a test harness
+// page. they access window.__skeinTest.social which is populated by boot.ts
+// in DEV builds.
+
+/** read the current social profile object from the standalone social doc */
+export async function getSocialProfile(page: Page): Promise<Record<string, unknown> | null> {
+  return page.evaluate(() => {
+    const social = (window as any).__skeinTest?.social;
+    if (!social?.doc) return null;
+    return (social.doc.current?.profile as Record<string, unknown>) ?? null;
+  });
+}
+
+/**
+ * generate or restore a P2P identity.
+ * simulates the user clicking "generate identity" in the profile tab.
+ */
+export async function ensureIdentityBridge(page: Page): Promise<string> {
+  return page.evaluate(async () => {
+    const social = (window as any).__skeinTest?.social;
+    if (!social) throw new Error("__skeinTest.social not found — is this a full boot page?");
+    const identity = await social.ensureIdentity();
+    return identity.node_id as string;
+  });
+}
+
+/** open or close the social overlay panel */
+export async function toggleSocialOverlay(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    (window as any).__skeinTest?.social?.toggleOverlay();
+  });
+}
+
+/**
+ * trigger the avatar file picker inside the social widget.
+ * call page.waitForEvent("filechooser") BEFORE this.
+ */
+export async function triggerAvatarPick(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    // fire and don't await — input.click() is synchronous so the filechooser
+    // event fires before the evaluate callback returns
+    (window as any).__skeinTest?.social?.pickAvatar?.();
+  });
+}
+
+/** wait for the social doc's profile to contain a 64-char hex nodeId */
+export async function waitForNodeId(page: Page, timeoutMs = 30_000): Promise<string> {
+  await page.waitForFunction(
+    () => {
+      const nodeId = (window as any).__skeinTest?.social?.doc?.current?.profile?.nodeId;
+      return typeof nodeId === "string" && nodeId.length === 64;
+    },
+    { timeout: timeoutMs }
+  );
+  return page.evaluate(
+    () => (window as any).__skeinTest?.social?.doc?.current?.profile?.nodeId ?? ""
+  );
 }

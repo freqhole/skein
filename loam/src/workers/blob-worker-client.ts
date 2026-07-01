@@ -33,7 +33,7 @@ export async function getBlobWorker(): Promise<Comlink.Remote<BlobWorkerApi> | n
   // vite ?worker import: returns a constructor for a module-format worker.
   // the wasm + topLevelAwait plugins are applied to worker bundles via
   // vite.config.ts `worker.plugins`.
-   
+
   const WorkerCtor = (await import("./blob-worker?worker")).default;
   workerInstance = new WorkerCtor();
   workerProxy = Comlink.wrap<BlobWorkerApi>(workerInstance);
@@ -189,18 +189,23 @@ export interface ResizeImageOptions {
 }
 
 /**
- * resize an image Blob to a (default WebP) data URL inside the worker.
- * the Blob is structured-cloned by reference so postMessage cost is O(1).
+ * resize an image Blob to a (default WebP) data URL.
+ * prefers the main-thread OffscreenCanvas path which is fast for typical
+ * image sizes (avatars, thumbnails) and doesn't depend on worker init.
+ * falls back to the blob worker only if OffscreenCanvas is unavailable.
  * returns null on failure (non-image input, decode failure, etc.).
  */
 export async function resizeImageToWebpDataUrl(
   blob: Blob,
   options?: ResizeImageOptions
 ): Promise<string | null> {
+  // main-thread path first — avoids any worker startup / wasm-init delay
+  const mainResult = await mainThreadResizeImage(blob, options);
+  if (mainResult !== null) return mainResult;
+  // fall back to worker only if OffscreenCanvas is unavailable (very old browsers)
   const worker = await getBlobWorker();
   if (worker) return worker.resizeImageToWebpDataUrl(blob, options);
-  // main-thread fallback — works on any modern browser.
-  return mainThreadResizeImage(blob, options);
+  return null;
 }
 
 /**

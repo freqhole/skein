@@ -20,6 +20,22 @@ export interface SkeinP2PBridge {
 }
 
 /**
+ * social test bridge — present on `window.__skeinTest.social` when the full
+ * boot router has initialised (i.e. the page loaded index.html, not a test
+ * harness page). populated in DEV builds only.
+ */
+export interface SkeinTestBridgeSocial {
+  /** the live standalone social doc (profile, friends, requests, etc.) */
+  readonly doc: { current: Record<string, unknown> } | null;
+  /** generate or restore a P2P identity. mirrors identity.ts ensureIdentity(). */
+  ensureIdentity(): Promise<{ node_id: string }>;
+  /** open / close the social overlay panel */
+  toggleOverlay(): void;
+  /** trigger the avatar file picker (set by profile-tab on mount) */
+  pickAvatar?(): Promise<void>;
+}
+
+/**
  * the single window-level test bridge placed on `window.__skeinTest`.
  *
  * consolidates all test-time APIs into one typed, documented object — no more
@@ -30,6 +46,11 @@ export interface SkeinP2PBridge {
 export interface SkeinTestBridge {
   /** the running skein canvas instance */
   canvas: SkeinCanvas;
+  /**
+   * social helpers — present when the full boot router is running (index.html).
+   * null when using test harness pages (test-harness.html etc.).
+   */
+  social?: SkeinTestBridgeSocial;
   /**
    * p2p helpers — present only when the page was bootstrapped via
    * test-harness-p2p.html / p2p-test-bootstrap.ts.

@@ -452,6 +452,24 @@ class SkeinRouter {
       });
 
       this.currentCanvas = canvas;
+      // in dev builds, initialise __skeinTest.social BEFORE mounting the social
+      // overlay — profile-tab.ts adds pickAvatar to this object during create(),
+      // so the object must exist before mountSocialOverlay() runs.
+      if (import.meta.env.DEV) {
+        const t: Record<string, unknown> = ((window as any).__skeinTest ??= {});
+        const self = this;
+        t.social = {
+          get doc() {
+            return self.socialDoc;
+          },
+          ensureIdentity,
+          toggleOverlay() {
+            const sw = window.visualViewport?.width ?? window.innerWidth;
+            self.currentSocialOverlay?.toggle(sw);
+          },
+          // pickAvatar is added by profile-tab.ts during socialWidget.create()
+        };
+      }
       // mount overlay panels and wire badge counts
       this.currentSocialOverlay = this.mountSocialOverlay(canvas);
       this.currentMessagesOverlay = this.mountMessagesOverlay(canvas);
@@ -461,15 +479,6 @@ class SkeinRouter {
         canvas.presenceManager.setLocalNodeId(this.localNodeId);
       }
       (window as any).__skein = canvas;
-      // expose test helpers in browser mode so e2e tests can inspect social state
-      // without full UI simulation
-      if (!isTauriMode()) {
-        (window as any).__skeinSocialDoc = this.socialDoc;
-        (window as any).__skeinToggleSocial = () => {
-          const sw = window.visualViewport?.width ?? window.innerWidth;
-          this.currentSocialOverlay?.toggle(sw);
-        };
-      }
 
       // when a canvas-card is deleted from the narthex, clean up the linked
       // canvas document and all its per-widget docs from IndexedDB.
@@ -1570,11 +1579,6 @@ async function boot(): Promise<void> {
 
   const router = new SkeinRouter(mountElement);
   (window as any).__skeinRouter = router;
-  // expose test utilities in browser mode so e2e tests can trigger identity
-  // generation without simulating full UI interaction
-  if (!isTauriMode()) {
-    (window as any).__skeinEnsureIdentity = ensureIdentity;
-  }
   await router.boot();
 }
 

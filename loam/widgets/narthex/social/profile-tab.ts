@@ -255,18 +255,17 @@ export function createProfileTab(ctx: TabContext): TabController {
       cropSquare: true,
     });
     if (dataUrl) {
-      // writing to the doc fires the change handler which calls
-      // updateAvatarSprite — no need to call it explicitly here.
-      // doing both caused a double async load that destroyed the
-      // texture while the render pipeline still referenced it.
       ctx.doc.change((d) => {
         d.profile.avatarDataUrl = dataUrl;
       });
     }
   };
-  // expose for e2e test access so tests can trigger a file pick without
-  // needing to locate and click the avatar circle
-  (window as any).__skeinPickAvatar = pickAvatarFile;
+  // in dev builds, attach pickAvatar to the social test bridge that boot.ts
+  // created — profile-tab owns the closure so it sets it here.
+  if (import.meta.env.DEV) {
+    const s = (((window as any).__skeinTest ??= {}).social ??= {});
+    (s as Record<string, unknown>).pickAvatar = pickAvatarFile;
+  }
 
   // -------------------------------------------------------------------------
   // text fields
