@@ -11,6 +11,9 @@
 import { ButtonContainer, Dialog, FancyButton } from "@pixi/ui";
 import { Container, Graphics, Text, type Application } from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
+import { log } from "../utils/log";
+
+const TAG = "canvas.share";
 
 // ---------------------------------------------------------------------------
 // types
@@ -170,7 +173,7 @@ function wireCopy(
         }, COPY_FEEDBACK_MS);
       },
       () => {
-        console.log("[skein:share] copy failed:", value.slice(0, 32) + "...");
+        log.debug(TAG, "copy failed:", value.slice(0, 32) + "...");
       }
     );
   });
@@ -196,7 +199,7 @@ function buildPeerRow(
   // defensive: coerce nodeId to string (automerge may return non-string from Rust peer writes)
   const safeNodeId = typeof nodeId === "string" ? nodeId : String((nodeId as unknown) ?? "unknown");
   if (safeNodeId !== nodeId) {
-    console.warn("[share-dialog] buildPeerRow: coerced non-string nodeId:", typeof nodeId, nodeId);
+    log.warn(TAG, "buildPeerRow: coerced non-string nodeId:", typeof nodeId, nodeId);
   }
 
   // peer display: show name if known, otherwise truncated node ID

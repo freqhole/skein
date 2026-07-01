@@ -77,7 +77,7 @@ function createMockBiStream(peerId: string, alpn: string = "iroh/automerge-repo/
   return stream;
 }
 
-type MockBiStream = ReturnType<typeof createMockBiStream>;
+type _MockBiStream = ReturnType<typeof createMockBiStream>;
 
 function createMockMidden(nodeId: string = "a".repeat(64)) {
   const acceptQueue: (BiStreamLike | null)[] = [];

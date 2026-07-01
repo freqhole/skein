@@ -1,6 +1,9 @@
 import { Container, Graphics, Text } from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { PresenceManager } from "./presence-manager";
+import { log } from "../utils/log";
+
+const TAG = "canvas.connection";
 
 // stoplight colors
 const COLOR_CONNECTED = 0x22c55e;
@@ -95,7 +98,7 @@ export class ConnectionStatus {
     // handle click — retry on error, otherwise open canvas info
     this.root.on("pointertap", () => {
       if (this.isErrorState && this.connectionState) {
-        console.log("[skein:connection-status] retrying failed connections");
+        log.debug(TAG, "retrying failed connections");
         this.connectionState.retryFailed();
       } else {
         this.onCanvasInfoClick?.();

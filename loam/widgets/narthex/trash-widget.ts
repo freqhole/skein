@@ -8,6 +8,7 @@
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics, Text } from "pixi.js";
 import { z } from "zod";
+import { log } from "../../src/utils/log";
 import { CanvasStore } from "../../src/canvas/canvas-store";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import type {
@@ -428,7 +429,7 @@ export const trashWidget: WidgetFactory<typeof trashSchema> = {
         // only accept canvas-card widgets
         const draggedEntry = store!.getWidget(draggedWidgetId);
         if (!draggedEntry || draggedEntry.type !== "canvas-card") {
-          console.log("[trash] rejected drop — not a canvas-card:", draggedEntry?.type);
+          log.debug("trash-widget", "rejected drop — not a canvas-card:", draggedEntry?.type);
           return false;
         }
 
@@ -522,13 +523,14 @@ export async function softDeleteCanvasForWidget(
     // only delete if not already deleted
     if (!canvasStore.isDeleted) {
       canvasStore.deleteCanvas("soft");
-      console.log(
-        "[trash] soft-deleted canvas:",
+      log.debug(
+        "trash-widget",
+        "soft-deleted canvas:",
         (cardDoc.canvasDocId as string).slice(0, 16) + "..."
       );
     }
   } catch (err) {
-    console.warn("[trash] failed to soft-delete canvas for widget:", cardWidgetId, err);
+    log.warn("trash-widget", "failed to soft-delete canvas for widget:", cardWidgetId, err);
   }
 }
 
@@ -555,10 +557,14 @@ async function restoreCanvasForWidget(
 
     if (canvasStore.isDeleted) {
       canvasStore.restoreCanvas();
-      console.log("[trash] restored canvas:", (cardDoc.canvasDocId as string).slice(0, 16) + "...");
+      log.debug(
+        "trash-widget",
+        "restored canvas:",
+        (cardDoc.canvasDocId as string).slice(0, 16) + "..."
+      );
     }
   } catch (err) {
-    console.warn("[trash] failed to restore canvas for widget:", cardWidgetId, err);
+    log.warn("trash-widget", "failed to restore canvas for widget:", cardWidgetId, err);
   }
 }
 
@@ -584,9 +590,13 @@ async function purgeCanvasForWidget(
     canvasStore.setLocalNodeId(narthexStore.localNodeId);
     canvasStore.deleteCanvas("purge");
 
-    console.log("[trash] purged canvas:", (cardDoc.canvasDocId as string).slice(0, 16) + "...");
+    log.debug(
+      "trash-widget",
+      "purged canvas:",
+      (cardDoc.canvasDocId as string).slice(0, 16) + "..."
+    );
   } catch (err) {
-    console.warn("[trash] failed to purge canvas for widget:", cardWidgetId, err);
+    log.warn("trash-widget", "failed to purge canvas for widget:", cardWidgetId, err);
   }
 }
 
@@ -654,10 +664,10 @@ export async function moveCardToTrash(
       draft.rows = computeRows(draft.items.length, cols);
     });
 
-    console.log("[trash] auto-collected card into trash:", cardWidgetId);
+    log.debug("trash-widget", "auto-collected card into trash:", cardWidgetId);
     return true;
   } catch (err) {
-    console.warn("[trash] failed to add card to trash items:", cardWidgetId, err);
+    log.warn("trash-widget", "failed to add card to trash items:", cardWidgetId, err);
     return false;
   }
 }

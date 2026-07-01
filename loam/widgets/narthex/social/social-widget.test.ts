@@ -8,7 +8,7 @@ import {
 } from "./helpers";
 import {
   friendEntrySchema,
-  friendGroupSchema,
+  friendGroupSchema as _friendGroupSchema,
   friendNodeIdSchema,
   outboundFriendRequestSchema,
   pendingFriendRequestSchema,

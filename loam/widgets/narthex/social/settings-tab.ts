@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
+import { log } from "../../../src/utils/log";
 import {
   setFriendRequestsFrom as bridgeSetFriendRequestsFrom,
   setProfileVisibility as bridgeSetProfileVisibility,
@@ -61,15 +62,15 @@ async function destroyAllLocalData(): Promise<void> {
       await new Promise<void>((resolve, reject) => {
         const req = indexedDB.deleteDatabase(dbName);
         req.onsuccess = () => {
-          console.log(`[destroy] deleted IndexedDB database: ${dbName}`);
+          log.debug("social.settings", `deleted IndexedDB database: ${dbName}`);
           resolve();
         };
         req.onerror = () => {
-          console.warn(`[destroy] failed to delete IndexedDB database: ${dbName}`, req.error);
+          log.warn("social.settings", `failed to delete IndexedDB database: ${dbName}`, req.error);
           reject(req.error);
         };
         req.onblocked = () => {
-          console.warn(`[destroy] IndexedDB delete blocked (close other tabs?): ${dbName}`);
+          log.warn("social.settings", `IndexedDB delete blocked (close other tabs?): ${dbName}`);
           // resolve anyway — the delete will proceed once other connections close
           resolve();
         };
@@ -86,7 +87,7 @@ async function destroyAllLocalData(): Promise<void> {
       for (const dirName of OPFS_DIRECTORIES) {
         try {
           await root.removeEntry(dirName, { recursive: true });
-          console.log(`[destroy] deleted OPFS directory: ${dirName}`);
+          log.debug("social.settings", `deleted OPFS directory: ${dirName}`);
         } catch (err) {
           // NotFoundError is fine — directory didn't exist
           if ((err as DOMException)?.name !== "NotFoundError") {
@@ -100,10 +101,10 @@ async function destroyAllLocalData(): Promise<void> {
   }
 
   if (errors.length > 0) {
-    console.warn("[destroy] some deletions failed:", errors);
+    log.warn("social.settings", "some deletions failed:", errors);
   }
 
-  console.log("[destroy] all local data destroyed — reloading page");
+  log.debug("social.settings", "all local data destroyed — reloading page");
   window.location.reload();
 }
 
@@ -329,7 +330,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
           stopEndpoint();
         } else if (state !== "starting") {
           restartEndpoint().catch((err) =>
-            console.error("[skein:settings] endpoint restart failed:", err)
+            log.error("social.settings", "endpoint restart failed:", err)
           );
         }
       });
@@ -450,7 +451,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
               rebuild();
             })
             .catch((err) => {
-              console.error("[skein:social:settings] export failed:", err);
+              log.error("social.settings", "export failed:", err);
             });
         });
 
@@ -651,7 +652,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
       destroyBtn.eventMode = "none";
 
       destroyAllLocalData().catch((err) => {
-        console.error("[destroy] unexpected error:", err);
+        log.error("social.settings", "unexpected error:", err);
         destroyBtnText.text = "failed — try again";
         destroyBtnText.style.fill = REJECT_COLOR;
         destroyBtnText.x = (destroyBtnW - destroyBtnText.width) / 2;

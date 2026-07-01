@@ -3,6 +3,10 @@
  * must be called early in the boot sequence — before any widgets are mounted.
  */
 
+import { log } from "../utils/log";
+
+const TAG = "fonts";
+
 const CUSTOM_FONTS = [
   "Space Grotesk",
   "Space Mono",
@@ -20,7 +24,7 @@ export async function preloadFonts(): Promise<void> {
 
   const promises = CUSTOM_FONTS.map((family) =>
     document.fonts.load(`400 16px "${family}"`).catch((err) => {
-      console.warn(`[fonts] failed to preload "${family}":`, err);
+      log.warn(TAG, `failed to preload "${family}":`, err);
     })
   );
 
@@ -30,7 +34,7 @@ export async function preloadFonts(): Promise<void> {
     new Promise<void>((resolve) => setTimeout(resolve, 3000)),
   ]);
 
-  console.log("[fonts] custom fonts preloaded");
+  log.debug(TAG, "custom fonts preloaded");
 }
 
 /**

@@ -8,18 +8,19 @@
  */
 
 import {
-    checkBlobLocality,
-    revealBlobInFinder,
-    saveBlobToDisk,
-    snatchBlobBatch,
-    type BatchSnatchOptions,
-    type FileUploadResult,
-    type PeersMap,
-    type SnatchBlobInfo,
+  checkBlobLocality,
+  revealBlobInFinder,
+  saveBlobToDisk,
+  snatchBlobBatch,
+  type BatchSnatchOptions,
+  type FileUploadResult,
+  type PeersMap,
+  type SnatchBlobInfo,
 } from "../../src/widgets/file-utils";
+import { log } from "../../src/utils/log";
 import type { ActionState, PeedeeeffState } from "./types";
 
-const TAG = "[peedeeeff:snatch]";
+const TAG = "peedeeeff.snatch";
 
 // ---------------------------------------------------------------------------
 // types
@@ -71,7 +72,7 @@ export async function checkPdfLocality(state: PeedeeeffState): Promise<ActionSta
     const info = await checkBlobLocality(blobId, blake3 || undefined);
 
     if (info.locality !== "local") {
-      console.debug(TAG, "main PDF blob is remote:", blobId.slice(0, 12));
+      log.debug(TAG, "main PDF blob is remote:", blobId.slice(0, 12));
       return "remote";
     }
 
@@ -83,7 +84,7 @@ export async function checkPdfLocality(state: PeedeeeffState): Promise<ActionSta
       if (pageInfo.locality === "local") {
         return "local";
       }
-      console.debug(TAG, "PDF local but first page blob is remote");
+      log.debug(TAG, "PDF local but first page blob is remote");
       return "remote";
     }
 
@@ -121,7 +122,7 @@ export async function snatchPdfContent(
   peers: PeersMap,
   signal: AbortSignal,
   callbacks: PdfSnatchCallbacks,
-  isPeerOnline?: (nodeId: string) => boolean,
+  isPeerOnline?: (nodeId: string) => boolean
 ): Promise<PdfSnatchResult> {
   const allBlobs: SnatchBlobInfo[] = [];
 
@@ -159,7 +160,7 @@ export async function snatchPdfContent(
   }
 
   if (allBlobs.length === 0) {
-    console.warn(TAG, "nothing to snatch — no blobId and no pageBlobIds");
+    log.warn(TAG, "nothing to snatch — no blobId and no pageBlobIds");
     return { pdfResult: null, pageResults: [] };
   }
 
@@ -179,9 +180,9 @@ export async function snatchPdfContent(
     probeBlobInfo = allBlobs[pdfBlobIndex];
   }
 
-  console.log(
+  log.debug(
     TAG,
-    `starting batch snatch: ${hasPdfBlob ? 1 : 0} PDF blob + ${pageBlobIds.length} page blobs`,
+    `starting batch snatch: ${hasPdfBlob ? 1 : 0} PDF blob + ${pageBlobIds.length} page blobs`
   );
 
   // step 3: result accumulators
@@ -201,7 +202,7 @@ export async function snatchPdfContent(
       if (hasPdfBlob && index === pdfBlobIndex) {
         // this is the main PDF blob
         pdfResult = result;
-        console.debug(TAG, "PDF blob snatched:", result.blobId.slice(0, 12));
+        log.debug(TAG, "PDF blob snatched:", result.blobId.slice(0, 12));
         callbacks.onStatusText?.("PDF downloaded, snatching pages...");
       } else {
         // this is a page blob
@@ -209,19 +210,15 @@ export async function snatchPdfContent(
         if (pageIndex >= 0 && pageIndex < pageBlobIds.length) {
           pageResults[pageIndex] = result;
           callbacks.onPageComplete?.(pageIndex, result);
-          console.debug(TAG, `page ${pageIndex + 1}/${totalPages} snatched`);
+          log.debug(TAG, `page ${pageIndex + 1}/${totalPages} snatched`);
         }
       }
     },
 
     onProgress: (completedCount: number, totalCount: number, _blobProgress: number) => {
       // compute page-oriented progress (skip the PDF blob from the count)
-      const pagesCompleted = hasPdfBlob
-        ? Math.max(0, completedCount - 1)
-        : completedCount;
-      const pagesTotal = hasPdfBlob
-        ? Math.max(0, totalCount - 1)
-        : totalCount;
+      const pagesCompleted = hasPdfBlob ? Math.max(0, completedCount - 1) : completedCount;
+      const pagesTotal = hasPdfBlob ? Math.max(0, totalCount - 1) : totalCount;
 
       if (pagesTotal > 0) {
         const progressLabel = `${pagesCompleted}/${pagesTotal}`;
@@ -229,9 +226,7 @@ export async function snatchPdfContent(
 
         if (pagesCompleted < pagesTotal) {
           const currentPage = pagesCompleted + 1;
-          callbacks.onStatusText?.(
-            `snatching page ${currentPage} of ${pagesTotal}...`,
-          );
+          callbacks.onStatusText?.(`snatching page ${currentPage} of ${pagesTotal}...`);
         }
       } else if (completedCount < totalCount) {
         callbacks.onProgressText?.(`${completedCount}/${totalCount}`);
@@ -258,17 +253,14 @@ export async function snatchPdfContent(
       }
     }
 
-    const successCount = results.filter((r) => r != null).length;
-    console.log(
-      TAG,
-      `batch snatch complete: ${successCount}/${totalBlobs} blobs succeeded`,
-    );
+    const successCount = results.filter((r) => r !== null).length;
+    log.debug(TAG, `batch snatch complete: ${successCount}/${totalBlobs} blobs succeeded`);
   } catch (err) {
     if (signal.aborted) {
-      console.log(TAG, "batch snatch aborted");
+      log.debug(TAG, "batch snatch aborted");
       throw err;
     }
-    console.error(TAG, "batch snatch failed:", err);
+    log.error(TAG, "batch snatch failed:", err);
     throw err;
   }
 
@@ -283,23 +275,20 @@ export async function snatchPdfContent(
  * save the main PDF blob to the user's filesystem via native save dialog.
  * thin wrapper around saveBlobToDisk from file-utils.
  */
-export async function savePdfToDisk(
-  blobId: string,
-  filename: string,
-): Promise<boolean> {
+export async function savePdfToDisk(blobId: string, filename: string): Promise<boolean> {
   if (!blobId) {
-    console.warn(TAG, "cannot save — no blobId");
+    log.warn(TAG, "cannot save — no blobId");
     return false;
   }
 
   try {
     const saved = await saveBlobToDisk(blobId, filename || "document.pdf");
     if (saved) {
-      console.log(TAG, "saved PDF to disk:", blobId.slice(0, 12));
+      log.debug(TAG, "saved PDF to disk:", blobId.slice(0, 12));
     }
     return saved;
   } catch (err) {
-    console.error(TAG, "save to disk failed:", err);
+    log.error(TAG, "save to disk failed:", err);
     throw err;
   }
 }
@@ -312,12 +301,9 @@ export async function savePdfToDisk(
  * reveal the PDF blob in the OS file manager (Finder on macOS, Explorer on Windows).
  * falls back to savePdfToDisk if reveal is not available or fails.
  */
-export async function revealPdfInFinder(
-  blobId: string,
-  filename?: string,
-): Promise<boolean> {
+export async function revealPdfInFinder(blobId: string, filename?: string): Promise<boolean> {
   if (!blobId) {
-    console.warn(TAG, "cannot reveal — no blobId");
+    log.warn(TAG, "cannot reveal — no blobId");
     return false;
   }
 
@@ -328,14 +314,14 @@ export async function revealPdfInFinder(
     }
 
     // reveal not available or failed — fall back to save dialog
-    console.debug(TAG, "reveal failed, falling back to save dialog");
+    log.debug(TAG, "reveal failed, falling back to save dialog");
     return savePdfToDisk(blobId, filename || "document.pdf");
   } catch (err) {
-    console.warn(TAG, "reveal failed, trying save fallback:", err);
+    log.warn(TAG, "reveal failed, trying save fallback:", err);
     try {
       return await savePdfToDisk(blobId, filename || "document.pdf");
     } catch (saveErr) {
-      console.error(TAG, "save fallback also failed:", saveErr);
+      log.error(TAG, "save fallback also failed:", saveErr);
       return false;
     }
   }

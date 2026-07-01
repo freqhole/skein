@@ -13,10 +13,12 @@
 
 import { Container, Graphics } from "pixi.js";
 import { audioManager, getMediaPlaybackUrl } from "../../src/media";
+import { getFullBlobDataUrl } from "../../src/widgets/file-utils";
 import { createMediaOverlay as createFullscreenOverlay } from "../../src/widgets/media-overlay";
+import { log } from "../../src/utils/log";
 import type { RenderedCard } from "./bin-types";
 
-const TAG = "[bin-media]";
+const TAG = "bin.media";
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -516,11 +518,10 @@ export class BinMediaController {
     if (blobId) {
       // file widget with a blob — resolve via getFullBlobDataUrl
       try {
-        const { getFullBlobDataUrl } = await import("../../src/widgets/file-utils");
         const peers = this.getPeers();
         src = await getFullBlobDataUrl(blobId, peers as any);
       } catch (err) {
-        console.warn(TAG, "failed to resolve photo blob:", err);
+        log.warn(TAG, "failed to resolve photo blob:", err);
       }
 
       if (!src) {
@@ -540,7 +541,7 @@ export class BinMediaController {
     }
 
     if (!src) {
-      console.warn(TAG, "could not resolve photo for preview");
+      log.warn(TAG, "could not resolve photo for preview");
       return;
     }
 
@@ -642,7 +643,7 @@ export class BinMediaController {
     });
 
     if (!ok) {
-      console.warn(TAG, "failed to play audio for card:", widgetId);
+      log.warn(TAG, "failed to play audio for card:", widgetId);
       this.audioPlayingId = null;
       this.setCardIcon(widgetId, "play");
     }
@@ -773,7 +774,7 @@ export class BinMediaController {
     });
 
     if (!src) {
-      console.warn(TAG, "failed to resolve video URL for card:", widgetId);
+      log.warn(TAG, "failed to resolve video URL for card:", widgetId);
       return;
     }
 
@@ -799,7 +800,7 @@ export class BinMediaController {
       // hide the pixi overlay while video is playing — the DOM video covers it
       this.setOverlayVisible(widgetId, false);
     } catch (err) {
-      console.warn(TAG, "video play failed:", err);
+      log.warn(TAG, "video play failed:", err);
       this.videoTracker.close();
       this.videoTracker = null;
       this.setCardIcon(widgetId, "play");

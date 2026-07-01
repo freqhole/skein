@@ -1,4 +1,5 @@
 import { type DocumentId } from "@automerge/automerge-repo";
+import * as Automerge from "@automerge/automerge";
 import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
 import type { CanvasStore } from "../src/canvas/canvas-store";
@@ -815,7 +816,6 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
 
     const loadAllDocSizes = async () => {
       try {
-        const Automerge = await import("@automerge/automerge");
         const entries: SizeEntry[] = [];
 
         // measure the canvas document itself

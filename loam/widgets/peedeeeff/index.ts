@@ -9,6 +9,7 @@
  */
 
 import { Container, Graphics, Text } from "pixi.js";
+import { log } from "../../src/utils/log";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import {
   getDocumentPages,
@@ -796,7 +797,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
       snatchBtn.setColor(0x2d5a27);
       syncOverlayVisibility();
       updateHeaderActions();
-      console.log("[peedeeeff] snatch cancelled by user");
+      log.debug("peedeeeff", "snatch cancelled by user");
     }
 
     async function handleSnatch() {
@@ -805,7 +806,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
       const state = ctx.doc.current;
       const allPeers = ctx.canvasStore?.peers();
       if (!allPeers || Object.keys(allPeers).length === 0) {
-        console.warn("[peedeeeff] no peers available for snatch");
+        log.warn("peedeeeff", "no peers available for snatch");
         return;
       }
 
@@ -875,7 +876,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
         // record this node as having the blobs
         const localNodeId = await getLocalNodeId();
         if (localNodeId) {
-          console.log("[peedeeeff] snatch complete, local node:", localNodeId.slice(0, 16));
+          log.debug("peedeeeff", "snatch complete, local node:", localNodeId.slice(0, 16));
         }
 
         actionState = "snatched";
@@ -892,10 +893,10 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
         renderPages();
       } catch (err) {
         if (snatchCancelled || destroyed) {
-          console.log("[peedeeeff] snatch aborted (cancelled)");
+          log.debug("peedeeeff", "snatch aborted (cancelled)");
           return;
         }
-        console.error("[peedeeeff] snatch failed:", err);
+        log.error("peedeeeff", "snatch failed:", err);
         actionState = "remote";
         snatchProgressText = "";
         snatchBtn.setLabel("snatch");
@@ -978,7 +979,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
         placeholderBorder.eventMode = "static";
         placeholderText.eventMode = "static";
       } catch (err) {
-        console.error("[peedeeeff] upload failed:", err);
+        log.error("peedeeeff", "upload failed:", err);
         placeholderText.text = "upload failed — click to retry";
         placeholderText.visible = true;
         placeholderBorder.visible = true;

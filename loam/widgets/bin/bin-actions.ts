@@ -5,16 +5,17 @@
  */
 
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
+import { log } from "../../src/utils/log";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import {
-    getThumbnailDataUrl,
-    snatchBlobBatch,
-    type FileUploadResult,
-    type PeersMap,
-    type SnatchBlobInfo,
+  getThumbnailDataUrl,
+  snatchBlobBatch,
+  type FileUploadResult,
+  type PeersMap,
+  type SnatchBlobInfo,
 } from "../../src/widgets/file-utils";
 import { fileSchema, type FileState } from "../file";
-import { binSchema } from "./index";
+import { binSchema } from "./bin-schema";
 
 // -----------------------------------------------------------------------
 // types
@@ -44,7 +45,7 @@ export interface SnatchAllOptions {
   signal?: AbortSignal;
 }
 
-const TAG = "[bin-actions]";
+const TAG = "bin.actions";
 
 // -----------------------------------------------------------------------
 // helpers
@@ -82,7 +83,7 @@ async function collectFileChildren(
     const parsed = binSchema.parse(doc);
     items = parsed.items;
   } catch {
-    console.warn(TAG, "failed to parse bin doc for", binWidgetId);
+    log.warn(TAG, "failed to parse bin doc for", binWidgetId);
     return [];
   }
 
@@ -118,7 +119,7 @@ async function collectFileChildren(
         state,
       });
     } catch {
-      console.warn(TAG, "failed to parse file doc for", item.widgetId);
+      log.warn(TAG, "failed to parse file doc for", item.widgetId);
     }
   }
 
@@ -154,7 +155,7 @@ async function applySnatchResult(
     }
   } catch {
     // thumbnail generation is best-effort — don't fail the snatch
-    console.debug(TAG, "thumbnail generation failed for", result.blobId);
+    log.debug(TAG, "thumbnail generation failed for", result.blobId);
   }
 }
 
@@ -231,7 +232,7 @@ export async function snatchAllInBin(
   // through the normal progress channel.
   const peerCount = Object.keys(peers).length;
   if (peerCount === 0) {
-    console.warn(TAG, "snatch all: no peers connected, nothing to snatch from");
+    log.warn(TAG, "snatch all: no peers connected, nothing to snatch from");
     progress.failed = allFiles.length;
     progress.done = true;
     emit();
@@ -286,7 +287,7 @@ export async function snatchAllInBin(
       // batch threw an unexpected error (e.g. all peers vanished
       // mid-flight). attribute anything un-accounted-for to failures so
       // the progress bar reflects reality.
-      console.warn(TAG, "snatch all: batch threw:", err);
+      log.warn(TAG, "snatch all: batch threw:", err);
       const accounted = progress.alreadyLocal + progress.snatched + progress.failed;
       progress.failed += Math.max(0, allFiles.length - accounted);
     }

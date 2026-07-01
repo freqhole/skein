@@ -8,12 +8,13 @@
 
 import type { BiStreamLike, MiddenStreamNode } from "./iroh-network-adapter";
 import { FRIENDZ_ALPN } from "./iroh-network-adapter";
+import { log } from "../utils/log";
 
 // ---------------------------------------------------------------------------
 // constants
 // ---------------------------------------------------------------------------
 
-const TAG = "[skein:friendz]";
+const TAG = "p2p.friendz";
 
 /** how often to send heartbeat pings to friends (ms). */
 export const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -458,7 +459,7 @@ export class FriendzProtocol {
    */
   handleStream(stream: BiStreamLike): void {
     const peerId = stream.peer_node_id();
-    console.log(TAG, "incoming stream from:", peerId.slice(0, 16) + "...");
+    log.debug(TAG, "incoming stream from:", peerId.slice(0, 16) + "...");
 
     // store the stream for potential replies
     const existing = this.streams.get(peerId);
@@ -479,7 +480,7 @@ export class FriendzProtocol {
         const data = await stream.read_message();
         if (!data) {
           // stream closed
-          console.log(TAG, "stream closed by peer:", peerId.slice(0, 16) + "...");
+          log.debug(TAG, "stream closed by peer:", peerId.slice(0, 16) + "...");
           break;
         }
 
@@ -487,7 +488,7 @@ export class FriendzProtocol {
           const msg = decodeMessage(data);
           this.handleMessage(msg, peerId, stream);
         } catch (err) {
-          console.warn(TAG, "failed to decode message from:", peerId.slice(0, 16) + "...", err);
+          log.warn(TAG, "failed to decode message from:", peerId.slice(0, 16) + "...", err);
         }
       }
     } catch (err) {
@@ -495,7 +496,7 @@ export class FriendzProtocol {
       // the new stream is already handling this peer, so don't mark them offline
       const wasReplaced = this.streams.get(peerId) !== stream;
       if (!this._destroyed && !wasReplaced) {
-        console.warn(TAG, "read loop error from:", peerId.slice(0, 16) + "...", err);
+        log.warn(TAG, "read loop error from:", peerId.slice(0, 16) + "...", err);
         // clear lastSeen so isOnline() returns false immediately
         this.lastSeen.delete(peerId);
         this.emitOnlineChange();
@@ -543,7 +544,7 @@ export class FriendzProtocol {
         // fast presence ACK: if this is the first heartbeat from a newly-online peer,
         // reply immediately so they know we're online too
         if (!wasOnline) {
-          console.log(TAG, "peer online:", fromNodeId.slice(0, 16) + "...");
+          log.debug(TAG, "peer online:", fromNodeId.slice(0, 16) + "...");
           const activity = this.getCanvasActivity?.() ?? [];
           const reply: HeartbeatMessage = {
             type: "heartbeat",
@@ -602,7 +603,7 @@ export class FriendzProtocol {
       case "blob-offer":
         // blob-offer is a response to our blob-seek — browser peers don't
         // currently send blob-seek, so this is a no-op placeholder.
-        console.log(
+        log.debug(
           TAG,
           "received blob-offer from:",
           fromNodeId.slice(0, 16) + "...",
@@ -613,33 +614,33 @@ export class FriendzProtocol {
 
       case "offline-announcement":
         if (this.lastSeen.has(msg.nodeId)) {
-          console.log(TAG, "peer offline (announced):", msg.nodeId.slice(0, 16) + "...");
+          log.debug(TAG, "peer offline (announced):", msg.nodeId.slice(0, 16) + "...");
           this.lastSeen.delete(msg.nodeId);
           this.emitOnlineChange();
         }
         break;
 
       default:
-        console.warn(TAG, "unknown message type from:", fromNodeId.slice(0, 16) + "...", msg);
+        log.warn(TAG, "unknown message type from:", fromNodeId.slice(0, 16) + "...", msg);
     }
   }
 
   private handleProfileRequest(fromNodeId: string, stream: BiStreamLike): void {
-    console.log(
+    log.debug(
       TAG,
-      "handleProfileRequest from " + fromNodeId.slice(0, 16) + "... (visibility=" + this.profileVisibility + ")"
+      "handleProfileRequest from " +
+        fromNodeId.slice(0, 16) +
+        "... (visibility=" +
+        this.profileVisibility +
+        ")"
     );
     // check privacy settings
     if (this.profileVisibility === "nobody") {
-      console.log(TAG, "ignoring profile request (visibility: nobody)");
+      log.debug(TAG, "ignoring profile request (visibility: nobody)");
       return;
     }
     if (this.profileVisibility === "friends" && !this.isFriend(fromNodeId)) {
-      console.log(
-        TAG,
-        "ignoring profile request from non-friend:",
-        fromNodeId.slice(0, 16) + "..."
-      );
+      log.debug(TAG, "ignoring profile request from non-friend:", fromNodeId.slice(0, 16) + "...");
       return;
     }
 
@@ -651,30 +652,34 @@ export class FriendzProtocol {
       avatarDataUrl: profile.avatarDataUrl,
     };
 
-    console.log(
+    log.debug(
       TAG,
       "handleProfileRequest sending profile-response to " + fromNodeId.slice(0, 16) + "..."
     );
     stream.write_message(encodeMessage(response)).catch((err) => {
-      console.warn(TAG, "failed to send profile response:", err);
+      log.warn(TAG, "failed to send profile response:", err);
     });
   }
 
   private handleFriendRequest(msg: FriendRequestMessage, fromNodeId: string): void {
-    console.log(
+    log.debug(
       TAG,
-      "handleFriendRequest from " + fromNodeId.slice(0, 16) + "... (fromUsername=" + (msg.fromUsername ?? "?") + ")"
+      "handleFriendRequest from " +
+        fromNodeId.slice(0, 16) +
+        "... (fromUsername=" +
+        (msg.fromUsername ?? "?") +
+        ")"
     );
     // check privacy settings
     if (this.friendRequestsFrom === "nobody") {
-      console.log(TAG, "ignoring friend request (requests disabled)");
+      log.debug(TAG, "ignoring friend request (requests disabled)");
       return;
     }
 
     if (!this.onFriendRequest) {
-      console.warn(
+      log.warn(
         TAG,
-        "handleFriendRequest: no onFriendRequest listener registered \u2014 dropping request from " +
+        "handleFriendRequest: no onFriendRequest listener registered — dropping request from " +
           fromNodeId.slice(0, 16) +
           "..."
       );
@@ -686,11 +691,11 @@ export class FriendzProtocol {
 
   private handleCanvasInvite(msg: CanvasInviteMessage, fromNodeId: string): void {
     if (this.canvasInvitesFrom === "nobody") {
-      console.log(TAG, "ignoring canvas invite (invites disabled)");
+      log.debug(TAG, "ignoring canvas invite (invites disabled)");
       return;
     }
     if (this.canvasInvitesFrom === "friends" && !this.isFriend(fromNodeId)) {
-      console.log(TAG, "ignoring canvas invite from non-friend:", fromNodeId.slice(0, 16) + "...");
+      log.debug(TAG, "ignoring canvas invite from non-friend:", fromNodeId.slice(0, 16) + "...");
       return;
     }
     this.onCanvasInvite?.(msg, fromNodeId);
@@ -703,9 +708,13 @@ export class FriendzProtocol {
    * opens a new stream if we don't have one, sends the request message.
    */
   async sendFriendRequest(peerNodeId: string): Promise<void> {
-    console.log(
+    log.debug(
       TAG,
-      "sendFriendRequest -> " + peerNodeId.slice(0, 16) + "... (fromUsername=" + this.localUsername + ")"
+      "sendFriendRequest -> " +
+        peerNodeId.slice(0, 16) +
+        "... (fromUsername=" +
+        this.localUsername +
+        ")"
     );
     const msg: FriendRequestMessage = {
       type: "friend-request",
@@ -713,7 +722,7 @@ export class FriendzProtocol {
       fromUsername: this.localUsername,
     };
     await this.sendMessage(peerNodeId, msg);
-    console.log(TAG, "sendFriendRequest delivered to " + peerNodeId.slice(0, 16) + "...");
+    log.debug(TAG, "sendFriendRequest delivered to " + peerNodeId.slice(0, 16) + "...");
   }
 
   /**
@@ -743,7 +752,7 @@ export class FriendzProtocol {
    * request a peer's profile.
    */
   async requestProfile(peerNodeId: string): Promise<void> {
-    console.log(TAG, "requestProfile -> " + peerNodeId.slice(0, 16) + "...");
+    log.debug(TAG, "requestProfile -> " + peerNodeId.slice(0, 16) + "...");
     const msg: ProfileRequestMessage = { type: "profile-request" };
     await this.sendMessage(peerNodeId, msg);
   }
@@ -857,7 +866,7 @@ export class FriendzProtocol {
     const msg = buildHeartbeatMsg();
     for (const peerId of allFriends) {
       this.sendMessage(peerId, msg).catch((err) => {
-        console.warn(TAG, "initial announce failed for:", peerId.slice(0, 16) + "...", err);
+        log.warn(TAG, "initial announce failed for:", peerId.slice(0, 16) + "...", err);
       });
     }
     this.onAfterHeartbeatTick?.(allFriends);
@@ -868,7 +877,7 @@ export class FriendzProtocol {
       const onlinePeers = this.getOnlinePeers();
       for (const peerId of onlinePeers) {
         this.sendMessage(peerId, hbMsg).catch((err) => {
-          console.warn(TAG, "heartbeat failed for:", peerId.slice(0, 16) + "...", err);
+          log.warn(TAG, "heartbeat failed for:", peerId.slice(0, 16) + "...", err);
         });
       }
 
@@ -876,7 +885,7 @@ export class FriendzProtocol {
       const now = Date.now();
       for (const [nodeId, lastSeenAt] of this.lastSeen) {
         if (now - lastSeenAt >= HEARTBEAT_TIMEOUT_MS) {
-          console.log(TAG, "peer offline (timeout):", nodeId.slice(0, 16) + "...");
+          log.debug(TAG, "peer offline (timeout):", nodeId.slice(0, 16) + "...");
           this.lastSeen.delete(nodeId);
           this.emitOnlineChange();
         }
@@ -1025,25 +1034,31 @@ export class FriendzProtocol {
       }
     }
 
-    console.log(
+    log.debug(
       TAG,
-      "sendMessage type=" + msg.type + " -> " + peerNodeId.slice(0, 16) + "... (" + (reused ? "reused" : "new") + " stream)"
+      "sendMessage type=" +
+        msg.type +
+        " -> " +
+        peerNodeId.slice(0, 16) +
+        "... (" +
+        (reused ? "reused" : "new") +
+        " stream)"
     );
     await stream.write_message(encodeMessage(msg));
   }
 
   private async openStream(peerNodeId: string): Promise<BiStreamLike> {
-    console.log(TAG, "openStream -> " + peerNodeId.slice(0, 16) + "... on " + FRIENDZ_ALPN);
+    log.debug(TAG, "openStream -> " + peerNodeId.slice(0, 16) + "... on " + FRIENDZ_ALPN);
     try {
       const midden = await this.getMidden();
       const stream = await midden.open_bi(peerNodeId, FRIENDZ_ALPN);
       this.streams.set(peerNodeId, stream);
       // start reading responses on this stream
       this.readLoop(peerNodeId, stream);
-      console.log(TAG, "openStream connected to " + peerNodeId.slice(0, 16) + "...");
+      log.debug(TAG, "openStream connected to " + peerNodeId.slice(0, 16) + "...");
       return stream;
     } catch (err) {
-      console.error(TAG, "failed to open stream to:", peerNodeId.slice(0, 16) + "...", err);
+      log.error(TAG, "failed to open stream to:", peerNodeId.slice(0, 16) + "...", err);
       throw err;
     }
   }

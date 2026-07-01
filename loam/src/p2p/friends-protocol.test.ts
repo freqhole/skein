@@ -19,7 +19,6 @@ import {
   type FriendzMessage,
   type FriendzProtocolOptions,
   type GossipDigestMessage,
-  type HeartbeatMessage,
   type ProfileResponseMessage,
 } from "./friends-protocol";
 import type { BiStreamLike, MiddenStreamNode } from "./iroh-network-adapter";
@@ -71,7 +70,7 @@ function createMockBiStream(peerId: string, alpn: string = FRIENDZ_ALPN) {
   return stream;
 }
 
-type MockBiStream = ReturnType<typeof createMockBiStream>;
+type _MockBiStream = ReturnType<typeof createMockBiStream>;
 
 function createMockMidden(nodeId: string = "a".repeat(64)) {
   const midden = {
@@ -995,7 +994,7 @@ describe("FriendzProtocol", () => {
       await flush();
 
       // now send — should reuse the existing stream, not open a new one
-      const msg: FriendzMessage = {
+      const _msg: FriendzMessage = {
         type: "friend-request",
         fromNodeId: "a".repeat(64),
         fromUsername: "alice",

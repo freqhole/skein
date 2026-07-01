@@ -2,6 +2,9 @@ import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { moveCardToTrash } from "../../widgets/narthex/trash-widget";
 import type { CanvasDocument } from "../canvas/canvas-doc";
 import { CanvasStore } from "../canvas/canvas-store";
+import { log } from "../utils/log";
+
+const TAG = "canvas.watchers";
 
 /**
  * iterates all canvas-card widgets in the narthex, opens each linked canvas
@@ -35,8 +38,9 @@ export async function syncCanvasMetadataToCards(
       // narthexStore.removeWidget triggers reconciliation → unmountWidget(permanent=true)
       // → beforeRemoveHook which deletes the canvas doc + all widget state docs.
       if (meta.deleted && meta.deleteMode === "purge") {
-        console.log(
-          "[skein] purge detected for canvas:",
+        log.debug(
+          TAG,
+          "purge detected for canvas:",
           (cardDoc.canvasDocId as string).slice(0, 16) + "...",
           "— auto-removing card"
         );
@@ -147,7 +151,7 @@ export async function syncCanvasMetadataToCards(
       });
 
       if (changed) {
-        console.log("[skein] synced metadata to canvas-card:", entry.id);
+        log.debug(TAG, "synced metadata to canvas-card:", entry.id);
       }
 
       // auto-collect soft-deleted cards into the trash widget.
@@ -158,7 +162,7 @@ export async function syncCanvasMetadataToCards(
       }
     } catch (err) {
       // if a canvas doc isn't reachable, skip silently
-      console.warn("[skein] failed to sync metadata for card:", entry.id, err);
+      log.warn(TAG, "failed to sync metadata for card:", entry.id, err);
     }
   }
 }
@@ -213,8 +217,9 @@ export async function watchCanvasDocsForUpdates(
           // purge: auto-remove the card immediately — the beforeRemoveHook
           // cascade will clean up the canvas doc + all widget state docs
           if (canvasDoc.deleteMode === "purge") {
-            console.log(
-              "[skein] purge detected via sync:",
+            log.debug(
+              TAG,
+              "purge detected via sync:",
               canvasDocId.slice(0, 16) + "...",
               "— auto-removing card"
             );
@@ -235,7 +240,7 @@ export async function watchCanvasDocsForUpdates(
           // auto-collect into the trash widget if not already there
           if (!entry.parentId) {
             moveCardToTrash(repo, narthexStore, entry.id).catch((err) => {
-              console.warn("[skein] failed to auto-collect card into trash:", err);
+              log.warn(TAG, "failed to auto-collect card into trash:", err);
             });
           }
 

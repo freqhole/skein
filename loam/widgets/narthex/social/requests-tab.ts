@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
+import { log } from "../../../src/utils/log";
 import {
   acceptFriendRequest,
   rejectFriendRequest,
@@ -239,7 +240,7 @@ export function createRequestsTab(ctx: TabContext): TabController {
       acceptBtn.on("pointertap", (e) => {
         e.stopPropagation();
         acceptFriendRequest(request.fromNodeId).catch((err) => {
-          console.warn("[social/requests] failed to accept friend request:", err);
+          log.warn("social.requests", "failed to accept friend request:", err);
         });
         ctx.doc.change((draft) => {
           const req = draft.pendingRequests.find(
@@ -309,7 +310,7 @@ export function createRequestsTab(ctx: TabContext): TabController {
       rejectBtn.on("pointertap", (e) => {
         e.stopPropagation();
         rejectFriendRequest(request.fromNodeId).catch((err) => {
-          console.warn("[social/requests] failed to reject friend request:", err);
+          log.warn("social.requests", "failed to reject friend request:", err);
         });
         ctx.doc.change((draft) => {
           const req = draft.pendingRequests.find(
@@ -506,8 +507,9 @@ export function createRequestsTab(ctx: TabContext): TabController {
     const outboundCount = (state.outboundRequests ?? []).filter(
       (r: any) => r.status === "pending"
     ).length;
-    console.log(
-      "[requests-tab] doc change \u2014 pending=" + pendingCount + " outbound=" + outboundCount
+    log.debug(
+      "social.requests",
+      "doc change — pending=" + pendingCount + " outbound=" + outboundCount
     );
     rebuild();
   });

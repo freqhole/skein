@@ -13,9 +13,17 @@
  *   const msg = await stream.read_message();
  */
 
+import { invoke } from "@tauri-apps/api/core";
 import type { BiStreamLike, MiddenStreamNode } from "./iroh-network-adapter";
+import { log } from "../utils/log";
 
-const TAG = "[tauri-transport]";
+declare global {
+  interface Window {
+    __TAURI_INTERNALS__?: { invoke: (...args: unknown[]) => Promise<unknown> };
+  }
+}
+
+const TAG = "tauri-transport";
 
 // ---------------------------------------------------------------------------
 // tauri bridge helpers
@@ -23,21 +31,16 @@ const TAG = "[tauri-transport]";
 
 /** detect if we're running inside a Tauri webview */
 export function isTauriMode(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    // @ts-expect-error __TAURI_INTERNALS__ is injected by tauri runtime
-    typeof window.__TAURI_INTERNALS__?.invoke === "function"
-  );
+  return typeof window !== "undefined" && typeof window.__TAURI_INTERNALS__?.invoke === "function";
 }
 
 /**
  * invoke the skein_dispatch command on the Rust side.
- * lazily imports @tauri-apps/api/core so the module can be parsed
- * even when Tauri is not present (the stub will throw at runtime).
  */
-export async function dispatch(action: string, payload: Record<string, unknown> = {}): Promise<any> {
-  // dynamic import so the module graph doesn't fail in non-Tauri builds
-  const { invoke } = await import("@tauri-apps/api/core");
+export async function dispatch(
+  action: string,
+  payload: Record<string, unknown> = {}
+): Promise<any> {
   return invoke("skein_dispatch", { action, payload });
 }
 
@@ -112,7 +115,7 @@ export class TauriBiStream implements BiStreamLike {
     this.closed = true;
     // fire-and-forget — don't block the caller
     dispatch("close_stream", { handle: this.handle }).catch((err) => {
-      console.warn(TAG, "close_stream error (handle", this.handle, "):", err);
+      log.warn(TAG, "close_stream error (handle", this.handle, "):", err);
     });
   }
 
@@ -166,7 +169,7 @@ export class TauriStreamNode implements MiddenStreamNode {
   /** create a TauriStreamNode using the running iroh endpoint's identity */
   static async create(): Promise<TauriStreamNode> {
     const result = await dispatch("get_node_id");
-    console.log(TAG, "node ID:", result.node_id.slice(0, 16) + "...");
+    log.debug(TAG, "node ID:", result.node_id.slice(0, 16) + "...");
     return new TauriStreamNode(result.node_id);
   }
 
@@ -176,7 +179,7 @@ export class TauriStreamNode implements MiddenStreamNode {
 
   async open_bi(peer_addr: string, alpn: string): Promise<TauriBiStream> {
     const result = await dispatch("open_bi", { peer_addr, alpn });
-    console.log(
+    log.debug(
       TAG,
       "opened stream to",
       result.peer_node_id.slice(0, 16) + "...",
@@ -191,14 +194,14 @@ export class TauriStreamNode implements MiddenStreamNode {
 
   async accept(): Promise<BiStreamLike | null> {
     try {
-      console.log(TAG, "accept(): polling backend for next inbound stream");
+      log.debug(TAG, "accept(): polling backend for next inbound stream");
       const result = await dispatch("accept_stream");
       if (result.handle === null || result.handle === undefined) {
         // channel closed or not configured — no more incoming streams
-        console.log(TAG, "accept(): backend signalled channel closed");
+        log.debug(TAG, "accept(): backend signalled channel closed");
         return null;
       }
-      console.log(
+      log.debug(
         TAG,
         "accepted incoming stream from",
         (result.peer_node_id as string).slice(0, 16) + "...",
@@ -210,7 +213,7 @@ export class TauriStreamNode implements MiddenStreamNode {
       );
       return new TauriBiStream(result.handle, result.peer_node_id, result.alpn);
     } catch (err) {
-      console.error(TAG, "accept_stream failed:", err);
+      log.error(TAG, "accept_stream failed:", err);
       return null;
     }
   }

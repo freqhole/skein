@@ -54,11 +54,13 @@ import {
   CANVAS_INFO_OVERLAY_H,
 } from "../canvas/widget-overlay";
 import type { WidgetDoc, WidgetMountContext } from "../widgets/widget-types";
+import { log } from "../utils/log";
 
 // indexeddb key for the well-known narthex document id
 const NARTHEX_DOC_KEY = "skein-narthex-doc-id";
 const MESSAGEZ_DOC_KEY = "skein-messagez-doc-id";
 const SOCIAL_DOC_KEY = "skein-social-doc-id"; // browser mode only
+const TAG = "skein.boot";
 
 // ---------------------------------------------------------------------------
 // router — manages navigation between the narthex and individual canvases
@@ -127,9 +129,9 @@ class SkeinRouter {
       const narthexStore = createNarthexWithSeed(this.repo);
       this.narthexDocId = narthexStore.handle.documentId;
       await setMetaValue(NARTHEX_DOC_KEY, this.narthexDocId);
-      console.log("[skein] first boot — created narthex doc:", this.narthexDocId);
+      log.debug(TAG, "first boot — created narthex doc:", this.narthexDocId);
     } else {
-      console.log("[skein] found existing narthex doc:", this.narthexDocId);
+      log.debug(TAG, "found existing narthex doc:", this.narthexDocId);
       await ensureSingletonWidgets(this.repo, this.narthexDocId as DocumentId);
     }
 
@@ -154,7 +156,7 @@ class SkeinRouter {
       try {
         this.socialDoc = await SqliteSocialDoc.create();
       } catch (err) {
-        console.warn("[skein] failed to create SqliteSocialDoc:", err);
+        log.warn(TAG, "failed to create SqliteSocialDoc:", err);
       }
     }
 
@@ -209,7 +211,7 @@ class SkeinRouter {
     // safe to call before navigateToNarthex because initFriendzProtocol now opens
     // the narthex store itself when this.currentCanvas is null.
     this.initFriendzProtocol().catch((err) => {
-      console.warn("[skein] failed to initialize friendz protocol:", err);
+      log.warn(TAG, "failed to initialize friendz protocol:", err);
     });
 
     // retry protocol init when the user generates an identity for the first time.
@@ -217,9 +219,9 @@ class SkeinRouter {
     // an identity while viewing a non-narthex canvas.
     const unsubIdentity = onIdentityChange((identity) => {
       if (identity && !this.friendzProtocol) {
-        console.log("[skein] identity created — retrying protocol init");
+        log.debug(TAG, "identity created — retrying protocol init");
         this.initFriendzProtocol().catch((err) => {
-          console.warn("[skein] deferred protocol init failed:", err);
+          log.warn(TAG, "deferred protocol init failed:", err);
         });
       }
     });
@@ -246,14 +248,14 @@ class SkeinRouter {
     // listen for the join-canvas event dispatched from the join-canvas wizard
     window.addEventListener("skein:join-canvas", ((e: CustomEvent) => {
       this.joinCanvasFromNarthex(e.detail).catch((err) => {
-        console.error("[skein] join failed:", err);
+        log.error(TAG, "join failed:", err);
       });
     }) as EventListener);
 
     // listen for accept-canvas-invite event dispatched from the inbox widget
     window.addEventListener("skein:accept-canvas-invite", ((e: CustomEvent) => {
       this.acceptCanvasInvite(e.detail).catch((err) => {
-        console.warn("[skein] failed to accept canvas invite:", err);
+        log.warn(TAG, "failed to accept canvas invite:", err);
       });
     }) as EventListener);
 
@@ -261,7 +263,7 @@ class SkeinRouter {
     window.addEventListener("skein:remove-widget", ((e: CustomEvent) => {
       const widgetId = e.detail?.widgetId;
       if (widgetId && this.currentCanvas) {
-        console.log("[skein] removing widget:", widgetId);
+        log.debug(TAG, "removing widget:", widgetId);
         this.currentCanvas.store.removeWidget(widgetId);
       }
     }) as EventListener);
@@ -281,7 +283,7 @@ class SkeinRouter {
     });
 
     // initial navigation based on current hash
-    console.log("[skein] router booted, initial hash:", JSON.stringify(window.location.hash));
+    log.debug(TAG, "router booted, initial hash:", JSON.stringify(window.location.hash));
     await this.onHashChange();
   }
 
@@ -296,15 +298,16 @@ class SkeinRouter {
       // share URL — decode and join
       const decoded = decodeShareString(hash);
       if (decoded) {
-        console.log(
-          "[skein] share URL detected, joining canvas from:",
+        log.debug(
+          TAG,
+          "share URL detected, joining canvas from:",
           decoded.nodeId.slice(0, 16) + "..."
         );
         // navigate to narthex first, then trigger join
         await this.navigateToNarthex();
         await this.joinCanvasFromNarthex({ shareString: hash });
       } else {
-        console.warn("[skein] invalid share URL:", hash.slice(0, 32) + "...");
+        log.warn(TAG, "invalid share URL:", hash.slice(0, 32) + "...");
         await this.navigateToNarthex();
       }
     } else {
@@ -394,7 +397,7 @@ class SkeinRouter {
         history.replaceState(null, "", window.location.pathname);
       }
 
-      console.log("[skein] navigating to narthex, doc:", this.narthexDocId);
+      log.debug(TAG, "navigating to narthex, doc:", this.narthexDocId);
 
       const canvas = await initCanvas({
         mountElement: this.mountElement,
@@ -460,22 +463,24 @@ class SkeinRouter {
 
           // delete the canvas document itself
           repo.delete(canvasDocId as DocumentId);
-          console.log(
-            "[skein] cleaned up canvas and widget docs for:",
+          log.debug(
+            TAG,
+            "cleaned up canvas and widget docs for:",
             canvasDocId.slice(0, 16) + "..."
           );
         } catch (err) {
-          console.warn("[skein] failed to clean up linked canvas docs:", err);
+          log.warn(TAG, "failed to clean up linked canvas docs:", err);
         }
       });
 
       // narthex share helper isn't applicable but clear any stale one
       (window as any).__skein.share = () => {
-        console.log("[skein] share is only available when viewing a canvas (not the narthex)");
+        log.debug(TAG, "share is only available when viewing a canvas (not the narthex)");
       };
 
-      console.log(
-        "[skein] narthex ready — widgets:",
+      log.debug(
+        TAG,
+        "narthex ready — widgets:",
         canvas.store.widgetCount(),
         "| registry:",
         canvas.registry.types().join(", ")
@@ -489,13 +494,13 @@ class SkeinRouter {
         try {
           await syncCanvasMetadataToCards(this.repo, canvas.store, this.localNodeId);
         } catch (err) {
-          console.warn("[skein] metadata sync failed:", err);
+          log.warn(TAG, "metadata sync failed:", err);
         }
         try {
           const unsubs = await watchCanvasDocsForUpdates(this.repo, canvas.store, this.localNodeId);
           this.canvasWatcherUnsubs.push(...unsubs);
         } catch (err) {
-          console.warn("[skein] canvas watcher setup failed:", err);
+          log.warn(TAG, "canvas watcher setup failed:", err);
         }
       })();
     } finally {
@@ -519,7 +524,7 @@ class SkeinRouter {
       try {
         store = await CanvasStore.open(this.repo, this.narthexDocId as DocumentId);
       } catch (err) {
-        console.warn("[skein] failed to open narthex store for friendz protocol:", err);
+        log.warn(TAG, "failed to open narthex store for friendz protocol:", err);
         return;
       }
     }
@@ -565,7 +570,7 @@ class SkeinRouter {
         history.replaceState(null, "", `#${docId}`);
       }
 
-      console.log("[skein] navigating to canvas:", docId);
+      log.debug(TAG, "navigating to canvas:", docId);
 
       const canvas = await initCanvas({
         mountElement: this.mountElement,
@@ -574,14 +579,14 @@ class SkeinRouter {
         repo: this.repo,
         connectionStateSource: this.connectionStateSource,
         onNavigateHome: () => {
-          console.log("[skein] home button clicked, navigating to narthex");
+          log.debug(TAG, "home button clicked, navigating to narthex");
           window.location.hash = "";
         },
         onShare: async () => {
           if (!this.currentCanvas) return;
           const identity = await getStoredIdentity();
           if (!identity) {
-            console.log("[skein] no identity — generate one first (profile widget)");
+            log.debug(TAG, "no identity — generate one first (profile widget)");
             return;
           }
           const shareStr = encodeShareString(identity.node_id, docId);
@@ -593,8 +598,9 @@ class SkeinRouter {
             .filter((p) => {
               // guard: automerge may return non-string nodeId from Rust-written entries
               if (typeof p.nodeId !== "string") {
-                console.warn(
-                  "[skein] share dialog: peer entry has non-string nodeId:",
+                log.warn(
+                  TAG,
+                  "share dialog: peer entry has non-string nodeId:",
                   typeof p.nodeId,
                   JSON.stringify(p)
                 );
@@ -704,14 +710,14 @@ class SkeinRouter {
               this.currentCanvas?.store.removePeer(nodeId);
               // tell the adapter to stop reconnecting to this peer
               this.irohAdapter.forgetPeer(nodeId);
-              console.log("[skein] revoked access for peer:", nodeId.slice(0, 16) + "...");
+              log.debug(TAG, "revoked access for peer:", nodeId.slice(0, 16) + "...");
             },
             onAddFriend: async (nodeId: string) => {
               try {
                 await sendFriendRequest(nodeId);
-                console.log("[skein] friend request sent to:", nodeId.slice(0, 16) + "...");
+                log.debug(TAG, "friend request sent to:", nodeId.slice(0, 16) + "...");
               } catch (err) {
-                console.warn("[skein] failed to send friend request:", err);
+                log.warn(TAG, "failed to send friend request:", err);
               }
             },
             friends: friendsForInvite,
@@ -806,22 +812,20 @@ class SkeinRouter {
                   acked: [],
                 });
               } catch (err) {
-                console.warn(
-                  "[skein] direct invite send failed (gossip relay will retry):",
+                log.warn(
+                  TAG,
+                  "direct invite send failed (gossip relay will retry):",
                   (err as Error)?.message ?? err
                 );
               }
 
-              console.log("[skein] canvas invite sent to:", friend.nodeId.slice(0, 16) + "...");
+              log.debug(TAG, "canvas invite sent to:", friend.nodeId.slice(0, 16) + "...");
             },
             pendingInvites: pendingInvitesList,
             declinedInvites,
             onCancelInvite: (targetNodeId: string) => {
               this.currentCanvas?.store.removePendingInvite(targetNodeId);
-              console.log(
-                "[skein] cancelled pending invite for:",
-                targetNodeId.slice(0, 16) + "..."
-              );
+              log.debug(TAG, "cancelled pending invite for:", targetNodeId.slice(0, 16) + "...");
             },
           });
         },
@@ -942,24 +946,26 @@ class SkeinRouter {
       (window as any).__skein.share = async () => {
         const identity = await getStoredIdentity();
         if (!identity) {
-          console.log("[skein] no identity — generate one first (profile widget)");
+          log.debug(TAG, "no identity — generate one first (profile widget)");
           return;
         }
         const shareStr = encodeShareString(identity.node_id, docId);
         try {
           await navigator.clipboard.writeText(shareStr);
-          console.log("[skein] share string copied to clipboard:", shareStr);
+          log.debug(TAG, "share string copied to clipboard:", shareStr);
         } catch {
-          console.log("[skein] share string (copy manually):", shareStr);
+          log.debug(TAG, "share string (copy manually):", shareStr);
         }
-        console.log(
-          "[skein] share URL:",
+        log.debug(
+          TAG,
+          "share URL:",
           window.location.origin + window.location.pathname + "#share/" + shareStr
         );
       };
 
-      console.log(
-        "[skein] canvas ready — doc:",
+      log.debug(
+        TAG,
+        "canvas ready — doc:",
         docId,
         "| widgets:",
         canvas.store.widgetCount(),
@@ -971,7 +977,7 @@ class SkeinRouter {
       // connections can be re-established after page reload.
       // then reconnect to all known peers in the doc.
       this.registerAndReconnectPeers(canvas).catch((err) => {
-        console.warn("[skein] peer registration/reconnection failed:", err);
+        log.warn(TAG, "peer registration/reconnection failed:", err);
       });
     } finally {
       this.navigating = false;
@@ -996,8 +1002,9 @@ class SkeinRouter {
     canvasPreviewUrl: string;
     fromUsername: string;
   }): Promise<void> {
-    console.log(
-      "[skein] accepting canvas invite:",
+    log.debug(
+      TAG,
+      "accepting canvas invite:",
       detail.canvasDocId,
       "from peer:",
       detail.fromNodeId.slice(0, 16) + "..."
@@ -1010,7 +1017,7 @@ class SkeinRouter {
     try {
       await this.irohAdapter.addPeer(detail.fromNodeId);
     } catch (err) {
-      console.error("[skein] failed to connect to invite peer:", err);
+      log.error(TAG, "failed to connect to invite peer:", err);
       // continue anyway — the peer might become reachable later
     }
 
@@ -1059,8 +1066,9 @@ class SkeinRouter {
       }
     }
 
-    console.log(
-      "[skein] canvas invite accepted — canvas card created on narthex, user can navigate when ready"
+    log.debug(
+      TAG,
+      "canvas invite accepted — canvas card created on narthex, user can navigate when ready"
     );
 
     // notify messagez widget that the accept flow completed successfully
@@ -1077,12 +1085,13 @@ class SkeinRouter {
   }): Promise<void> {
     const decoded = decodeShareString(detail.shareString);
     if (!decoded) {
-      console.warn("[skein] invalid share string");
+      log.warn(TAG, "invalid share string");
       return;
     }
 
-    console.log(
-      "[skein] joining canvas:",
+    log.debug(
+      TAG,
+      "joining canvas:",
       decoded.docId,
       "from peer:",
       decoded.nodeId.slice(0, 16) + "..."
@@ -1095,7 +1104,7 @@ class SkeinRouter {
     try {
       await this.irohAdapter.addPeer(decoded.nodeId);
     } catch (err) {
-      console.error("[skein] failed to connect to peer:", err);
+      log.error(TAG, "failed to connect to peer:", err);
       // continue anyway — the peer might become reachable later
     }
 
@@ -1195,11 +1204,11 @@ class SkeinRouter {
 
     if (peerNodeIds.length === 0) return;
 
-    console.log("[skein] reconnecting to", peerNodeIds.length, "known peer(s)");
+    log.debug(TAG, "reconnecting to", peerNodeIds.length, "known peer(s)");
 
     for (const nodeId of peerNodeIds) {
       this.irohAdapter.addPeer(nodeId).catch((err) => {
-        console.warn("[skein] failed to reconnect to peer:", nodeId.slice(0, 16) + "...", err);
+        log.warn(TAG, "failed to reconnect to peer:", nodeId.slice(0, 16) + "...", err);
       });
     }
 
@@ -1207,8 +1216,9 @@ class SkeinRouter {
     const pendingInvites = canvas.store.pendingInvites();
     if (pendingInvites[identity.node_id]) {
       canvas.store.removePendingInvite(identity.node_id);
-      console.log(
-        "[skein] cleaned up pending invite for self on canvas:",
+      log.debug(
+        TAG,
+        "cleaned up pending invite for self on canvas:",
         canvas.store.handle.documentId
       );
     }
@@ -1240,8 +1250,9 @@ class SkeinRouter {
 
     const title = detail?.title || "untitled canvas";
     const now = new Date().toISOString();
-    console.log(
-      "[skein] creating new canvas:",
+    log.debug(
+      TAG,
+      "creating new canvas:",
       JSON.stringify(title),
       "author:",
       JSON.stringify(authorName),
@@ -1334,7 +1345,7 @@ class SkeinRouter {
       const ctrl = socialWidget.create(ctx);
       return new WidgetOverlay(canvas.app, ctrl, SOCIAL_OVERLAY_W, SOCIAL_OVERLAY_H, canvas.theme);
     } catch (err) {
-      console.warn("[skein] failed to mount social overlay:", err);
+      log.warn(TAG, "failed to mount social overlay:", err);
       return null;
     }
   }
@@ -1390,7 +1401,7 @@ class SkeinRouter {
         canvas.theme
       );
     } catch (err) {
-      console.warn("[skein] failed to mount messages overlay:", err);
+      log.warn(TAG, "failed to mount messages overlay:", err);
       return null;
     }
   }
@@ -1441,7 +1452,7 @@ class SkeinRouter {
         canvas.theme
       );
     } catch (err) {
-      console.warn("[skein] failed to mount canvas-info overlay:", err);
+      log.warn(TAG, "failed to mount canvas-info overlay:", err);
       return null;
     }
   }
@@ -1526,7 +1537,7 @@ async function boot(): Promise<void> {
 }
 
 boot().catch((err) => {
-  console.error("skein boot failed:", err);
+  log.error(TAG, "skein boot failed:", err);
   const root = document.getElementById("canvas-root");
   if (root) {
     root.className = "boot-error";

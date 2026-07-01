@@ -1,6 +1,10 @@
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics, Text } from "pixi.js";
-import { z } from "zod";
+
+import { log } from "../../src/utils/log";
+import { pickFiles, uploadFile } from "../../src/widgets/file-utils";
+import { fileSchema } from "../file";
+import { snatchAllInBin } from "./bin-actions";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import type {
   CompactInfo,
@@ -25,38 +29,8 @@ import {
 import { BinMediaController } from "./bin-media";
 import { BinRenderer, type CardInteractionCallbacks } from "./bin-renderer";
 
-// -----------------------------------------------------------------------
-// schema
-// -----------------------------------------------------------------------
-
-const slotSchema = z.object({
-  col: z.number(),
-  row: z.number(),
-});
-
-const binItemSchema = z.object({
-  widgetId: z.string(),
-  slot: slotSchema,
-});
-
-export const binSchema = z.object({
-  /** layout mode */
-  mode: z.enum(["grid", "shelf", "crate", "drawer"]).default("grid"),
-  /** display title for the bin header */
-  title: z.string().default(""),
-  /** number of columns */
-  cols: z.number().default(3),
-  /** number of rows — auto-computed from items.length / cols */
-  rows: z.number().default(1),
-  /** ordered list of child widgets and their slot positions */
-  items: z.array(binItemSchema).default([]),
-  /** shelf text direction — top = text reads top-to-bottom, bottom = bottom-to-top */
-  shelfTextOrigin: z.enum(["top", "bottom"]).default("top"),
-  /** slot size preset — controls density of the grid */
-  slotScale: z.enum(["s", "m", "l", "xl"]).default("m"),
-});
-
-export type BinState = z.infer<typeof binSchema>;
+import { binSchema, type BinState } from "./bin-schema";
+export { binSchema, type BinState };
 
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2;
@@ -295,9 +269,6 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
     async function handleAddFiles() {
       if (!store || !repo) return;
 
-      // dynamically import file-utils to avoid circular deps at module level
-      const { pickFiles, uploadFile } = await import("../../src/widgets/file-utils");
-
       const picked = await pickFiles();
       if (!picked || picked.length === 0) return;
 
@@ -305,10 +276,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       const scale = resolveScale(state.slotScale as SlotScale);
       const contentWidth = currentWidth - BIN_PADDING * 2;
       const cols = autoFitCols(state.mode as BinMode, contentWidth, { scale });
-      let currentItems = [...state.items];
-
-      // pre-load file schema once for all children
-      const { fileSchema } = await import("../file");
+      const currentItems = [...state.items];
 
       for (const file of picked) {
         // find the next empty slot
@@ -374,7 +342,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
             draft.rows = computeRows(draft.items.length, cols);
           });
         } catch (err) {
-          console.warn(`bin: upload failed for ${file.filename}:`, err);
+          log.warn("bin", `upload failed for ${file.filename}:`, err);
           // clean up the child widget entry — upload failed, no point keeping it
           store.removeWidget(childId);
         }
@@ -395,7 +363,6 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       ctx.setHeaderActions?.(buildHeaderActions());
 
       try {
-        const { snatchAllInBin } = await import("./bin-actions");
         const peers = store.peers();
 
         await snatchAllInBin(ctx.widgetId, store, repo, peers, {
@@ -411,7 +378,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
           },
         });
       } catch (err) {
-        console.warn("bin: snatch all failed:", err);
+        log.warn("bin", "snatch all failed:", err);
       } finally {
         snatchInProgress = false;
         snatchAbortController = null;

@@ -10,6 +10,7 @@
 // worker at all (rust handles hashing).
 
 import * as Comlink from "comlink";
+import * as middenWasm from "midden";
 
 const OPFS_DIR = "skein-blobs";
 
@@ -22,13 +23,7 @@ const OPFS_DIR = "skein-blobs";
  */
 async function hashBlake3(data: Uint8Array): Promise<string> {
   try {
-    const midden = (await import("midden")) as unknown as {
-      hash_blake3?: (bytes: Uint8Array) => string;
-    };
-    if (typeof midden.hash_blake3 === "function") {
-      return midden.hash_blake3(data);
-    }
-    return "";
+    return typeof middenWasm.hash_blake3 === "function" ? middenWasm.hash_blake3(data) : "";
   } catch {
     return "";
   }
@@ -181,10 +176,7 @@ async function processBlobBytes(
   // run sha256 and blake3 concurrently. SubtleCrypto.digest does its own
   // copy of the bytes, so we can't transfer-and-reuse — do them in parallel
   // and let the runtime overlap them.
-  const [sha256, blake3] = await Promise.all([
-    hashSha256(data),
-    hashBlake3(new Uint8Array(data)),
-  ]);
+  const [sha256, blake3] = await Promise.all([hashSha256(data), hashBlake3(new Uint8Array(data))]);
   await writeBlobToOpfs(sha256, data);
   return {
     blob_id: sha256,
@@ -284,10 +276,7 @@ async function resizeImageToWebpDataUrl(
  * signature: skips non-image blobs, fits inside `maxSize` x `maxSize`,
  * encodes WebP at 0.75 quality.
  */
-async function generateThumbnailDataUrl(
-  blob: Blob,
-  maxSize = 200
-): Promise<string | null> {
+async function generateThumbnailDataUrl(blob: Blob, maxSize = 200): Promise<string | null> {
   if (!blob.type.startsWith("image/")) return null;
   return resizeImageToWebpDataUrl(blob, {
     maxWidth: maxSize,

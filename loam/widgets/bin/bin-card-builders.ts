@@ -2,6 +2,13 @@
 // extracted from BinRenderer to keep modules under ~300 lines.
 
 import { Container, Graphics, Sprite, Text } from "pixi.js";
+import { log } from "../../src/utils/log";
+import {
+  checkBlobLocality,
+  revealBlobInFinder,
+  saveBlobToDisk,
+  snatchBlob,
+} from "../../src/widgets/file-utils";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import { drawRevealIcon, drawSaveIcon } from "../../src/widgets/icons";
 import {
@@ -168,36 +175,34 @@ function buildActionButtons(
     const blobId = String(info.blobId ?? "");
     const filename = String(info.filename ?? "file");
 
-    import("../../src/widgets/file-utils").then(
-      async ({ checkBlobLocality, snatchBlob, saveBlobToDisk, revealBlobInFinder }) => {
-        try {
-          // ensure the blob is local before saving/revealing
-          const localityInfo = await checkBlobLocality(blobId, info.blake3 ?? undefined);
-          if (localityInfo.locality !== "local") {
-            const peers = getPeers?.() ?? {};
-            await snatchBlob(
-              {
-                blobId,
-                filename,
-                mime: String(info.mime ?? ""),
-                size: info.size ?? 0,
-                blake3: String(info.blake3 ?? ""),
-                domain: String(info.domain ?? ""),
-              },
-              peers as any
-            );
-          }
-
-          if (isTauri) {
-            await revealBlobInFinder(blobId);
-          } else {
-            await saveBlobToDisk(blobId, filename);
-          }
-        } catch (err) {
-          console.warn("[bin-actions] save/reveal failed:", err);
+    void (async () => {
+      try {
+        // ensure the blob is local before saving/revealing
+        const localityInfo = await checkBlobLocality(blobId, info.blake3 ?? undefined);
+        if (localityInfo.locality !== "local") {
+          const peers = getPeers?.() ?? {};
+          await snatchBlob(
+            {
+              blobId,
+              filename,
+              mime: String(info.mime ?? ""),
+              size: info.size ?? 0,
+              blake3: String(info.blake3 ?? ""),
+              domain: String(info.domain ?? ""),
+            },
+            peers as any
+          );
         }
+
+        if (isTauri) {
+          await revealBlobInFinder(blobId);
+        } else {
+          await saveBlobToDisk(blobId, filename);
+        }
+      } catch (err) {
+        log.warn("bin", "save/reveal failed:", err);
       }
-    );
+    })();
   });
   btn.x = 0;
   row.addChild(btn);
@@ -310,7 +315,7 @@ function buildGridCard(state: CardRenderState, ctx: CardBuildContext): RenderedC
   card.addChild(bg);
 
   // thumbnail or fallback
-  let thumbSprite: Sprite | null = null;
+  const thumbSprite: Sprite | null = null;
   let textureKey: string | null = null;
 
   if (info.thumbnailUrl && info.thumbnailUrl.length > 0) {
@@ -465,7 +470,7 @@ function buildShelfCard(state: CardRenderState, ctx: CardBuildContext): Rendered
   card.addChild(bg);
 
   // endcap thumbnail at top of spine
-  let thumbSprite: Sprite | null = null;
+  const thumbSprite: Sprite | null = null;
   let textureKey: string | null = null;
   const endcapH = spineW; // square, proportional to spine width
 
@@ -609,7 +614,7 @@ function buildCrateCard(state: CardRenderState, ctx: CardBuildContext): Rendered
 
   // endcap thumbnail — flush left, square matching row height
   const endcapW = slotH; // square, proportional to row height
-  let thumbSprite: Sprite | null = null;
+  const thumbSprite: Sprite | null = null;
   let textureKey: string | null = null;
 
   // endcap placeholder
@@ -763,7 +768,7 @@ function buildDrawerCard(state: CardRenderState, ctx: CardBuildContext): Rendere
 
   // endcap thumbnail — flush left, square matching row height
   const endcapW = slotH; // square, proportional to row height
-  let thumbSprite: Sprite | null = null;
+  const thumbSprite: Sprite | null = null;
   let textureKey: string | null = null;
 
   // endcap placeholder

@@ -1,8 +1,9 @@
 import { Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { PeerPresence, PresenceManager } from "./presence-manager";
+import { log } from "../utils/log";
 
-const TAG = "[presence-renderer]";
+const TAG = "canvas.presence";
 
 /** avatar circle diameter for presence cursors */
 const AVATAR_SIZE = 28;
@@ -135,7 +136,7 @@ export class PresenceRenderer {
         const oldCursor = this.cursors.get(existingOwner);
         if (oldCursor) {
           oldCursor.visible = false;
-          console.log(
+          log.debug(
             TAG,
             `dedup: hiding stale cursor for "${resolvedName}" (old peerId=${existingOwner.slice(0, 8)}, new peerId=${peerId.slice(0, 8)})`
           );
@@ -146,7 +147,7 @@ export class PresenceRenderer {
 
     let cursor = this.cursors.get(peerId);
     if (!cursor) {
-      console.log(
+      log.debug(
         TAG,
         `creating cursor for peerId=${peerId.slice(0, 12)} name="${resolvedName ?? peerId.slice(0, 8)}" (total cursors: ${this.cursors.size + 1})`
       );

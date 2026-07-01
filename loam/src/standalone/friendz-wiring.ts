@@ -19,6 +19,8 @@ import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
 import { handleSkeinStream } from "../p2p/skein-handler";
 import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
+import { log } from "../utils/log";
+import { getBlobRecordByBlake3 } from "../storage/skein-blob-store";
 
 export interface FriendzWiringDeps {
   repo: Repo;
@@ -39,6 +41,8 @@ export interface FriendzWiringResult {
   unsubs: Array<() => void>;
   flushCanvasUpdates: () => void;
 }
+
+const TAG = "friendz.wiring";
 
 /** wrap an automerge DocHandle as a SocialDoc (for browser/standalone mode) */
 export function docHandleAsSocialDoc(handle: DocHandle<any>): SocialDoc {
@@ -76,7 +80,7 @@ export async function initFriendzWiring(
   } else {
     const identity = await getStoredIdentity();
     if (!identity) {
-      console.warn("[friendz-wiring] aborting: no stored identity (browser mode)");
+      log.warn(TAG, "aborting: no stored identity (browser mode)");
       return null;
     }
     localNodeId = identity.node_id;
@@ -89,8 +93,9 @@ export async function initFriendzWiring(
   } else {
     const socialEntry = store.getWidget(socialWidgetId);
     if (!socialEntry) {
-      console.warn(
-        "[friendz-wiring] aborting: socialWidgetId not found in store, FRIENDZ_ALPN handler will NOT be registered",
+      log.warn(
+        TAG,
+        "aborting: socialWidgetId not found in store, FRIENDZ_ALPN handler will NOT be registered",
         { socialWidgetId }
       );
       return null;
@@ -198,13 +203,15 @@ export async function initFriendzWiring(
   });
 
   // register ALPN handler for incoming friendz streams
-  console.log(
-    "[friendz-wiring] registering FRIENDZ_ALPN handler on irohAdapter, localNodeId:",
+  log.debug(
+    TAG,
+    "registering FRIENDZ_ALPN handler on irohAdapter, localNodeId:",
     localNodeId.slice(0, 16) + "..."
   );
   irohAdapter.registerAlpnHandler(FRIENDZ_ALPN, (stream) => {
-    console.log(
-      "[friendz-wiring] FRIENDZ_ALPN callback fired, peer:",
+    log.debug(
+      TAG,
+      "FRIENDZ_ALPN callback fired, peer:",
       stream.peer_node_id().slice(0, 16) + "...",
       "-> handing to protocol.handleStream"
     );
@@ -212,7 +219,7 @@ export async function initFriendzWiring(
   });
 
   // register ALPN handler for incoming skein/1 streams (blob serving, proxy requests)
-  console.log("[friendz-wiring] registering skein/1 handler on irohAdapter");
+  log.debug(TAG, "registering skein/1 handler on irohAdapter");
   irohAdapter.registerAlpnHandler("skein/1", handleSkeinStream);
 
   // collect unsub callbacks so the caller can tear everything down
@@ -265,22 +272,17 @@ export async function initFriendzWiring(
     const pendingCount = (sDoc.current.pendingRequests ?? []).filter(
       (r: any) => r.status === "pending"
     ).length;
-    console.log(
-      "[friendz-wiring] onFriendRequest from " +
-        fromNodeId.slice(0, 16) +
-        "... didAdd=" +
-        didAdd +
-        " reciprocal=" +
-        reciprocal +
-        " pending-count=" +
-        pendingCount
+    log.debug(
+      TAG,
+      `onFriendRequest from ${fromNodeId.slice(0, 16)}... didAdd=${didAdd} reciprocal=${reciprocal} pending-count=${pendingCount}`
     );
 
     if (reciprocal) {
       // auto-accept: tell the peer we accept and add them to friends if needed
       protocol.sendFriendAccept(fromNodeId).catch((err) => {
-        console.warn(
-          "[friendz-wiring] auto-accept friend-request failed for",
+        log.warn(
+          TAG,
+          "auto-accept friend-request failed for",
           fromNodeId.slice(0, 16) + "...",
           err
         );
@@ -433,8 +435,9 @@ export async function initFriendzWiring(
 
   // canvas invite handling
   protocol.onCanvasInvite = (msg, fromNodeId) => {
-    console.log(
-      "[friendz-wiring] received canvas invite from:",
+    log.debug(
+      TAG,
+      "received canvas invite from:",
       fromNodeId.slice(0, 16) + "...",
       "canvas:",
       msg.canvasDocId.slice(0, 16) + "...",
@@ -447,7 +450,7 @@ export async function initFriendzWiring(
     );
 
     if (!messagezHandle) {
-      console.warn("[friendz-wiring] no messagez handle — cannot write invite to inbox");
+      log.warn(TAG, "no messagez handle — cannot write invite to inbox");
       return;
     }
 
@@ -461,7 +464,7 @@ export async function initFriendzWiring(
       );
 
       if (alreadyHave) {
-        console.log("[friendz-wiring] duplicate invite — already in inbox, skipping");
+        log.debug(TAG, "duplicate invite — already in inbox, skipping");
         return;
       }
 
@@ -480,8 +483,9 @@ export async function initFriendzWiring(
       };
 
       draft.invites.push(inviteRecord);
-      console.log(
-        "[friendz-wiring] wrote invite to inbox — total invites:",
+      log.debug(
+        TAG,
+        "wrote invite to inbox — total invites:",
         draft.invites.length,
         "record:",
         JSON.stringify(inviteRecord)
@@ -496,13 +500,14 @@ export async function initFriendzWiring(
         ackerNodeId: localNodeId,
       })
       .catch((err) => {
-        console.warn("[friendz-wiring] failed to send invite ACK:", err);
+        log.warn(TAG, "failed to send invite ACK:", err);
       });
   };
 
   protocol.onCanvasInviteAck = (msg, fromNodeId) => {
-    console.log(
-      "[friendz-wiring] received invite ACK from:",
+    log.debug(
+      TAG,
+      "received invite ACK from:",
       fromNodeId.slice(0, 16) + "...",
       "canvas:",
       msg.canvasDocId.slice(0, 16) + "..."
@@ -533,8 +538,9 @@ export async function initFriendzWiring(
   };
 
   protocol.onCanvasInviteAccept = (msg, fromNodeId) => {
-    console.log(
-      "[friendz-wiring] received invite ACCEPT from:",
+    log.debug(
+      TAG,
+      "received invite ACCEPT from:",
       fromNodeId.slice(0, 16) + "...",
       "canvas:",
       msg.canvasDocId.slice(0, 16) + "..."
@@ -574,21 +580,24 @@ export async function initFriendzWiring(
     // because they don't yet appear in the canvas peers map.
     const syncTargetId = msg.accepterNodeId || fromNodeId;
     irohAdapter.addPeer(syncTargetId).catch((err) => {
-      console.warn(
-        "[friendz-wiring] failed to connect to accepting peer for sync:",
+      log.warn(
+        TAG,
+        "failed to connect to accepting peer for sync:",
         syncTargetId.slice(0, 16) + "...",
         err
       );
     });
-    console.log(
-      "[friendz-wiring] initiated sync connection to accepting peer:",
+    log.debug(
+      TAG,
+      "initiated sync connection to accepting peer:",
       syncTargetId.slice(0, 16) + "..."
     );
   };
 
   protocol.onCanvasInviteDecline = (msg, fromNodeId) => {
-    console.log(
-      "[friendz-wiring] received invite DECLINE from:",
+    log.debug(
+      TAG,
+      "received invite DECLINE from:",
       fromNodeId.slice(0, 16) + "...",
       "canvas:",
       msg.canvasDocId.slice(0, 16) + "..."
@@ -700,7 +709,7 @@ export async function initFriendzWiring(
         canvasHandle.on("change", onChange);
         unsubs.push(() => canvasHandle.off("change", onChange));
       } catch (err) {
-        console.warn("[friendz-wiring] failed to watch canvas for federation:", err);
+        log.warn(TAG, "failed to watch canvas for federation:", err);
       }
     })();
   }
@@ -822,8 +831,9 @@ export async function initFriendzWiring(
                 deletedAt: (canvasDoc as any)?.deletedAt ?? new Date().toISOString(),
               })
               .catch((err) => {
-                console.warn(
-                  "[friendz-wiring] canvas-deleted send failed for:",
+                log.warn(
+                  TAG,
+                  "canvas-deleted send failed for:",
                   peerNodeId.slice(0, 16) + "...",
                   err
                 );
@@ -845,19 +855,11 @@ export async function initFriendzWiring(
               modifiedByUsername: localUsername,
             })
             .catch((err) => {
-              console.warn(
-                "[friendz-wiring] canvas update send failed for:",
-                peerNodeId.slice(0, 16) + "...",
-                err
-              );
+              log.warn(TAG, "canvas update send failed for:", peerNodeId.slice(0, 16) + "...", err);
             });
         }
       } catch (err) {
-        console.warn(
-          "[friendz-wiring] failed to flush canvas update:",
-          info.canvasDocId.slice(0, 16) + "...",
-          err
-        );
+        log.warn(TAG, "failed to flush canvas update:", info.canvasDocId.slice(0, 16) + "...", err);
       }
     }
 
@@ -948,8 +950,9 @@ export async function initFriendzWiring(
     if (canvasUpdates.length === 0 && pendingInvites.length === 0 && sharedCanvasIds.length === 0)
       return;
 
-    console.log(
-      "[friendz-wiring] sending gossip digest to:",
+    log.debug(
+      TAG,
+      "sending gossip digest to:",
       peerNodeId.slice(0, 16) + "...",
       "updates:",
       canvasUpdates.length,
@@ -990,16 +993,13 @@ export async function initFriendzWiring(
       (r: any) => r.toNodeId === peerNodeId && r.status === "pending"
     );
     if (stillPending) {
-      console.log(
-        "[friendz-wiring] retrying pending outbound friend-request to:",
+      log.debug(
+        TAG,
+        "retrying pending outbound friend-request to:",
         peerNodeId.slice(0, 16) + "..."
       );
       protocol.sendFriendRequest(peerNodeId).catch((err) => {
-        console.warn(
-          "[friendz-wiring] retry sendFriendRequest failed for",
-          peerNodeId.slice(0, 16) + "...",
-          err
-        );
+        log.warn(TAG, "retry sendFriendRequest failed for", peerNodeId.slice(0, 16) + "...", err);
       });
     }
 
@@ -1008,16 +1008,9 @@ export async function initFriendzWiring(
       const node = friendEntry.nodeIds?.find((n: any) => n.nodeId === peerNodeId);
       const hasProfile = !!(node?.username || node?.bio || node?.avatarDataUrl);
       if (!hasProfile) {
-        console.log(
-          "[friendz-wiring] retrying profile-request to:",
-          peerNodeId.slice(0, 16) + "..."
-        );
+        log.debug(TAG, "retrying profile-request to:", peerNodeId.slice(0, 16) + "...");
         protocol.requestProfile(peerNodeId).catch((err) => {
-          console.warn(
-            "[friendz-wiring] retry requestProfile failed for",
-            peerNodeId.slice(0, 16) + "...",
-            err
-          );
+          log.warn(TAG, "retry requestProfile failed for", peerNodeId.slice(0, 16) + "...", err);
         });
       }
     }
@@ -1025,11 +1018,7 @@ export async function initFriendzWiring(
     if (!isFriend) return;
 
     computeAndSendGossipDigest(peerNodeId).catch((err) => {
-      console.warn(
-        "[friendz-wiring] gossip digest failed for:",
-        peerNodeId.slice(0, 16) + "...",
-        err
-      );
+      log.warn(TAG, "gossip digest failed for:", peerNodeId.slice(0, 16) + "...", err);
     });
   };
 
@@ -1063,14 +1052,15 @@ export async function initFriendzWiring(
         }
       }
     } catch (err) {
-      console.warn("[friendz-wiring] failed to mark canvas update:", err);
+      log.warn(TAG, "failed to mark canvas update:", err);
     }
   };
 
   // handle incoming canvas-deleted notifications
   protocol.onCanvasDeleted = (msg, fromNodeId) => {
-    console.log(
-      "[friendz-wiring] received canvas-deleted from:",
+    log.debug(
+      TAG,
+      "received canvas-deleted from:",
       fromNodeId.slice(0, 16) + "...",
       "canvas:",
       msg.canvasDocId.slice(0, 16) + "...",
@@ -1088,7 +1078,7 @@ export async function initFriendzWiring(
           (d: any) => d.canvasDocId === msg.canvasDocId
         );
         if (existing) {
-          console.log("[friendz-wiring] duplicate deletion notification — skipping");
+          log.debug(TAG, "duplicate deletion notification — skipping");
           return;
         }
 
@@ -1104,10 +1094,7 @@ export async function initFriendzWiring(
           status: "unread",
         });
 
-        console.log(
-          "[friendz-wiring] wrote deletion notification to inbox — total:",
-          draft.deletions.length
-        );
+        log.debug(TAG, "wrote deletion notification to inbox — total:", draft.deletions.length);
       });
     }
 
@@ -1129,8 +1116,9 @@ export async function initFriendzWiring(
                 draft.deletedBy = msg.deletedBy ?? "";
                 draft.deleteMode = msg.deleteMode ?? "soft";
               });
-              console.log(
-                "[friendz-wiring] synced deletion state to canvas card:",
+              log.debug(
+                TAG,
+                "synced deletion state to canvas card:",
                 msg.canvasDocId.slice(0, 16) + "..."
               );
               break;
@@ -1139,7 +1127,7 @@ export async function initFriendzWiring(
         }
       }
     } catch (err) {
-      console.warn("[friendz-wiring] failed to sync card metadata after deletion:", err);
+      log.warn(TAG, "failed to sync card metadata after deletion:", err);
     }
   };
 
@@ -1156,10 +1144,7 @@ export async function initFriendzWiring(
 
       // check if this is a deletion notification via gossip
       if (update.deleted) {
-        console.log(
-          "[friendz-wiring] gossip: canvas deleted:",
-          update.canvasDocId.slice(0, 16) + "..."
-        );
+        log.debug(TAG, "gossip: canvas deleted:", update.canvasDocId.slice(0, 16) + "...");
 
         // write deletion notification to messagez (dedup)
         if (messagezHandle) {
@@ -1264,8 +1249,9 @@ export async function initFriendzWiring(
           status: "pending" as const,
         });
 
-        console.log(
-          "[friendz-wiring] gossip digest: wrote invite to inbox for canvas:",
+        log.debug(
+          TAG,
+          "gossip digest: wrote invite to inbox for canvas:",
           invite.canvasDocId.slice(0, 16) + "..."
         );
       });
@@ -1277,15 +1263,15 @@ export async function initFriendzWiring(
   protocol.onBlobSeek = async (msg: BlobSeekMessage, fromNodeId: string) => {
     if (!msg.needed || msg.needed.length === 0) return;
 
-    console.log(
-      "[friendz-wiring] received blob-seek from:",
+    log.debug(
+      TAG,
+      "received blob-seek from:",
       fromNodeId.slice(0, 16) + "...",
       "needed:",
       msg.needed.length
     );
 
     try {
-      const { getBlobRecordByBlake3 } = await import("../storage/skein-blob-store");
       const available: string[] = [];
 
       for (const blake3Hash of msg.needed) {
@@ -1299,19 +1285,13 @@ export async function initFriendzWiring(
         }
       }
 
-      console.log(
-        "[friendz-wiring] blob-seek response:",
-        available.length,
-        "of",
-        msg.needed.length,
-        "available"
-      );
+      log.debug(TAG, "blob-seek response:", available.length, "of", msg.needed.length, "available");
 
       if (available.length > 0) {
         await protocol.sendBlobOffer(fromNodeId, { available });
       }
     } catch (err) {
-      console.warn("[friendz-wiring] blob-seek handler failed:", err);
+      log.warn(TAG, "blob-seek handler failed:", err);
     }
   };
 
@@ -1342,8 +1322,9 @@ export async function initFriendzWiring(
       (r: any) => r.toNodeId === peerId && r.status === "pending"
     );
     if (!isFriendPeer && !hasPendingOutbound) {
-      console.log(
-        "[friendz-wiring] peer connected but not a friend / no pending outbound, skipping probe:",
+      log.debug(
+        TAG,
+        "peer connected but not a friend / no pending outbound, skipping probe:",
         peerId.slice(0, 16) + "..."
       );
       return;
@@ -1351,17 +1332,15 @@ export async function initFriendzWiring(
 
     // only probe if they're not already online (avoid redundant heartbeats)
     if (protocol.isOnline(peerId)) {
-      console.log(
-        "[friendz-wiring] peer connected but already online, skipping probe:",
+      log.debug(
+        TAG,
+        "peer connected but already online, skipping probe:",
         peerId.slice(0, 16) + "..."
       );
       return;
     }
 
-    console.log(
-      "[friendz-wiring] peer connected at transport, probing:",
-      peerId.slice(0, 16) + "..."
-    );
+    log.debug(TAG, "peer connected at transport, probing:", peerId.slice(0, 16) + "...");
     protocol.probePeer(peerId).catch(() => {
       // silent — probe is best-effort
     });

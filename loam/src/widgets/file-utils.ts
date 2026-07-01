@@ -19,8 +19,30 @@
  */
 
 import { dispatch, isTauriMode } from "../p2p/tauri-transport";
+import { log } from "../utils/log";
+import { getStoredIdentity, getMiddenNode } from "../p2p/identity";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { save, open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import {
+  hasBlob,
+  getBlobRecord,
+  getBlobRecordBySha256,
+  getBlobRecordByBlake3,
+  getBlobObjectURL,
+  storeBlob,
+  computeSha256,
+  storeBlobFromFile,
+  resolveBlob,
+  getBlobData,
+  classifyDomain,
+} from "../storage/skein-blob-store";
+import {
+  base64Decode,
+  generateThumbnailDataUrl as generateThumbnailDataUrlWorker,
+} from "../workers/blob-worker-client";
 
-const TAG = "[file-utils]";
+const TAG = "file-utils";
 
 const PEER_TIMEOUT_MS = 8000;
 
@@ -87,6 +109,7 @@ function base64ToBytes(b64: string): Uint8Array {
  *  automerge stores strings as Text objects which have toString() but lack
  *  string methods like slice(). wrapping in String() normalizes them. */
 function coerceStr(v: unknown): string {
+  // eslint-disable-next-line eqeqeq -- intentional: catches both null and undefined
   if (v == null) return "";
   return String(v);
 }
@@ -206,7 +229,6 @@ let _cachedLocalNodeId: string | null | undefined = undefined;
 export async function getLocalNodeId(): Promise<string | null> {
   if (_cachedLocalNodeId !== undefined) return _cachedLocalNodeId;
   try {
-    const { getStoredIdentity } = await import("../p2p/identity");
     const identity = await getStoredIdentity();
     _cachedLocalNodeId = identity?.node_id ?? null;
   } catch {
@@ -228,15 +250,6 @@ async function getPeerNodeIds(
 // ---------------------------------------------------------------------------
 // tauri bridge helper
 // ---------------------------------------------------------------------------
-
-/**
- * invoke a Tauri command. lazily imports @tauri-apps/api/core so the module
- * can be parsed even when Tauri is not present.
- */
-async function tauriInvoke(cmd: string, args: Record<string, unknown>): Promise<any> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke(cmd, args);
-}
 
 // ---------------------------------------------------------------------------
 // thumbnail cache
@@ -286,8 +299,6 @@ export async function checkBlobLocality(
 
   if (!isTauriMode()) {
     try {
-      const { hasBlob, getBlobRecord, getBlobRecordBySha256 } =
-        await import("../storage/skein-blob-store");
       const exists = await hasBlob(blobId);
       if (!exists) {
         // blobId might be a server-assigned UUID that doesn't match our IDB primary key.
@@ -313,7 +324,6 @@ export async function checkBlobLocality(
         // doesn't match our sha256-based primary key, but the content hash is
         // the same regardless of which peer assigned the ID.
         if (blake3) {
-          const { getBlobRecordByBlake3 } = await import("../storage/skein-blob-store");
           const blake3Record = await getBlobRecordByBlake3(blake3);
           if (blake3Record) {
             const result: BlobLocalityInfo = {
@@ -352,7 +362,7 @@ export async function checkBlobLocality(
       localityCache.set(blobId, result);
       return result;
     } catch (err) {
-      console.debug(TAG, "browser blob locality check failed:", err);
+      log.debug(TAG, "browser blob locality check failed:", err);
       return { locality: "unknown" };
     }
   }
@@ -385,7 +395,7 @@ export async function checkBlobLocality(
     if (msg.includes("not found") || msg.includes("NotFound")) {
       return { locality: "remote" };
     }
-    console.debug(TAG, "blob locality check failed:", err);
+    log.debug(TAG, "blob locality check failed:", err);
     return { locality: "unknown" };
   }
 }
@@ -440,7 +450,7 @@ export async function snatchBlob(
     try {
       const local = await dispatch("blob_get_path", { blake3: info.blake3 });
       if (local?.path) {
-        console.log(
+        log.debug(
           TAG,
           `blob found locally in rust blobz by blake3 (${info.blake3.slice(0, 16)}...), skipping P2P snatch`
         );
@@ -461,7 +471,7 @@ export async function snatchBlob(
         };
       }
     } catch (err) {
-      console.debug(TAG, "local rust blobz blake3 check failed, proceeding to P2P:", err);
+      log.debug(TAG, "local rust blobz blake3 check failed, proceeding to P2P:", err);
     }
   }
 
@@ -482,7 +492,7 @@ export async function snatchBlob(
     const isOnline = options?.isPeerOnline?.(bestPeer) ?? false;
     options?.onPeerAttempt?.(peerIndex, allPeerAddrs.length, isOnline);
 
-    console.log(
+    log.debug(
       TAG,
       `probe winner: ${bestPeer.slice(0, 16)}... (${isOnline ? "connected" : "responded to probe"}), starting download`
     );
@@ -496,7 +506,7 @@ export async function snatchBlob(
       return result;
     } catch (err) {
       lastError = err;
-      console.debug(TAG, `download from probed peer ${bestPeer.slice(0, 16)}... failed:`, err);
+      log.debug(TAG, `download from probed peer ${bestPeer.slice(0, 16)}... failed:`, err);
       remaining = remaining.filter((p) => p !== bestPeer);
       continue;
     }
@@ -528,7 +538,10 @@ async function probePeersForBlob(
   // sort so connected peers are probed first (their responses arrive faster)
   const sorted = sortPeersByConnectivity(peerAddrs, options?.isPeerOnline);
 
-  console.log(TAG, `probing ${sorted.length} peer(s) for blob ${info.blobId.slice(0, 8)}... blake3=${info.blake3?.slice(0, 16) ?? "<none>"}`);
+  log.debug(
+    TAG,
+    `probing ${sorted.length} peer(s) for blob ${info.blobId.slice(0, 8)}... blake3=${info.blake3?.slice(0, 16) ?? "<none>"}`
+  );
 
   const probes = sorted.map((peerAddr) => probeSinglePeer(info, peerAddr, options));
 
@@ -541,7 +554,7 @@ async function probePeersForBlob(
     // the failure mode (connection lost, blob unavailable, timeout, etc.)
     // is visible instead of just "all peer probes failed".
     const errs = (err as AggregateError | undefined)?.errors ?? [];
-    console.warn(
+    log.warn(
       TAG,
       `all ${sorted.length} peer probe(s) failed for blob ${info.blobId.slice(0, 8)}...`,
       errs.map((e: unknown) => (e instanceof Error ? e.message : String(e)))
@@ -564,9 +577,8 @@ async function probeSinglePeer(
   }
 
   // both browser midden and TauriStreamNode expose the same `ensure_blob`
-  // shape (skein/1 protocol). the previous `tauriInvoke("p2p_probe_blob")`
+  // shape (skein/1 protocol). the previous `invoke("p2p_probe_blob")`
   // path referenced a freqhole-era command that doesn't exist in skein.
-  const { getMiddenNode } = await import("../p2p/identity");
   const node = await getMiddenNode();
   const nodeAny = node as any;
 
@@ -574,7 +586,7 @@ async function probeSinglePeer(
     throw new Error("p2p node does not support ensure_blob");
   }
 
-  console.log(
+  log.debug(
     TAG,
     `probing peer ${peerAddr.slice(0, 16)}... for blake3=${info.blake3?.slice(0, 16) ?? "<none>"} (blobId=${info.blobId.slice(0, 16)}...)`
   );
@@ -584,7 +596,7 @@ async function probeSinglePeer(
       nodeAny.ensure_blob(peerAddr, info.blake3) as Promise<boolean>,
       PROBE_TIMEOUT_MS
     ).catch((err) => {
-      console.warn(
+      log.warn(
         TAG,
         `probe ${label} to ${peerAddr.slice(0, 16)} threw:`,
         err instanceof Error ? err.message : err
@@ -603,16 +615,16 @@ async function probeSinglePeer(
     const msg = err instanceof Error ? err.message : String(err);
     const isTransient = /connection (lost|closed)|stream closed|reset|broken/i.test(msg);
     if (!isTransient) throw err;
-    console.log(TAG, `retrying probe to ${peerAddr.slice(0, 16)} after transient error`);
+    log.debug(TAG, `retrying probe to ${peerAddr.slice(0, 16)} after transient error`);
     await new Promise((r) => setTimeout(r, 1500));
     available = await attempt("attempt 2");
   }
 
   if (available) {
-    console.log(TAG, `probe to ${peerAddr.slice(0, 16)}: available=true`);
+    log.debug(TAG, `probe to ${peerAddr.slice(0, 16)}: available=true`);
     return peerAddr;
   }
-  console.warn(
+  log.warn(
     TAG,
     `probe to ${peerAddr.slice(0, 16)}: peer reported blob unavailable (blake3=${info.blake3?.slice(0, 16) ?? "<none>"})`
   );
@@ -641,7 +653,7 @@ function sortPeersByConnectivity(
   }
 
   if (online.length > 0 && offline.length > 0) {
-    console.log(TAG, `peer ordering: ${online.length} connected, ${offline.length} not connected`);
+    log.debug(TAG, `peer ordering: ${online.length} connected, ${offline.length} not connected`);
   }
 
   return [...online, ...offline];
@@ -659,13 +671,9 @@ async function snatchFromBrowserPeer(
   peerAddr: string,
   options?: SnatchOptions
 ): Promise<FileUploadResult> {
-  const { getMiddenNode } = await import("../p2p/identity");
-  const { storeBlob, computeSha256 } =
-    await import("../storage/skein-blob-store");
-
   const node = await getMiddenNode();
 
-  console.log(
+  log.debug(
     TAG,
     `browser snatch: blob ${info.blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
   );
@@ -687,7 +695,7 @@ async function snatchFromBrowserPeer(
   // node is `TauriStreamNode`, which has no `download_verified_*` methods
   // \u2014 strategies 1+2 always silently no-op there and we always end up on
   // the proxy_request fallback.
-  console.log(TAG, "snatch capabilities:", {
+  log.debug(TAG, "snatch capabilities:", {
     have_blake3_in_doc: !!blake3Hash,
     download_verified_with_ensure_progress:
       typeof nodeAny.download_verified_with_ensure_progress === "function",
@@ -709,10 +717,7 @@ async function snatchFromBrowserPeer(
     typeof nodeAny.download_verified_with_ensure_progress === "function"
   ) {
     try {
-      console.log(
-        TAG,
-        `trying iroh-blobs verified (blake3 known) from ${peerAddr.slice(0, 16)}...`
-      );
+      log.debug(TAG, `trying iroh-blobs verified (blake3 known) from ${peerAddr.slice(0, 16)}...`);
       bytes = await withPeerTimeout(
         nodeAny.download_verified_with_ensure_progress(
           peerAddr,
@@ -724,10 +729,10 @@ async function snatchFromBrowserPeer(
       );
       downloaded = true;
     } catch (err) {
-      console.warn(TAG, `strategy 1 (verified, blake3 known) failed:`, err);
+      log.warn(TAG, `strategy 1 (verified, blake3 known) failed:`, err);
     }
   } else if (!downloaded) {
-    console.log(
+    log.debug(
       TAG,
       `strategy 1 skipped — ${
         !blake3Hash
@@ -740,7 +745,7 @@ async function snatchFromBrowserPeer(
   // strategy 2: iroh-blobs verified download with on-demand blake3 compute
   if (!downloaded && typeof nodeAny.download_verified_by_id_progress === "function") {
     try {
-      console.log(
+      log.debug(
         TAG,
         `trying iroh-blobs verified (compute blake3) from ${peerAddr.slice(0, 16)}...`
       );
@@ -757,10 +762,10 @@ async function snatchFromBrowserPeer(
       blake3Hash = (result[1] as string) || blake3Hash;
       downloaded = true;
     } catch (err) {
-      console.warn(TAG, `strategy 2 (verified, compute blake3) failed:`, err);
+      log.warn(TAG, `strategy 2 (verified, compute blake3) failed:`, err);
     }
   } else if (!downloaded) {
-    console.log(
+    log.debug(
       TAG,
       "strategy 2 skipped — node has no download_verified_by_id_progress (likely tauri TauriStreamNode)"
     );
@@ -773,10 +778,7 @@ async function snatchFromBrowserPeer(
     // tauri's frontend ALPN router does accept.
     if (typeof nodeAny.proxy_request === "function") {
       try {
-        console.log(
-          TAG,
-          `trying skein/1 proxy_request fallback from ${peerAddr.slice(0, 16)}...`
-        );
+        log.debug(TAG, `trying skein/1 proxy_request fallback from ${peerAddr.slice(0, 16)}...`);
         const resp = await withPeerTimeout(
           nodeAny.proxy_request(
             peerAddr,
@@ -789,7 +791,7 @@ async function snatchFromBrowserPeer(
         // proxy_request returns { status, body }; body is the JSON envelope
         // sent by skein-handler: { success, data: { data, mime } }
         if (resp?.status !== 200) {
-          console.debug(TAG, `proxy_request returned status ${resp?.status}`);
+          log.debug(TAG, `proxy_request returned status ${resp?.status}`);
         } else {
           const parsed = JSON.parse(resp.body) as {
             success?: boolean;
@@ -800,7 +802,6 @@ async function snatchFromBrowserPeer(
           if (parsed?.success && typeof b64 === "string") {
             // base64 decode is delegated to the blob worker for large
             // payloads (snatched blobs are routinely megabytes).
-            const { base64Decode } = await import("../workers/blob-worker-client");
             bytes = await base64Decode(b64);
             // mime may have been refined by the responder
             if (typeof parsed.data?.mime === "string" && !info.mime) {
@@ -809,11 +810,11 @@ async function snatchFromBrowserPeer(
             progressFn(1);
             downloaded = true;
           } else {
-            console.debug(TAG, "proxy_request not successful:", parsed?.message);
+            log.debug(TAG, "proxy_request not successful:", parsed?.message);
           }
         }
       } catch (err) {
-        console.debug(TAG, "skein/1 proxy_request fallback failed:", err);
+        log.debug(TAG, "skein/1 proxy_request fallback failed:", err);
       }
     }
   }
@@ -834,10 +835,7 @@ async function snatchFromBrowserPeer(
     );
   }
 
-  console.log(
-    TAG,
-    `browser snatch: downloaded ${formatFileSize(bytes.length)}, storing in OPFS...`
-  );
+  log.debug(TAG, `browser snatch: downloaded ${formatFileSize(bytes.length)}, storing in OPFS...`);
 
   if (options?.signal?.aborted) {
     throw new DOMException("snatch cancelled", "AbortError");
@@ -867,7 +865,7 @@ async function snatchFromBrowserPeer(
   localityCache.set(info.blobId, { locality: "local" });
   localityCache.set(sha256, { locality: "local" });
 
-  console.log(
+  log.debug(
     TAG,
     `browser snatch complete: blob ${sha256.slice(0, 8)}... (doc blobId=${info.blobId.slice(0, 8)}...)`
   );
@@ -980,7 +978,7 @@ export async function snatchBlobBatch(
           blake3: info.blake3,
         })) as { path?: string; mime?: string | null; size?: number | null } | null;
         if (localCheck?.path) {
-          console.log(
+          log.debug(
             TAG,
             `batch: blob ${i} found locally by blake3 (${info.blake3.slice(0, 8)}...)`
           );
@@ -1005,7 +1003,7 @@ export async function snatchBlobBatch(
         // NotFound is the expected "remote" signal — only log unexpected errors
         const msg = err instanceof Error ? err.message : String(err);
         if (!msg.includes("not found") && !msg.includes("NotFound")) {
-          console.debug(TAG, `batch: local blake3 check failed for blob ${i}:`, err);
+          log.debug(TAG, `batch: local blake3 check failed for blob ${i}:`, err);
         }
       }
     }
@@ -1015,7 +1013,7 @@ export async function snatchBlobBatch(
       try {
         const localInfo = await checkBlobLocality(info.blobId, info.blake3);
         if (localInfo.locality === "local") {
-          console.log(TAG, `batch: blob ${i} already local`);
+          log.debug(TAG, `batch: blob ${i} already local`);
           const result: FileUploadResult = {
             blobId: localInfo.metadata?.id ?? info.blobId,
             domain: info.domain,
@@ -1033,14 +1031,14 @@ export async function snatchBlobBatch(
           continue;
         }
       } catch (err) {
-        console.debug(TAG, `batch: locality check failed for blob ${i}:`, err);
+        log.debug(TAG, `batch: locality check failed for blob ${i}:`, err);
       }
     }
 
     pending.push(i);
   }
 
-  console.log(
+  log.debug(
     TAG,
     `batch: ${completedCount}/${totalCount} already local, ${pending.length} to download`
   );
@@ -1071,11 +1069,11 @@ export async function snatchBlobBatch(
     const bestPeer = await probePeersForBlob(probeBlob, remaining, probeOpts);
 
     if (!bestPeer) {
-      console.debug(TAG, "batch: no peer responded to probe, aborting");
+      log.debug(TAG, "batch: no peer responded to probe, aborting");
       break;
     }
 
-    console.log(
+    log.debug(
       TAG,
       `batch: probe winner ${bestPeer.slice(0, 16)}..., downloading ${pending.length} blob(s)`
     );
@@ -1105,7 +1103,7 @@ export async function snatchBlobBatch(
         options?.onBlobComplete?.(idx, result);
         options?.onProgress?.(completedCount, totalCount, -1);
       } catch (err) {
-        console.debug(
+        log.debug(
           TAG,
           `batch: download failed for blob ${idx} from ${bestPeer.slice(0, 16)}...:`,
           err
@@ -1126,7 +1124,7 @@ export async function snatchBlobBatch(
       // (which now only contains blobs that failed on the previous peer).
       // if options.probeBlobInfo was set, re-probing with the same representative
       // blob on a different peer is still valid.
-      console.log(
+      log.debug(
         TAG,
         `batch: ${pending.length} blob(s) failed, retrying with ${remaining.length} remaining peer(s)`
       );
@@ -1134,7 +1132,7 @@ export async function snatchBlobBatch(
   }
 
   if (pending.length > 0) {
-    console.log(TAG, `batch: ${pending.length} blob(s) could not be snatched from any peer`);
+    log.debug(TAG, `batch: ${pending.length} blob(s) could not be snatched from any peer`);
   }
 
   return results;
@@ -1143,16 +1141,6 @@ export async function snatchBlobBatch(
 // ---------------------------------------------------------------------------
 // save blob to disk
 // ---------------------------------------------------------------------------
-
-/**
- * dynamically load the Tauri dialog plugin's save function.
- */
-async function loadTauriSaveDialog(): Promise<{
-  save: (options?: { defaultPath?: string; title?: string }) => Promise<string | null>;
-}> {
-  // @ts-ignore — @tauri-apps/plugin-dialog is only available in Tauri builds
-  return import("@tauri-apps/plugin-dialog");
-}
 
 /**
  * save a locally-stored blob to a user-chosen location on the filesystem.
@@ -1174,7 +1162,6 @@ export async function saveBlobToDisk(blobId: string, filename: string): Promise<
 
   try {
     // open native save dialog with suggested filename
-    const { save } = await loadTauriSaveDialog();
     const destPath = await save({
       defaultPath: filename,
       title: "save file",
@@ -1185,15 +1172,15 @@ export async function saveBlobToDisk(blobId: string, filename: string): Promise<
     }
 
     // copy blob file to chosen path via custom Tauri command
-    await tauriInvoke("save_blob_to_path", {
+    await invoke("save_blob_to_path", {
       blobId,
       destPath,
     });
 
-    console.log(TAG, `saved blob ${blobId.slice(0, 8)}... to ${destPath}`);
+    log.debug(TAG, `saved blob ${blobId.slice(0, 8)}... to ${destPath}`);
     return true;
   } catch (err) {
-    console.error(TAG, "save to disk failed:", err);
+    log.error(TAG, "save to disk failed:", err);
     throw err;
   }
 }
@@ -1211,16 +1198,14 @@ export async function revealBlobInFinder(blobId: string): Promise<boolean> {
   try {
     const localPath = await getBlobLocalPath(blobId);
     if (!localPath) {
-      console.warn(TAG, "no local path for blob, cannot reveal:", blobId.slice(0, 8));
+      log.warn(TAG, "no local path for blob, cannot reveal:", blobId.slice(0, 8));
       return false;
     }
 
-    // @ts-ignore — @tauri-apps/plugin-opener is only available in Tauri builds
-    const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
     await revealItemInDir(localPath);
     return true;
   } catch (err) {
-    console.error(TAG, "reveal in finder failed:", err);
+    log.error(TAG, "reveal in finder failed:", err);
     return false;
   }
 }
@@ -1258,7 +1243,7 @@ async function saveBlobToDiskBrowser(blobId: string, filename: string): Promise<
 
     return true;
   } catch (err) {
-    console.error(TAG, "browser save to disk failed:", err);
+    log.error(TAG, "browser save to disk failed:", err);
     throw err;
   }
 }
@@ -1303,7 +1288,6 @@ export async function getFullBlobDataUrl(blobId: string, peers?: PeersMap): Prom
 async function fetchFullBlobLocal(blobId: string): Promise<string | null> {
   if (!isTauriMode()) {
     try {
-      const { getBlobObjectURL } = await import("../storage/skein-blob-store");
       const url = await getBlobObjectURL(blobId);
       return url;
     } catch {
@@ -1319,7 +1303,7 @@ async function fetchFullBlobLocal(blobId: string): Promise<string | null> {
     if (!response?.data) return null;
     const mime = response.meta?.mime ?? "application/octet-stream";
     return `data:${mime};base64,${response.data}`;
-  } catch (err) {
+  } catch {
     return null;
   }
 }
@@ -1336,7 +1320,6 @@ async function fetchFullBlobFromPeers(blobId: string, peers: PeersMap): Promise<
 
   if (!isTauriMode()) {
     try {
-      const { getMiddenNode } = await import("../p2p/identity");
       const node = await getMiddenNode();
       const nodeAny = node as any;
 
@@ -1359,7 +1342,7 @@ async function fetchFullBlobFromPeers(blobId: string, peers: PeersMap): Promise<
 
           if (bytes) {
             const blob = new Blob([new Uint8Array(bytes)], { type: contentType });
-            console.log(
+            log.debug(
               TAG,
               `fetched full blob ${blobId.slice(0, 8)}... from browser peer ${peerAddr.slice(0, 16)}...`
             );
@@ -1384,7 +1367,7 @@ async function fetchFullBlobFromPeers(blobId: string, peers: PeersMap): Promise<
             }
           }
         } catch (err) {
-          console.debug(
+          log.debug(
             TAG,
             `browser peer ${peerAddr.slice(0, 16)}... failed for full blob ${blobId.slice(0, 8)}...:`,
             err
@@ -1393,7 +1376,7 @@ async function fetchFullBlobFromPeers(blobId: string, peers: PeersMap): Promise<
         }
       }
     } catch (err) {
-      console.debug(TAG, "browser P2P full blob fetch setup failed:", err);
+      log.debug(TAG, "browser P2P full blob fetch setup failed:", err);
     }
     return null;
   }
@@ -1401,9 +1384,7 @@ async function fetchFullBlobFromPeers(blobId: string, peers: PeersMap): Promise<
   for (const peerAddr of peerAddrs) {
     try {
       const result = await withPeerTimeout(
-        tauriInvoke("p2p_proxy_request", {
-          peerAddr,
-          method: "GET",
+        invoke<any>("p2p_proxy_request", {
           path: `/api/blobs/${blobId}/data`,
           body: null,
         }),
@@ -1424,13 +1405,13 @@ async function fetchFullBlobFromPeers(blobId: string, peers: PeersMap): Promise<
         continue;
       }
 
-      console.log(
+      log.debug(
         TAG,
         `fetched full blob ${blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
       );
       return `data:${mime};base64,${data}`;
     } catch (err) {
-      console.debug(
+      log.debug(
         TAG,
         `peer ${peerAddr.slice(0, 16)}... failed for full blob ${blobId.slice(0, 8)}...:`,
         err
@@ -1462,7 +1443,7 @@ export async function getBlobLocalPath(blobId: string): Promise<string | null> {
       blake3: blobId,
     })) as { path?: string } | null;
     return response?.path ?? null;
-  } catch (err) {
+  } catch {
     return null;
   }
 }
@@ -1480,11 +1461,11 @@ export async function getBlobLocalPath(blobId: string): Promise<string | null> {
  */
 export async function getLocalBlobUrl(blobId: string, blake3?: string): Promise<string | null> {
   if (!blobId) {
-    console.debug(TAG, "getLocalBlobUrl: no blobId provided");
+    log.debug(TAG, "getLocalBlobUrl: no blobId provided");
     return null;
   }
 
-  console.debug(
+  log.debug(
     TAG,
     "getLocalBlobUrl:",
     blobId,
@@ -1501,32 +1482,32 @@ export async function getLocalBlobUrl(blobId: string, blake3?: string): Promise<
     const resolvedId = blobId;
 
     try {
-      console.debug(TAG, "getLocalBlobUrl: trying getBlobLocalPath for", blobId);
+      log.debug(TAG, "getLocalBlobUrl: trying getBlobLocalPath for", blobId);
       const localPath = await getBlobLocalPath(resolvedId);
-      console.debug(TAG, "getLocalBlobUrl: getBlobLocalPath returned:", localPath);
+      log.debug(TAG, "getLocalBlobUrl: getBlobLocalPath returned:", localPath);
       if (localPath) {
         const assetUrl = await convertToAssetUrl(localPath);
-        console.debug(TAG, "getLocalBlobUrl: asset URL:", assetUrl.slice(0, 80));
+        log.debug(TAG, "getLocalBlobUrl: asset URL:", assetUrl.slice(0, 80));
         return assetUrl;
       }
     } catch (err) {
-      console.debug(TAG, "getLocalBlobUrl: getBlobLocalPath threw:", err);
+      log.debug(TAG, "getLocalBlobUrl: getBlobLocalPath threw:", err);
       // fall through to data URL approach
     }
 
     // fall back to base64 data URL via blob_get dispatch
     try {
-      console.debug(TAG, "getLocalBlobUrl: trying blob_get fallback for", resolvedId);
+      log.debug(TAG, "getLocalBlobUrl: trying blob_get fallback for", resolvedId);
       const dataUrl = await fetchFullBlobLocal(resolvedId);
       if (dataUrl) {
-        console.debug(TAG, "getLocalBlobUrl: returning base64 data URL");
+        log.debug(TAG, "getLocalBlobUrl: returning base64 data URL");
         return dataUrl;
       }
     } catch (err) {
-      console.debug(TAG, "getLocalBlobUrl: blob_get fallback threw:", err);
+      log.debug(TAG, "getLocalBlobUrl: blob_get fallback threw:", err);
     }
 
-    console.debug(TAG, "getLocalBlobUrl: tauri — all paths failed for", blobId);
+    log.debug(TAG, "getLocalBlobUrl: tauri — all paths failed for", blobId);
     return null;
   }
 
@@ -1535,10 +1516,9 @@ export async function getLocalBlobUrl(blobId: string, blake3?: string): Promise<
   // it misses blobs uploaded by Tauri peers (whose server UUID doesn't match
   // the browser's sha256-based primary key).
   try {
-    console.debug(TAG, "getLocalBlobUrl: browser — trying OPFS resolveBlob...");
-    const { resolveBlob, getBlobData } = await import("../storage/skein-blob-store");
+    log.debug(TAG, "getLocalBlobUrl: browser — trying OPFS resolveBlob...");
     const record = await resolveBlob(blobId, blake3);
-    console.debug(
+    log.debug(
       TAG,
       "getLocalBlobUrl: resolveBlob returned:",
       record ? { blob_id: record.blob_id, filename: record.filename } : null
@@ -1547,21 +1527,17 @@ export async function getLocalBlobUrl(blobId: string, blake3?: string): Promise<
 
     const data = await getBlobData(record.blob_id);
     if (!data) {
-      console.debug(
-        TAG,
-        "getLocalBlobUrl: OPFS file not found for resolved blob_id:",
-        record.blob_id
-      );
+      log.debug(TAG, "getLocalBlobUrl: OPFS file not found for resolved blob_id:", record.blob_id);
       return null;
     }
 
     const mime = record.mime ?? "application/octet-stream";
     const blob = new Blob([data], { type: mime });
     const url = URL.createObjectURL(blob);
-    console.debug(TAG, "getLocalBlobUrl: OPFS blob URL created:", url.slice(0, 60));
+    log.debug(TAG, "getLocalBlobUrl: OPFS blob URL created:", url.slice(0, 60));
     return url;
   } catch (err) {
-    console.debug(TAG, "getLocalBlobUrl: OPFS threw:", err);
+    log.debug(TAG, "getLocalBlobUrl: OPFS threw:", err);
     return null;
   }
 }
@@ -1605,7 +1581,7 @@ export async function getDocumentPages(blobId: string): Promise<DocumentPageInfo
     }
     return result;
   } catch (err) {
-    console.warn(TAG, "getDocumentPages failed:", err);
+    log.warn(TAG, "getDocumentPages failed:", err);
     return [];
   }
 }
@@ -1618,7 +1594,6 @@ const pdfPagesCache = new Map<string, DocumentPageInfo[]>();
  * the entire file into memory.
  */
 export async function convertToAssetUrl(localPath: string): Promise<string> {
-  const { convertFileSrc } = await import("@tauri-apps/api/core");
   return convertFileSrc(localPath);
 }
 
@@ -1665,7 +1640,6 @@ export async function pickPdfFile(): Promise<PickedFile | null> {
 
 async function pickPdfFileTauri(): Promise<PickedFile | null> {
   try {
-    const { open } = await loadTauriDialog();
     const result = await open({
       multiple: false,
       filters: [{ name: "PDF", extensions: ["pdf"] }],
@@ -1685,7 +1659,7 @@ async function pickPdfFileTauri(): Promise<PickedFile | null> {
       file: null,
     };
   } catch (err) {
-    console.error(TAG, "PDF file picker failed:", err);
+    log.error(TAG, "PDF file picker failed:", err);
     return null;
   }
 }
@@ -1722,32 +1696,16 @@ async function pickPdfFileBrowser(): Promise<PickedFile | null> {
       file,
     };
   } catch (err) {
-    console.error(TAG, "browser PDF file picker failed:", err);
+    log.error(TAG, "browser PDF file picker failed:", err);
     return null;
   } finally {
     input.remove();
   }
 }
 
-/**
- * dynamically load the Tauri dialog plugin.
- * uses a variable module specifier so TypeScript doesn't try to resolve
- * the package at compile time (it's only available in Tauri builds).
- */
-async function loadTauriDialog(): Promise<{
-  open: (options?: {
-    multiple?: boolean;
-    filters?: Array<{ name: string; extensions: string[] }>;
-  }) => Promise<string | string[] | null>;
-}> {
-  // @ts-ignore — @tauri-apps/plugin-dialog is only available in Tauri builds
-  return import("@tauri-apps/plugin-dialog");
-}
-
 /** Tauri-mode file picker — uses @tauri-apps/plugin-dialog */
 async function pickFileTauri(): Promise<PickedFile | null> {
   try {
-    const { open } = await loadTauriDialog();
     const result = await open({ multiple: false });
 
     if (result === null) {
@@ -1770,7 +1728,7 @@ async function pickFileTauri(): Promise<PickedFile | null> {
       file: null,
     };
   } catch (err) {
-    console.error(TAG, "native file picker failed:", err);
+    log.error(TAG, "native file picker failed:", err);
     return null;
   }
 }
@@ -1778,7 +1736,6 @@ async function pickFileTauri(): Promise<PickedFile | null> {
 /** Tauri-mode multi-file picker — uses @tauri-apps/plugin-dialog with multiple: true */
 async function pickFilesTauri(): Promise<PickedFile[]> {
   try {
-    const { open } = await loadTauriDialog();
     const result = await open({ multiple: true });
 
     if (result === null) {
@@ -1796,7 +1753,7 @@ async function pickFilesTauri(): Promise<PickedFile[]> {
         file: null,
       }));
   } catch (err) {
-    console.error(TAG, "native multi-file picker failed:", err);
+    log.error(TAG, "native multi-file picker failed:", err);
     return [];
   }
 }
@@ -1838,7 +1795,7 @@ async function pickFileBrowser(): Promise<PickedFile | null> {
       file,
     };
   } catch (err) {
-    console.error(TAG, "browser file picker failed:", err);
+    log.error(TAG, "browser file picker failed:", err);
     return null;
   } finally {
     input.remove();
@@ -1880,7 +1837,7 @@ async function pickFilesBrowser(): Promise<PickedFile[]> {
       file,
     }));
   } catch (err) {
-    console.error(TAG, "browser multi-file picker failed:", err);
+    log.error(TAG, "browser multi-file picker failed:", err);
     return [];
   } finally {
     input.remove();
@@ -1907,8 +1864,6 @@ export async function uploadFile(
     if (!picked.file) {
       throw new Error("no File object available in browser mode");
     }
-
-    const { storeBlobFromFile } = await import("../storage/skein-blob-store");
 
     const record = await storeBlobFromFile(picked.file);
 
@@ -1966,10 +1921,6 @@ export async function uploadFile(
     bytes.byteOffset + bytes.byteLength
   ) as ArrayBuffer;
 
-  const { storeBlob, classifyDomain, getBlobRecord } = await import(
-    "../storage/skein-blob-store"
-  );
-
   // dedup: if we already mirrored this blake3, skip the OPFS write.
   const existingRecord = await getBlobRecord(meta.blake3);
   const resolvedMime = meta.mime || mime;
@@ -1998,7 +1949,7 @@ export async function uploadFile(
       const blob = new Blob([new Uint8Array(buffer)], { type: resolvedMime });
       thumbnailDataUrl = await generateThumbnailDataUrl(blob);
     } catch (err) {
-      console.debug(TAG, "tauri thumbnail generation failed:", err);
+      log.debug(TAG, "tauri thumbnail generation failed:", err);
     }
   }
 
@@ -2076,7 +2027,6 @@ async function fetchThumbnailLocal(blobId: string, size: number): Promise<string
     // was overwritten by a Tauri peer with a server UUID that doesn't match
     // the browser's sha256-based primary key.
     try {
-      const { resolveBlob, getBlobData } = await import("../storage/skein-blob-store");
       const record = await resolveBlob(blobId);
       if (!record) return null;
 
@@ -2094,7 +2044,7 @@ async function fetchThumbnailLocal(blobId: string, size: number): Promise<string
   }
 
   try {
-    const response = await tauriInvoke("api_call", {
+    const response = await invoke<any>("api_call", {
       path: "/api/blobs/thumbnail_data",
       body: {
         blob_id: blobId,
@@ -2112,7 +2062,7 @@ async function fetchThumbnailLocal(blobId: string, size: number): Promise<string
     }
 
     return `data:${mime};base64,${data}`;
-  } catch (err) {
+  } catch {
     // not an error — just means the blob isn't available locally
     return null;
   }
@@ -2137,7 +2087,6 @@ async function fetchThumbnailFromPeers(
 
   if (!isTauriMode()) {
     try {
-      const { getMiddenNode } = await import("../p2p/identity");
       const node = await getMiddenNode();
       const nodeAny = node as any;
 
@@ -2163,7 +2112,7 @@ async function fetchThumbnailFromPeers(
         const { data, mime } = parsed.data;
         if (!data || !mime) throw new Error("missing data or mime");
 
-        console.log(
+        log.debug(
           TAG,
           `fetched thumbnail for ${blobId.slice(0, 8)}... from browser peer ${peerAddr.slice(0, 16)}...`
         );
@@ -2179,14 +2128,14 @@ async function fetchThumbnailFromPeers(
         }
       }
     } catch (err) {
-      console.debug(TAG, "browser peer thumbnail fetch setup failed:", err);
+      log.debug(TAG, "browser peer thumbnail fetch setup failed:", err);
     }
     return null;
   }
 
   const fetchFromTauriPeer = async (peerAddr: string): Promise<string> => {
     const result = await withPeerTimeout(
-      tauriInvoke("p2p_proxy_request", {
+      invoke<any>("p2p_proxy_request", {
         peerAddr,
         method: "POST",
         path: "/api/blobs/thumbnail_data",
@@ -2202,7 +2151,7 @@ async function fetchThumbnailFromPeers(
     const { data, mime } = parsed.data;
     if (!data || !mime) throw new Error("missing data or mime");
 
-    console.log(
+    log.debug(
       TAG,
       `fetched thumbnail for ${blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
     );
@@ -2233,10 +2182,9 @@ async function fetchThumbnailFromPeers(
 export async function generateThumbnailDataUrl(blob: Blob, maxSize = 200): Promise<string | null> {
   if (!blob.type.startsWith("image/")) return null;
   try {
-    const { generateThumbnailDataUrl: gen } = await import("../workers/blob-worker-client");
-    return await gen(blob, maxSize);
+    return await generateThumbnailDataUrlWorker(blob, maxSize);
   } catch (err) {
-    console.warn(TAG, "thumbnail generation failed:", err);
+    log.warn(TAG, "thumbnail generation failed:", err);
     return null;
   }
 }
@@ -2272,4 +2220,3 @@ export function formatFileSize(bytes: number): string {
 // ---------------------------------------------------------------------------
 // internal helpers
 // ---------------------------------------------------------------------------
-

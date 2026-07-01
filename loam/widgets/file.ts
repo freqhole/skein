@@ -1,5 +1,6 @@
 import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
+import { log } from "../src/utils/log";
 import { getMediaPlaybackUrl } from "../src/media";
 import { isTauriMode } from "../src/p2p/tauri-transport";
 import {
@@ -710,7 +711,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         }
       } catch (err) {
         // sprite/texture destruction can fail if the WebGL context was lost
-        console.warn("[file-widget] destroySprite: sprite cleanup failed", err);
+        log.warn("file-widget", "destroySprite: sprite cleanup failed", err);
         thumbSprite = null;
       }
       if (loadedAssetKey) {
@@ -727,7 +728,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             try {
               Assets.unload(keyToUnload);
             } catch (err) {
-              console.warn("[file-widget] destroySprite: asset unload failed", err);
+              log.warn("file-widget", "destroySprite: asset unload failed", err);
             }
             if (keyToUnload.startsWith("blob:")) {
               URL.revokeObjectURL(keyToUnload);
@@ -775,7 +776,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       syncActionButtons();
 
       const info = await checkBlobLocality(blobId, ctx.doc.current.blake3);
-      console.debug("[file:locality] checkBlobLocality result:", {
+      log.debug("file-widget", "checkBlobLocality result:", {
         blobId,
         locality: info.locality,
         metadata: info.metadata,
@@ -807,7 +808,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           }
         }
       }
-      console.debug("[file:locality] final actionState:", actionState, "for blobId:", blobId);
+      log.debug("file-widget", "final actionState:", actionState, "for blobId:", blobId);
       syncActionButtons();
 
       // re-layout to account for action bar height change
@@ -866,7 +867,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           try {
             texture = await Assets.load<Texture>(dataUrl);
           } catch (texErr) {
-            console.warn("[file-widget] loadThumbnail: Assets.load failed for", blobId, texErr);
+            log.warn("file-widget", "loadThumbnail: Assets.load failed for", blobId, texErr);
             texture = null;
           }
 
@@ -876,10 +877,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           // "addressModeU" crash during the render frame when PixiJS tries to
           // bind the texture. treat it as a failed load instead.
           if (texture && !texture.source?.style) {
-            console.warn(
-              "[file-widget] loadThumbnail: texture has invalid source, skipping",
-              blobId
-            );
+            log.warn("file-widget", "loadThumbnail: texture has invalid source, skipping", blobId);
             // only unload non-data: URLs — data: thumbnails are shared with the
             // bin renderer via the asset cache; unloading destroys the shared source.
             if (!dataUrl.startsWith("data:")) {
@@ -967,8 +965,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       }
 
       if (!isValidImageDataUrl(dataUrl)) {
-        console.warn(
-          "[file-widget] loadEmbeddedThumbnail: malformed data URL, falling back to async fetch"
+        log.warn(
+          "file-widget",
+          "loadEmbeddedThumbnail: malformed data URL, falling back to async fetch"
         );
         loadThumbnail(ctx.doc.current.blobId);
         return;
@@ -981,13 +980,13 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         try {
           texture = await Assets.load<Texture>(dataUrl);
         } catch (texErr) {
-          console.warn("[file-widget] loadEmbeddedThumbnail: Assets.load failed", texErr);
+          log.warn("file-widget", "loadEmbeddedThumbnail: Assets.load failed", texErr);
           texture = null;
         }
 
         // validate the texture has a usable WebGL source (same guard as loadThumbnail)
         if (texture && !texture.source?.style) {
-          console.warn("[file-widget] loadEmbeddedThumbnail: texture has invalid source, skipping");
+          log.warn("file-widget", "loadEmbeddedThumbnail: texture has invalid source, skipping");
           if (!dataUrl.startsWith("data:")) {
             try {
               Assets.unload(dataUrl);
@@ -1056,9 +1055,6 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       const selfEntry = store.getWidget(ctx.widgetId);
       if (!selfEntry) return;
 
-      // dynamically import bin schema to avoid circular deps
-      const { binSchema: _binSchema } = await import("./bin/index");
-
       // create the bin widget at the same position as this file widget.
       // make it a bit wider/taller to accommodate multiple items.
       const binId = crypto.randomUUID();
@@ -1083,7 +1079,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
       const binEntry = store.getWidget(binId);
       if (!binEntry?.docId) {
-        console.warn("file: bin doc not created after auto-bin, aborting");
+        log.warn("file-widget", "bin doc not created after auto-bin, aborting");
         return;
       }
 
@@ -1091,7 +1087,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       const repo = store.repo;
       const binDocHandle = repo.handles[binEntry.docId as any];
       if (!binDocHandle) {
-        console.warn("file: bin doc handle not found, aborting");
+        log.warn("file-widget", "bin doc handle not found, aborting");
         return;
       }
 
@@ -1148,7 +1144,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             });
           })
           .catch((err) => {
-            console.warn(`file: auto-bin upload failed for ${file.filename}:`, err);
+            log.warn("file-widget", `auto-bin upload failed for ${file.filename}:`, err);
             // leave the child widget in place — it will show as empty
           });
       }
@@ -1245,7 +1241,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
                 }
               }
               // timed out — pages may still be rendering, leave file widget in place
-              console.warn("[file] PDF page rendering timed out for", uploadBlobId.slice(0, 8));
+              log.warn("file-widget", "PDF page rendering timed out for", uploadBlobId.slice(0, 8));
             })();
           }
 
@@ -1291,7 +1287,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         // multiple files: replace this file widget with a bin
         await handleMultiFileUpload(picked);
       } catch (err) {
-        console.error("file upload failed:", err);
+        log.error("file-widget", "upload failed:", err);
         loadState = "error";
         syncVisibility();
       }
@@ -1316,7 +1312,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       snatchBtn.setColor(0x2d5a27);
       syncActionButtons();
       positionInfoBar(currentWidth, currentHeight);
-      console.log("[file] snatch cancelled by user");
+      log.debug("file-widget", "snatch cancelled by user");
     }
 
     async function handleSnatch() {
@@ -1325,7 +1321,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       const state = ctx.doc.current;
       const allPeers = ctx.canvasStore?.peers();
       if (!allPeers || Object.keys(allPeers).length === 0) {
-        console.warn("[file] no peers available for snatch");
+        log.warn("file-widget", "no peers available for snatch");
         return;
       }
 
@@ -1405,7 +1401,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         );
 
         if (snatchCancelled) {
-          console.log("[file] snatch result discarded (cancelled)");
+          log.debug("file-widget", "snatch result discarded (cancelled)");
           return;
         }
 
@@ -1474,10 +1470,10 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         }
       } catch (err) {
         if (snatchCancelled) {
-          console.log("[file] snatch aborted (cancelled)");
+          log.debug("file-widget", "snatch aborted (cancelled)");
           return;
         }
-        console.error("[file] snatch failed:", err);
+        log.error("file-widget", "snatch failed:", err);
         actionState = "remote";
         syncActionButtons();
       } finally {
@@ -1492,7 +1488,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       const state = ctx.doc.current;
       const revealed = await revealBlobInFinder(state.blobId);
       if (!revealed) {
-        console.warn("[file] could not reveal blob in finder, falling back to save dialog");
+        log.warn("file-widget", "could not reveal blob in finder, falling back to save dialog");
         handleSaveToDisk();
       }
     }
@@ -1509,10 +1505,10 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       try {
         const saved = await saveBlobToDisk(state.blobId, state.filename || "file");
         if (saved) {
-          console.log("[file] saved to disk successfully");
+          log.debug("file-widget", "saved to disk successfully");
         }
       } catch (err) {
-        console.error("[file] save to disk failed:", err);
+        log.error("file-widget", "save to disk failed:", err);
       }
 
       actionState = prevState;
@@ -1524,7 +1520,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     async function handlePreview() {
       const state = ctx.doc.current;
-      console.debug("[file:preview] handlePreview called", {
+      log.debug("file-widget", "handlePreview called", {
         blobId: state.blobId,
         domain: state.domain,
         actionState,
@@ -1533,20 +1529,16 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         isPreviewable: isPreviewableDomain(state.domain),
       });
       if (!state.blobId || !isPreviewableDomain(state.domain)) {
-        console.debug("[file:preview] bail: no blobId or not previewable domain");
+        log.debug("file-widget", "bail: no blobId or not previewable domain");
         return;
       }
       if (actionState !== "local" && actionState !== "snatched") {
-        console.debug(
-          "[file:preview] bail: actionState is",
-          actionState,
-          "(need local or snatched)"
-        );
+        log.debug("file-widget", "bail: actionState is", actionState, "(need local or snatched)");
         return;
       }
 
       const overlayType = domainToOverlayType(state.domain);
-      console.debug("[file:preview] overlayType:", overlayType);
+      log.debug("file-widget", "overlayType:", overlayType);
 
       // photos use the fullscreen overlay — inline at widget scale isn't useful
       if (overlayType === "photo") {
@@ -1561,21 +1553,24 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
         let src: string | null = null;
         // local-first: only preview from local sources, no peer fetch
-        console.debug(
-          "[file:preview] photo: calling getLocalBlobUrl for",
+        log.debug(
+          "file-widget",
+          "photo: calling getLocalBlobUrl for",
           state.blobId,
           "blake3:",
           state.blake3?.slice(0, 12)
         );
         src = await getLocalBlobUrl(state.blobId, state.blake3);
-        console.debug(
-          "[file:preview] photo: getLocalBlobUrl returned",
+        log.debug(
+          "file-widget",
+          "photo: getLocalBlobUrl returned",
           src ? `${src.slice(0, 80)}...` : null
         );
 
         if (!src) {
-          console.warn(
-            "[file:preview] could not resolve blob data for photo preview, blobId:",
+          log.warn(
+            "file-widget",
+            "could not resolve blob data for photo preview, blobId:",
             state.blobId
           );
           return;
@@ -1607,8 +1602,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       // use the unified media URL resolver — handles asset:// on macOS,
       // blob: URL workaround on Linux WebKitGTK, and OPFS in browser mode
       // local-first: try local URL without peer fallback
-      console.debug(
-        "[file:preview] audio/video: calling getMediaPlaybackUrl for",
+      log.debug(
+        "file-widget",
+        "audio/video: calling getMediaPlaybackUrl for",
         state.blobId,
         "mime:",
         state.mime
@@ -1619,14 +1615,16 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         blake3: state.blake3,
         // no peers — preview only uses local sources
       });
-      console.debug(
-        "[file:preview] audio/video: getMediaPlaybackUrl returned",
+      log.debug(
+        "file-widget",
+        "audio/video: getMediaPlaybackUrl returned",
         src ? `${src.slice(0, 80)}...` : null
       );
 
       if (!src) {
-        console.warn(
-          "[file:preview] could not resolve blob data for preview, blobId:",
+        log.warn(
+          "file-widget",
+          "could not resolve blob data for preview, blobId:",
           state.blobId,
           "domain:",
           state.domain

@@ -10,6 +10,7 @@
 
 import * as Comlink from "comlink";
 import type { BlobWorkerApi } from "./blob-worker";
+import * as middenWasm from "midden";
 
 let workerProxy: Comlink.Remote<BlobWorkerApi> | null = null;
 let workerInstance: Worker | null = null;
@@ -32,6 +33,7 @@ export async function getBlobWorker(): Promise<Comlink.Remote<BlobWorkerApi> | n
   // vite ?worker import: returns a constructor for a module-format worker.
   // the wasm + topLevelAwait plugins are applied to worker bundles via
   // vite.config.ts `worker.plugins`.
+  // eslint-disable-next-line no-restricted-syntax -- vite ?worker suffix requires dynamic import
   const WorkerCtor = (await import("./blob-worker?worker")).default;
   workerInstance = new WorkerCtor();
   workerProxy = Comlink.wrap<BlobWorkerApi>(workerInstance);
@@ -56,10 +58,7 @@ export function shutdownBlobWorker(): void {
 
 async function fallbackHashBlake3(data: Uint8Array): Promise<string> {
   try {
-    const midden = (await import("midden")) as unknown as {
-      hash_blake3?: (bytes: Uint8Array) => string;
-    };
-    return typeof midden.hash_blake3 === "function" ? midden.hash_blake3(data) : "";
+    return typeof middenWasm.hash_blake3 === "function" ? middenWasm.hash_blake3(data) : "";
   } catch {
     return "";
   }
@@ -208,10 +207,7 @@ export async function resizeImageToWebpDataUrl(
  * generate a thumbnail data URL (default 200x200 WebP @ q=0.75) for an
  * image Blob. delegates to the worker.
  */
-export async function generateThumbnailDataUrl(
-  blob: Blob,
-  maxSize = 200
-): Promise<string | null> {
+export async function generateThumbnailDataUrl(blob: Blob, maxSize = 200): Promise<string | null> {
   if (!blob.type.startsWith("image/")) return null;
   return resizeImageToWebpDataUrl(blob, {
     maxWidth: maxSize,

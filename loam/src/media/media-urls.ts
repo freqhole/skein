@@ -20,8 +20,12 @@
  */
 
 import { dispatch as tauriDispatch, isTauriMode } from "../p2p/tauri-transport";
+import { log } from "../utils/log";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { resolveBlob, getBlobData } from "../storage/skein-blob-store";
+import { getFullBlobDataUrl } from "../widgets/file-utils";
 
-const TAG = "[media-urls]";
+const TAG = "media-urls";
 
 // ---------------------------------------------------------------------------
 // platform detection
@@ -84,16 +88,6 @@ function ensureBeforeUnloadCleanup(): void {
 
 type PeersMap = Record<string, { nodeId: string }>;
 
-/** lazy-import and cache convertFileSrc from @tauri-apps/api/core */
-let _convertFileSrc: ((path: string) => string) | null = null;
-
-async function getConvertFileSrc(): Promise<(path: string) => string> {
-  if (_convertFileSrc) return _convertFileSrc;
-  const { convertFileSrc } = await import("@tauri-apps/api/core");
-  _convertFileSrc = convertFileSrc;
-  return convertFileSrc;
-}
-
 // ---------------------------------------------------------------------------
 // internal: resolve blob to a local filesystem path (tauri only)
 // ---------------------------------------------------------------------------
@@ -116,7 +110,7 @@ async function getBlobLocalPath(blobId: string): Promise<BlobPathInfo | null> {
 
     return { path: response.path, mime: response.mime ?? undefined };
   } catch (err) {
-    console.debug(TAG, "getBlobLocalPath failed:", err);
+    log.debug(TAG, "getBlobLocalPath failed:", err);
     return null;
   }
 }
@@ -138,8 +132,6 @@ async function createMediaBlobUrl(
   mime: string | undefined,
   category: "audio" | "video"
 ): Promise<string> {
-  const convertFileSrc = await getConvertFileSrc();
-
   // revoke previous URL in this category to free memory
   const prev = mediaBlobSlots[category];
   if (prev) {
@@ -174,16 +166,15 @@ async function getBlobUrlFromOpfs(blobId: string, blake3?: string): Promise<stri
   try {
     // use resolveBlob (which tries blob_id, sha256, and blake3 indexes)
     // instead of getBlobObjectURL (which only passes blobId, missing blake3)
-    const { resolveBlob, getBlobData } = await import("../storage/skein-blob-store");
     const record = await resolveBlob(blobId, blake3);
     if (!record) {
-      console.debug(TAG, "getBlobUrlFromOpfs: resolveBlob found nothing for", blobId);
+      log.debug(TAG, "getBlobUrlFromOpfs: resolveBlob found nothing for", blobId);
       return null;
     }
 
     const data = await getBlobData(record.blob_id);
     if (!data) {
-      console.debug(TAG, "getBlobUrlFromOpfs: OPFS file missing for", record.blob_id);
+      log.debug(TAG, "getBlobUrlFromOpfs: OPFS file missing for", record.blob_id);
       return null;
     }
 
@@ -216,7 +207,7 @@ async function getBlobDataUrl(blobId: string): Promise<string | null> {
     const mime = response.meta?.mime ?? "application/octet-stream";
     return `data:${mime};base64,${response.data}`;
   } catch (err) {
-    console.debug(TAG, "getBlobDataUrl failed:", err);
+    log.debug(TAG, "getBlobDataUrl failed:", err);
     return null;
   }
 }
@@ -255,7 +246,7 @@ export async function getMediaPlaybackUrl(
 ): Promise<string | null> {
   const { category = "audio", mime, blake3 } = options;
 
-  console.debug(
+  log.debug(
     TAG,
     "getMediaPlaybackUrl:",
     blobId,
@@ -277,46 +268,45 @@ export async function getMediaPlaybackUrl(
     // canvas), `blob_get_path` returns null and we fall through to the
     // base64 IPC fallback (which also won't find it, leaving P2P below).
     const lookupId = blake3 || blobId;
-    console.debug(TAG, "getMediaPlaybackUrl: trying blob_get_path for", lookupId);
+    log.debug(TAG, "getMediaPlaybackUrl: trying blob_get_path for", lookupId);
     const pathInfo = await getBlobLocalPath(lookupId);
-    console.debug(TAG, "getMediaPlaybackUrl: blob_get_path returned:", pathInfo);
+    log.debug(TAG, "getMediaPlaybackUrl: blob_get_path returned:", pathInfo);
 
     if (pathInfo) {
       // on Linux WebKitGTK, asset:// doesn't work for media elements —
       // fetch the file via asset:// and create a blob: URL instead
       if (isLinuxWebKit) {
         try {
-          console.debug(TAG, "getMediaPlaybackUrl: linux — creating blob URL from asset...");
+          log.debug(TAG, "getMediaPlaybackUrl: linux — creating blob URL from asset...");
           const url = await createMediaBlobUrl(
             blobId,
             pathInfo.path,
             mime ?? pathInfo.mime,
             category
           );
-          console.debug(TAG, "getMediaPlaybackUrl: linux blob URL created:", url.slice(0, 60));
+          log.debug(TAG, "getMediaPlaybackUrl: linux blob URL created:", url.slice(0, 60));
           return url;
         } catch (err) {
-          console.warn(TAG, "linux blob URL fallback failed:", err);
+          log.warn(TAG, "linux blob URL fallback failed:", err);
           // fall through to other approaches
         }
       } else {
         // macOS / Windows: asset:// URLs work natively
         try {
-          const convertFileSrc = await getConvertFileSrc();
           const assetUrl = convertFileSrc(pathInfo.path);
-          console.debug(TAG, "getMediaPlaybackUrl: asset URL:", assetUrl.slice(0, 80));
+          log.debug(TAG, "getMediaPlaybackUrl: asset URL:", assetUrl.slice(0, 80));
           return assetUrl;
         } catch (err) {
-          console.warn(TAG, "convertFileSrc failed:", err);
+          log.warn(TAG, "convertFileSrc failed:", err);
           // fall through
         }
       }
     }
 
     // tauri fallback: base64 data URL from IPC
-    console.debug(TAG, "getMediaPlaybackUrl: trying base64 data URL fallback for", lookupId);
+    log.debug(TAG, "getMediaPlaybackUrl: trying base64 data URL fallback for", lookupId);
     const dataUrl = await getBlobDataUrl(lookupId);
-    console.debug(
+    log.debug(
       TAG,
       "getMediaPlaybackUrl: getBlobDataUrl returned:",
       dataUrl ? "data URL" : null
@@ -327,14 +317,14 @@ export async function getMediaPlaybackUrl(
   // ---- browser mode: OPFS blob URL ----
 
   if (!isTauriMode()) {
-    console.debug(
+    log.debug(
       TAG,
       "getMediaPlaybackUrl: browser — trying OPFS...",
       "blake3:",
       blake3?.slice(0, 12)
     );
     const opfsUrl = await getBlobUrlFromOpfs(blobId, blake3);
-    console.debug(
+    log.debug(
       TAG,
       "getMediaPlaybackUrl: OPFS returned:",
       opfsUrl ? opfsUrl.slice(0, 60) : null
@@ -346,19 +336,16 @@ export async function getMediaPlaybackUrl(
 
   if (options.peers) {
     try {
-      console.debug(TAG, "getMediaPlaybackUrl: trying P2P fallback...");
-      // delegate to file-utils getFullBlobDataUrl which already has
-      // the P2P fetch logic. lazy import to avoid circular dependency.
-      const { getFullBlobDataUrl } = await import("../widgets/file-utils");
+      log.debug(TAG, "getMediaPlaybackUrl: trying P2P fallback...");
       const peerUrl = await getFullBlobDataUrl(blobId, options.peers);
-      console.debug(TAG, "getMediaPlaybackUrl: P2P returned:", peerUrl ? "got URL" : null);
+      log.debug(TAG, "getMediaPlaybackUrl: P2P returned:", peerUrl ? "got URL" : null);
       if (peerUrl) return peerUrl;
     } catch (err) {
-      console.warn(TAG, "P2P fallback failed:", err);
+      log.warn(TAG, "P2P fallback failed:", err);
     }
   }
 
-  console.debug(TAG, "getMediaPlaybackUrl: all paths failed for", blobId);
+  log.debug(TAG, "getMediaPlaybackUrl: all paths failed for", blobId);
   return null;
 }
 

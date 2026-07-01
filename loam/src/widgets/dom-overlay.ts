@@ -114,7 +114,7 @@ export function createDomOverlay(options: DomOverlayOptions): DomOverlayHandle {
 
   el.value = value;
   if (placeholder) el.placeholder = placeholder;
-  if (maxLength != null) el.maxLength = maxLength;
+  if (maxLength !== null && maxLength !== undefined) el.maxLength = maxLength;
 
   // suppress autocomplete / spellcheck for code-like inputs
   el.autocomplete = "off";

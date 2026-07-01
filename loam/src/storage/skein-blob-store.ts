@@ -6,6 +6,10 @@
 // operation, close it when done. no idb library dependency.
 // ---------------------------------------------------------------------------
 
+import { writeBlobToOpfs, processBlobBytes, base64Decode } from "../workers/blob-worker-client";
+import { isTauriMode, dispatch } from "../p2p/tauri-transport";
+import { log } from "../utils/log";
+
 // ---- interfaces -----------------------------------------------------------
 
 export interface SkeinBlobRecord {
@@ -23,6 +27,8 @@ export interface SkeinBlobRecord {
 }
 
 // ---- constants ------------------------------------------------------------
+
+const TAG = "blob-store";
 
 const BLOB_DB_NAME = "skein-blobs";
 const BLOB_STORE = "blobs";
@@ -180,10 +186,9 @@ export function classifyDomain(mime: string): string {
  */
 async function tryWriteOpfs(blobId: string, data: ArrayBuffer): Promise<void> {
   try {
-    const { writeBlobToOpfs } = await import("../workers/blob-worker-client");
     await writeBlobToOpfs(blobId, data);
   } catch (err) {
-    console.warn("[skein-blob-store] tryWriteOpfs failed for", blobId.slice(0, 16), err);
+    log.warn(TAG, "tryWriteOpfs failed for", blobId.slice(0, 16), err);
   }
 }
 
@@ -240,7 +245,6 @@ export async function storeBlobFromFile(file: File, domain?: string): Promise<Sk
   // hand the whole upload pipeline to the blob worker: sha256 + blake3
   // hashing AND the OPFS write happen off the main thread in a single
   // round-trip. transfers ownership of `buffer` \u2014 do not use it after.
-  const { processBlobBytes } = await import("../workers/blob-worker-client");
   const processed = await processBlobBytes(buffer, file.name, mime);
   const blobId = processed.sha256;
 
@@ -382,7 +386,6 @@ export async function getBlobRecordByBlake3(blake3Hash: string): Promise<SkeinBl
  */
 async function tauriBlobRecordByBlake3(blake3Hash: string): Promise<SkeinBlobRecord | null> {
   try {
-    const { isTauriMode, dispatch } = await import("../p2p/tauri-transport");
     if (!isTauriMode()) return null;
     const response = (await dispatch("blob_get_path", { blake3: blake3Hash })) as {
       path?: string;
@@ -401,11 +404,7 @@ async function tauriBlobRecordByBlake3(blake3Hash: string): Promise<SkeinBlobRec
  * blake3 as the canonical id, so blob_id and blake3 are the same; sha256 is
  * not tracked there and stays empty.
  */
-function synthesizeTauriRecord(
-  blake3Hash: string,
-  mime: string,
-  size: number
-): SkeinBlobRecord {
+function synthesizeTauriRecord(blake3Hash: string, mime: string, size: number): SkeinBlobRecord {
   return {
     blob_id: blake3Hash,
     sha256: "",
@@ -442,27 +441,23 @@ export async function getBlobData(blobId: string): Promise<ArrayBuffer | null> {
       }
     }
   } catch (err) {
-    console.warn("[skein-blob-store] getBlobData OPFS access failed for", blobId, err);
+    log.warn(TAG, "getBlobData OPFS access failed for", blobId, err);
   }
 
   // tauri fallback — ask the rust side for the bytes by blake3.
   try {
-    const { isTauriMode, dispatch } = await import("../p2p/tauri-transport");
     if (!isTauriMode()) return null;
-    const response = (await dispatch("blob_get", { blake3: blobId })) as
-      | { data: string }
-      | null;
+    const response = (await dispatch("blob_get", { blake3: blobId })) as { data: string } | null;
     if (!response?.data) return null;
     // base64 decode delegated to the blob worker — these payloads are
     // routinely megabyte-scale (full blob bytes shipped over IPC).
-    const { base64Decode } = await import("../workers/blob-worker-client");
     const out = await base64Decode(response.data);
     // best-effort: cache the bytes back into OPFS so future reads are local.
     // (no-op on webkit where createWritable is missing.)
     void tryWriteOpfs(blobId, out.buffer as ArrayBuffer);
     return out.buffer as ArrayBuffer;
   } catch (err) {
-    console.warn("[skein-blob-store] getBlobData tauri fallback failed for", blobId, err);
+    log.warn(TAG, "getBlobData tauri fallback failed for", blobId, err);
     return null;
   }
 }

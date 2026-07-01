@@ -1,6 +1,7 @@
 import type { CanvasStore } from "./canvas-store";
+import { log } from "../utils/log";
 
-const TAG = "[presence]";
+const TAG = "canvas.presence";
 
 // palette for assigning distinct colors to each peer
 const PEER_COLORS = [
@@ -101,7 +102,7 @@ export class PresenceManager {
    */
   setLocalNodeId(nodeId: string): void {
     this.localNodeId = nodeId;
-    console.log(
+    log.debug(
       TAG,
       `localNodeId set: ${nodeId.slice(0, 16)} (localPeerId: ${this.localPeerId.slice(0, 12)})`
     );
@@ -334,7 +335,7 @@ export class PresenceManager {
     // log all known peerIds so we can detect when the same person
     // appears under multiple IDs (reconnection, different tab, etc.)
     const allPeerIds = [...this.peers.keys()].map((id) => id.slice(0, 12));
-    console.log(
+    log.debug(
       TAG,
       `new peer created: ${peerId.slice(0, 12)} (color=#${color.toString(16)}, total peers: ${this.peers.size}, all: [${allPeerIds.join(", ")}])`
     );
@@ -393,7 +394,7 @@ export class PresenceManager {
 
     // log non-cursor messages (cursor messages are too frequent to log every time)
     if (msg.type !== "cursor") {
-      console.log(
+      log.debug(
         TAG,
         `ephemeral from ${senderId.slice(0, 12)}: type=${msg.type} nodeId=${msgNodeId?.slice(0, 12) ?? "none"} effectivePeer=${effectivePeerId.slice(0, 12)} (local=${this.localPeerId.slice(0, 12)}, known peers: ${this.peers.size})`
       );

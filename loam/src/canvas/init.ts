@@ -333,8 +333,7 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     app.stage.addChild(syncOverlay);
 
     // pulse animation
-    let syncOverlayTimer: ReturnType<typeof setInterval> | undefined;
-    syncOverlayTimer = setInterval(() => {
+    const syncOverlayTimer: ReturnType<typeof setInterval> | undefined = setInterval(() => {
       if (!syncOverlay) return;
       syncOverlay.alpha = 0.4 + Math.abs(Math.sin(Date.now() / 800)) * 0.6;
     }, 50);

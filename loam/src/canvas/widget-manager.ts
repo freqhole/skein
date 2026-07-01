@@ -470,6 +470,7 @@ export class WidgetManager {
         get current() {
           return {};
         },
+        // eslint-disable-next-line no-empty-function -- intentional no-op for stateless widgets
         change() {},
         on() {
           return () => {};

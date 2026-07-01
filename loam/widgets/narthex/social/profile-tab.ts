@@ -750,7 +750,7 @@ export function createProfileTab(ctx: TabContext): TabController {
       setupBtnText.y = (BUTTON_HEIGHT - TEXT_SIZE) / 2;
 
       // "import existing identity" link or UI — positioned below generate button (or in its place)
-      let importY = importMode ? btnY : btnY + BUTTON_HEIGHT + 12;
+      const importY = importMode ? btnY : btnY + BUTTON_HEIGHT + 12;
 
       if (!importMode) {
         // show just the link

@@ -47,6 +47,7 @@ async function mountGallery(): Promise<void> {
         get current() {
           return {};
         },
+        // eslint-disable-next-line no-empty-function -- intentional no-op stub
         change() {},
         on() {
           return () => {};

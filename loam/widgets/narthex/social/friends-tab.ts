@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import { Assets, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
+import { log } from "../../../src/utils/log";
 import {
   isOnline as bridgeIsOnline,
   isProtocolReady as bridgeIsProtocolReady,
@@ -449,7 +450,6 @@ export function createFriendsTab(ctx: TabContext): TabController {
     }
   });
 
-
   // scroll handler on the list container — only capture when content overflows
   listContainer.on("wheel", (e: WheelEvent) => {
     const canScroll = totalListHeight > listAreaHeight;
@@ -690,13 +690,22 @@ export function createFriendsTab(ctx: TabContext): TabController {
           }, HEADER_HOLD_MS);
         });
         headerRow.on("pointerup", () => {
-          if (headerHoldTimer) { clearTimeout(headerHoldTimer); headerHoldTimer = null; }
+          if (headerHoldTimer) {
+            clearTimeout(headerHoldTimer);
+            headerHoldTimer = null;
+          }
         });
         headerRow.on("pointerupoutside", () => {
-          if (headerHoldTimer) { clearTimeout(headerHoldTimer); headerHoldTimer = null; }
+          if (headerHoldTimer) {
+            clearTimeout(headerHoldTimer);
+            headerHoldTimer = null;
+          }
         });
         headerRow.on("pointermove", () => {
-          if (headerHoldTimer) { clearTimeout(headerHoldTimer); headerHoldTimer = null; }
+          if (headerHoldTimer) {
+            clearTimeout(headerHoldTimer);
+            headerHoldTimer = null;
+          }
         });
         currentY += ROW_HEIGHT;
 
@@ -734,7 +743,6 @@ export function createFriendsTab(ctx: TabContext): TabController {
         if (dragState?.isDragging && dragState.friendId === friend.id) {
           rowContainer.alpha = DRAG_ROW_DIMMED_ALPHA;
         }
-
 
         // colored group indicator line on the left edge
         if (friend.group) {
@@ -1829,7 +1837,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
 
     // validate node ID format if provided
     if (nodeId && !isValidNodeId(nodeId)) {
-      console.warn("[friends-tab] invalid node ID format — expected 64-char hex string");
+      log.warn("social.friends", "invalid node ID format — expected 64-char hex string");
       return;
     }
 
@@ -1867,22 +1875,25 @@ export function createFriendsTab(ctx: TabContext): TabController {
     // a friend request so the remote peer gets notified
     if (nodeId) {
       const ready = bridgeIsProtocolReady();
-      console.log(
-        "[friends-tab] add-friend submit nodeId=" + nodeId.slice(0, 16) + "... protocolReady=" + ready
+      log.debug(
+        "social.friends",
+        "add-friend submit nodeId=" + nodeId.slice(0, 16) + "... protocolReady=" + ready
       );
       if (ready) {
         sendFriendRequest(nodeId)
           .then(() => {
-            console.log(
-              "[friends-tab] sendFriendRequest resolved for " + nodeId.slice(0, 16) + "..."
+            log.debug(
+              "social.friends",
+              "sendFriendRequest resolved for " + nodeId.slice(0, 16) + "..."
             );
           })
           .catch((err) => {
-            console.warn("[friends-tab] failed to send friend request after add:", err);
+            log.warn("social.friends", "failed to send friend request after add:", err);
           });
       } else {
-        console.warn(
-          "[friends-tab] skipped sendFriendRequest \u2014 friendz protocol bridge not ready yet"
+        log.warn(
+          "social.friends",
+          "skipped sendFriendRequest — friendz protocol bridge not ready yet"
         );
       }
     }

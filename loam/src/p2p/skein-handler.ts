@@ -16,6 +16,11 @@
 // ---------------------------------------------------------------------------
 
 import type { BiStreamLike } from "./iroh-network-adapter";
+import { base64Encode } from "../workers/blob-worker-client";
+import * as blobStore from "../storage/skein-blob-store";
+import { getMiddenNode as getMiddenNodeFromIdentity } from "./identity";
+import { isTauriMode, dispatch } from "./tauri-transport";
+import { log } from "../utils/log";
 
 // ---- peer message types ---------------------------------------------------
 // these match midden's PeerMessage enum (serde tag = "type", rename_all = "snake_case")
@@ -72,7 +77,7 @@ type PeerMessage =
 
 // ---- constants ------------------------------------------------------------
 
-const TAG = "[skein-handler]";
+const TAG = "skein.handler";
 
 // ---- helpers --------------------------------------------------------------
 
@@ -98,21 +103,7 @@ async function sendRawResponse(stream: BiStreamLike, msg: PeerMessage): Promise<
 // base64 encoding is delegated to the blob worker (off-main-thread).
 // `data` ownership is transferred to the worker — do not reuse after.
 async function arrayBufferToBase64(buffer: ArrayBuffer): Promise<string> {
-  const { base64Encode } = await import("../workers/blob-worker-client");
   return base64Encode(buffer);
-}
-
-// lazy import to avoid circular deps and keep the module light at load time
-async function getBlobStore() {
-  return import("../storage/skein-blob-store");
-}
-
-// lazy import for midden node (used by compute_blake3 and ensure_blob handlers)
-async function getMiddenNode() {
-  const { getMiddenNode: getMidden } = await import("./identity");
-  const node = await getMidden();
-  if (!node) throw new Error("midden node not available");
-  return node;
 }
 
 // ---- proxy request dispatch -----------------------------------------------
@@ -130,7 +121,7 @@ async function handleProxyRequest(stream: BiStreamLike, msg: ProxyRequest): Prom
   const { id, method, path, body } = msg;
   const peerId = stream.peer_node_id().slice(0, 16);
 
-  console.log(TAG, `proxy ${method} ${path} from ${peerId}...`);
+  log.debug(TAG, `proxy ${method} ${path} from ${peerId}...`);
 
   let parsedBody: Record<string, unknown> = {};
   if (body) {
@@ -165,7 +156,7 @@ async function handleProxyRequest(stream: BiStreamLike, msg: ProxyRequest): Prom
     }
 
     // fallback — not implemented
-    console.log(TAG, `unhandled proxy route: ${method} ${path}`);
+    log.debug(TAG, `unhandled proxy route: ${method} ${path}`);
     await sendRawResponse(stream, {
       type: "proxy_response",
       id,
@@ -173,7 +164,7 @@ async function handleProxyRequest(stream: BiStreamLike, msg: ProxyRequest): Prom
       body: JSON.stringify({ success: false, message: "not implemented" }),
     });
   } catch (err) {
-    console.error(TAG, `error handling proxy ${method} ${path}:`, err);
+    log.error(TAG, `error handling proxy ${method} ${path}:`, err);
     await sendRawResponse(stream, {
       type: "proxy_response",
       id,
@@ -202,7 +193,7 @@ async function handleThumbnailData(
     return;
   }
 
-  const store = await getBlobStore();
+  const store = blobStore;
   const record = await store.resolveBlob(blobId);
   if (!record) {
     await sendRawResponse(stream, {
@@ -243,7 +234,7 @@ async function handleThumbnailData(
 }
 
 async function handleBlobData(stream: BiStreamLike, id: number, blobId: string): Promise<void> {
-  const store = await getBlobStore();
+  const store = blobStore;
   const record = await store.resolveBlob(blobId);
   if (!record) {
     await sendRawResponse(stream, {
@@ -297,7 +288,7 @@ async function handleBlobMetadata(
     return;
   }
 
-  const store = await getBlobStore();
+  const store = blobStore;
   const record = await store.resolveBlob(blobId);
   if (!record) {
     await sendRawResponse(stream, {
@@ -335,9 +326,9 @@ async function handleComputeBlake3(stream: BiStreamLike, msg: ComputeBlake3Reque
   const { id, blob_id } = msg;
   const peerId = stream.peer_node_id().slice(0, 16);
 
-  console.log(TAG, `compute_blake3 for ${blob_id.slice(0, 8)}... from ${peerId}...`);
+  log.debug(TAG, `compute_blake3 for ${blob_id.slice(0, 8)}... from ${peerId}...`);
 
-  const store = await getBlobStore();
+  const store = blobStore;
   const resolved = await store.resolveBlobData(blob_id);
 
   if (!resolved) {
@@ -357,7 +348,7 @@ async function handleComputeBlake3(stream: BiStreamLike, msg: ComputeBlake3Reque
     // import_blob_and_export_bao returns { hash, bao } — we use its hash
     // as the blake3 result instead of calling hash_blake3 separately.
     // this avoids copying the full blob into WASM twice (OOM fix).
-    const node = await getMiddenNode();
+    const node = await getMiddenNodeFromIdentity();
     let hash: string;
 
     if (typeof (node as any).import_blob_and_export_bao === "function") {
@@ -367,16 +358,16 @@ async function handleComputeBlake3(stream: BiStreamLike, msg: ComputeBlake3Reque
         data = null;
         hash = result.hash;
         if (result && result.bao) {
-          const baoStore = await getBlobStore();
+          const baoStore = blobStore;
           await baoStore.storeBaoData(hash, result.bao.buffer);
-          console.log(
+          log.debug(
             TAG,
             `cached bao data for ${hash.slice(0, 16)}... (${result.bao.byteLength} bytes)`
           );
         }
       } catch (baoErr) {
         // fallback to plain import if bao export fails — import_blob also returns the hash
-        console.warn(TAG, `bao export failed, falling back to plain import:`, baoErr);
+        log.warn(TAG, `bao export failed, falling back to plain import:`, baoErr);
         hash = await (node as any).import_blob(new Uint8Array(data!));
         data = null;
       }
@@ -386,7 +377,7 @@ async function handleComputeBlake3(stream: BiStreamLike, msg: ComputeBlake3Reque
       data = null;
     }
 
-    console.log(TAG, `computed blake3 for ${blob_id.slice(0, 8)}...: ${hash.slice(0, 16)}...`);
+    log.debug(TAG, `computed blake3 for ${blob_id.slice(0, 8)}...: ${hash.slice(0, 16)}...`);
 
     await sendRawResponse(stream, {
       type: "compute_blake3_response",
@@ -394,7 +385,7 @@ async function handleComputeBlake3(stream: BiStreamLike, msg: ComputeBlake3Reque
       blake3: hash,
     });
   } catch (err) {
-    console.error(TAG, `blake3 computation failed:`, err);
+    log.error(TAG, `blake3 computation failed:`, err);
     await sendRawResponse(stream, {
       type: "compute_blake3_response",
       id,
@@ -410,7 +401,7 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
   const { id, blake3_hash } = msg;
   const peerId = stream.peer_node_id().slice(0, 16);
 
-  console.log(TAG, `ensure_blob ${blake3_hash.slice(0, 16)}... from ${peerId}...`);
+  log.debug(TAG, `ensure_blob ${blake3_hash.slice(0, 16)}... from ${peerId}...`);
 
   // tauri short-circuit: import the blob's bytes from rust `blobz` into
   // the iroh-blobs FsStore (rust-side, registered on the same endpoint via
@@ -419,40 +410,36 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
   // chunked, verified, no size cap. the JS-side MemStore code below never
   // runs in tauri mode (we have no midden in the webview).
   try {
-    const { isTauriMode, dispatch } = await import("./tauri-transport");
     if (isTauriMode()) {
       let available = false;
       try {
         const result = await dispatch("blob_iroh_ensure", { blake3: blake3_hash });
         available = result?.available === true;
         if (!available) {
-          console.log(
+          log.debug(
             TAG,
             `tauri ensure_blob ${blake3_hash.slice(0, 16)}... → missing (${result?.reason ?? "unknown"})`
           );
         } else {
-          console.log(
-            TAG,
-            `tauri ensure_blob ${blake3_hash.slice(0, 16)}... → loaded into FsStore`
-          );
+          log.debug(TAG, `tauri ensure_blob ${blake3_hash.slice(0, 16)}... → loaded into FsStore`);
         }
       } catch (err) {
-        console.warn(TAG, "blob_iroh_ensure dispatch failed:", err);
+        log.warn(TAG, "blob_iroh_ensure dispatch failed:", err);
       }
       await sendRawResponse(stream, { type: "ensure_blob_response", id, available });
       return;
     }
   } catch (err) {
-    console.warn(TAG, "tauri ensure_blob short-circuit failed, falling through:", err);
+    log.warn(TAG, "tauri ensure_blob short-circuit failed, falling through:", err);
   }
 
   try {
     // check if already in MemStore (avoids expensive OPFS read + bao recomputation)
-    const node = await getMiddenNode();
+    const node = await getMiddenNodeFromIdentity();
     if (typeof (node as any).has_active_blob === "function") {
       const alreadyLoaded = (node as any).has_active_blob(blake3_hash);
       if (alreadyLoaded) {
-        console.log(
+        log.debug(
           TAG,
           `blob ${blake3_hash.slice(0, 16)}... already in MemStore, skipping re-import`
         );
@@ -463,21 +450,18 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
 
     // try fast path: import from cached bao data (skips bao tree recomputation).
     // the bao cache is populated by handleComputeBlake3 / import_blob_and_export_bao.
-    const store = await getBlobStore();
+    const store = blobStore;
     if (typeof (node as any).import_bao === "function") {
       const baoData = await store.getBaoData(blake3_hash);
       if (baoData) {
         try {
           await (node as any).import_bao(blake3_hash, new Uint8Array(baoData));
-          console.log(
-            TAG,
-            `ensured blob ${blake3_hash.slice(0, 16)}... via cached bao (fast path)`
-          );
+          log.debug(TAG, `ensured blob ${blake3_hash.slice(0, 16)}... via cached bao (fast path)`);
           await sendRawResponse(stream, { type: "ensure_blob_response", id, available: true });
           return;
         } catch (baoErr) {
           // bao import failed — fall through to full import path
-          console.warn(TAG, `bao import failed, falling back to full import:`, baoErr);
+          log.warn(TAG, `bao import failed, falling back to full import:`, baoErr);
         }
       }
     }
@@ -513,20 +497,20 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
         const result = await (node as any).import_blob_and_export_bao(new Uint8Array(data));
         if (result && result.bao) {
           await store.storeBaoData(blake3_hash, result.bao.buffer);
-          console.log(
+          log.debug(
             TAG,
             `ensured blob ${blake3_hash.slice(0, 16)}... and cached bao (${result.bao.byteLength} bytes)`
           );
         }
       } catch (baoErr) {
-        console.warn(TAG, `bao export failed, falling back to plain import:`, baoErr);
+        log.warn(TAG, `bao export failed, falling back to plain import:`, baoErr);
         await (node as any).import_blob(new Uint8Array(data));
       }
     } else {
       await (node as any).import_blob(new Uint8Array(data));
     }
 
-    console.log(TAG, `ensured blob ${blake3_hash.slice(0, 16)}... in MemStore`);
+    log.debug(TAG, `ensured blob ${blake3_hash.slice(0, 16)}... in MemStore`);
 
     await sendRawResponse(stream, {
       type: "ensure_blob_response",
@@ -534,7 +518,7 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
       available: true,
     });
   } catch (err) {
-    console.error(TAG, `ensure_blob failed:`, err);
+    log.error(TAG, `ensure_blob failed:`, err);
     await sendRawResponse(stream, {
       type: "ensure_blob_response",
       id,
@@ -561,7 +545,7 @@ async function handleStreamAsync(stream: BiStreamLike): Promise<void> {
   }
   if (!raw) {
     // stream closed before any message — nothing to do
-    console.log(TAG, `stream from ${peerId}... closed before message`);
+    log.debug(TAG, `stream from ${peerId}... closed before message`);
     return;
   }
 
@@ -570,7 +554,7 @@ async function handleStreamAsync(stream: BiStreamLike): Promise<void> {
   try {
     msg = JSON.parse(json) as PeerMessage;
   } catch (err) {
-    console.error(TAG, `failed to parse message from ${peerId}...:`, err);
+    log.error(TAG, `failed to parse message from ${peerId}...:`, err);
     return;
   }
 
@@ -588,7 +572,7 @@ async function handleStreamAsync(stream: BiStreamLike): Promise<void> {
       break;
 
     default:
-      console.log(TAG, `unhandled message type "${msg.type}" from ${peerId}...`);
+      log.debug(TAG, `unhandled message type "${msg.type}" from ${peerId}...`);
       // try to send a generic error response if the message has an id
       if ("id" in msg && typeof msg.id === "number") {
         await sendRawResponse(stream, {
@@ -614,7 +598,7 @@ async function handleStreamAsync(stream: BiStreamLike): Promise<void> {
 export function handleSkeinStream(stream: BiStreamLike): void {
   handleStreamAsync(stream)
     .catch((err) => {
-      console.error(TAG, "stream handler error:", err);
+      log.error(TAG, "stream handler error:", err);
     })
     .finally(() => {
       try {

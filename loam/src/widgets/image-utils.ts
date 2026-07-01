@@ -3,6 +3,8 @@
  * and converting them to small WebP data URLs.
  */
 
+import { resizeImageToWebpDataUrl } from "../workers/blob-worker-client";
+
 /**
  * options for picking and resizing an image file.
  */
@@ -25,9 +27,7 @@ const DEFAULT_QUALITY = 0.8;
  * open a native file picker for images, resize and encode as a WebP data URL.
  * returns null if the user cancels or an error occurs.
  */
-export async function pickImageAsDataUrl(
-  options?: PickImageOptions,
-): Promise<string | null> {
+export async function pickImageAsDataUrl(options?: PickImageOptions): Promise<string | null> {
   const input = document.createElement("input");
   input.type = "file";
   input.accept = "image/*";
@@ -75,9 +75,8 @@ export async function pickImageAsDataUrl(
  */
 export async function resizeImageToDataUrl(
   file: Blob,
-  options?: PickImageOptions,
+  options?: PickImageOptions
 ): Promise<string | null> {
-  const { resizeImageToWebpDataUrl } = await import("../workers/blob-worker-client");
   return resizeImageToWebpDataUrl(file, {
     maxWidth: options?.maxWidth ?? DEFAULT_MAX_WIDTH,
     maxHeight: options?.maxHeight ?? DEFAULT_MAX_HEIGHT,

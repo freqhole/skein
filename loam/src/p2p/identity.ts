@@ -11,6 +11,8 @@
 
 import { deleteMetaRecord, getMetaRecord, setMetaRecord } from "../storage/meta-db";
 import { isTauriMode, TauriStreamNode } from "./tauri-transport";
+import { MiddenNode } from "midden";
+import { log } from "../utils/log";
 
 // ---------------------------------------------------------------------------
 // types
@@ -47,7 +49,7 @@ export interface MiddenNodeLike {
 const IDENTITY_KEY = "p2p_identity";
 
 /** console log prefix for this module. */
-const TAG = "[skein:p2p]";
+const TAG = "p2p.identity";
 
 // ---------------------------------------------------------------------------
 // module-level singleton state
@@ -70,7 +72,7 @@ function notifyListeners(identity: P2PIdentity | null): void {
     try {
       cb(identity);
     } catch (err) {
-      console.error(TAG, "identity change listener threw:", err);
+      log.error(TAG, "identity change listener threw:", err);
     }
   }
 }
@@ -136,7 +138,7 @@ export async function getMiddenNode(): Promise<MiddenNodeLike> {
     if (!middenNode) {
       const tauriNode = await TauriStreamNode.create();
       middenNode = tauriNode as unknown as MiddenNodeLike;
-      console.log(TAG, "using tauri transport, node_id:", tauriNode.node_id().slice(0, 16) + "...");
+      log.debug(TAG, "using tauri transport, node_id:", tauriNode.node_id().slice(0, 16) + "...");
     }
     return middenNode;
   }
@@ -153,9 +155,6 @@ export async function getMiddenNode(): Promise<MiddenNodeLike> {
   }
 
   middenNodePromise = (async (): Promise<MiddenNodeLike> => {
-    // dynamic import keeps the midden WASM out of the initial bundle.
-    const { MiddenNode } = await import("midden");
-
     const existing = await getStoredIdentity();
 
     let node: MiddenNodeLike;
@@ -163,7 +162,7 @@ export async function getMiddenNode(): Promise<MiddenNodeLike> {
     if (existing) {
       // restore from the persisted secret key
       const truncated = existing.node_id.slice(0, 16) + "...";
-      console.log(TAG, "restoring identity from IndexedDB:", truncated);
+      log.debug(TAG, "restoring identity from IndexedDB:", truncated);
       node = await MiddenNode.create_from_key(existing.secret_key);
     } else {
       // generate a brand-new identity
@@ -176,13 +175,13 @@ export async function getMiddenNode(): Promise<MiddenNodeLike> {
       await setMetaRecord<P2PIdentity>(IDENTITY_KEY, identity);
 
       const truncated = identity.node_id.slice(0, 16) + "...";
-      console.log(TAG, "created new identity:", truncated);
+      log.debug(TAG, "created new identity:", truncated);
 
       notifyListeners(identity);
     }
 
     middenNode = node;
-    console.log(TAG, "node ready, node_id:", node.node_id().slice(0, 16) + "...");
+    log.debug(TAG, "node ready, node_id:", node.node_id().slice(0, 16) + "...");
     return node;
   })();
 
@@ -338,7 +337,6 @@ export async function importIdentity(secretKey: Uint8Array): Promise<P2PIdentity
   middenNodePromise = null;
 
   // start a new node from the provided key
-  const { MiddenNode } = await import("midden");
   const node = await MiddenNode.create_from_key(secretKey);
 
   const identity: P2PIdentity = {
@@ -350,7 +348,7 @@ export async function importIdentity(secretKey: Uint8Array): Promise<P2PIdentity
   await setMetaRecord<P2PIdentity>(IDENTITY_KEY, identity);
   middenNode = node;
 
-  console.log(TAG, "imported identity:", identity.node_id.slice(0, 16) + "...");
+  log.debug(TAG, "imported identity:", identity.node_id.slice(0, 16) + "...");
   notifyListeners(identity);
 
   return identity;
@@ -392,6 +390,6 @@ export async function deleteIdentity(): Promise<void> {
 
   await deleteMetaRecord(IDENTITY_KEY);
 
-  console.log(TAG, "identity deleted");
+  log.debug(TAG, "identity deleted");
   notifyListeners(null);
 }

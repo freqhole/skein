@@ -16,10 +16,13 @@
  * and friendz-wiring. see docs/peer-identity-unification-plan.md phase 4.
  */
 
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { FriendEntry, FriendNodeId, SocialState } from "../../widgets/narthex/social/schema";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
+import { log } from "../utils/log";
 
-const TAG = "[sqlite-social-doc]";
+const TAG = "sqlite-social-doc";
 
 // ---------------------------------------------------------------------------
 // IPC helpers
@@ -27,10 +30,8 @@ const TAG = "[sqlite-social-doc]";
 
 /**
  * invoke skein_dispatch on the Rust side.
- * dynamic import so the module graph doesn't fail in non-Tauri builds.
  */
 async function dispatch(action: string, payload: Record<string, unknown> = {}): Promise<any> {
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke("skein_dispatch", { action, payload });
 }
 
@@ -38,7 +39,6 @@ async function dispatch(action: string, payload: Record<string, unknown> = {}): 
  * listen for a tauri event. returns an unlisten function.
  */
 async function listenForEvent(event: string, handler: () => void): Promise<() => void> {
-  const { listen } = await import("@tauri-apps/api/event");
   return listen(event, handler);
 }
 
@@ -281,11 +281,11 @@ export class SqliteSocialDoc implements SocialDoc {
     // listen for tauri events emitted after any social mutation
     doc.unlisten = await listenForEvent("social-state-changed", () => {
       doc.refetch().catch((err) => {
-        console.warn(TAG, "refetch after event failed:", err);
+        log.warn(TAG, "refetch after event failed:", err);
       });
     });
 
-    console.log(
+    log.debug(
       TAG,
       "initialized —",
       raw.friends.length,
@@ -318,7 +318,7 @@ export class SqliteSocialDoc implements SocialDoc {
 
     // dispatch IPC calls based on the diff (fire-and-forget)
     this.dispatchDiff(prev, draft).catch((err) => {
-      console.warn(TAG, "diff dispatch error:", err);
+      log.warn(TAG, "diff dispatch error:", err);
     });
   }
 
@@ -347,7 +347,7 @@ export class SqliteSocialDoc implements SocialDoc {
       try {
         fn(state);
       } catch (e) {
-        console.warn(TAG, "listener error:", e);
+        log.warn(TAG, "listener error:", e);
       }
     }
   }
@@ -389,7 +389,7 @@ export class SqliteSocialDoc implements SocialDoc {
       const results = await Promise.allSettled(promises);
       results.forEach((r) => {
         if (r.status === "rejected") {
-          console.warn(TAG, "dispatch failed:", r.reason);
+          log.warn(TAG, "dispatch failed:", r.reason);
         }
       });
     }

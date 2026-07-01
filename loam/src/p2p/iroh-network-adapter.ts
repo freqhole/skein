@@ -21,6 +21,7 @@ import {
 } from "@automerge/automerge-repo";
 
 import { getStoredIdentity, onIdentityChange } from "./identity";
+import { log } from "../utils/log";
 
 // ---------------------------------------------------------------------------
 // constants
@@ -62,7 +63,7 @@ export interface ConnectionSummary {
 }
 
 /** console log prefix. */
-const TAG = "[skein:iroh-adapter]";
+const TAG = "p2p.iroh-adapter";
 
 /**
  * minimal interface for a midden BiStream.
@@ -183,7 +184,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
     // check if user already has a P2P identity, and if so, start midden
     this.checkIdentityAndStart().catch((err) => {
-      console.error(TAG, "identity check failed:", err);
+      log.error(TAG, "identity check failed:", err);
     });
   }
 
@@ -198,7 +199,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     const stream = this.streams.get(targetId);
 
     if (!stream) {
-      console.warn(TAG, "no stream for peer:", targetId.slice(0, 16) + "...");
+      log.warn(TAG, "no stream for peer:", targetId.slice(0, 16) + "...");
       return;
     }
 
@@ -206,7 +207,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     const bytes = new Uint8Array(encoded.buffer, encoded.byteOffset, encoded.byteLength);
 
     stream.write_message(bytes).catch((err) => {
-      console.error(TAG, "write failed for peer:", targetId.slice(0, 16) + "...", err);
+      log.error(TAG, "write failed for peer:", targetId.slice(0, 16) + "...", err);
       this.removePeer(targetId);
     });
   }
@@ -276,7 +277,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
     // skip if already connected
     if (this.streams.has(nodeId)) {
-      console.log(TAG, "already connected to:", nodeId.slice(0, 16) + "...");
+      log.debug(TAG, "already connected to:", nodeId.slice(0, 16) + "...");
       return;
     }
 
@@ -435,7 +436,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
     for (const peerId of this.intendedPeers) {
       this.addPeer(peerId).catch((err) => {
-        console.warn(TAG, "restart: failed to re-add peer:", peerId.slice(0, 16) + "...", err);
+        log.warn(TAG, "restart: failed to re-add peer:", peerId.slice(0, 16) + "...", err);
       });
     }
   }
@@ -466,17 +467,17 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
     if (identity) {
       // user has an identity — start midden and begin accepting connections
-      console.log(TAG, "identity found, starting P2P transport");
+      log.debug(TAG, "identity found, starting P2P transport");
       await this.initialize();
     } else {
       // no identity yet — subscribe to identity changes so we start
       // when the user generates one (e.g. clicks "generate" in profile widget)
-      console.log(TAG, "no identity yet, deferring P2P transport");
+      log.debug(TAG, "no identity yet, deferring P2P transport");
       this.identityUnsub = onIdentityChange((newIdentity) => {
         if (newIdentity && !this.midden && !this._disconnected) {
-          console.log(TAG, "identity created, starting P2P transport");
+          log.debug(TAG, "identity created, starting P2P transport");
           this.initialize().catch((err) => {
-            console.error(TAG, "deferred initialization failed:", err);
+            log.error(TAG, "deferred initialization failed:", err);
           });
         }
       });
@@ -490,7 +491,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
       this.startAcceptLoop();
       this.setEndpointState("online");
     } catch (err) {
-      console.error(TAG, "failed to initialize midden:", err);
+      log.error(TAG, "failed to initialize midden:", err);
       this.setEndpointState("error");
       throw err;
     }
@@ -515,7 +516,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
           if (!stream) {
             // endpoint closed
-            console.log(TAG, "accept loop: endpoint closed");
+            log.debug(TAG, "accept loop: endpoint closed");
             break;
           }
 
@@ -524,16 +525,16 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
           if (alpn === SYNC_ALPN) {
             // automerge-repo sync — handle internally
-            console.log(TAG, "accepted sync connection from:", peerId.slice(0, 16) + "...");
+            log.debug(TAG, "accepted sync connection from:", peerId.slice(0, 16) + "...");
             this.registerStream(peerId, stream);
           } else {
             const handler = this.alpnHandlers.get(alpn);
             if (handler) {
-              console.log(TAG, "dispatching", alpn, "stream from:", peerId.slice(0, 16) + "...");
+              log.debug(TAG, "dispatching", alpn, "stream from:", peerId.slice(0, 16) + "...");
               handler(stream);
             } else {
               // no handler registered — close the stream
-              console.warn(
+              log.warn(
                 TAG,
                 "DROPPING inbound stream — no handler registered for ALPN:",
                 alpn,
@@ -545,7 +546,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
           }
         } catch (err) {
           if (this._disconnected || this._stopped) break;
-          console.error(TAG, "accept loop error:", err);
+          log.error(TAG, "accept loop error:", err);
           // brief pause before retrying to avoid tight error loops
           await new Promise((r) => setTimeout(r, 1000));
         }
@@ -555,7 +556,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     };
 
     loop_().catch((err) => {
-      console.error(TAG, "accept loop crashed:", err);
+      log.error(TAG, "accept loop crashed:", err);
       this._acceptLoopRunning = false;
     });
   }
@@ -566,7 +567,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     // won't call removePeer() because the stream reference won't match.
     const existing = this.streams.get(peerId);
     if (existing) {
-      console.log(TAG, "replacing existing stream for peer:", peerId.slice(0, 16) + "...");
+      log.debug(TAG, "replacing existing stream for peer:", peerId.slice(0, 16) + "...");
       existing.close();
     }
 
@@ -599,7 +600,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
           if (!data) {
             // stream closed cleanly
-            console.log(TAG, "stream closed by peer:", peerId.slice(0, 16) + "...");
+            log.debug(TAG, "stream closed by peer:", peerId.slice(0, 16) + "...");
             break;
           }
 
@@ -612,7 +613,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
           this.emit("message", message);
         } catch (err) {
           if (this._disconnected || this._stopped) break;
-          console.error(TAG, "read error from peer:", peerId.slice(0, 16) + "...", err);
+          log.error(TAG, "read error from peer:", peerId.slice(0, 16) + "...", err);
           break;
         }
       }
@@ -627,7 +628,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     };
 
     loop_().catch((err) => {
-      console.error(TAG, "read loop crashed for peer:", peerId.slice(0, 16) + "...", err);
+      log.error(TAG, "read loop crashed for peer:", peerId.slice(0, 16) + "...", err);
       if (this.streams.get(peerId) === stream) {
         this.removePeer(peerId);
       }
@@ -678,7 +679,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
 
     // give up after max attempts
     if (state.attempt >= RECONNECT_MAX_ATTEMPTS) {
-      console.warn(
+      log.warn(
         TAG,
         "giving up reconnection to peer after",
         RECONNECT_MAX_ATTEMPTS,
@@ -699,7 +700,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     const jitter = Math.floor(Math.random() * RECONNECT_JITTER_MS);
     const delay = cappedDelay + jitter;
 
-    console.log(
+    log.debug(
       TAG,
       "scheduling reconnect to peer:",
       peerId.slice(0, 16) + "...",
@@ -741,11 +742,11 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     try {
       const midden = await this.ensureMidden();
       const stream = await midden.open_bi(peerId, SYNC_ALPN);
-      console.log(TAG, "reconnected to peer:", peerId.slice(0, 16) + "...");
+      log.debug(TAG, "reconnected to peer:", peerId.slice(0, 16) + "...");
       this.registerStream(peerId, stream);
       // registerStream calls clearReconnectState, so no need to do it here
     } catch (err) {
-      console.warn(TAG, "reconnect attempt failed for peer:", peerId.slice(0, 16) + "...", err);
+      log.warn(TAG, "reconnect attempt failed for peer:", peerId.slice(0, 16) + "...", err);
       // schedule next attempt with increased backoff
       this.scheduleReconnect(peerId);
     }
