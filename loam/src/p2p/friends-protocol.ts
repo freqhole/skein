@@ -41,6 +41,14 @@ export interface ProfileResponseMessage {
   username: string;
   bio: string;
   avatarDataUrl: string;
+  /** pointer to the sender's profile automerge doc (docs/hub-and-profile-plan.md
+   *  section 6), if they have one. omitted (not sent as "") when the
+   *  sender has no profile doc yet — matches the optional-field-omission
+   *  convention already used elsewhere in this file (e.g. `isHub`). */
+  profileDocId?: string;
+  /** ISO timestamp mirroring `ProfileStore.updatedAt()` at send time —
+   *  lets the receiver compare against any cached copy for staleness. */
+  profileUpdatedAt?: string;
 }
 
 /** send a friend request to a peer. */
@@ -250,15 +258,35 @@ export interface GossipDigestPendingKnock {
   knockedAt: string;
 }
 
+/** a profile-doc pointer entry in a gossip digest (docs/hub-and-profile-plan.md
+ *  section 6's "hub gossip of profile docs") — relays what the sender
+ *  knows about a peer's profile doc (their own, or a mutual friend's
+ *  learned earlier) so the receiver can sync/update it without a direct
+ *  connection to the profile's owner. mirrors `GossipDigestPendingKnock`'s
+ *  "just a pointer + timestamp, let ordinary automerge sync pull the real
+ *  doc" shape. */
+export interface GossipDigestProfileEntry {
+  /** whose profile this is (not necessarily the digest's sender). */
+  peerNodeId: string;
+  profileDocId: string;
+  /** ISO timestamp mirroring `ProfileStore.updatedAt()` — lets the
+   *  receiver skip entries no newer than what it already has cached. */
+  updatedAt: string;
+}
+
 /** gossip digest sent when a peer comes online.
- *  bundles canvas updates, pending invites, and pending knocks for the
- *  receiving peer, computed from the sender's local canvas doc state. */
+ *  bundles canvas updates, pending invites, pending knocks, and profile-doc
+ *  pointers for the receiving peer, computed from the sender's local state. */
 export interface GossipDigestMessage {
   type: "gossip-digest";
   canvasUpdates: GossipDigestCanvasUpdate[];
   pendingInvites: GossipDigestPendingInvite[];
   pendingKnocks: GossipDigestPendingKnock[];
   sharedCanvasIds?: string[];
+  /** optional/omit-if-empty, same convention as `sharedCanvasIds` —
+   *  older peers without this field simply never relay/receive profile
+   *  pointers, no wire-format break. */
+  profiles?: GossipDigestProfileEntry[];
 }
 
 /** batch blob availability query — "i need these blobs, which do you have?"
@@ -396,8 +424,17 @@ export interface FriendzProtocolOptions {
   /** local username (from profile). */
   localUsername: string;
 
-  /** callback to get the local profile for responding to profile requests. */
-  getLocalProfile: () => { username: string; bio: string; avatarDataUrl: string };
+  /** callback to get the local profile for responding to profile requests.
+   *  `profileDocId`/`profileUpdatedAt` are optional — omitted (not sent as
+   *  ""/undefined explicitly) when the caller has no profile doc wired up
+   *  yet (see docs/hub-and-profile-plan.md section 6). */
+  getLocalProfile: () => {
+    username: string;
+    bio: string;
+    avatarDataUrl: string;
+    profileDocId?: string;
+    profileUpdatedAt?: string;
+  };
 
   /** callback to check if a node ID is a known friend. */
   isFriend: (nodeId: string) => boolean;
@@ -433,7 +470,13 @@ export class FriendzProtocol {
   private getMidden: () => Promise<MiddenStreamNode>;
   private localNodeId: string;
   private localUsername: string;
-  private getLocalProfile: () => { username: string; bio: string; avatarDataUrl: string };
+  private getLocalProfile: () => {
+    username: string;
+    bio: string;
+    avatarDataUrl: string;
+    profileDocId?: string;
+    profileUpdatedAt?: string;
+  };
   private isFriend: (nodeId: string) => boolean;
   private profileVisibility: "friends" | "everyone" | "nobody";
   private friendRequestsFrom: "everyone" | "nobody";
@@ -763,6 +806,8 @@ export class FriendzProtocol {
       username: profile.username,
       bio: profile.bio,
       avatarDataUrl: profile.avatarDataUrl,
+      ...(profile.profileDocId ? { profileDocId: profile.profileDocId } : {}),
+      ...(profile.profileUpdatedAt ? { profileUpdatedAt: profile.profileUpdatedAt } : {}),
     };
 
     log.debug(

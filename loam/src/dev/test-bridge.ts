@@ -10,14 +10,16 @@ import {
   approveKnock,
   declineKnock,
   mergeGossipDigestKnocks,
+  mergeGossipDigestProfiles,
   wireKnockHandlers,
   type KnockRelayInfo,
+  type ProfileRelayInfo,
 } from "../standalone/friendz-wiring";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
 import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { HubProfilePanelState } from "../../widgets/narthex/social/hub-profile-panel";
 import type { CanvasBinNode } from "../canvas/canvas-bin-doc";
-import type { ProfileCanvasEntry } from "../canvas/profile-doc";
+import type { ProfileCanvasEntry, ProfileStore } from "../canvas/profile-doc";
 import type { FriendInfo } from "../canvas/share-dialog";
 import { storeBlob, classifyDomain } from "../storage/skein-blob-store";
 
@@ -454,6 +456,13 @@ export interface SkeinTestBridge {
    */
   knock?: SkeinKnockTestBridge | null;
   /**
+   * profile-doc gossip-relay helpers (docs/hub-and-profile-plan.md section 6)
+   * — present only when the page was bootstrapped via
+   * test-harness-p2p.html / p2p-test-bootstrap.ts.
+   * null for ordinary BroadcastChannel-only test pages.
+   */
+  profileGossip?: SkeinProfileGossipTestBridge | null;
+  /**
    * share dialog test hooks — present once the toolbar's share button has
    * been pressed at least once for the current canvas (index.html only).
    * null/absent otherwise.
@@ -765,6 +774,178 @@ export function buildKnockTestBridge(options: {
       const handle = await repo.find(canvasDocId as DocumentId);
       const doc = handle.doc() as { acl?: Record<string, { role: string }> } | undefined;
       return doc?.acl?.[nodeId]?.role ?? null;
+    },
+  };
+}
+
+/**
+ * profile-doc gossip test bridge — methods only available when the page
+ * was bootstrapped with a real `ProfileStore` + `FriendzProtocol` + `Repo`
+ * (test-harness-p2p.html). exercises the real
+ * `mergeGossipDigestProfiles()`/`computeAndSendGossipDigest()`-equivalent
+ * relay logic from `standalone/friendz-wiring.ts` (docs/hub-and-profile-plan.md
+ * section 6), same "wrap the real production function, minimal in-memory
+ * stand-in for what a full narthex/social/messagez setup would otherwise
+ * provide" reasoning as `buildKnockTestBridge` above — has its own
+ * independent in-memory `SocialDoc` stand-in (not shared with
+ * `buildKnockTestBridge`'s), since these two bridges test unrelated
+ * features and a test using this one has no need for knock plumbing too.
+ */
+export interface SkeinProfileGossipTestBridge {
+  /** this peer's own profile-doc id. */
+  getMyProfileDocId(): string;
+  /** update this peer's own profile content (bumps `ProfileStore.updatedAt()`). */
+  setMyProfile(username: string, bio: string): void;
+  /** seed a friend entry with a known node id — mirrors what a real
+   *  friend-request/accept handshake would already have populated, so
+   *  gossip merge has somewhere to write a relayed profile pointer into. */
+  addFriend(peerNodeId: string): void;
+  /** the profile-doc pointer this peer currently knows for a given peer
+   *  node id (learned directly via profile-response, or relayed via
+   *  gossip), or null if unknown/not yet learned. */
+  getKnownProfilePointer(peerNodeId: string): { profileDocId: string; updatedAt: string } | null;
+  /** profile-doc pointers merged via gossip relay so far. */
+  getRelayedProfiles(): ProfileRelayInfo[];
+  /** manually send a gossip digest to `peerNodeId` carrying this peer's
+   *  own profile pointer plus every other known friend's pointer it's
+   *  aware of — lets tests trigger relay delivery deterministically
+   *  instead of waiting on the real heartbeat/peer-online timer. */
+  sendProfileGossipDigest(peerNodeId: string): Promise<void>;
+  /** read a profile doc's content directly, opening/syncing it first if
+   *  this peer doesn't already hold it. returns null if unreachable —
+   *  proves the actual doc content (not just the pointer) arrived. */
+  readProfileDoc(profileDocId: string): Promise<{ username: string; bio: string } | null>;
+}
+
+/**
+ * build a SkeinProfileGossipTestBridge, wiring `mergeGossipDigestProfiles()`
+ * onto `protocol.onGossipDigest` and exposing a manual send method that
+ * mirrors `computeAndSendGossipDigest()`'s profile-gathering logic in
+ * `friendz-wiring.ts` (that function isn't exported standalone — it's a
+ * closure inside `initFriendzWiring()` — so this rebuilds just the
+ * profiles-array-gathering half here, same reasoning
+ * `sendKnocksGossipDigest` above already established for pending knocks).
+ */
+export function buildProfileGossipTestBridge(options: {
+  protocol: FriendzProtocol;
+  repo: Repo;
+  profileStore: ProfileStore;
+  localNodeId: string;
+}): SkeinProfileGossipTestBridge {
+  const { protocol, repo, profileStore, localNodeId } = options;
+  const relayedProfiles: ProfileRelayInfo[] = [];
+
+  const socialState: SocialState = { friends: [] } as unknown as SocialState;
+  const socialDoc: SocialDoc = {
+    get current() {
+      return socialState;
+    },
+    change(fn) {
+      fn(socialState);
+    },
+    on() {
+      return () => {};
+    },
+  };
+
+  protocol.onGossipDigest = (msg, fromNodeId) => {
+    mergeGossipDigestProfiles(repo, socialDoc, msg, fromNodeId, (info) =>
+      relayedProfiles.push(info)
+    ).catch(() => {
+      // best effort — logged inside mergeGossipDigestProfiles already
+    });
+  };
+
+  return {
+    getMyProfileDocId() {
+      return profileStore.handle.documentId;
+    },
+
+    setMyProfile(username, bio) {
+      profileStore.setUsername(username);
+      profileStore.setBio(bio);
+    },
+
+    addFriend(peerNodeId) {
+      socialDoc.change((draft: any) => {
+        if (!draft.friends) draft.friends = [];
+        draft.friends.push({
+          id: crypto.randomUUID(),
+          alias: "",
+          username: "",
+          group: "",
+          nodeIds: [
+            {
+              nodeId: peerNodeId,
+              addedAt: new Date().toISOString(),
+              lastSeenAt: "",
+              username: "",
+              bio: "",
+              avatarDataUrl: "",
+              profileDocId: "",
+              profileUpdatedAt: "",
+            },
+          ],
+          createdAt: new Date().toISOString(),
+          isHub: false,
+        });
+      });
+    },
+
+    getKnownProfilePointer(peerNodeId) {
+      for (const friend of socialState.friends ?? []) {
+        for (const n of friend.nodeIds ?? []) {
+          if (n.nodeId === peerNodeId && n.profileDocId) {
+            return { profileDocId: n.profileDocId, updatedAt: n.profileUpdatedAt ?? "" };
+          }
+        }
+      }
+      return null;
+    },
+
+    getRelayedProfiles() {
+      return [...relayedProfiles];
+    },
+
+    async sendProfileGossipDigest(peerNodeId) {
+      const profiles: Array<{ peerNodeId: string; profileDocId: string; updatedAt: string }> = [];
+
+      const myUpdatedAt = profileStore.updatedAt();
+      profiles.push({
+        peerNodeId: localNodeId,
+        profileDocId: profileStore.handle.documentId,
+        updatedAt: myUpdatedAt,
+      });
+
+      for (const friend of socialState.friends ?? []) {
+        for (const n of friend.nodeIds ?? []) {
+          if (!n.profileDocId) continue;
+          if (n.nodeId === peerNodeId) continue;
+          profiles.push({
+            peerNodeId: n.nodeId,
+            profileDocId: n.profileDocId,
+            updatedAt: n.profileUpdatedAt ?? "",
+          });
+        }
+      }
+
+      await protocol.sendGossipDigest(peerNodeId, {
+        canvasUpdates: [],
+        pendingInvites: [],
+        pendingKnocks: [],
+        profiles,
+      });
+    },
+
+    async readProfileDoc(profileDocId) {
+      try {
+        const handle = await repo.find(profileDocId as DocumentId);
+        const doc = handle.doc() as { username?: string; bio?: string } | undefined;
+        if (!doc) return null;
+        return { username: doc.username ?? "", bio: doc.bio ?? "" };
+      } catch {
+        return null;
+      }
     },
   };
 }

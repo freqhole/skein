@@ -60,6 +60,16 @@ export const profileDocumentSchema = z.object({
   /** curated, user-chosen list — see `ProfileCanvasEntry` above. */
   canvases: z.array(profileCanvasEntrySchema),
   /**
+   * ISO timestamp of the last content mutation (username/bio/avatar/
+   * canvases — NOT `.acl` changes, which aren't "profile content").
+   * stamped by every mutating `ProfileStore` method. used for gossip
+   * staleness comparison (see `docs/hub-and-profile-plan.md` section 6's
+   * gossip relay) — a peer relaying a `GossipDigestProfileEntry` includes
+   * this so the receiver can tell whether its own cached copy (if any) is
+   * out of date, without opening the doc itself.
+   */
+  updatedAt: z.string().optional(),
+  /**
    * access control — see the "access control" section of this file's doc
    * comment (near `ProfileStore`) for the full reasoning. reuses
    * `CanvasRole`'s shape/schema so the existing generic
@@ -152,6 +162,14 @@ export class ProfileStore {
     return this.handle.doc() ?? emptyProfileDoc();
   }
 
+  /** ISO timestamp of the last content mutation, or `""` if never set
+   *  (a brand-new profile doc that's never had `setUsername`/`setBio`/
+   *  `setAvatarDataUrl`/`addCanvasToProfile`/`removeCanvasFromProfile`
+   *  called on it yet). used by gossip relay for staleness comparison. */
+  updatedAt(): string {
+    return this.doc().updatedAt ?? "";
+  }
+
   // -- username / bio / avatar --------------------------------------------
 
   username(): string {
@@ -161,6 +179,7 @@ export class ProfileStore {
   setUsername(name: string): void {
     this.handle.change((doc) => {
       doc.username = name;
+      doc.updatedAt = new Date().toISOString();
     });
   }
 
@@ -171,6 +190,7 @@ export class ProfileStore {
   setBio(bio: string): void {
     this.handle.change((doc) => {
       doc.bio = bio;
+      doc.updatedAt = new Date().toISOString();
     });
   }
 
@@ -181,6 +201,7 @@ export class ProfileStore {
   setAvatarDataUrl(url: string): void {
     this.handle.change((doc) => {
       doc.avatarDataUrl = url;
+      doc.updatedAt = new Date().toISOString();
     });
   }
 
@@ -249,6 +270,7 @@ export class ProfileStore {
       if (entry.color !== undefined) fresh.color = entry.color;
       if (entry.previewUrl !== undefined) fresh.previewUrl = entry.previewUrl;
       doc.canvases.push(fresh);
+      doc.updatedAt = new Date().toISOString();
     });
   }
 
@@ -259,6 +281,7 @@ export class ProfileStore {
       const index = doc.canvases.findIndex((c) => c.canvasDocId === canvasDocId);
       if (index !== -1) {
         doc.canvases.splice(index, 1);
+        doc.updatedAt = new Date().toISOString();
       }
     });
   }

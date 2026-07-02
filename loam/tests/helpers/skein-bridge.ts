@@ -270,6 +270,75 @@ export async function getCanvasAcl(
   );
 }
 
+// --- profile-doc gossip relay (docs/hub-and-profile-plan.md section 6) ---
+// only work on pages loaded from test-harness-p2p.html — see
+// src/dev/test-bridge.ts's buildProfileGossipTestBridge() for what these wrap.
+
+/** this page's own profile-doc id. */
+export async function getMyProfileDocId(page: Page): Promise<string> {
+  return page.evaluate(() => (window as any).__skeinTest.profileGossip.getMyProfileDocId());
+}
+
+/** update this page's own profile content (bumps the doc's `updatedAt`). */
+export async function setMyProfile(page: Page, username: string, bio: string): Promise<void> {
+  return page.evaluate(
+    ([u, b]) => (window as any).__skeinTest.profileGossip.setMyProfile(u, b),
+    [username, bio] as const
+  );
+}
+
+/** seed a friend entry on this page with a known node id — mirrors what a
+ *  real friend-request/accept handshake would already have populated, so
+ *  gossip merge has somewhere to write a relayed profile pointer into. */
+export async function addProfileGossipFriend(page: Page, peerNodeId: string): Promise<void> {
+  return page.evaluate(
+    (id) => (window as any).__skeinTest.profileGossip.addFriend(id),
+    peerNodeId
+  );
+}
+
+/** the profile-doc pointer this page currently knows for a peer node id
+ *  (learned directly or via relay), or null if unknown. */
+export async function getKnownProfilePointer(
+  page: Page,
+  peerNodeId: string
+): Promise<{ profileDocId: string; updatedAt: string } | null> {
+  return page.evaluate(
+    (id) => (window as any).__skeinTest.profileGossip.getKnownProfilePointer(id),
+    peerNodeId
+  );
+}
+
+/** profile-doc pointers merged via gossip relay so far on this page. */
+export async function getRelayedProfiles(
+  page: Page
+): Promise<Array<{ peerNodeId: string; profileDocId: string; relayedBy: string }>> {
+  return page.evaluate(() => (window as any).__skeinTest.profileGossip.getRelayedProfiles());
+}
+
+/** manually send a gossip digest from this page to a peer, carrying this
+ *  page's own profile pointer plus every other known friend pointer it's
+ *  aware of — triggers relay delivery deterministically instead of waiting
+ *  on the real heartbeat/peer-online timer. */
+export async function sendProfileGossipDigest(page: Page, peerNodeId: string): Promise<void> {
+  return page.evaluate(
+    (id) => (window as any).__skeinTest.profileGossip.sendProfileGossipDigest(id),
+    peerNodeId
+  );
+}
+
+/** read a profile doc's content directly from this page, opening/syncing it
+ *  first if not already held. null if unreachable. */
+export async function readProfileDoc(
+  page: Page,
+  profileDocId: string
+): Promise<{ username: string; bio: string } | null> {
+  return page.evaluate(
+    (id) => (window as any).__skeinTest.profileGossip.readProfileDoc(id),
+    profileDocId
+  );
+}
+
 // --- canvas-doc direct assertions ---
 
 /** the raw automerge doc snapshot (snapshot, not live) */
@@ -451,7 +520,7 @@ export async function openShareDialog(page: Page): Promise<void> {
 /** wait until window.__skeinTest.share has been registered (the share
  *  dialog has been opened at least once). */
 export async function waitForShareHooks(page: Page, timeoutMs = 15_000): Promise<void> {
-  await page.waitForFunction(() => (window as any).__skeinTest?.share != null, {
+  await page.waitForFunction(() => (window as any).__skeinTest?.share !== null, {
     timeout: timeoutMs,
   });
 }

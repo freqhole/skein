@@ -267,6 +267,8 @@ export function createRequestsTab(ctx: TabContext): TabController {
                   username: request.fromUsername,
                   bio: "",
                   avatarDataUrl: "",
+                  profileDocId: "",
+                  profileUpdatedAt: "",
                 },
               ],
               createdAt: new Date().toISOString(),

@@ -1,11 +1,13 @@
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import type { CanvasDocument, InvitableRole } from "../canvas/canvas-doc";
 import { CanvasStore } from "../canvas/canvas-store";
+import type { ProfileStore } from "../canvas/profile-doc";
 import {
   FriendzProtocol,
   type BlobSeekMessage,
   type CanvasActivityEntry,
   type GossipDigestMessage,
+  type GossipDigestProfileEntry,
 } from "../p2p/friends-protocol";
 import { initBridge, setOutboundRequestHook } from "../p2p/friendz-bridge";
 import { getMiddenNode, getStoredIdentity } from "../p2p/identity";
@@ -32,6 +34,12 @@ export interface FriendzWiringDeps {
   socialDoc?: SocialDoc;
   /** optional pre-resolved messagez doc handle — when provided, skips the store lookup */
   messagezDocHandle?: import("@automerge/automerge-repo").DocHandle<any>;
+  /** optional \u2014 when provided, our own profile-doc pointer (id +
+   *  updatedAt) is included in outgoing profile-response replies and
+   *  gossip digests (docs/hub-and-profile-plan.md section 6). omitted
+   *  entirely (not "no profile") when not provided, e.g. contexts with no
+   *  profile doc wired up yet. */
+  profileStore?: ProfileStore;
 }
 
 export interface FriendzWiringResult {
@@ -68,7 +76,8 @@ export function docHandleAsSocialDoc(handle: DocHandle<any>): SocialDoc {
 export async function initFriendzWiring(
   deps: FriendzWiringDeps
 ): Promise<FriendzWiringResult | null> {
-  const { repo, irohAdapter, store, narthexDocId, socialWidgetId, messagezWidgetId } = deps;
+  const { repo, irohAdapter, store, narthexDocId, socialWidgetId, messagezWidgetId, profileStore } =
+    deps;
 
   // in tauri mode, identity comes from the running iroh endpoint
   // in standalone mode, identity is stored in IndexedDB
@@ -133,10 +142,17 @@ export async function initFriendzWiring(
     localUsername: sDoc.current.profile?.username ?? "anonymous",
     getLocalProfile: () => {
       const p = sDoc.current.profile;
-      return {
+      const base = {
         username: p?.username ?? "anonymous",
         bio: p?.bio ?? "",
         avatarDataUrl: p?.avatarDataUrl ?? "",
+      };
+      if (!profileStore) return base;
+      const updatedAt = profileStore.updatedAt();
+      return {
+        ...base,
+        profileDocId: profileStore.handle.documentId,
+        ...(updatedAt ? { profileUpdatedAt: updatedAt } : {}),
       };
     },
     isFriend: (nodeId: string) => {
@@ -261,6 +277,17 @@ export async function initFriendzWiring(
             if (msg.bio !== undefined) n.bio = msg.bio;
             if (msg.avatarDataUrl !== undefined) n.avatarDataUrl = msg.avatarDataUrl;
             n.lastSeenAt = new Date().toISOString();
+            // profile-doc pointer (docs/hub-and-profile-plan.md section 6)
+            // — only overwrite if strictly newer, or the current entry has
+            // no id yet at all, so a stale/incomplete late arrival can't
+            // clobber a more recent value learned via gossip relay.
+            if (
+              msg.profileDocId &&
+              (!n.profileDocId || (msg.profileUpdatedAt ?? "") > (n.profileUpdatedAt ?? ""))
+            ) {
+              n.profileDocId = msg.profileDocId;
+              n.profileUpdatedAt = msg.profileUpdatedAt ?? "";
+            }
           }
         }
         // also update the top-level friend.username so the display name
@@ -746,14 +773,50 @@ export async function initFriendzWiring(
     const canvasUpdates: GossipDigestMessage["canvasUpdates"] = [];
     const pendingInvites: GossipDigestMessage["pendingInvites"] = [];
     const pendingKnocks: GossipDigestMessage["pendingKnocks"] = [];
+    const profiles: GossipDigestMessage["profiles"] = [];
     const sharedCanvasIds: string[] = [];
+
+    // our own profile-doc pointer (docs/hub-and-profile-plan.md section 6)
+    // — sent directly here too (not just via profile-request/response) so
+    // a friend who comes online learns about profile updates without
+    // needing to separately re-request our profile.
+    if (profileStore) {
+      const updatedAt = profileStore.updatedAt();
+      profiles.push({
+        peerNodeId: localNodeId,
+        profileDocId: profileStore.handle.documentId,
+        updatedAt,
+      });
+    }
+
+    // relay every OTHER friend's profile-doc pointer we already know about
+    // (learned via an earlier direct profile-response or an earlier relay)
+    // — this is what lets profile info reach a peer with no direct
+    // connection to the profile's actual owner, same "gossip everything
+    // relevant, let the receiver dedupe/ignore stale" pattern as
+    // pendingInvites/pendingKnocks above.
+    for (const friend of sDoc.current.friends ?? []) {
+      for (const n of friend.nodeIds ?? []) {
+        if (!n.profileDocId) continue;
+        if (n.nodeId === peerNodeId) continue; // no point telling them about themselves
+        profiles.push({
+          peerNodeId: n.nodeId,
+          profileDocId: n.profileDocId,
+          updatedAt: n.profileUpdatedAt ?? "",
+        });
+      }
+    }
 
     const narthexHandle = repo.handles[narthexDocId as any];
     const narthexDoc = narthexHandle?.doc();
-    if (!narthexDoc?.widgets) return;
-
-    for (const [_cardId, card] of Object.entries(narthexDoc.widgets) as any[]) {
-      if (card.type !== "canvas-card") continue;
+    // note: canvas-update/invite/knock gathering below all depend on the
+    // narthex doc being ready — but a profile-only digest (nothing to do
+    // with canvases at all) shouldn't be discarded just because the
+    // narthex doc happens to not be synced yet, so this is a guarded block
+    // rather than an early `return`.
+    if (narthexDoc?.widgets) {
+      for (const [_cardId, card] of Object.entries(narthexDoc.widgets) as any[]) {
+        if (card.type !== "canvas-card") continue;
       const canvasDocId = (card.props as any)?.canvasDocId;
       if (!canvasDocId) continue;
 
@@ -836,12 +899,14 @@ export async function initFriendzWiring(
       } catch {
         // canvas doc not synced yet — skip
       }
+      }
     }
 
     if (
       canvasUpdates.length === 0 &&
       pendingInvites.length === 0 &&
       pendingKnocks.length === 0 &&
+      profiles.length === 0 &&
       sharedCanvasIds.length === 0
     )
       return;
@@ -856,6 +921,8 @@ export async function initFriendzWiring(
       pendingInvites.length,
       "knocks:",
       pendingKnocks.length,
+      "profiles:",
+      profiles.length,
       "canvases:",
       sharedCanvasIds.length
     );
@@ -865,6 +932,7 @@ export async function initFriendzWiring(
       pendingInvites,
       pendingKnocks,
       ...(sharedCanvasIds.length > 0 ? { sharedCanvasIds } : {}),
+      ...(profiles.length > 0 ? { profiles } : {}),
     });
   }
 
@@ -1163,6 +1231,13 @@ export async function initFriendzWiring(
     // don't hold that canvas doc at all.
     mergeGossipDigestKnocks(repo, msg, fromNodeId).catch((err) => {
       log.warn(TAG, "failed to merge gossip-relayed knocks:", err);
+    });
+
+    // process relayed profile-doc pointers (docs/hub-and-profile-plan.md
+    // section 6) — merges into the social doc's matching friend nodeIds
+    // and best-effort syncs the actual doc content.
+    mergeGossipDigestProfiles(repo, sDoc, msg, fromNodeId).catch((err) => {
+      log.warn(TAG, "failed to merge gossip-relayed profiles:", err);
     });
   };
 
@@ -1696,6 +1771,101 @@ export async function mergeGossipDigestKnocks(
   }
 }
 
+/** fired once per profile-doc pointer merged via {@link mergeGossipDigestProfiles}. */
+export interface ProfileRelayInfo {
+  peerNodeId: string;
+  profileDocId: string;
+  relayedBy: string;
+}
+
+/**
+ * merge a gossip digest's profile-doc pointer entries
+ * (docs/hub-and-profile-plan.md section 6's "hub gossip of profile docs")
+ * into our own social doc's matching friend `nodeIds` entries, then
+ * best-effort kick off an automerge sync for each newly-learned doc id so
+ * the actual profile content (not just the pointer) arrives via ordinary
+ * CRDT sync from whichever connected peer holds it.
+ *
+ * only updates a friend we already know about — an entry for a peer we
+ * have no `nodeIds` match for is silently skipped (nowhere to record it;
+ * this also naturally filters out a stray entry about ourselves, since we
+ * don't keep our own node id in our own friends list). sticky/newer-wins,
+ * same rule `onProfileResponse` uses for a direct response: only
+ * overwrites when the incoming entry is strictly newer, or the existing
+ * entry has no doc id yet at all.
+ *
+ * exported (not just inlined into `initFriendzWiring()`'s `onGossipDigest`
+ * handler) so it can be exercised directly in tests, same pattern as
+ * `mergeGossipDigestKnocks` above.
+ */
+export async function mergeGossipDigestProfiles(
+  repo: Repo,
+  sDoc: SocialDoc,
+  msg: { profiles?: GossipDigestProfileEntry[] },
+  fromNodeId: string,
+  onProfileRelayed?: (info: ProfileRelayInfo) => void
+): Promise<void> {
+  const entries = msg.profiles ?? [];
+  if (entries.length === 0) return;
+
+  const toSync: string[] = [];
+
+  sDoc.change((draft: any) => {
+    if (!draft.friends) return;
+    for (const entry of entries) {
+      for (const friend of draft.friends) {
+        if (!friend.nodeIds) continue;
+        for (const n of friend.nodeIds) {
+          if (n.nodeId !== entry.peerNodeId) continue;
+          const isNewer = !n.profileDocId || entry.updatedAt > (n.profileUpdatedAt ?? "");
+          if (!isNewer) continue;
+          n.profileDocId = entry.profileDocId;
+          n.profileUpdatedAt = entry.updatedAt;
+          toSync.push(entry.profileDocId);
+          onProfileRelayed?.({
+            peerNodeId: entry.peerNodeId,
+            profileDocId: entry.profileDocId,
+            relayedBy: fromNodeId,
+          });
+        }
+      }
+    }
+  });
+
+  for (const docId of toSync) {
+    // brand-new-doc sync-request round-trips can need a moment even after
+    // the underlying connection is up (same relay-discovery-lag class of
+    // flake documented elsewhere in this codebase — mirrors
+    // `p2p-test-bootstrap.ts`'s `joinCanvasForTest()` retry loop: 5
+    // attempts, 1s delay) — retry rather than giving up after a single
+    // attempt, since this is production code (a real friend relaying a
+    // real profile pointer), not just a test-only path.
+    let synced = false;
+    for (let attempt = 1; attempt <= 8 && !synced; attempt++) {
+      try {
+        await repo.find(docId as DocumentId);
+        synced = true;
+        log.debug(
+          TAG,
+          "gossip digest: synced relayed profile doc:",
+          docId.slice(0, 16) + "...",
+          "relayed via:",
+          fromNodeId.slice(0, 16) + "...",
+          "attempt:",
+          attempt
+        );
+      } catch (err) {
+        if (attempt === 8) {
+          // best effort — sync will catch up once a connection path exists
+          log.warn(TAG, "failed to sync gossip-relayed profile doc:", err);
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+    }
+  }
+}
+
 export interface ApproveKnockDeps {
   protocol: FriendzProtocol;
   store: CanvasStore;
@@ -1771,6 +1941,8 @@ export async function approveKnock(
             username: requesterUsername,
             bio: "",
             avatarDataUrl: "",
+            profileDocId: "",
+            profileUpdatedAt: "",
           },
         ],
         createdAt: new Date().toISOString(),

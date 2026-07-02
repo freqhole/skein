@@ -605,6 +605,8 @@ export function createProfileTab(ctx: TabContext): TabController {
                       username: "",
                       bio: "",
                       avatarDataUrl: "",
+                      profileDocId: "",
+                      profileUpdatedAt: "",
                     },
                   ],
                   createdAt: new Date().toISOString(),

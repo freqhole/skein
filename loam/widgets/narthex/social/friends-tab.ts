@@ -2013,6 +2013,8 @@ export function createFriendsTab(ctx: TabContext): TabController {
                 username: "",
                 bio: "",
                 avatarDataUrl: "",
+                profileDocId: "",
+                profileUpdatedAt: "",
               },
             ]
           : [],

@@ -12,6 +12,18 @@ export const friendNodeIdSchema = z.object({
   username: z.string().default(""),
   bio: z.string().default(""),
   avatarDataUrl: z.string().default(""),
+  // pointer to this peer's profile automerge doc (docs/hub-and-profile-plan.md
+  // section 6) — learned either directly (profile-request/response) or
+  // relayed via gossip digest from a mutual friend/hub (section 6's "hub
+  // gossip of profile docs"). "" means unknown. `profileUpdatedAt` mirrors
+  // ProfileStore.updatedAt() at the time this was learned, so a later
+  // gossip entry for the same peer can be compared for staleness without
+  // opening the doc itself. sticky: once learned, only ever overwritten by
+  // a strictly newer `profileUpdatedAt` (or an equal-or-later one with a
+  // non-empty id, when the currently stored id is empty) — never blanked
+  // out by an older/incomplete message arriving late.
+  profileDocId: z.string().default(""),
+  profileUpdatedAt: z.string().default(""),
 });
 
 export const friendEntrySchema = z.object({

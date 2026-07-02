@@ -666,6 +666,7 @@ class SkeinRouter {
       messagezWidgetId: MESSAGEZ_WIDGET_ID,
       messagezDocHandle: this.messagezDocHandle ?? undefined,
       socialDoc,
+      profileStore: this.profileStore ?? undefined,
     });
 
     if (!result) return;

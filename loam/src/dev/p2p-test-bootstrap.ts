@@ -17,12 +17,18 @@ import { z } from "zod";
 import { createTestRegistry } from "../../widgets/index";
 import { initCanvas } from "../canvas/init";
 import { PresenceManager } from "../canvas/presence-manager";
+import { ProfileStore } from "../canvas/profile-doc";
 import { Viewport } from "../canvas/viewport";
 import { createSkeinHarness } from "../harness/skein-harness";
 import { FriendzProtocol } from "../p2p/friends-protocol";
 import { FRIENDZ_ALPN, type IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
 import { createWidgetDoc } from "../widgets/widget-doc";
-import { buildFriendzTestBridge, buildKnockTestBridge, buildP2PBridge } from "./test-bridge";
+import {
+  buildFriendzTestBridge,
+  buildKnockTestBridge,
+  buildP2PBridge,
+  buildProfileGossipTestBridge,
+} from "./test-bridge";
 
 // a simple zod schema exercised by createWidgetDoc in tests
 const testWidgetSchema = z.object({
@@ -144,12 +150,26 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
     localNodeId: nodeId,
   });
 
+  // profile-doc gossip test bridge (docs/hub-and-profile-plan.md section 6)
+  // — own dedicated ProfileStore per test peer (this harness has no real
+  // "my own profile doc" discovery/boot.ts wiring, so create one fresh
+  // rather than trying to reuse ensureMyProfileDoc()'s IndexedDB-meta-key
+  // singleton pattern, which is specific to the real app's boot sequence).
+  const profileStore = ProfileStore.create(harness.repo);
+  const profileGossipBridge = buildProfileGossipTestBridge({
+    protocol: friendzProtocol,
+    repo: harness.repo,
+    profileStore,
+    localNodeId: nodeId,
+  });
+
   // expose the typed bridge as the single window test entry point
   (window as any).__skeinTest = {
     canvas,
     p2p: p2pBridge,
     friendz: friendzBridge,
     knock: knockBridge,
+    profileGossip: profileGossipBridge,
   };
 
   // backward-compat aliases used by existing tests

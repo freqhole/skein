@@ -202,6 +202,11 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
             username: n.display_name,
             bio: n.bio,
             avatarDataUrl: n.avatar_url,
+            // profile-doc gossip (docs/hub-and-profile-plan.md section 6)
+            // is browser/automerge-only for now — tauri's sqlite-backed
+            // social doc has no equivalent column to source this from.
+            profileDocId: "",
+            profileUpdatedAt: "",
           })
         ),
         createdAt: unixToIso(f.created_at),

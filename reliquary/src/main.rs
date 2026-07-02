@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         Command::NodeId => {
             let secret = identity::load_keypair(&data_dir)?;
             println!("{}", secret.public());
+            eprintln!("data_dir = {}", data_dir.display());
             Ok(())
         }
         Command::Serve => serve(data_dir, cli.port).await,
@@ -188,6 +189,16 @@ async fn serve(data_dir: PathBuf, port: u16) -> anyhow::Result<()> {
 }
 
 async fn friend(data_dir: PathBuf, cmd: FriendCommand) -> anyhow::Result<()> {
+    // print the resolved data_dir up front on every invocation — `--data-dir`
+    // is a top-level flag that must be repeated on every separate CLI
+    // invocation (it is NOT persisted/remembered anywhere), and a mismatch
+    // between this and whatever data_dir a running `reliquary serve`/embedded
+    // hub process actually uses means this command silently operates on a
+    // *different* sqlite file — succeeding here with zero effect on the
+    // actually-running hub. surfacing this plainly is cheap insurance
+    // against exactly that class of "i ran friend allow but it's still
+    // rejecting me" confusion.
+    eprintln!("data_dir = {}", data_dir.display());
     let pool = db::open(&data_dir).await?;
     let users = userz::Directory::new(pool.clone());
     let store = friendz::Store::new(pool);
@@ -261,6 +272,8 @@ async fn friend(data_dir: PathBuf, cmd: FriendCommand) -> anyhow::Result<()> {
 }
 
 async fn admin(data_dir: PathBuf, cmd: AdminCommand) -> anyhow::Result<()> {
+    // see the matching comment in `friend()` above — same reasoning.
+    eprintln!("data_dir = {}", data_dir.display());
     let pool = db::open(&data_dir).await?;
     let store = adminz::Store::new(pool);
 
