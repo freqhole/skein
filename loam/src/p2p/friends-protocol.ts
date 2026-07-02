@@ -48,6 +48,10 @@ export interface FriendRequestMessage {
   type: "friend-request";
   fromNodeId: string;
   fromUsername: string;
+  /** true only when the sender is a reliquary hub node (see
+   *  docs/hub-and-profile-plan.md section 3) — never sent by a browser
+   *  peer, omitted rather than sent as `false`. */
+  isHub?: boolean;
 }
 
 /** accept an incoming friend request. */
@@ -55,6 +59,10 @@ export interface FriendAcceptMessage {
   type: "friend-accept";
   fromNodeId: string;
   fromUsername: string;
+  /** true only when the sender is a reliquary hub node (see
+   *  docs/hub-and-profile-plan.md section 3) — never sent by a browser
+   *  peer, omitted rather than sent as `false`. */
+  isHub?: boolean;
 }
 
 /** reject an incoming friend request. */

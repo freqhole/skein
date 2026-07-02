@@ -21,6 +21,12 @@ export const friendEntrySchema = z.object({
   group: z.string().default(""), // folder-style group name ("" = ungrouped)
   nodeIds: z.array(friendNodeIdSchema).default([]),
   createdAt: z.string().default(""),
+  // true if this friend is a reliquary hub node, set from the isHub flag on
+  // an incoming friend-request/friend-accept message (see
+  // docs/hub-and-profile-plan.md section 3). sticky/OR-merge once true —
+  // never unset by a later message that omits the flag (same spirit as
+  // CanvasStore.addHubNodeId()'s append-only dedup).
+  isHub: z.boolean().default(false),
 });
 
 export const friendGroupSchema = z.object({

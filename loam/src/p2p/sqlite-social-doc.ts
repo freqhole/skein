@@ -204,6 +204,12 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
           })
         ),
         createdAt: unixToIso(f.created_at),
+        // the sqlite (tauri) social-doc backend has no isHub column yet —
+        // hub flag recording (docs/hub-and-profile-plan.md section 3) is
+        // only wired up for the browser/automerge SocialDoc path
+        // (friendz-wiring.ts). defaults false until that backend gets the
+        // same treatment.
+        isHub: false,
       })
     ),
 

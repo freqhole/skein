@@ -98,6 +98,12 @@ pub enum FriendzMessage {
         from_node_id: String,
         #[serde(rename = "fromUsername")]
         from_username: String,
+        /// true only when the sender is a reliquary hub node (see
+        /// docs/hub-and-profile-plan.md section 3) — omitted, not `false`,
+        /// for an ordinary (non-hub) peer.
+        #[serde(rename = "isHub")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_hub: Option<bool>,
     },
 
     /// accept an incoming friend request.
@@ -106,6 +112,12 @@ pub enum FriendzMessage {
         from_node_id: String,
         #[serde(rename = "fromUsername")]
         from_username: String,
+        /// true only when the sender is a reliquary hub node (see
+        /// docs/hub-and-profile-plan.md section 3) — omitted, not `false`,
+        /// for an ordinary (non-hub) peer.
+        #[serde(rename = "isHub")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_hub: Option<bool>,
     },
 
     /// acknowledge a friend-accept (two-phase handshake).
@@ -444,6 +456,7 @@ mod tests {
         let msg = FriendzMessage::FriendRequest {
             from_node_id: "node-abc".to_string(),
             from_username: "alice".to_string(),
+            is_hub: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -451,6 +464,27 @@ mod tests {
         assert_eq!(parsed["type"], "friend-request");
         assert_eq!(parsed["fromNodeId"], "node-abc");
         assert_eq!(parsed["fromUsername"], "alice");
+        // isHub should be omitted entirely (skip_serializing_if), not sent as `false`
+        assert!(parsed.get("isHub").is_none());
+    }
+
+    #[test]
+    fn test_friend_request_is_hub_round_trip() {
+        let msg = FriendzMessage::FriendRequest {
+            from_node_id: "node-abc".to_string(),
+            from_username: "alice".to_string(),
+            is_hub: Some(true),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["isHub"], true);
+
+        let deserialized: FriendzMessage = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            FriendzMessage::FriendRequest { is_hub, .. } => assert_eq!(is_hub, Some(true)),
+            _ => panic!("expected FriendRequest"),
+        }
     }
 
     #[test]
@@ -458,12 +492,45 @@ mod tests {
         let msg = FriendzMessage::FriendAccept {
             from_node_id: "node-abc".to_string(),
             from_username: "alice".to_string(),
+            is_hub: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "friend-accept");
         assert_eq!(parsed["fromNodeId"], "node-abc");
+        assert!(parsed.get("isHub").is_none());
+    }
+
+    #[test]
+    fn test_friend_accept_is_hub_round_trip() {
+        let msg = FriendzMessage::FriendAccept {
+            from_node_id: "node-abc".to_string(),
+            from_username: "alice".to_string(),
+            is_hub: Some(true),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["isHub"], true);
+
+        let deserialized: FriendzMessage = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            FriendzMessage::FriendAccept { is_hub, .. } => assert_eq!(is_hub, Some(true)),
+            _ => panic!("expected FriendAccept"),
+        }
+    }
+
+    #[test]
+    fn test_friend_accept_is_hub_absent_when_omitted_by_a_browser_peer() {
+        // simulates a browser peer's wire payload, which never includes
+        // `isHub` at all (not even `false`) — should still deserialize fine.
+        let json = r#"{"type":"friend-accept","fromNodeId":"node-abc","fromUsername":"alice"}"#;
+        let deserialized: FriendzMessage = serde_json::from_str(json).unwrap();
+        match deserialized {
+            FriendzMessage::FriendAccept { is_hub, .. } => assert_eq!(is_hub, None),
+            _ => panic!("expected FriendAccept"),
+        }
     }
 
     #[test]

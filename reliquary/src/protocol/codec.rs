@@ -223,6 +223,7 @@ mod tests {
             FriendzMessage::FriendRequest {
                 from_node_id: "node-xyz".to_string(),
                 from_username: "bob".to_string(),
+                is_hub: None,
             },
         ];
 
@@ -262,9 +263,14 @@ mod tests {
             FriendzMessage::FriendRequest {
                 from_node_id,
                 from_username,
+                is_hub,
             } => {
                 assert_eq!(from_node_id, "node-xyz");
                 assert_eq!(from_username, "bob");
+                assert_eq!(
+                    is_hub, None,
+                    "a plain (non-hub) FriendRequest should decode with isHub omitted"
+                );
             }
             _ => panic!("third message should be FriendRequest"),
         }

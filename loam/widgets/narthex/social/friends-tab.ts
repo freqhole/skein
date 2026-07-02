@@ -63,10 +63,13 @@ import {
 } from "./constants";
 import {
   bestBio,
+  buildFriendRowItems,
   colorForName,
   friendDisplayName,
   friendDisplayNameFull,
   generateUniqueGroupName,
+  HUB_GROUP_KEY,
+  HUB_GROUP_LABEL,
   isValidNodeId,
   truncate,
 } from "./helpers";
@@ -493,46 +496,10 @@ export function createFriendsTab(ctx: TabContext): TabController {
       Math.floor((contentW - ROW_AVATAR_SIZE - ROW_PADDING_X * 4) / (ROW_NAME_SIZE * 0.55))
     );
 
-    // group friends by their group field
-    const grouped = new Map<string, FriendEntry[]>();
-    const ungrouped: FriendEntry[] = [];
-
-    for (const friend of friends) {
-      if (friend.group) {
-        const existing = grouped.get(friend.group);
-        if (existing) {
-          existing.push(friend);
-        } else {
-          grouped.set(friend.group, [friend]);
-        }
-      } else {
-        ungrouped.push(friend);
-      }
-    }
-
-    // sort group names alphabetically
-    const sortedGroupNames = [...grouped.keys()].sort((a, b) => a.localeCompare(b));
-
-    // build the ordered list of items to render
-    type RowItem =
-      | { type: "header"; group: string; count: number }
-      | { type: "friend"; friend: FriendEntry };
-    const items: RowItem[] = [];
-
-    for (const groupName of sortedGroupNames) {
-      const groupFriends = grouped.get(groupName)!;
-      items.push({ type: "header", group: groupName, count: groupFriends.length });
-      if (!collapsedGroups.has(groupName)) {
-        for (const friend of groupFriends) {
-          items.push({ type: "friend", friend });
-        }
-      }
-    }
-
-    // ungrouped friends at the end without a header
-    for (const friend of ungrouped) {
-      items.push({ type: "friend", friend });
-    }
+    // group friends by their group field, plus the reserved hub-nodes
+    // section — see `buildFriendRowItems()`'s doc comment (helpers.ts) for
+    // the full grouping/sort-order/hub-precedence rules.
+    const items = buildFriendRowItems(friends, collapsedGroups);
 
     let friendRowIndex = 0;
     let currentY = 0;
@@ -553,8 +520,14 @@ export function createFriendsTab(ctx: TabContext): TabController {
         headerBg.fill({ color: 0x1c1c28 });
         headerRow.addChild(headerBg);
 
+        // the reserved hub-nodes section (see HUB_GROUP_KEY's doc comment
+        // above) uses the same header UI as a real group, but is never
+        // renameable/deletable and never a drag-and-drop target.
+        const isReservedHeader = item.group === HUB_GROUP_KEY;
+        const headerDisplayName = isReservedHeader ? HUB_GROUP_LABEL : item.group;
+
         // colored group indicator line on header left edge
-        const headerLineColor = colorForName(item.group, 0);
+        const headerLineColor = colorForName(headerDisplayName, 0);
         const headerLine = new Graphics();
         headerLine.eventMode = "none";
         headerLine.rect(GROUP_LINE_INSET, 0, GROUP_LINE_WIDTH, ROW_HEIGHT);
@@ -633,7 +606,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
         } else {
           // normal group name text
           const groupNameText = new Text({
-            text: item.group,
+            text: headerDisplayName,
             style: { fontFamily: FONT, fontSize: 11, fontWeight: "bold", fill: LABEL_COLOR },
             resolution: RESOLUTION,
           });
@@ -661,6 +634,17 @@ export function createFriendsTab(ctx: TabContext): TabController {
           // ignore taps while a long-press rename is pending
           if (editingGroupName === groupName) return;
 
+          // reserved section: collapse/expand only, never renameable
+          if (isReservedHeader) {
+            if (collapsedGroups.has(groupName)) {
+              collapsedGroups.delete(groupName);
+            } else {
+              collapsedGroups.add(groupName);
+            }
+            layout(currentWidth, currentHeight);
+            return;
+          }
+
           const now = Date.now();
           const prev = headerLastTapTime.get(groupName) || 0;
           headerLastTapTime.set(groupName, now);
@@ -683,6 +667,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
         // long-press detection — hold to rename
         let headerHoldTimer: ReturnType<typeof setTimeout> | null = null;
         headerRow.on("pointerdown", () => {
+          if (isReservedHeader) return; // reserved section is never renameable
           headerHoldTimer = setTimeout(() => {
             headerHoldTimer = null;
             editingGroupName = groupName;
@@ -709,8 +694,12 @@ export function createFriendsTab(ctx: TabContext): TabController {
         });
         currentY += ROW_HEIGHT;
 
-        // register header for drop hit testing
-        groupHeaderHitAreas.push({ group: item.group, y: headerRow.y, height: ROW_HEIGHT });
+        // register header for drop hit testing — the reserved hub-nodes
+        // section is never a valid drag-and-drop target (hub membership is
+        // never assigned by dragging a friend into a group).
+        if (!isReservedHeader) {
+          groupHeaderHitAreas.push({ group: item.group, y: headerRow.y, height: ROW_HEIGHT });
+        }
       } else {
         // render friend row
         const friend = item.friend;
@@ -1868,6 +1857,10 @@ export function createFriendsTab(ctx: TabContext): TabController {
             ]
           : [],
         createdAt: new Date().toISOString(),
+        // a manually-added friend is never a hub — hub status only ever
+        // arrives via the isHub flag on a friend-request/friend-accept
+        // message (see friendz-wiring.ts's wireFriendHandlers()).
+        isHub: false,
       });
     });
 

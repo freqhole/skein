@@ -138,6 +138,7 @@ impl HubPeerService {
             FriendzMessage::FriendRequest {
                 from_node_id: _req_node_id,
                 from_username,
+                is_hub: _,
             } => {
                 // policy: auto-accept only if the peer was pre-approved by the
                 // operator (status = Allowed) or already accepted. unknown peers
@@ -221,6 +222,11 @@ impl HubPeerService {
                 let accept = FriendzMessage::FriendAccept {
                     from_node_id: self.node_id_str.clone(),
                     from_username: self.profile_username.clone(),
+                    // this router is a hub's friendz handler — always flag
+                    // ourselves as a hub node (see docs/hub-and-profile-plan.md
+                    // section 3.2; the tauri-desktop-peer router in service.rs
+                    // is NOT a hub and must never set this).
+                    is_hub: Some(true),
                 };
                 match self.friendz.send_message(from_node_id, &accept).await {
                     Ok(()) => {
@@ -276,6 +282,7 @@ impl HubPeerService {
             FriendzMessage::FriendAccept {
                 from_node_id: _accept_node_id,
                 from_username,
+                is_hub: _,
             } => {
                 // a peer accepted our friend request (or is confirming mutual friendship).
                 // honor only if we already have a row for them — either Allowed

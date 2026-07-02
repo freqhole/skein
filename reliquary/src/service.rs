@@ -372,6 +372,10 @@ impl Service {
                 let ack = FriendzMessage::FriendAccept {
                     from_node_id: self.node_id_str.clone(),
                     from_username: self.local_username.clone(),
+                    // this router is the tauri-desktop outbound-only peer, NOT
+                    // a hub (see docs/hub-and-profile-plan.md section 3.2) — never
+                    // set the hub flag here, matching an ordinary browser peer.
+                    is_hub: None,
                 };
                 if let Err(e) = self.friendz_handler.send_message(from, &ack).await {
                     tracing::warn!(error = %e, peer = %from, "failed to send friend-accept");

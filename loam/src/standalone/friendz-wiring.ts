@@ -227,157 +227,11 @@ export async function initFriendzWiring(
 
   // --- wire event callbacks ---
 
-  // incoming friend request -> write to social doc.
-  // edge cases handled here:
-  //   1. duplicate request from same peer: skip the push
-  //   2. sender is already in our friends list (reciprocal add): auto-accept
-  //   3. we have a still-pending outbound request to this peer: auto-accept
-  //      (their request races our request — both sides add each other)
-  protocol.onFriendRequest = (msg, fromNodeId) => {
-    const friends = sDoc.current.friends ?? [];
-    const isAlreadyFriend = friends.some((f: any) =>
-      f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
-    );
-    const outbound = sDoc.current.outboundRequests ?? [];
-    const hasPendingOutbound = outbound.some(
-      (r: any) => r.toNodeId === fromNodeId && r.status === "pending"
-    );
-    const reciprocal = isAlreadyFriend || hasPendingOutbound;
-
-    let didAdd = false;
-    sDoc.change((draft: any) => {
-      if (!draft.pendingRequests) draft.pendingRequests = [];
-      const idx = draft.pendingRequests.findIndex((r: any) => r.fromNodeId === fromNodeId);
-      if (idx === -1) {
-        draft.pendingRequests.push({
-          fromNodeId,
-          fromUsername: msg.fromUsername ?? "unknown",
-          receivedAt: new Date().toISOString(),
-          status: reciprocal ? "accepted" : "pending",
-        });
-        didAdd = true;
-      } else if (reciprocal && draft.pendingRequests[idx].status === "pending") {
-        // upgrade an existing pending entry to accepted on reciprocal match
-        draft.pendingRequests[idx].status = "accepted";
-      }
-      // mirror status on outbound request if present
-      if (reciprocal && draft.outboundRequests) {
-        for (const r of draft.outboundRequests) {
-          if (r.toNodeId === fromNodeId && r.status === "pending") {
-            r.status = "accepted";
-          }
-        }
-      }
-    });
-    const pendingCount = (sDoc.current.pendingRequests ?? []).filter(
-      (r: any) => r.status === "pending"
-    ).length;
-    log.debug(
-      TAG,
-      `onFriendRequest from ${fromNodeId.slice(0, 16)}... didAdd=${didAdd} reciprocal=${reciprocal} pending-count=${pendingCount}`
-    );
-
-    if (reciprocal) {
-      // auto-accept: tell the peer we accept and add them to friends if needed
-      protocol.sendFriendAccept(fromNodeId).catch((err) => {
-        log.warn(
-          TAG,
-          "auto-accept friend-request failed for",
-          fromNodeId.slice(0, 16) + "...",
-          err
-        );
-      });
-      if (!isAlreadyFriend) {
-        sDoc.change((draft: any) => {
-          if (!draft.friends) draft.friends = [];
-          draft.friends.push({
-            id: crypto.randomUUID(),
-            alias: "",
-            username: msg.fromUsername ?? "",
-            group: "default",
-            nodeIds: [
-              {
-                nodeId: fromNodeId,
-                addedAt: new Date().toISOString(),
-                lastSeenAt: new Date().toISOString(),
-                username: msg.fromUsername ?? "",
-                bio: "",
-                avatarDataUrl: "",
-              },
-            ],
-            createdAt: new Date().toISOString(),
-          });
-        });
-      }
-    }
-  };
-
-  // incoming friend accept -> add to friends list
-  protocol.onFriendAccept = (msg, fromNodeId) => {
-    sDoc.change((draft: any) => {
-      if (!draft.friends) draft.friends = [];
-
-      // find existing friend entry by node ID
-      const existingFriend = draft.friends.find((f: any) =>
-        f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
-      );
-      if (!existingFriend) {
-        draft.friends.push({
-          id: crypto.randomUUID(),
-          alias: "",
-          username: msg.fromUsername ?? "",
-          group: "default",
-          nodeIds: [
-            {
-              nodeId: fromNodeId,
-              addedAt: new Date().toISOString(),
-              lastSeenAt: new Date().toISOString(),
-              username: msg.fromUsername ?? "",
-              bio: "",
-              avatarDataUrl: "",
-            },
-          ],
-          createdAt: new Date().toISOString(),
-        });
-      } else {
-        // friend entry was pre-created (e.g. by the add-friend UI) with
-        // empty username — backfill from the accept message.
-        // alias is intentionally left alone (user-controlled local label).
-        const acceptName = msg.fromUsername ?? "";
-        if (acceptName) {
-          if (!existingFriend.username) existingFriend.username = acceptName;
-          // also update the matching node-level username
-          for (const n of existingFriend.nodeIds ?? []) {
-            if (n.nodeId === fromNodeId && !n.username) {
-              n.username = acceptName;
-            }
-          }
-        }
-      }
-
-      // update pending request status
-      if (draft.pendingRequests) {
-        for (const req of draft.pendingRequests) {
-          if (req.fromNodeId === fromNodeId && req.status === "pending") {
-            req.status = "accepted";
-          }
-        }
-      }
-
-      // update outbound request status
-      if (draft.outboundRequests) {
-        for (const req of draft.outboundRequests) {
-          if (req.toNodeId === fromNodeId && req.status === "pending") {
-            req.status = "accepted";
-          }
-        }
-      }
-    });
-
-    // request the accepted peer's profile so bio/avatar arrive immediately
-    // (without this, profile data only populates on next init / page reload)
-    protocol.requestProfile(fromNodeId).catch(() => {});
-  };
+  // extracted (mirrors wireKnockHandlers below) so the friend-entry-recording
+  // logic — including the sticky hub-flag merge — is directly unit-testable
+  // without the rest of initFriendzWiring's heavier setup (identity, midden,
+  // narthex doc lookups, etc).
+  wireFriendHandlers({ protocol, sDoc });
 
   // incoming friend reject -> update outbound request status
   protocol.onFriendReject = (_msg, fromNodeId) => {
@@ -1434,6 +1288,198 @@ export async function initFriendzWiring(
 }
 
 // ---------------------------------------------------------------------------
+// friend-request / friend-accept handling
+//
+// exported as a standalone function (rather than inlined into
+// `initFriendzWiring()` above, mirroring how `wireKnockHandlers` below is
+// factored out) so the friend-entry-recording logic — including the sticky
+// hub-flag merge (docs/hub-and-profile-plan.md section 3.3) — can be
+// exercised directly in tests without the full narthex/social/messagez setup
+// `initFriendzWiring()` requires.
+// ---------------------------------------------------------------------------
+
+export interface FriendHandlersDeps {
+  protocol: FriendzProtocol;
+  sDoc: SocialDoc;
+}
+
+/**
+ * wire the `friend-request`/`friend-accept` message handlers onto `protocol`.
+ */
+export function wireFriendHandlers(deps: FriendHandlersDeps): void {
+  const { protocol, sDoc } = deps;
+
+  // incoming friend request -> write to social doc.
+  // edge cases handled here:
+  //   1. duplicate request from same peer: skip the push
+  //   2. sender is already in our friends list (reciprocal add): auto-accept
+  //   3. we have a still-pending outbound request to this peer: auto-accept
+  //      (their request races our request — both sides add each other)
+  protocol.onFriendRequest = (msg, fromNodeId) => {
+    const friends = sDoc.current.friends ?? [];
+    const isAlreadyFriend = friends.some((f: any) =>
+      f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
+    );
+    const outbound = sDoc.current.outboundRequests ?? [];
+    const hasPendingOutbound = outbound.some(
+      (r: any) => r.toNodeId === fromNodeId && r.status === "pending"
+    );
+    const reciprocal = isAlreadyFriend || hasPendingOutbound;
+
+    let didAdd = false;
+    sDoc.change((draft: any) => {
+      if (!draft.pendingRequests) draft.pendingRequests = [];
+      const idx = draft.pendingRequests.findIndex((r: any) => r.fromNodeId === fromNodeId);
+      if (idx === -1) {
+        draft.pendingRequests.push({
+          fromNodeId,
+          fromUsername: msg.fromUsername ?? "unknown",
+          receivedAt: new Date().toISOString(),
+          status: reciprocal ? "accepted" : "pending",
+        });
+        didAdd = true;
+      } else if (reciprocal && draft.pendingRequests[idx].status === "pending") {
+        // upgrade an existing pending entry to accepted on reciprocal match
+        draft.pendingRequests[idx].status = "accepted";
+      }
+      // mirror status on outbound request if present
+      if (reciprocal && draft.outboundRequests) {
+        for (const r of draft.outboundRequests) {
+          if (r.toNodeId === fromNodeId && r.status === "pending") {
+            r.status = "accepted";
+          }
+        }
+      }
+      // sticky hub flag (section 3.3): a duplicate/retried request from an
+      // already-known friend can still be the first message that reveals
+      // they're a hub — update it in place. never reset to false/undefined
+      // on a later message that simply omits the flag.
+      if (msg.isHub === true) {
+        const existing = draft.friends?.find((f: any) =>
+          f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
+        );
+        if (existing && existing.isHub !== true) existing.isHub = true;
+      }
+    });
+    const pendingCount = (sDoc.current.pendingRequests ?? []).filter(
+      (r: any) => r.status === "pending"
+    ).length;
+    log.debug(
+      TAG,
+      `onFriendRequest from ${fromNodeId.slice(0, 16)}... didAdd=${didAdd} reciprocal=${reciprocal} pending-count=${pendingCount}`
+    );
+
+    if (reciprocal) {
+      // auto-accept: tell the peer we accept and add them to friends if needed
+      protocol.sendFriendAccept(fromNodeId).catch((err) => {
+        log.warn(
+          TAG,
+          "auto-accept friend-request failed for",
+          fromNodeId.slice(0, 16) + "...",
+          err
+        );
+      });
+      if (!isAlreadyFriend) {
+        sDoc.change((draft: any) => {
+          if (!draft.friends) draft.friends = [];
+          draft.friends.push({
+            id: crypto.randomUUID(),
+            alias: "",
+            username: msg.fromUsername ?? "",
+            group: "default",
+            nodeIds: [
+              {
+                nodeId: fromNodeId,
+                addedAt: new Date().toISOString(),
+                lastSeenAt: new Date().toISOString(),
+                username: msg.fromUsername ?? "",
+                bio: "",
+                avatarDataUrl: "",
+              },
+            ],
+            createdAt: new Date().toISOString(),
+            isHub: msg.isHub === true,
+          });
+        });
+      }
+    }
+  };
+
+  // incoming friend accept -> add to friends list
+  protocol.onFriendAccept = (msg, fromNodeId) => {
+    sDoc.change((draft: any) => {
+      if (!draft.friends) draft.friends = [];
+
+      // find existing friend entry by node ID
+      const existingFriend = draft.friends.find((f: any) =>
+        f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
+      );
+      if (!existingFriend) {
+        draft.friends.push({
+          id: crypto.randomUUID(),
+          alias: "",
+          username: msg.fromUsername ?? "",
+          group: "default",
+          nodeIds: [
+            {
+              nodeId: fromNodeId,
+              addedAt: new Date().toISOString(),
+              lastSeenAt: new Date().toISOString(),
+              username: msg.fromUsername ?? "",
+              bio: "",
+              avatarDataUrl: "",
+            },
+          ],
+          createdAt: new Date().toISOString(),
+          isHub: msg.isHub === true,
+        });
+      } else {
+        // friend entry was pre-created (e.g. by the add-friend UI) with
+        // empty username — backfill from the accept message.
+        // alias is intentionally left alone (user-controlled local label).
+        const acceptName = msg.fromUsername ?? "";
+        if (acceptName) {
+          if (!existingFriend.username) existingFriend.username = acceptName;
+          // also update the matching node-level username
+          for (const n of existingFriend.nodeIds ?? []) {
+            if (n.nodeId === fromNodeId && !n.username) {
+              n.username = acceptName;
+            }
+          }
+        }
+        // sticky hub flag (section 3.3): once true, never unset by a later
+        // message that omits the flag — only ever flips false -> true here.
+        if (msg.isHub === true && existingFriend.isHub !== true) {
+          existingFriend.isHub = true;
+        }
+      }
+
+      // update pending request status
+      if (draft.pendingRequests) {
+        for (const req of draft.pendingRequests) {
+          if (req.fromNodeId === fromNodeId && req.status === "pending") {
+            req.status = "accepted";
+          }
+        }
+      }
+
+      // update outbound request status
+      if (draft.outboundRequests) {
+        for (const req of draft.outboundRequests) {
+          if (req.toNodeId === fromNodeId && req.status === "pending") {
+            req.status = "accepted";
+          }
+        }
+      }
+    });
+
+    // request the accepted peer's profile so bio/avatar arrive immediately
+    // (without this, profile data only populates on next init / page reload)
+    protocol.requestProfile(fromNodeId).catch(() => {});
+  };
+}
+
+// ---------------------------------------------------------------------------
 // knock (access request) handling — docs/knock-and-hub-relay-plan.md
 //
 // exported as standalone functions (rather than inlined into
@@ -1716,6 +1762,10 @@ export async function approveKnock(
           },
         ],
         createdAt: new Date().toISOString(),
+        // a knock requester being approved here isn't (as far as this code
+        // knows) a hub — hub status only ever arrives via the isHub flag on
+        // a friend-request/friend-accept message (see wireFriendHandlers()).
+        isHub: false,
       });
     });
   }

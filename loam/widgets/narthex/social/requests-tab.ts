@@ -270,6 +270,12 @@ export function createRequestsTab(ctx: TabContext): TabController {
                 },
               ],
               createdAt: new Date().toISOString(),
+              // this manual "accept" click builds a FriendEntry from the
+              // locally-stored pendingRequest, which has no isHub field of
+              // its own (unlike the message-arrival path in
+              // friendz-wiring.ts's wireFriendHandlers()) — defaults false,
+              // same as every other manual-add site.
+              isHub: false,
             });
           }
         });

@@ -597,6 +597,10 @@ export function createProfileTab(ctx: TabContext): TabController {
                     },
                   ],
                   createdAt: new Date().toISOString(),
+                  // a bundle-imported friend id has no hub info attached —
+                  // hub status only ever arrives via the isHub flag on a
+                  // friend-request/friend-accept message.
+                  isHub: false,
                 });
               }
             }

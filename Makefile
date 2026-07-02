@@ -10,7 +10,7 @@
 # those targets instead of touching the checked-in-locally .cargo/config.toml.
 DEV_DB := $(CURDIR)/reliquary/dev-data/skein-hub.db
 
-.PHONY: dev-data tauri-dev tauri-build
+.PHONY: dev-data tauri-dev tauri-build hub-dev
 
 # (re)creates the sqlite dev db reliquary's sqlx macros need, by running a
 # side-effect-free reliquary CLI subcommand (applies migrations, nothing else).
@@ -22,3 +22,12 @@ tauri-dev: dev-data
 
 tauri-build: dev-data
 	cd tauri && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri build
+
+# runs a real reliquary hub against the same dev-data dir/db the sqlx macros
+# and `tauri-dev` use, so `reliquary admin allow`/`reliquary friend allow`
+# invocations against that same --data-dir affect this running hub. port
+# defaults to 0 (ephemeral) - the hub's node id (printed on startup) is what
+# other peers dial, not a fixed port. RUST_LOG matches the level
+# loam/tests/helpers/reliquary-hub.ts already uses for a real hub process.
+hub-dev: dev-data
+	RUST_LOG=reliquary=debug cargo run -p reliquary -- --data-dir reliquary/dev-data serve

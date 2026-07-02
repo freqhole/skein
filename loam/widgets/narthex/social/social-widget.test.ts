@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildFriendRowItems,
   colorForName,
   friendDisplayName,
   friendDisplayNameFull,
+  HUB_GROUP_KEY,
   isValidNodeId,
   truncate,
 } from "./helpers";
@@ -69,6 +71,7 @@ describe("socialSchema", () => {
             },
           ],
           createdAt: "2025-01-01",
+          isHub: false,
         },
       ],
       groups: [{ name: "close", createdAt: "2025-01-01" }],
@@ -123,7 +126,7 @@ describe("socialSchema", () => {
     };
     const result = socialSchema.parse({ friends: [friend] });
     expect(result.friends).toHaveLength(1);
-    expect(result.friends[0]).toEqual(friend);
+    expect(result.friends[0]).toEqual({ ...friend, isHub: false });
   });
 
   it("fills friend entry defaults", () => {
@@ -133,6 +136,12 @@ describe("socialSchema", () => {
     expect(result.group).toBe("");
     expect(result.nodeIds).toEqual([]);
     expect(result.createdAt).toBe("");
+    expect(result.isHub).toBe(false);
+  });
+
+  it("parses an explicit isHub: true", () => {
+    const result = friendEntrySchema.parse({ id: "f1", isHub: true });
+    expect(result.isHub).toBe(true);
   });
 
   it("fills nodeId entry defaults", () => {
@@ -528,5 +537,95 @@ describe("truncate", () => {
 
   it("handles empty string", () => {
     expect(truncate("", 5)).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildFriendRowItems — grouping / sort-order / reserved hub-nodes section
+// (docs/hub-and-profile-plan.md section 4)
+// ---------------------------------------------------------------------------
+
+function makeFriend(overrides: Partial<FriendEntry> & { id: string }): FriendEntry {
+  return {
+    alias: "",
+    username: overrides.id,
+    group: "",
+    nodeIds: [],
+    createdAt: "",
+    isHub: false,
+    ...overrides,
+  };
+}
+
+describe("buildFriendRowItems", () => {
+  it("sorts real groups alphabetically with ungrouped friends last, no hub section when there are no hub friends", () => {
+    const friends = [
+      makeFriend({ id: "a", group: "zebra" }),
+      makeFriend({ id: "b", group: "" }),
+      makeFriend({ id: "c", group: "apple" }),
+    ];
+    const items = buildFriendRowItems(friends, new Set());
+
+    expect(items).toEqual([
+      { type: "header", group: "apple", count: 1 },
+      { type: "friend", friend: friends[2] },
+      { type: "header", group: "zebra", count: 1 },
+      { type: "friend", friend: friends[0] },
+      { type: "friend", friend: friends[1] },
+    ]);
+  });
+
+  it("puts the reserved hub-nodes section after every real group and the ungrouped bucket", () => {
+    const friends = [
+      makeFriend({ id: "grouped", group: "zebra" }),
+      makeFriend({ id: "ungrouped", group: "" }),
+      makeFriend({ id: "hub-1", isHub: true }),
+    ];
+    const items = buildFriendRowItems(friends, new Set());
+
+    expect(items).toEqual([
+      { type: "header", group: "zebra", count: 1 },
+      { type: "friend", friend: friends[0] },
+      { type: "friend", friend: friends[1] },
+      { type: "header", group: HUB_GROUP_KEY, count: 1 },
+      { type: "friend", friend: friends[2] },
+    ]);
+  });
+
+  it("excludes a hub friend from the normal group listing even when it has a stray group value, without mutating that field", () => {
+    const hub = makeFriend({ id: "hub-1", isHub: true, group: "leftover-group" });
+    const items = buildFriendRowItems([hub], new Set());
+
+    // only ever appears once, in the reserved hub section — never under "leftover-group"
+    const friendRows = items.filter((i) => i.type === "friend");
+    expect(friendRows).toHaveLength(1);
+    expect(items).toEqual([
+      { type: "header", group: HUB_GROUP_KEY, count: 1 },
+      { type: "friend", friend: hub },
+    ]);
+    // the friend's own group field is untouched
+    expect(hub.group).toBe("leftover-group");
+  });
+
+  it("omits the hub-nodes header entirely when there are no hub friends", () => {
+    const friends = [makeFriend({ id: "a" })];
+    const items = buildFriendRowItems(friends, new Set());
+    expect(items.some((i) => i.type === "header" && i.group === HUB_GROUP_KEY)).toBe(false);
+  });
+
+  it("hides a real group's members when its name is collapsed, but keeps its header", () => {
+    const friends = [makeFriend({ id: "a", group: "zebra" }), makeFriend({ id: "b", group: "zebra" })];
+    const items = buildFriendRowItems(friends, new Set(["zebra"]));
+    expect(items).toEqual([{ type: "header", group: "zebra", count: 2 }]);
+  });
+
+  it("hides hub friends when the reserved hub-nodes key is collapsed, but keeps its header", () => {
+    const friends = [makeFriend({ id: "hub-1", isHub: true }), makeFriend({ id: "hub-2", isHub: true })];
+    const items = buildFriendRowItems(friends, new Set([HUB_GROUP_KEY]));
+    expect(items).toEqual([{ type: "header", group: HUB_GROUP_KEY, count: 2 }]);
+  });
+
+  it("returns an empty list for no friends at all", () => {
+    expect(buildFriendRowItems([], new Set())).toEqual([]);
   });
 });
