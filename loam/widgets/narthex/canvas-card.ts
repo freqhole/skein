@@ -225,7 +225,6 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
 
     let previewSprite: Sprite | null = null;
     let lastRequestedPreviewUrl = "";
-    let loadedPreviewAssetKey = "";
     const previewMask = new Graphics();
     container.addChild(previewMask);
 
@@ -566,10 +565,14 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
         previewSprite.destroy();
         previewSprite = null;
       }
-      if (loadedPreviewAssetKey) {
-        Assets.unload(loadedPreviewAssetKey);
-        loadedPreviewAssetKey = "";
-      }
+      // NOTE: do NOT call Assets.unload() here — previewUrl is always a
+      // data: URL, which can be shared with other live consumers of the
+      // same texture (another canvas-card with the same previewUrl, the
+      // canvas-wizard's own preview field, a file widget's thumbnail,
+      // etc). unloading it out from under them crashes the renderer
+      // mid-frame ("alphaMode" null error in StencilMaskPipe, since this
+      // widget's own preview sprite is masked) — same root cause already
+      // fixed the same way in file.ts/property-tray.ts/canvas-wizard.ts.
 
       if (!dataUrl) return;
 
@@ -582,7 +585,6 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
         const top = ACCENT_HEIGHT;
 
         previewSprite = new Sprite(texture);
-        loadedPreviewAssetKey = dataUrl;
         previewSprite.eventMode = "none";
 
         // cover/fill the preview area — scale up to fill, center-crop overflow
@@ -1000,10 +1002,8 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
           previewSprite.destroy();
           previewSprite = null;
         }
-        if (loadedPreviewAssetKey) {
-          Assets.unload(loadedPreviewAssetKey);
-          loadedPreviewAssetKey = "";
-        }
+        // see updatePreviewSprite()'s comment above — never unload a data:
+        // URL texture, it may still be referenced elsewhere.
         container.destroy({ children: true });
       },
       resize(width: number, height: number) {

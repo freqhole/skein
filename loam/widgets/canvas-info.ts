@@ -372,9 +372,18 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
         previewSprite.destroy();
         previewSprite = null;
       }
+      // NOTE: do NOT call Assets.unload() for a data: URL — it can be
+      // shared with other live consumers of the same texture (a
+      // canvas-card thumbnail, the canvas-wizard's preview, a file
+      // widget's thumbnail, etc). unloading it out from under them
+      // crashes the renderer mid-frame ("alphaMode" null error in
+      // StencilMaskPipe) — same root cause already fixed the same way in
+      // file.ts/property-tray.ts/canvas-wizard.ts/canvas-card.ts. blob:
+      // URLs are never shared this way (each is unique per load), so
+      // those are still safe to unload/revoke.
       if (loadedAssetKey) {
-        Assets.unload(loadedAssetKey);
         if (loadedAssetKey.startsWith("blob:")) {
+          Assets.unload(loadedAssetKey);
           URL.revokeObjectURL(loadedAssetKey);
         }
         loadedAssetKey = "";

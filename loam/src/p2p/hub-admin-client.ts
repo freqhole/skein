@@ -35,11 +35,26 @@ const DEFAULT_MAX_ADMIN_RESPONSE_BYTES = 1024 * 1024;
 // wire types
 // ---------------------------------------------------------------------------
 
-/** a single friendz row, as reported by an `AdminResponse::List`. */
+/**
+ * a single friendz row, as reported by an `AdminResponse::List`.
+ *
+ * `username`/`bio`/`avatarDataUrl` are best-effort profile info the hub
+ * already has cached in its own `userz` directory — empty strings if it's
+ * never seen a profile for this peer. `avatarDataUrl` is a ready-to-render
+ * `data:<mime>;base64,...` string, computed server-side (see
+ * `FriendSummary`'s doc comment in `reliquary/src/protocol/hub_admin.rs`
+ * for why: a hub's cached avatar blob isn't tied to any canvas, so it
+ * wouldn't pass the canvas-membership half of the blob ACL gate anyway).
+ * `isAdmin` cross-references the hub's `adminz` table.
+ */
 export interface HubAdminFriendSummary {
   nodeId: string;
   status: string;
   updatedAt: number;
+  username: string;
+  bio: string;
+  avatarDataUrl: string;
+  isAdmin: boolean;
 }
 
 /**
@@ -71,6 +86,9 @@ export type HubAdminRequest =
   | { kind: "allow"; nodeId: string }
   | { kind: "list" }
   | { kind: "remove"; nodeId: string }
+  | { kind: "block"; nodeId: string }
+  | { kind: "promoteAdmin"; nodeId: string }
+  | { kind: "demoteAdmin"; nodeId: string }
   | { kind: "listPendingKnocks" };
 
 /**
@@ -81,6 +99,8 @@ export type HubAdminResponse =
   | { kind: "allowed"; nodeId: string; status: string }
   | { kind: "list"; friends: HubAdminFriendSummary[] }
   | { kind: "removed"; nodeId: string }
+  | { kind: "blocked"; nodeId: string }
+  | { kind: "adminChanged"; nodeId: string; isAdmin: boolean }
   | { kind: "notAdmin" }
   | { kind: "error"; message: string }
   | { kind: "pendingKnocks"; knocks: HubAdminPendingKnockSummary[] };
@@ -100,6 +120,12 @@ function toWireAdminRequest(request: HubAdminRequest): unknown {
       return "List";
     case "remove":
       return { Remove: { node_id: request.nodeId } };
+    case "block":
+      return { Block: { node_id: request.nodeId } };
+    case "promoteAdmin":
+      return { PromoteAdmin: { node_id: request.nodeId } };
+    case "demoteAdmin":
+      return { DemoteAdmin: { node_id: request.nodeId } };
     case "listPendingKnocks":
       return "ListPendingKnocks";
   }
@@ -118,7 +144,15 @@ function fromWireAdminResponse(wire: unknown): HubAdminResponse {
     }
     if ("List" in obj) {
       const v = obj.List as {
-        friends: Array<{ node_id: string; status: string; updated_at: number }>;
+        friends: Array<{
+          node_id: string;
+          status: string;
+          updated_at: number;
+          username: string;
+          bio: string;
+          avatar_data_url: string;
+          is_admin: boolean;
+        }>;
       };
       return {
         kind: "list",
@@ -126,12 +160,24 @@ function fromWireAdminResponse(wire: unknown): HubAdminResponse {
           nodeId: f.node_id,
           status: f.status,
           updatedAt: f.updated_at,
+          username: f.username,
+          bio: f.bio,
+          avatarDataUrl: f.avatar_data_url,
+          isAdmin: f.is_admin,
         })),
       };
     }
     if ("Removed" in obj) {
       const v = obj.Removed as { node_id: string };
       return { kind: "removed", nodeId: v.node_id };
+    }
+    if ("Blocked" in obj) {
+      const v = obj.Blocked as { node_id: string };
+      return { kind: "blocked", nodeId: v.node_id };
+    }
+    if ("AdminChanged" in obj) {
+      const v = obj.AdminChanged as { node_id: string; is_admin: boolean };
+      return { kind: "adminChanged", nodeId: v.node_id, isAdmin: v.is_admin };
     }
     if ("Error" in obj) {
       const v = obj.Error as { message: string };
@@ -242,6 +288,14 @@ export interface HubAdminClient {
   hubAdminList(peerNodeId: string): Promise<HubAdminResponse>;
   /** remove a peer from the hub's friendz entirely (mirrors `reliquary friend remove`). */
   hubAdminRemove(peerNodeId: string, nodeIdToRemove: string): Promise<HubAdminResponse>;
+  /** deny a peer (sets friendz status to blocked) — the reverse ("unblock")
+   *  is just `hubAdminAllow` again, no separate method. */
+  hubAdminBlock(peerNodeId: string, nodeIdToBlock: string): Promise<HubAdminResponse>;
+  /** grant a friend hub-admin rights (mirrors `reliquary admin allow`) —
+   *  lets them make their own remote hub-admin requests. */
+  hubAdminPromoteAdmin(peerNodeId: string, nodeIdToPromote: string): Promise<HubAdminResponse>;
+  /** revoke a peer's hub-admin rights (mirrors `reliquary admin remove`). */
+  hubAdminDemoteAdmin(peerNodeId: string, nodeIdToDemote: string): Promise<HubAdminResponse>;
   /**
    * list pending knocks the hub is holding across every canvas doc it
    * holds — read-only, informational aggregation. approving/declining a
@@ -262,6 +316,21 @@ export function createHubAdminClient(transport: HubAdminTransport): HubAdminClie
     },
     hubAdminRemove(peerNodeId, nodeIdToRemove) {
       return sendAdminRequest(transport, peerNodeId, { kind: "remove", nodeId: nodeIdToRemove });
+    },
+    hubAdminBlock(peerNodeId, nodeIdToBlock) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "block", nodeId: nodeIdToBlock });
+    },
+    hubAdminPromoteAdmin(peerNodeId, nodeIdToPromote) {
+      return sendAdminRequest(transport, peerNodeId, {
+        kind: "promoteAdmin",
+        nodeId: nodeIdToPromote,
+      });
+    },
+    hubAdminDemoteAdmin(peerNodeId, nodeIdToDemote) {
+      return sendAdminRequest(transport, peerNodeId, {
+        kind: "demoteAdmin",
+        nodeId: nodeIdToDemote,
+      });
     },
     hubAdminListPendingKnocks(peerNodeId) {
       return sendAdminRequest(transport, peerNodeId, { kind: "listPendingKnocks" });

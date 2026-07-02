@@ -202,10 +202,18 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
         sprite.destroy();
         sprite = null;
       }
+      // NOTE: do NOT unload a data: URL's texture — it can be shared with
+      // other live consumers of the same texture (a canvas-card thumbnail,
+      // the canvas-wizard's preview, a file widget's thumbnail, etc).
+      // unloading it out from under them crashes the renderer mid-frame
+      // ("alphaMode" null error in StencilMaskPipe) — same root cause
+      // already fixed the same way in file.ts/property-tray.ts/
+      // canvas-wizard.ts/canvas-card.ts/canvas-info.ts. blob: URLs are
+      // never shared this way (each is unique per load), so those are
+      // still safe to unload/revoke.
       if (loadedAssetKey) {
-        Assets.unload(loadedAssetKey);
-        // if it was a blob URL, revoke it to free blob memory
         if (loadedAssetKey.startsWith("blob:")) {
+          Assets.unload(loadedAssetKey);
           URL.revokeObjectURL(loadedAssetKey);
         }
         loadedAssetKey = "";
@@ -258,8 +266,10 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
 
         // check if this request is still current
         if (abort.signal.aborted || lastRequestedUrl !== url) {
-          Assets.unload(assetKey);
+          // same reasoning as destroySprite() above — never unload a data:
+          // URL, it may be shared with other live consumers.
           if (assetKey.startsWith("blob:")) {
+            Assets.unload(assetKey);
             URL.revokeObjectURL(assetKey);
           }
           return;

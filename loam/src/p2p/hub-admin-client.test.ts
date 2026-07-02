@@ -78,8 +78,24 @@ describe("hub-admin-client", () => {
       const fake = createFakeNode({
         List: {
           friends: [
-            { node_id: "node-a", status: "accepted", updated_at: 1000 },
-            { node_id: "node-b", status: "allowed", updated_at: 2000 },
+            {
+              node_id: "node-a",
+              status: "accepted",
+              updated_at: 1000,
+              username: "alice",
+              bio: "hi",
+              avatar_data_url: "data:image/webp;base64,abc",
+              is_admin: true,
+            },
+            {
+              node_id: "node-b",
+              status: "allowed",
+              updated_at: 2000,
+              username: "",
+              bio: "",
+              avatar_data_url: "",
+              is_admin: false,
+            },
           ],
         },
       });
@@ -91,9 +107,70 @@ describe("hub-admin-client", () => {
       expect(response).toEqual({
         kind: "list",
         friends: [
-          { nodeId: "node-a", status: "accepted", updatedAt: 1000 },
-          { nodeId: "node-b", status: "allowed", updatedAt: 2000 },
+          {
+            nodeId: "node-a",
+            status: "accepted",
+            updatedAt: 1000,
+            username: "alice",
+            bio: "hi",
+            avatarDataUrl: "data:image/webp;base64,abc",
+            isAdmin: true,
+          },
+          {
+            nodeId: "node-b",
+            status: "allowed",
+            updatedAt: 2000,
+            username: "",
+            bio: "",
+            avatarDataUrl: "",
+            isAdmin: false,
+          },
         ],
+      });
+    });
+  });
+
+  describe("hubAdminBlock", () => {
+    it("sends the correct wire request and parses a Blocked response", async () => {
+      const fake = createFakeNode({ Blocked: { node_id: "target-node" } });
+      const client = createHubAdminClient(transportFor(fake.node));
+
+      const response = await client.hubAdminBlock(PEER_NODE_ID, "target-node");
+
+      expect(fake.getWrittenRequest()).toEqual({ Block: { node_id: "target-node" } });
+      expect(response).toEqual({ kind: "blocked", nodeId: "target-node" });
+    });
+  });
+
+  describe("hubAdminPromoteAdmin / hubAdminDemoteAdmin", () => {
+    it("sends the correct wire requests and parses AdminChanged responses", async () => {
+      const promoteFake = createFakeNode({
+        AdminChanged: { node_id: "target-node", is_admin: true },
+      });
+      const promoteClient = createHubAdminClient(transportFor(promoteFake.node));
+      const promoteResponse = await promoteClient.hubAdminPromoteAdmin(
+        PEER_NODE_ID,
+        "target-node"
+      );
+      expect(promoteFake.getWrittenRequest()).toEqual({
+        PromoteAdmin: { node_id: "target-node" },
+      });
+      expect(promoteResponse).toEqual({
+        kind: "adminChanged",
+        nodeId: "target-node",
+        isAdmin: true,
+      });
+
+      const demoteFake = createFakeNode({
+        AdminChanged: { node_id: "target-node", is_admin: false },
+      });
+      const demoteClient = createHubAdminClient(transportFor(demoteFake.node));
+      const demoteResponse = await demoteClient.hubAdminDemoteAdmin(PEER_NODE_ID, "target-node");
+      expect(demoteFake.getWrittenRequest()).toEqual({ DemoteAdmin: { node_id: "target-node" } });
+      expect(demoteResponse).toEqual({
+        kind: "adminChanged",
+        nodeId: "target-node",
+        isAdmin: false,
       });
     });
   });

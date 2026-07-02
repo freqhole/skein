@@ -85,10 +85,6 @@ async function mountPanelAndWaitReady(
   return lastState!;
 }
 
-async function getPanelState(page: Page): Promise<HubProfilePanelState> {
-  return page.evaluate(() => (window as any).__hubProfileTest.getPanelState());
-}
-
 async function hubAdminAllow(page: Page, hubNodeId: string, nodeId: string) {
   return page.evaluate(
     ([hub, target]) => (window as any).__hubProfileTest.client.hubAdminAllow(hub, target),
@@ -99,6 +95,27 @@ async function hubAdminAllow(page: Page, hubNodeId: string, nodeId: string) {
 async function hubAdminRemove(page: Page, hubNodeId: string, nodeId: string) {
   return page.evaluate(
     ([hub, target]) => (window as any).__hubProfileTest.client.hubAdminRemove(hub, target),
+    [hubNodeId, nodeId] as const
+  );
+}
+
+async function hubAdminBlock(page: Page, hubNodeId: string, nodeId: string) {
+  return page.evaluate(
+    ([hub, target]) => (window as any).__hubProfileTest.client.hubAdminBlock(hub, target),
+    [hubNodeId, nodeId] as const
+  );
+}
+
+async function hubAdminPromoteAdmin(page: Page, hubNodeId: string, nodeId: string) {
+  return page.evaluate(
+    ([hub, target]) => (window as any).__hubProfileTest.client.hubAdminPromoteAdmin(hub, target),
+    [hubNodeId, nodeId] as const
+  );
+}
+
+async function hubAdminDemoteAdmin(page: Page, hubNodeId: string, nodeId: string) {
+  return page.evaluate(
+    ([hub, target]) => (window as any).__hubProfileTest.client.hubAdminDemoteAdmin(hub, target),
     [hubNodeId, nodeId] as const
   );
 }
@@ -201,11 +218,104 @@ test.describe("hub profile panel @hub", () => {
     test.setTimeout(90_000);
 
     hub = await startReliquaryHub();
-    const stranger = await openHarnessPage(page);
-    // deliberately skip hub.adminAllow() — `stranger` is not in hub_adminz.
+    await openHarnessPage(page);
+    // deliberately skip hub.adminAllow() — this page's peer is not in hub_adminz.
 
     const state = await mountPanelAndWaitReady(page, hub.nodeId);
 
     expect(state).toEqual({ status: "notAdmin" });
+  });
+
+  test("block sets a friend's status to blocked; unblock (allow again) restores it @hub", async ({
+    page,
+    browser,
+  }) => {
+    test.setTimeout(90_000);
+
+    hub = await startReliquaryHub();
+    const admin = await openHarnessPage(page);
+    await hub.adminAllow(admin.nodeId);
+
+    const targetContext = await browser.newContext();
+    const targetPage = await targetContext.newPage();
+    const target = await openHarnessPage(targetPage);
+
+    await hubAdminAllow(page, hub.nodeId, target.nodeId);
+
+    const blockResponse = await hubAdminBlock(page, hub.nodeId, target.nodeId);
+    expect(blockResponse).toEqual({ kind: "blocked", nodeId: target.nodeId });
+
+    let state = await mountPanelAndWaitReady(page, hub.nodeId);
+    expect(state.status).toBe("ready");
+    if (state.status === "ready") {
+      const friend = state.friends.find((f) => f.nodeId === target.nodeId);
+      expect(friend?.status).toBe("blocked");
+    }
+
+    // "unblock" is just allow again.
+    const unblockResponse = await hubAdminAllow(page, hub.nodeId, target.nodeId);
+    expect(unblockResponse).toEqual({ kind: "allowed", nodeId: target.nodeId, status: "allowed" });
+
+    state = await mountPanelAndWaitReady(page, hub.nodeId);
+    expect(state.status).toBe("ready");
+    if (state.status === "ready") {
+      const friend = state.friends.find((f) => f.nodeId === target.nodeId);
+      expect(friend?.status).toBe("allowed");
+    }
+
+    await targetPage.close();
+    await targetContext.close();
+  });
+
+  test("promote grants a friend hub-admin rights; demote revokes them @hub", async ({
+    page,
+    browser,
+  }) => {
+    test.setTimeout(90_000);
+
+    hub = await startReliquaryHub();
+    const admin = await openHarnessPage(page);
+    await hub.adminAllow(admin.nodeId);
+
+    const targetContext = await browser.newContext();
+    const targetPage = await targetContext.newPage();
+    const target = await openHarnessPage(targetPage);
+
+    await hubAdminAllow(page, hub.nodeId, target.nodeId);
+
+    const promoteResponse = await hubAdminPromoteAdmin(page, hub.nodeId, target.nodeId);
+    expect(promoteResponse).toEqual({
+      kind: "adminChanged",
+      nodeId: target.nodeId,
+      isAdmin: true,
+    });
+
+    let state = await mountPanelAndWaitReady(page, hub.nodeId);
+    expect(state.status).toBe("ready");
+    if (state.status === "ready") {
+      const friend = state.friends.find((f) => f.nodeId === target.nodeId);
+      expect(friend?.isAdmin).toBe(true);
+    }
+
+    // the newly-promoted admin can now make their own requests.
+    const targetState = await mountPanelAndWaitReady(targetPage, hub.nodeId);
+    expect(targetState.status).toBe("ready");
+
+    const demoteResponse = await hubAdminDemoteAdmin(page, hub.nodeId, target.nodeId);
+    expect(demoteResponse).toEqual({
+      kind: "adminChanged",
+      nodeId: target.nodeId,
+      isAdmin: false,
+    });
+
+    state = await mountPanelAndWaitReady(page, hub.nodeId);
+    expect(state.status).toBe("ready");
+    if (state.status === "ready") {
+      const friend = state.friends.find((f) => f.nodeId === target.nodeId);
+      expect(friend?.isAdmin).toBe(false);
+    }
+
+    await targetPage.close();
+    await targetContext.close();
   });
 });

@@ -16,7 +16,7 @@
 // building style.
 // ---------------------------------------------------------------------------
 
-import { Container, Graphics, Rectangle, Text } from "pixi.js";
+import { Assets, Container, Graphics, Rectangle, Sprite, Text } from "pixi.js";
 import { log } from "../../../src/utils/log";
 import {
   type HubAdminClient,
@@ -24,7 +24,7 @@ import {
   type HubAdminPendingKnockSummary,
 } from "../../../src/p2p/hub-admin-client";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
-import { isValidNodeId, truncate } from "./helpers";
+import { colorForName, isValidNodeId, truncate } from "./helpers";
 import {
   ACCENT,
   BG,
@@ -40,6 +40,7 @@ import {
   REJECT_COLOR,
   RESOLUTION,
   ROW_ALT_BG,
+  ROW_AVATAR_SIZE,
   ROW_PADDING_X,
   SCROLL_SPEED,
   TEXT_COLOR,
@@ -52,11 +53,17 @@ const TAG = "social.hub-profile-panel";
 // local layout constants
 // ---------------------------------------------------------------------------
 
-const FRIEND_ROW_HEIGHT = 40;
+// friend row is taller than the original 40px to fit an avatar, username,
+// truncated bio, and a row of compact action buttons (block/admin/remove).
+const FRIEND_ROW_HEIGHT = 84;
 const KNOCK_ROW_HEIGHT = 68;
 const SECTION_GAP = 18;
-const REMOVE_BTN_W = 60;
-const REMOVE_BTN_H = 22;
+const REMOVE_BTN_W = 52;
+const BLOCK_BTN_W = 52;
+const ADMIN_BTN_W = 56;
+const ACTION_BTN_H = 20;
+const ACTION_BTN_GAP = 6;
+const COPY_BTN_FEEDBACK_MS = 1500;
 const ALLOW_BTN_W = 70;
 
 // ---------------------------------------------------------------------------
@@ -116,6 +123,17 @@ export interface HubProfilePanelHandle {
    *  button, by that friend's node id, or null if that row isn't currently
    *  rendered (not in the friendz list, or the panel isn't ready). */
   getRemoveButtonGlobalPos(nodeId: string): { x: number; y: number } | null;
+  /** dev/test-only: global center position of a friend row's "block"/
+   *  "unblock" button, by that friend's node id, or null if not rendered. */
+  getBlockButtonGlobalPos(nodeId: string): { x: number; y: number } | null;
+  /** dev/test-only: global center position of a friend row's admin
+   *  toggle ("+admin"/"-admin") button, by that friend's node id, or null
+   *  if not rendered. */
+  getAdminButtonGlobalPos(nodeId: string): { x: number; y: number } | null;
+  /** dev/test-only: global center position of a friend row's "copy" (node
+   *  id to clipboard) button, by that friend's node id, or null if not
+   *  rendered. */
+  getCopyButtonGlobalPos(nodeId: string): { x: number; y: number } | null;
   /** tear down all resources (event listeners, DOM overlays, textures). */
   destroy(): void;
 }
@@ -141,11 +159,16 @@ export function mountHubProfilePanel(
   let allowFeedback = "";
   let allowInFlight = false;
   const removeInFlight = new Set<string>();
+  const blockInFlight = new Set<string>();
+  const promoteInFlight = new Set<string>();
 
   // dev/test-only refs to rendered buttons — see getAllowButtonGlobalPos()/
   // getRemoveButtonGlobalPos() below. reset at the top of every rebuild().
   let allowButtonRef: Container | null = null;
   const removeButtonRefs = new Map<string, Container>();
+  const blockButtonRefs = new Map<string, Container>();
+  const adminButtonRefs = new Map<string, Container>();
+  const copyButtonRefs = new Map<string, Container>();
 
   function globalCenter(c: Container): { x: number; y: number } {
     const pos = c.getGlobalPosition();
@@ -302,6 +325,110 @@ export function mountHubProfilePanel(
     }
   }
 
+  async function handleBlock(nodeId: string): Promise<void> {
+    if (blockInFlight.has(nodeId)) return;
+    blockInFlight.add(nodeId);
+    rebuild();
+    try {
+      const response = await client.hubAdminBlock(hubNodeId, nodeId);
+      if (destroyed) return;
+      if (response.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (response.kind === "error") {
+        log.warn(TAG, "hubAdminBlock failed:", response.message);
+        return;
+      }
+      await refresh();
+    } catch (err) {
+      log.warn(TAG, "hubAdminBlock failed:", err);
+    } finally {
+      blockInFlight.delete(nodeId);
+      if (!destroyed) rebuild();
+    }
+  }
+
+  /** "unblock" is just `hubAdminAllow` again — reuses the same wire request
+   *  as the manual allow-a-node-id flow, but bypasses `handleAllow()`'s
+   *  input-validation/feedback-text logic (which is specific to that flow,
+   *  not this one). */
+  async function handleUnblock(nodeId: string): Promise<void> {
+    if (blockInFlight.has(nodeId)) return;
+    blockInFlight.add(nodeId);
+    rebuild();
+    try {
+      const response = await client.hubAdminAllow(hubNodeId, nodeId);
+      if (destroyed) return;
+      if (response.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (response.kind === "error") {
+        log.warn(TAG, "hubAdminAllow (unblock) failed:", response.message);
+        return;
+      }
+      await refresh();
+    } catch (err) {
+      log.warn(TAG, "hubAdminAllow (unblock) failed:", err);
+    } finally {
+      blockInFlight.delete(nodeId);
+      if (!destroyed) rebuild();
+    }
+  }
+
+  async function handlePromoteAdmin(nodeId: string): Promise<void> {
+    if (promoteInFlight.has(nodeId)) return;
+    promoteInFlight.add(nodeId);
+    rebuild();
+    try {
+      const response = await client.hubAdminPromoteAdmin(hubNodeId, nodeId);
+      if (destroyed) return;
+      if (response.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (response.kind === "error") {
+        log.warn(TAG, "hubAdminPromoteAdmin failed:", response.message);
+        return;
+      }
+      await refresh();
+    } catch (err) {
+      log.warn(TAG, "hubAdminPromoteAdmin failed:", err);
+    } finally {
+      promoteInFlight.delete(nodeId);
+      if (!destroyed) rebuild();
+    }
+  }
+
+  async function handleDemoteAdmin(nodeId: string): Promise<void> {
+    if (promoteInFlight.has(nodeId)) return;
+    promoteInFlight.add(nodeId);
+    rebuild();
+    try {
+      const response = await client.hubAdminDemoteAdmin(hubNodeId, nodeId);
+      if (destroyed) return;
+      if (response.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (response.kind === "error") {
+        log.warn(TAG, "hubAdminDemoteAdmin failed:", response.message);
+        return;
+      }
+      await refresh();
+    } catch (err) {
+      log.warn(TAG, "hubAdminDemoteAdmin failed:", err);
+    } finally {
+      promoteInFlight.delete(nodeId);
+      if (!destroyed) rebuild();
+    }
+  }
+
   // -- small button builder --------------------------------------------------
 
   function buildOutlinedButton(opts2: {
@@ -353,6 +480,9 @@ export function mountHubProfilePanel(
 
     allowButtonRef = null;
     removeButtonRefs.clear();
+    blockButtonRefs.clear();
+    adminButtonRefs.clear();
+    copyButtonRefs.clear();
 
     if (allowInputHandle) {
       allowInputHandle.destroy();
@@ -558,50 +688,210 @@ export function mountHubProfilePanel(
           row.addChild(rowBg);
         }
 
-        const isAccepted = friend.status === "accepted";
-        const dot = new Graphics();
-        dot.eventMode = "none";
-        dot.circle(0, 0, 4);
-        dot.fill({ color: isAccepted ? ONLINE_COLOR : MUTED_TEXT });
-        dot.x = ROW_PADDING_X + 4;
-        dot.y = FRIEND_ROW_HEIGHT / 2;
-        row.addChild(dot);
+        const displayName = friend.username || truncate(friend.nodeId, 16);
 
-        const textX = ROW_PADDING_X + 16;
+        // -- avatar: real image if we have one, initial-letter circle
+        // fallback otherwise — same pattern as friends-tab.ts's row avatar.
+        const avatarX = ROW_PADDING_X + ROW_AVATAR_SIZE / 2;
+        const avatarY = 6 + ROW_AVATAR_SIZE / 2;
+        const avatarColor = colorForName(displayName, i);
+
+        const avatar = new Graphics();
+        avatar.eventMode = "none";
+        avatar.circle(avatarX, avatarY, ROW_AVATAR_SIZE / 2);
+        avatar.fill({ color: avatarColor });
+        row.addChild(avatar);
+
+        const initial = displayName.charAt(0).toUpperCase() || "?";
+        const avatarLetter = new Text({
+          text: initial,
+          style: { fontFamily: FONT, fontSize: 11, fontWeight: "bold", fill: 0xffffff },
+          resolution: RESOLUTION,
+        });
+        avatarLetter.eventMode = "none";
+        avatarLetter.anchor.set(0.5);
+        avatarLetter.x = avatarX;
+        avatarLetter.y = avatarY;
+        row.addChild(avatarLetter);
+
+        if (friend.avatarDataUrl) {
+          const cacheKey = `hub-admin-friend-avatar-${friend.nodeId}`;
+          Assets.load({ src: friend.avatarDataUrl, alias: cacheKey })
+            .then((texture) => {
+              if (row.destroyed) return;
+              const sprite = new Sprite(texture);
+              sprite.eventMode = "none";
+              sprite.width = ROW_AVATAR_SIZE;
+              sprite.height = ROW_AVATAR_SIZE;
+              sprite.x = avatarX - ROW_AVATAR_SIZE / 2;
+              sprite.y = avatarY - ROW_AVATAR_SIZE / 2;
+
+              const spriteMask = new Graphics();
+              spriteMask.circle(avatarX, avatarY, ROW_AVATAR_SIZE / 2);
+              spriteMask.fill({ color: 0xffffff });
+              row.addChild(spriteMask);
+              sprite.mask = spriteMask;
+              row.addChild(sprite);
+
+              avatar.visible = false;
+              avatarLetter.visible = false;
+            })
+            .catch(() => {});
+        }
+
+        const textX = ROW_PADDING_X + ROW_AVATAR_SIZE + 8;
+
+        // -- username --
+        const nameText = new Text({
+          text: displayName,
+          style: { fontFamily: FONT, fontSize: TEXT_SIZE, fontWeight: "bold", fill: TEXT_COLOR },
+          resolution: RESOLUTION,
+        });
+        nameText.eventMode = "none";
+        nameText.x = textX;
+        nameText.y = 2;
+        row.addChild(nameText);
+
+        // -- node id + compact copy-to-clipboard button --
         const nodeIdText = new Text({
-          text: truncate(friend.nodeId, 20),
-          style: { fontFamily: FONT, fontSize: TEXT_SIZE, fill: TEXT_COLOR },
+          text: truncate(friend.nodeId, 18),
+          style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
           resolution: RESOLUTION,
         });
         nodeIdText.eventMode = "none";
         nodeIdText.x = textX;
-        nodeIdText.y = 6;
+        nodeIdText.y = 18;
         row.addChild(nodeIdText);
 
+        const copyBtn = new Container();
+        copyBtn.eventMode = "static";
+        copyBtn.cursor = "pointer";
+        copyBtn.x = textX + nodeIdText.width + 6;
+        copyBtn.y = 17;
+        const copyLabel = new Text({
+          text: "copy",
+          style: { fontFamily: FONT, fontSize: 8, fill: ACCENT },
+          resolution: RESOLUTION,
+        });
+        copyLabel.eventMode = "none";
+        const copyPadX = 5;
+        const copyPadY = 2;
+        const copyW = copyLabel.width + copyPadX * 2;
+        const copyH = copyLabel.height + copyPadY * 2;
+        const copyBg = new Graphics();
+        copyBg.eventMode = "none";
+        copyBg.roundRect(0, 0, copyW, copyH, 3);
+        copyBg.fill({ color: 0x111118 });
+        copyBg.stroke({ color: BORDER, width: 1 });
+        copyBtn.addChild(copyBg);
+        copyLabel.x = copyPadX;
+        copyLabel.y = copyPadY;
+        copyBtn.addChild(copyLabel);
+        copyBtn.hitArea = new Rectangle(0, 0, copyW, copyH);
+        const fullNodeId = friend.nodeId;
+        copyBtn.on("pointertap", (e) => {
+          e.stopPropagation();
+          navigator.clipboard.writeText(fullNodeId).then(
+            () => {
+              copyLabel.text = "copied!";
+              setTimeout(() => {
+                if (row.destroyed) return;
+                copyLabel.text = "copy";
+              }, COPY_BTN_FEEDBACK_MS);
+            },
+            () => {}
+          );
+        });
+        row.addChild(copyBtn);
+        copyButtonRefs.set(friend.nodeId, copyBtn);
+
+        // -- truncated bio (only if present) --
+        if (friend.bio) {
+          const bioText = new Text({
+            text: truncate(friend.bio, 48),
+            style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          bioText.eventMode = "none";
+          bioText.x = textX;
+          bioText.y = 32;
+          row.addChild(bioText);
+        }
+
+        // -- status + admin badge --
+        const isAccepted = friend.status === "accepted" || friend.status === "allowed";
         const statusText = new Text({
-          text: friend.status,
-          style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
+          text: friend.isAdmin ? `${friend.status} \u00b7 admin` : friend.status,
+          style: {
+            fontFamily: FONT,
+            fontSize: LABEL_SIZE,
+            fill: isAccepted ? ONLINE_COLOR : MUTED_TEXT,
+          },
           resolution: RESOLUTION,
         });
         statusText.eventMode = "none";
         statusText.x = textX;
-        statusText.y = 22;
+        statusText.y = 46;
         row.addChild(statusText);
 
+        // -- action buttons: admin toggle, block/unblock, remove — right-aligned --
+        const promoting = promoteInFlight.has(friend.nodeId);
+        const blocking = blockInFlight.has(friend.nodeId);
         const removing = removeInFlight.has(friend.nodeId);
+        const isBlocked = friend.status === "blocked";
+
+        const adminBtn = buildOutlinedButton({
+          label: promoting ? "\u2026" : friend.isAdmin ? "-admin" : "+admin",
+          width: ADMIN_BTN_W,
+          height: ACTION_BTN_H,
+          color: friend.isAdmin ? ACCENT : MUTED_TEXT,
+          disabled: promoting,
+          onTap: () => {
+            if (friend.isAdmin) {
+              handleDemoteAdmin(friend.nodeId).catch(() => {});
+            } else {
+              handlePromoteAdmin(friend.nodeId).catch(() => {});
+            }
+          },
+        });
+        const blockBtn = buildOutlinedButton({
+          label: blocking ? "\u2026" : isBlocked ? "unblock" : "block",
+          width: BLOCK_BTN_W,
+          height: ACTION_BTN_H,
+          color: isBlocked ? ONLINE_COLOR : REJECT_COLOR,
+          disabled: blocking,
+          onTap: () => {
+            if (isBlocked) {
+              handleUnblock(friend.nodeId).catch(() => {});
+            } else {
+              handleBlock(friend.nodeId).catch(() => {});
+            }
+          },
+        });
         const removeBtn = buildOutlinedButton({
           label: removing ? "\u2026" : "remove",
           width: REMOVE_BTN_W,
-          height: REMOVE_BTN_H,
+          height: ACTION_BTN_H,
           color: REJECT_COLOR,
           disabled: removing,
           onTap: () => {
             handleRemove(friend.nodeId).catch(() => {});
           },
         });
+
+        const actionsY = FRIEND_ROW_HEIGHT - ACTION_BTN_H - 6;
         removeBtn.x = contentW - REMOVE_BTN_W - ROW_PADDING_X;
-        removeBtn.y = (FRIEND_ROW_HEIGHT - REMOVE_BTN_H) / 2;
+        removeBtn.y = actionsY;
+        blockBtn.x = removeBtn.x - BLOCK_BTN_W - ACTION_BTN_GAP;
+        blockBtn.y = actionsY;
+        adminBtn.x = blockBtn.x - ADMIN_BTN_W - ACTION_BTN_GAP;
+        adminBtn.y = actionsY;
+
+        row.addChild(adminBtn);
+        row.addChild(blockBtn);
         row.addChild(removeBtn);
+        adminButtonRefs.set(friend.nodeId, adminBtn);
+        blockButtonRefs.set(friend.nodeId, blockBtn);
         removeButtonRefs.set(friend.nodeId, removeBtn);
 
         dy += FRIEND_ROW_HEIGHT;
@@ -753,6 +1043,24 @@ export function mountHubProfilePanel(
     return globalCenter(btn);
   }
 
+  function getBlockButtonGlobalPos(nodeId: string): { x: number; y: number } | null {
+    const btn = blockButtonRefs.get(nodeId);
+    if (!btn) return null;
+    return globalCenter(btn);
+  }
+
+  function getAdminButtonGlobalPos(nodeId: string): { x: number; y: number } | null {
+    const btn = adminButtonRefs.get(nodeId);
+    if (!btn) return null;
+    return globalCenter(btn);
+  }
+
+  function getCopyButtonGlobalPos(nodeId: string): { x: number; y: number } | null {
+    const btn = copyButtonRefs.get(nodeId);
+    if (!btn) return null;
+    return globalCenter(btn);
+  }
+
   function destroy(): void {
     destroyed = true;
     if (allowInputHandle) {
@@ -774,6 +1082,9 @@ export function mountHubProfilePanel(
     getAllowInputGlobalPos,
     getAllowButtonGlobalPos,
     getRemoveButtonGlobalPos,
+    getBlockButtonGlobalPos,
+    getAdminButtonGlobalPos,
+    getCopyButtonGlobalPos,
     destroy,
   };
 }

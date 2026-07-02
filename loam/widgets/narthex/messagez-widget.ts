@@ -992,6 +992,85 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
           statusLabel.x = statusIcon.x + 16;
           statusLabel.y = (ROW_HEIGHT - ROW_SUB_SIZE) / 2;
           rowContainer.addChild(statusLabel);
+
+          // re-add button: an already-accepted invite's canvas-card can
+          // still be deleted from the narthex later (a normal, separate
+          // action) — `acceptCanvasInvite()` (boot.ts) is idempotent (it
+          // checks whether a card for this canvasDocId already exists), so
+          // re-running the exact same accept flow is a safe, correct way
+          // to restore the card without needing a whole separate
+          // "re-invite" round trip from the original sender.
+          const reAddW = 52;
+          const reAddH = 20;
+          const reAddBtn = new Container();
+          reAddBtn.eventMode = "static";
+          reAddBtn.cursor = "pointer";
+          reAddBtn.hitArea = new Rectangle(0, 0, reAddW, reAddH);
+          reAddBtn.x = contentW - reAddW - ROW_PADDING_X;
+          reAddBtn.y = ROW_HEIGHT - reAddH - 4;
+
+          const reAddBg = new Graphics();
+          reAddBg.eventMode = "none";
+          reAddBg.roundRect(0, 0, reAddW, reAddH, 4);
+          reAddBg.fill({ color: 0x111118 });
+          reAddBg.stroke({ color: ACCEPT_COLOR, width: 1.5 });
+          reAddBtn.addChild(reAddBg);
+
+          const reAddLabel = new Text({
+            text: "re-add",
+            style: { fontFamily: FONT, fontSize: 9, fill: ACCEPT_COLOR },
+            resolution: RESOLUTION,
+          });
+          reAddLabel.eventMode = "none";
+          reAddLabel.anchor.set(0.5);
+          reAddLabel.x = reAddW / 2;
+          reAddLabel.y = reAddH / 2;
+          reAddBtn.addChild(reAddLabel);
+
+          reAddBtn.on("pointertap", (e) => {
+            e.stopPropagation();
+            reAddBtn.eventMode = "none";
+            reAddBtn.cursor = "default";
+            reAddLabel.text = "\u2026";
+
+            const cleanup = () => {
+              window.removeEventListener("skein:accept-canvas-invite-done", onDone as EventListener);
+              clearTimeout(timeout);
+            };
+            const onDone = (evt: CustomEvent) => {
+              if (evt.detail?.canvasDocId !== invite.canvasDocId) return;
+              cleanup();
+              if (!reAddBtn.destroyed) {
+                reAddBtn.eventMode = "static";
+                reAddBtn.cursor = "pointer";
+                reAddLabel.text = "re-add";
+              }
+            };
+            const timeout = setTimeout(() => {
+              cleanup();
+              if (!reAddBtn.destroyed) {
+                reAddBtn.eventMode = "static";
+                reAddBtn.cursor = "pointer";
+                reAddLabel.text = "re-add";
+              }
+            }, 15000);
+            window.addEventListener("skein:accept-canvas-invite-done", onDone as EventListener);
+
+            window.dispatchEvent(
+              new CustomEvent("skein:accept-canvas-invite", {
+                detail: {
+                  canvasDocId: invite.canvasDocId,
+                  fromNodeId: invite.fromNodeId,
+                  canvasTitle: invite.canvasTitle,
+                  canvasDescription: invite.canvasDescription ?? "",
+                  canvasColor: invite.canvasColor ?? 0,
+                  canvasPreviewUrl: invite.canvasPreviewUrl ?? "",
+                  fromUsername: invite.fromUsername ?? "",
+                },
+              })
+            );
+          });
+          rowContainer.addChild(reAddBtn);
         } else if (invite.status === "declined") {
           const statusIcon = new Text({
             text: "\u00d7",

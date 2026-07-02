@@ -45,6 +45,19 @@ pub fn decode_data_url(data_url: &str) -> Option<(String, Vec<u8>)> {
     Some((mime.to_string(), bytes))
 }
 
+/// the inverse of [`decode_data_url`]: build a `data:<mime>;base64,...`
+/// string from raw bytes + a mime type. used by the remote hub-admin
+/// protocol (`protocol::hub_admin`'s `AdminRequest::List` handler) to send
+/// a friend's cached avatar directly in the response, so the remote panel
+/// can render it with no separate blob fetch.
+pub fn encode_data_url(mime: &str, bytes: &[u8]) -> String {
+    use base64::Engine;
+    format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -294,10 +294,15 @@ export const canvasWizardWidget: WidgetFactory<typeof canvasWizardSchema> = {
         previewSprite.destroy();
         previewSprite = null;
       }
-      if (loadedPreviewAssetKey) {
-        Assets.unload(loadedPreviewAssetKey);
-        loadedPreviewAssetKey = "";
-      }
+      // NOTE: do NOT call Assets.unload() here — this field always deals in
+      // data: URLs (pickImageAsDataUrl() never returns anything else), which
+      // can be shared with other live consumers of the same texture (e.g. a
+      // canvas-card thumbnail already rendering the same previewUrl). doing
+      // so used to crash the renderer mid-frame ("alphaMode" null error in
+      // StencilMaskPipe) since this call wasn't deferred/guarded the way
+      // file.ts's/property-tray.ts's equivalent image fields already are —
+      // same root cause, same fix: just don't unload.
+      loadedPreviewAssetKey = "";
 
       if (!dataUrl) return;
 
@@ -556,9 +561,8 @@ export const canvasWizardWidget: WidgetFactory<typeof canvasWizardSchema> = {
         if (previewSprite) {
           previewSprite.destroy();
         }
-        if (loadedPreviewAssetKey) {
-          Assets.unload(loadedPreviewAssetKey);
-        }
+        // see updatePreviewSprite()'s comment above — never unload a data:
+        // URL texture, it may still be referenced elsewhere.
         unsub();
         container.destroy({ children: true });
       },

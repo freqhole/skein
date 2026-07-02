@@ -183,18 +183,12 @@ export function createProfileTab(ctx: TabContext): TabController {
   };
 
   let lastRequestedAvatarUrl = "";
-  let loadedAvatarAssetKey = "";
 
   const updateAvatarSprite = async (dataUrl: string) => {
     // deduplicate — if we're already loading (or loaded) this exact URL, skip.
     // prevents the double-call that happens when pickAvatarFile writes to the
     // doc (firing the change handler) and then the layout also triggers a load.
     if (dataUrl && lastRequestedAvatarUrl === dataUrl) return;
-
-    // capture the previous asset key so we can defer its unload until
-    // the new texture is ready — avoids destroying a texture source that
-    // the render pipeline may still reference this frame.
-    const previousAssetKey = loadedAvatarAssetKey;
 
     lastRequestedAvatarUrl = dataUrl;
 
@@ -206,11 +200,12 @@ export function createProfileTab(ctx: TabContext): TabController {
       avatarSprite.destroy();
       avatarSprite = null;
     }
-    loadedAvatarAssetKey = "";
 
     if (!dataUrl) {
-      // no image — unload the old texture immediately (nothing to swap to)
-      if (previousAssetKey) Assets.unload(previousAssetKey);
+      // no image — nothing to swap to. do NOT unload the old data: URL
+      // texture here either — same reasoning as everywhere else in this
+      // file: it may still be referenced by another live consumer
+      // (another widget rendering the identical data: URL bytes).
       avatarPlaceholder.visible = true;
       avatarInitial.visible = true;
       return;
@@ -225,7 +220,6 @@ export function createProfileTab(ctx: TabContext): TabController {
       if (lastRequestedAvatarUrl !== dataUrl) return;
 
       avatarSprite = new Sprite(texture);
-      loadedAvatarAssetKey = dataUrl;
       avatarSprite.eventMode = "none";
       avatarSprite.anchor.set(0.5, 0.5);
       avatarSprite.x = avatarCx;
@@ -235,15 +229,15 @@ export function createProfileTab(ctx: TabContext): TabController {
       avatarSprite.mask = avatarMask;
       avatarContainer.addChild(avatarSprite);
 
-      // now safe to release the old texture — the new one is in the tree
-      if (previousAssetKey && previousAssetKey !== dataUrl) {
-        Assets.unload(previousAssetKey);
-      }
+      // NOTE: do NOT unload the previous data: URL's texture — it can be
+      // shared with other live consumers of the identical data: URL bytes
+      // (e.g. this same avatar rendered elsewhere). unloading it out from
+      // under them crashes the renderer mid-frame ("alphaMode" null error
+      // in StencilMaskPipe) — same root cause already fixed the same way
+      // in file.ts/property-tray.ts/canvas-wizard.ts/canvas-card.ts/
+      // canvas-info.ts/image.ts.
     } catch {
       // failed to load — fall back to placeholder
-      if (previousAssetKey && previousAssetKey !== dataUrl) {
-        Assets.unload(previousAssetKey);
-      }
       avatarPlaceholder.visible = true;
       avatarInitial.visible = true;
     }
@@ -890,10 +884,6 @@ export function createProfileTab(ctx: TabContext): TabController {
         avatarSprite.destroy();
         avatarSprite = null;
       }
-      if (loadedAvatarAssetKey) {
-        Assets.unload(loadedAvatarAssetKey);
-        loadedAvatarAssetKey = "";
-      }
       avatarPlaceholder.visible = true;
       avatarInitial.visible = true;
     }
@@ -1189,10 +1179,6 @@ export function createProfileTab(ctx: TabContext): TabController {
         avatarSprite.mask = null;
         avatarSprite.destroy();
         avatarSprite = null;
-      }
-      if (loadedAvatarAssetKey) {
-        Assets.unload(loadedAvatarAssetKey);
-        loadedAvatarAssetKey = "";
       }
       container.destroy({ children: true });
     },

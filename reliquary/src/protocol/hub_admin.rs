@@ -37,6 +37,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use serde::{Deserialize, Serialize};
 
 use crate::adminz;
+use crate::blobz;
 use crate::friendz;
 use crate::hub_repo::HubRepo;
 use crate::userz;
@@ -53,11 +54,27 @@ const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 // ---------------------------------------------------------------------------
 
 /// a single friendz row as reported to a remote admin.
+///
+/// `username`/`bio`/`avatar_data_url` are best-effort profile info from
+/// `userz` (the hub's own tiny peer directory) — empty strings if the hub
+/// has never seen a profile for this peer. `avatar_data_url` is a full
+/// `data:<mime>;base64,...` string (not just the blake3 hash), computed
+/// server-side by reading the avatar blob out of `blobz`/the filesystem, so
+/// the remote admin panel can render it directly with no separate blob
+/// fetch/ACL round-trip (a hub's own avatar blob isn't tied to any canvas,
+/// so it wouldn't pass the canvas-membership half of `blob_acl`'s gate
+/// anyway — see that module's doc comment). `is_admin` cross-references the
+/// `adminz` table so the panel can show/manage hub-admin status alongside
+/// friend status in one list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FriendSummary {
     pub node_id: String,
     pub status: String,
     pub updated_at: i64,
+    pub username: String,
+    pub bio: String,
+    pub avatar_data_url: String,
+    pub is_admin: bool,
 }
 
 /// a single pending knock, aggregated across every canvas doc the hub
@@ -92,6 +109,21 @@ pub enum AdminRequest {
     List,
     /// remove a peer from friendz entirely (mirrors `reliquary friend remove`).
     Remove { node_id: String },
+    /// deny a peer — drops their requests on the floor (mirrors setting
+    /// `friendz.status` to `blocked`). the reverse ("unblock") is just
+    /// `Allow` again — there's no separate `Unblock` variant since `Allow`
+    /// already promotes any non-`Accepted` status back to `Allowed`.
+    Block { node_id: String },
+    /// grant a peer hub-admin rights (mirrors `reliquary admin allow`) —
+    /// lets a hub friend become a *second* remote administrator, not just
+    /// a friend. deliberately separate from friendz status (see
+    /// `adminz`'s module doc comment: admin rights and friend status are
+    /// orthogonal).
+    PromoteAdmin { node_id: String },
+    /// revoke a peer's hub-admin rights (mirrors `reliquary admin remove`).
+    /// no self-demotion guard, same reasoning as the CLI: a lockout is
+    /// always recoverable via direct machine/CLI access.
+    DemoteAdmin { node_id: String },
     /// list pending knocks the hub is holding across every canvas doc it
     /// holds — a cross-canvas convenience view, mirroring tomb's
     /// `PendingKnocksView` aggregation. read-only: actually
@@ -113,6 +145,15 @@ pub enum AdminResponse {
     },
     Removed {
         node_id: String,
+    },
+    /// response to `AdminRequest::Block`.
+    Blocked {
+        node_id: String,
+    },
+    /// response to `AdminRequest::PromoteAdmin`/`DemoteAdmin`.
+    AdminChanged {
+        node_id: String,
+        is_admin: bool,
     },
     /// caller's node id isn't in the `adminz` table.
     NotAdmin,
@@ -141,6 +182,10 @@ struct Inner {
     adminz: adminz::Store,
     friendz: friendz::Store,
     userz: userz::Directory,
+    /// read here only to build a `FriendSummary.avatar_data_url` for
+    /// `AdminRequest::List` — see that struct's doc comment for why this
+    /// is computed server-side rather than left to a separate blob fetch.
+    blobz: blobz::Store,
     /// used to cancel a peer's already-accepted `iroh/automerge-repo/1`
     /// connection immediately after a `Remove` request deletes their
     /// `friendz` row (see `HubRepo::cancel_peer`'s doc comment for the full
@@ -164,6 +209,7 @@ impl HubAdminHandler {
         adminz: adminz::Store,
         friendz: friendz::Store,
         userz: userz::Directory,
+        blobz: blobz::Store,
         hub_repo: HubRepo,
     ) -> Self {
         Self {
@@ -171,6 +217,7 @@ impl HubAdminHandler {
                 adminz,
                 friendz,
                 userz,
+                blobz,
                 hub_repo,
             }),
         }
@@ -296,16 +343,39 @@ async fn handle_request(
             }
         }
         AdminRequest::List => match handler.inner.friendz.list(false).await {
-            Ok(friends) => AdminResponse::List {
-                friends: friends
-                    .into_iter()
-                    .map(|f| FriendSummary {
+            Ok(friends) => {
+                let mut summaries = Vec::with_capacity(friends.len());
+                for f in friends {
+                    let (username, bio, avatar_data_url) =
+                        match handler.inner.userz.get(&f.friend_node_id).await {
+                            Ok(Some(peer)) => {
+                                let avatar_data_url = match &peer.avatar_blake3 {
+                                    Some(hash) => build_avatar_data_url(&handler.inner.blobz, hash)
+                                        .await
+                                        .unwrap_or_default(),
+                                    None => String::new(),
+                                };
+                                (
+                                    peer.display_name.unwrap_or_default(),
+                                    peer.bio.unwrap_or_default(),
+                                    avatar_data_url,
+                                )
+                            }
+                            _ => (String::new(), String::new(), String::new()),
+                        };
+                    let is_admin = handler.inner.adminz.is_admin(&f.friend_node_id).await;
+                    summaries.push(FriendSummary {
                         node_id: f.friend_node_id,
                         status: f.status.as_str().to_string(),
                         updated_at: f.updated_at,
-                    })
-                    .collect(),
-            },
+                        username,
+                        bio,
+                        avatar_data_url,
+                        is_admin,
+                    });
+                }
+                AdminResponse::List { friends: summaries }
+            }
             Err(e) => AdminResponse::Error {
                 message: format!("friendz list failed: {e}"),
             },
@@ -334,10 +404,85 @@ async fn handle_request(
                 },
             }
         }
+        AdminRequest::Block { node_id } => {
+            let node_id = node_id.trim();
+            if node_id.is_empty() {
+                return AdminResponse::Error {
+                    message: "node_id cannot be empty".to_string(),
+                };
+            }
+            match handler
+                .inner
+                .friendz
+                .upsert(node_id, friendz::FriendStatus::Blocked, None)
+                .await
+            {
+                Ok(_) => AdminResponse::Blocked {
+                    node_id: node_id.to_string(),
+                },
+                Err(e) => AdminResponse::Error {
+                    message: format!("friendz upsert failed: {e}"),
+                },
+            }
+        }
+        AdminRequest::PromoteAdmin { node_id } => {
+            let node_id = node_id.trim();
+            if node_id.is_empty() {
+                return AdminResponse::Error {
+                    message: "node_id cannot be empty".to_string(),
+                };
+            }
+            // ensure a userz row exists so the FK on adminz.node_id holds,
+            // same reasoning as the friendz `Allow` handler above.
+            if let Err(e) = handler.inner.userz.touch(node_id).await {
+                return AdminResponse::Error {
+                    message: format!("userz touch failed: {e}"),
+                };
+            }
+            match handler.inner.adminz.allow(node_id).await {
+                Ok(_) => AdminResponse::AdminChanged {
+                    node_id: node_id.to_string(),
+                    is_admin: true,
+                },
+                Err(e) => AdminResponse::Error {
+                    message: format!("adminz allow failed: {e}"),
+                },
+            }
+        }
+        AdminRequest::DemoteAdmin { node_id } => {
+            let node_id = node_id.trim();
+            if node_id.is_empty() {
+                return AdminResponse::Error {
+                    message: "node_id cannot be empty".to_string(),
+                };
+            }
+            match handler.inner.adminz.remove(node_id).await {
+                Ok(()) => AdminResponse::AdminChanged {
+                    node_id: node_id.to_string(),
+                    is_admin: false,
+                },
+                Err(e) => AdminResponse::Error {
+                    message: format!("adminz remove failed: {e}"),
+                },
+            }
+        }
         AdminRequest::ListPendingKnocks => AdminResponse::PendingKnocks {
             knocks: list_pending_knocks(&handler.inner.hub_repo).await,
         },
     }
+}
+
+/// read an avatar blob's bytes out of `blobz` and encode as a
+/// `data:<mime>;base64,...` string, for `AdminRequest::List`'s
+/// `FriendSummary.avatar_data_url`. returns `None` (never a hard error —
+/// this is best-effort presentation data, not something worth failing an
+/// entire `List` request over) if the blob row is missing, has no mime, or
+/// the bytes can't be read.
+async fn build_avatar_data_url(blobz: &blobz::Store, blake3: &str) -> Option<String> {
+    let blob = blobz.get(blake3).await.ok()??;
+    let mime = blob.mime.clone()?;
+    let bytes = blobz.read_bytes(blake3).await.ok()??;
+    Some(crate::hub::avatar::encode_data_url(&mime, &bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -474,14 +619,16 @@ mod tests {
         adminz::Store,
         friendz::Store,
         userz::Directory,
+        blobz::Store,
         HubRepo,
         tempfile::TempDir,
     ) {
         let pool = db::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
         let friendz_store = friendz::Store::new(pool.clone());
-        let userz_dir = userz::Directory::new(pool);
+        let userz_dir = userz::Directory::new(pool.clone());
         let tmp = tempfile::tempdir().expect("tempdir");
+        let blobz_store = blobz::Store::new(pool, tmp.path());
         let hub_repo = HubRepo::new("hub-node".to_string(), &tmp.path().join("hub-docs.db"))
             .await
             .expect("HubRepo::new should succeed");
@@ -490,11 +637,13 @@ mod tests {
                 adminz_store.clone(),
                 friendz_store.clone(),
                 userz_dir.clone(),
+                blobz_store.clone(),
                 hub_repo.clone(),
             ),
             adminz_store,
             friendz_store,
             userz_dir,
+            blobz_store,
             hub_repo,
             tmp,
         )
@@ -521,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_admin_is_rejected_for_all_operations() {
-        let (handler, _adminz, _friendz, _userz, _hub_repo, _tmp) = make_handler().await;
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
         let stranger = "stranger-node";
 
         let allow = handle_request(
@@ -550,7 +699,8 @@ mod tests {
 
     #[tokio::test]
     async fn admin_can_allow_list_and_remove() {
-        let (handler, adminz_store, _friendz, _userz, _hub_repo, _tmp) = make_handler().await;
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp) =
+            make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 
@@ -607,7 +757,7 @@ mod tests {
     /// since no unit test in this crate spins up a real iroh connection).
     #[tokio::test]
     async fn admin_remove_cancels_an_active_connection() {
-        let (handler, adminz_store, friendz_store, userz_dir, hub_repo, _tmp) =
+        let (handler, adminz_store, friendz_store, userz_dir, _blobz, hub_repo, _tmp) =
             make_handler().await;
         let admin_node = "admin-node";
         let target_peer = "target-peer";
@@ -655,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_allow_does_not_demote_an_already_accepted_friend() {
-        let (handler, adminz_store, friendz_store, userz_dir, _hub_repo, _tmp) =
+        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -688,7 +838,8 @@ mod tests {
     /// the wire response looks right.
     #[tokio::test]
     async fn non_admin_requests_have_no_side_effects_on_friendz_table() {
-        let (handler, _adminz, friendz_store, userz_dir, _hub_repo, _tmp) = make_handler().await;
+        let (handler, _adminz, friendz_store, userz_dir, _blobz, _hub_repo, _tmp) =
+            make_handler().await;
         let stranger = "stranger-node";
 
         let allow = handle_request(
@@ -742,7 +893,7 @@ mod tests {
     /// variants), so it must never affect the caller's own admin rights.
     #[tokio::test]
     async fn admin_remove_never_touches_the_adminz_table() {
-        let (handler, adminz_store, friendz_store, userz_dir, _hub_repo, _tmp) =
+        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -777,7 +928,8 @@ mod tests {
     /// it's an intentional "delete is idempotent" convention, not a bug.
     #[tokio::test]
     async fn admin_remove_of_nonexistent_friend_reports_removed_not_error() {
-        let (handler, adminz_store, _friendz, _userz, _hub_repo, _tmp) = make_handler().await;
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp) =
+            make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 
@@ -797,7 +949,8 @@ mod tests {
     /// mutating request variants.
     #[tokio::test]
     async fn allow_and_remove_reject_whitespace_only_node_id() {
-        let (handler, adminz_store, _friendz, _userz, _hub_repo, _tmp) = make_handler().await;
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp) =
+            make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 
@@ -822,7 +975,233 @@ mod tests {
         assert!(matches!(remove, AdminResponse::Error { .. }));
     }
 
-    /// `handle_stream` decodes the request with `ciborium::from_reader`
+    // -- Block / PromoteAdmin / DemoteAdmin ------------------------------
+
+    #[tokio::test]
+    async fn admin_can_block_and_then_unblock_via_allow() {
+        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+        userz_dir.touch("target-peer").await.unwrap();
+        friendz_store
+            .upsert("target-peer", friendz::FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+
+        let block = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::Block {
+                node_id: "target-peer".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(block, AdminResponse::Blocked { node_id } if node_id == "target-peer"));
+        assert!(!friendz_store.is_friend("target-peer").await);
+        assert_eq!(
+            friendz_store
+                .get("target-peer")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            friendz::FriendStatus::Blocked
+        );
+
+        // "unblock" is just Allow again — no separate Unblock variant.
+        let unblock = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::Allow {
+                node_id: "target-peer".to_string(),
+            },
+        )
+        .await;
+        match unblock {
+            AdminResponse::Allowed { status, .. } => assert_eq!(status, "allowed"),
+            other => panic!("expected Allowed, got {other:?}"),
+        }
+        assert!(friendz_store.is_friend("target-peer").await);
+    }
+
+    #[tokio::test]
+    async fn block_rejects_empty_node_id_and_non_admin_callers() {
+        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let empty = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::Block {
+                node_id: "   ".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(empty, AdminResponse::Error { .. }));
+
+        userz_dir.touch("target-peer").await.unwrap();
+        friendz_store
+            .upsert("target-peer", friendz::FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+        let stranger = "stranger-node";
+        let rejected = handle_request(
+            &handler,
+            stranger,
+            AdminRequest::Block {
+                node_id: "target-peer".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(rejected, AdminResponse::NotAdmin));
+        assert!(
+            friendz_store.is_friend("target-peer").await,
+            "a non-admin Block request must not change friendz status"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_can_promote_and_demote_a_second_admin() {
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+        assert!(!adminz_store.is_admin("new-admin").await);
+
+        let promote = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::PromoteAdmin {
+                node_id: "new-admin".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            promote,
+            AdminResponse::AdminChanged { node_id, is_admin: true } if node_id == "new-admin"
+        ));
+        assert!(adminz_store.is_admin("new-admin").await);
+
+        // the newly-promoted admin can now make their own requests.
+        let list = handle_request(&handler, "new-admin", AdminRequest::List).await;
+        assert!(matches!(list, AdminResponse::List { .. }));
+
+        let demote = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::DemoteAdmin {
+                node_id: "new-admin".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            demote,
+            AdminResponse::AdminChanged { node_id, is_admin: false } if node_id == "new-admin"
+        ));
+        assert!(!adminz_store.is_admin("new-admin").await);
+
+        let list_after = handle_request(&handler, "new-admin", AdminRequest::List).await;
+        assert!(matches!(list_after, AdminResponse::NotAdmin));
+    }
+
+    #[tokio::test]
+    async fn promote_and_demote_admin_reject_non_admin_callers() {
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
+        let stranger = "stranger-node";
+
+        let promote = handle_request(
+            &handler,
+            stranger,
+            AdminRequest::PromoteAdmin {
+                node_id: "target".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(promote, AdminResponse::NotAdmin));
+
+        let demote = handle_request(
+            &handler,
+            stranger,
+            AdminRequest::DemoteAdmin {
+                node_id: "target".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(demote, AdminResponse::NotAdmin));
+    }
+
+    // -- List profile enrichment ------------------------------------------
+
+    #[tokio::test]
+    async fn list_includes_username_bio_avatar_and_admin_status() {
+        let (handler, adminz_store, friendz_store, userz_dir, blobz_store, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        // a friend with a full profile, including an avatar blob.
+        userz_dir.touch("alice").await.unwrap();
+        userz_dir
+            .upsert_profile("alice", Some("alice"), Some("hi, i'm alice"), None)
+            .await
+            .unwrap();
+        let avatar_bytes = b"fake-png-bytes";
+        let avatar_blob = blobz_store
+            .insert(
+                "alice-avatar-iroh-hash".to_string(),
+                None,
+                Some("image/png".to_string()),
+                avatar_bytes,
+            )
+            .await
+            .unwrap();
+        userz_dir
+            .upsert_profile("alice", None, None, Some(&avatar_blob.blake3))
+            .await
+            .unwrap();
+        friendz_store
+            .upsert("alice", friendz::FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+        adminz_store.allow("alice").await.unwrap();
+
+        // a friend with no profile data at all — should still list cleanly
+        // with empty strings, not error.
+        userz_dir.touch("bob").await.unwrap();
+        friendz_store
+            .upsert("bob", friendz::FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+
+        let list = handle_request(&handler, admin_node, AdminRequest::List).await;
+        let mut friends = match list {
+            AdminResponse::List { friends } => friends,
+            other => panic!("expected List, got {other:?}"),
+        };
+        friends.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+        assert_eq!(friends.len(), 2);
+        let alice = &friends[0];
+        assert_eq!(alice.node_id, "alice");
+        assert_eq!(alice.username, "alice");
+        assert_eq!(alice.bio, "hi, i'm alice");
+        assert_eq!(
+            alice.avatar_data_url,
+            "data:image/png;base64,ZmFrZS1wbmctYnl0ZXM="
+        );
+        assert!(alice.is_admin);
+
+        let bob = &friends[1];
+        assert_eq!(bob.node_id, "bob");
+        assert_eq!(bob.username, "");
+        assert_eq!(bob.bio, "");
+        assert_eq!(bob.avatar_data_url, "");
+        assert!(!bob.is_admin);
+    }
+
     /// before ever consulting `adminz` — malformed bytes on the wire (a
     /// truncated frame, a non-admin-protocol payload accidentally dialed at
     /// this ALPN, etc.) must fail cleanly rather than panic. `handle_stream`
@@ -899,9 +1278,15 @@ mod tests {
         let pool = db::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
         let friendz_store = friendz::Store::new(pool.clone());
-        let userz_dir = userz::Directory::new(pool);
-        let handler =
-            HubAdminHandler::new(adminz_store.clone(), friendz_store, userz_dir, hub_repo);
+        let userz_dir = userz::Directory::new(pool.clone());
+        let blobz_store = blobz::Store::new(pool, tmp.path());
+        let handler = HubAdminHandler::new(
+            adminz_store.clone(),
+            friendz_store,
+            userz_dir,
+            blobz_store,
+            hub_repo,
+        );
 
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -979,9 +1364,15 @@ mod tests {
         let pool = db::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
         let friendz_store = friendz::Store::new(pool.clone());
-        let userz_dir = userz::Directory::new(pool);
-        let handler =
-            HubAdminHandler::new(adminz_store.clone(), friendz_store, userz_dir, hub_repo);
+        let userz_dir = userz::Directory::new(pool.clone());
+        let blobz_store = blobz::Store::new(pool, tmp.path());
+        let handler = HubAdminHandler::new(
+            adminz_store.clone(),
+            friendz_store,
+            userz_dir,
+            blobz_store,
+            hub_repo,
+        );
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 
@@ -1022,8 +1413,15 @@ mod tests {
         let pool = db::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
         let friendz_store = friendz::Store::new(pool.clone());
-        let userz_dir = userz::Directory::new(pool);
-        let handler = HubAdminHandler::new(adminz_store, friendz_store, userz_dir, hub_repo);
+        let userz_dir = userz::Directory::new(pool.clone());
+        let blobz_store = blobz::Store::new(pool, tmp.path());
+        let handler = HubAdminHandler::new(
+            adminz_store,
+            friendz_store,
+            userz_dir,
+            blobz_store,
+            hub_repo,
+        );
 
         let stranger = "stranger-node";
         let response = handle_request(&handler, stranger, AdminRequest::ListPendingKnocks).await;

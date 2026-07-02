@@ -22,8 +22,16 @@ export function createPageCache() {
       slot.sprite = null;
     }
     if (slot.assetKey) {
-      Assets.unload(slot.assetKey);
+      // NOTE: do NOT unload a data: URL's texture — it can be shared with
+      // other live consumers of the identical data: URL bytes elsewhere in
+      // the app. unloading it out from under them crashes the renderer
+      // mid-frame ("alphaMode" null error in StencilMaskPipe) — same root
+      // cause already fixed the same way across this codebase (file.ts,
+      // property-tray.ts, canvas-wizard.ts, canvas-card.ts, canvas-info.ts,
+      // image.ts, profile-tab.ts). blob: URLs are never shared this way
+      // (each is unique per load), so those are still safe to unload/revoke.
       if (slot.assetKey.startsWith("blob:")) {
+        Assets.unload(slot.assetKey);
         URL.revokeObjectURL(slot.assetKey);
       }
       slot.assetKey = "";
@@ -109,11 +117,10 @@ export function createPageCache() {
       }
 
       if (abort.signal.aborted) {
-        if (assetKey) {
+        // same reasoning as destroySlot() above — never unload a data: URL.
+        if (assetKey && assetKey.startsWith("blob:")) {
           Assets.unload(assetKey);
-          if (assetKey.startsWith("blob:")) {
-            URL.revokeObjectURL(assetKey);
-          }
+          URL.revokeObjectURL(assetKey);
         } else if (texture) {
           texture.destroy(true);
         }

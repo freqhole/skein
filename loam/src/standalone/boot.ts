@@ -1312,9 +1312,29 @@ class SkeinRouter {
       // continue anyway — the peer might become reachable later
     }
 
-    // check if a canvas-card already exists for this docId on the narthex
-    if (this.currentCanvas) {
-      const existing = this.currentCanvas.store.allWidgets();
+    // check if a canvas-card already exists for this docId on the narthex.
+    //
+    // this must always resolve the actual narthex store, never whatever
+    // canvas the user happens to be viewing right now — an invite accepted
+    // while looking at some OTHER canvas used to silently add the shared
+    // canvas-card widget to *that* canvas instead of the narthex (a real
+    // bug: the card would then only ever be visible from inside that
+    // unrelated canvas, never from the narthex root where it belongs).
+    let narthexStore: CanvasStore | null = null;
+    if (this.narthexDocId) {
+      if (this.currentCanvas?.store.handle.documentId === this.narthexDocId) {
+        narthexStore = this.currentCanvas.store;
+      } else {
+        try {
+          narthexStore = await CanvasStore.open(this.repo, this.narthexDocId as DocumentId);
+        } catch (err) {
+          log.warn(TAG, "failed to open narthex store to accept canvas invite:", err);
+        }
+      }
+    }
+
+    if (narthexStore) {
+      const existing = narthexStore.allWidgets();
       const alreadyExists = existing.some((w) => {
         if (w.type !== "canvas-card") return false;
         return (w.props as Record<string, unknown>)?.canvasDocId === detail.canvasDocId;
@@ -1322,10 +1342,10 @@ class SkeinRouter {
 
       if (!alreadyExists) {
         // add a remote canvas-card widget to the narthex
-        const existingCount = this.currentCanvas.store.widgetCount();
+        const existingCount = narthexStore.widgetCount();
         const shortDate = new Date().toISOString().slice(0, 10);
 
-        this.currentCanvas.store.addWidget({
+        narthexStore.addWidget({
           id: crypto.randomUUID(),
           type: "canvas-card",
           x: 60 + (existingCount % 4) * 300,

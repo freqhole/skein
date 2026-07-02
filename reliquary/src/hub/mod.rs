@@ -216,6 +216,7 @@ impl HubPeerService {
             adminz_store.clone(),
             friendz_store.clone(),
             userz.clone(),
+            blobz.clone(),
             hub_repo.clone(),
         );
 
