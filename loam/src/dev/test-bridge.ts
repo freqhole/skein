@@ -142,13 +142,16 @@ export interface SkeinP2PBridge {
    */
   fetchBlob(peerNodeId: string, blake3Hash: string): Promise<Uint8Array>;
   /**
-   * PROTOTYPE test hook for the blob-ACL gating spike (see
-   * `midden::build_gated_blobs_events` / `MiddenNode::restrict_blob_to_peers`
-   * in `midden/src/lib.rs`): restricts a blob (by blake3 hash) on THIS
-   * peer's `iroh_blobs::BlobsProtocol` so only the given peer node ids may
-   * fetch it. a hash never passed to this method is unrestricted (today's
-   * default, unchanged) — this is a stopgap demo of the extension point,
-   * not the real canvas-ACL integration.
+   * test hook for the blob-ACL gate (see `midden::build_gated_blobs_events`
+   * / `MiddenNode::restrict_blob_to_peers` in `midden/src/lib.rs`):
+   * restricts a blob (by blake3 hash) on THIS peer's
+   * `iroh_blobs::BlobsProtocol` so only the given peer node ids may fetch
+   * it. a hash never passed to this method is unrestricted (today's
+   * default, unchanged). delegates to `IrohNetworkAdapter.restrictBlobToPeers`
+   * — the same production entry point `CanvasBlobAclSync`
+   * (`canvas/blob-acl-sync.ts`) uses to mirror a canvas's real `.acl` onto
+   * this gate, so calling it directly here is a manual stand-in for that
+   * real wiring, not a separate/fake code path.
    */
   restrictBlobToPeers(blake3Hash: string, peerNodeIds: string[]): Promise<void>;
   /**
@@ -314,13 +317,11 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
     },
 
     async restrictBlobToPeers(blake3Hash: string, peerNodeIds: string[]): Promise<void> {
-      const node = await adapter.getNode();
-      // `restrict_blob_to_peers` is the prototype gating hook exposed by
-      // midden (see midden/src/lib.rs); not part of MiddenStreamNode.
-      const nodeAny = node as unknown as {
-        restrict_blob_to_peers(blake3: string, peerNodeIds: string[]): void;
-      };
-      nodeAny.restrict_blob_to_peers(blake3Hash, peerNodeIds);
+      // delegates to the real production entry point (IrohNetworkAdapter.
+      // restrictBlobToPeers, added alongside CanvasBlobAclSync) rather than
+      // reaching into the wasm node directly — this test hook and real
+      // canvas-ACL-driven callers now go through the exact same path.
+      return adapter.restrictBlobToPeers(blake3Hash, peerNodeIds);
     },
 
     async hubAdminRequest(peerNodeId: string, request: AdminRequest): Promise<AdminResponse> {

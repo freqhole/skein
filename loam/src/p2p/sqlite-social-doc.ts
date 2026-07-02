@@ -212,6 +212,14 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
       createdAt: "", // grimoire groups don't track createdAt
     })),
 
+    // canvas-sharing groups (see widgets/narthex/social/schema.ts's
+    // shareGroupSchema) aren't backed by grimoire/sqlite yet — this
+    // backend has no storage for them, so it always reports none. writes
+    // via GroupStore against a SqliteSocialDoc are a no-op today (the
+    // diff engine below doesn't recognize this field); wiring it up needs
+    // a grimoire-side table + IPC actions, tracked as follow-up work.
+    shareGroups: [],
+
     pendingRequests: raw.pending_requests.map((r) => ({
       fromNodeId: r.remote_node_id || "",
       fromUsername: r.remote_display_name || r.remote_alias || r.remote_username,

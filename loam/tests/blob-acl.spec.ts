@@ -13,36 +13,41 @@
  *   caller's identity against anything.
  * - `iroh-blobs/*` ALPN (handled entirely in Rust/WASM inside midden, see
  *   `MiddenNode::accept()` in midden/src/lib.rs): incoming connections on
- *   this ALPN are hand off straight to `iroh_blobs::BlobsProtocol::accept()`
- *   — the upstream `iroh-blobs` crate's own protocol implementation, which
- *   serves any hash present in the local store to any peer that can open a
- *   connection. this is where the actual blob bytes are transferred
- *   (`download_verified` / `download_verified_with_ensure`); it never goes
- *   through `skein-handler.ts` or any TypeScript code skein owns, and it
- *   never touches automerge-repo's `NetworkAdapter` machinery at all.
+ *   this ALPN are handed off to `iroh_blobs::BlobsProtocol::accept()` — the
+ *   upstream `iroh-blobs` crate's own protocol implementation.
  *
- * **finding: there is currently NO access-control check of any kind on blob
- * fetches between two browser peers** — neither canvas-doc ACL
- * (`CanvasStore.getRole()` / `.acl`) nor canvas membership (`.peers`) is
- * consulted anywhere in the fetch path. any peer that knows another peer's
- * iroh node id and a blob's blake3 hash can fetch that blob's bytes, full
- * stop, regardless of whether it has ever been invited to (or even heard
- * of) any canvas referencing that blob.
+ * **originally found (2026-07-01): there was no access-control check of any
+ * kind on blob fetches between two browser peers** — neither canvas-doc ACL
+ * (`CanvasStore.getRole()` / `.acl`) nor canvas membership (`.peers`) was
+ * consulted anywhere in the fetch path.
  *
- * **`AclFilteringNetworkAdapter` has zero bearing on this** — confirmed by
- * reading both the adapter (it only ever touches the `NetworkAdapter` passed
- * to automerge-repo's `Repo`) and midden's raw iroh `Endpoint.accept()` loop
- * (which dispatches `skein/1` and `iroh-blobs/*` connections directly,
- * without ever routing through the `Repo`/`NetworkAdapter` layer the ACL
- * adapter wraps). they are different ALPNs, different transports, and
- * different code entirely.
+ * **fixed the same day**, in two layers:
+ * 1. `midden/src/lib.rs`'s `build_gated_blobs_events()` — a real gate on the
+ *    `iroh-blobs/*` wire protocol itself, using `iroh_blobs::BlobsProtocol`'s
+ *    `EventSender`/`ConnectMode`/`RequestMode::Intercept` extension point to
+ *    check each requested hash against a per-hash allow-list
+ *    (`MiddenNode::restrict_blob_to_peers()`). proven in isolation (with a
+ *    hardcoded allow-list) by `blob-acl-gate-prototype.spec.ts`.
+ * 2. `src/canvas/blob-acl-sync.ts`'s `CanvasBlobAclSync` — the real wiring
+ *    from canvas ACL data into that gate: watches a `CanvasStore` via its
+ *    `onChange()` mechanism and keeps every referenced blob's allow-list in
+ *    sync with `.acl` (invite grants access, revocation removes it — modulo
+ *    the local-caching caveat documented on `blob-acl-live-sync.spec.ts`,
+ *    which is the dedicated end-to-end coverage for this wiring: invite,
+ *    role-change, and revoke scenarios all live there, not in this file).
+ *    wired into the real app in `standalone/boot.ts` and into this test
+ *    fixture's harness (`src/dev/p2p-test-bootstrap.ts`).
  *
- * this matches `docs/skein-runtime-plan.md`'s own "blob service and
- * filesystem abstraction" section, which describes a `BlobService` that
- * "checks canvas ACL before serving a fetch" as a **planned, not-yet-built**
- * piece of infrastructure — i.e. this is a known, documented gap, not a
- * surprise. this spec makes it concrete and reproducible with an e2e test
- * (previously: no e2e coverage of blob access control existed at all).
+ * **`AclFilteringNetworkAdapter` still has zero bearing on this** — it only
+ * ever touches the `NetworkAdapter` passed to automerge-repo's `Repo`; blob
+ * transfer is a different ALPN, different transport, gated by the two
+ * layers above instead.
+ *
+ * this file keeps the original "invited peer can fetch, uninvited peer
+ * cannot" baseline coverage (using the `p2pPage` two-peer fixture directly,
+ * simpler setup than `blob-acl-live-sync.spec.ts`'s role-transition
+ * coverage) — it no longer documents a gap, it proves the fix holds for
+ * the simplest possible case too.
  *
  * tag: @p2p
  * run with: npx playwright test tests/blob-acl.spec.ts --workers=1
@@ -175,10 +180,10 @@ test("an invited canvas peer can fetch a blob referenced by a widget on that can
 });
 
 // ---------------------------------------------------------------------------
-// the gap: a peer with zero canvas access can fetch the same blob anyway
+// the fix: a peer with zero canvas access is now denied the same blob
 // ---------------------------------------------------------------------------
 
-test("KNOWN GAP: a peer with no canvas access can still fetch a blob by node id + hash alone @p2p", async ({
+test("a peer with no canvas access cannot fetch a blob by node id + hash alone @p2p", async ({
   p2pPage,
 }) => {
   test.setTimeout(180_000);
@@ -209,20 +214,9 @@ test("KNOWN GAP: a peer with no canvas access can still fetch a blob by node id 
   // which are realistically learnable out-of-band (a pasted link, a log
   // line, a screenshot) independent of ever being invited to the canvas
   // that references the blob — exactly the leak scenario "blob ACL must
-  // mirror canvas ACL" exists to guard against.
-  const strangerBytes = await fetchBlobWithRetry(stranger.page, owner.nodeId, blake3);
-
-  // ==========================================================================
-  // THIS IS THE GAP. per this file's header comment: blob fetches (skein/1's
-  // ensure_blob/compute_blake3 plus the iroh-blobs/* ALPN handled entirely
-  // in Rust/WASM by iroh_blobs::BlobsProtocol) have no access-control check
-  // of any kind, independent of canvas ACL. `AclFilteringNetworkAdapter`
-  // only wraps automerge-repo's doc-sync NetworkAdapter and never runs on
-  // this path at all. the assertion below documents the CURRENT (insecure)
-  // behavior on purpose — it is expected to PASS today. once a
-  // canvas-ACL-aware `BlobService` lands (see docs/skein-runtime-plan.md
-  // "blob service and filesystem abstraction"), this test should be
-  // rewritten to expect the fetch to reject instead of succeeding.
-  // ==========================================================================
-  expect(new TextDecoder().decode(Uint8Array.from(strangerBytes))).toBe(marker);
+  // mirror canvas ACL" exists to guard against. this must now fail: the
+  // owner's `CanvasBlobAclSync` restricts `blake3` to just its own `.acl`
+  // (itself, since it's the admin) the moment the file widget above is
+  // added, and the stranger was never added to it.
+  await expect(fetchBlobWithRetry(stranger.page, owner.nodeId, blake3)).rejects.toThrow();
 });

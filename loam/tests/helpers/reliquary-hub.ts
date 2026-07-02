@@ -66,6 +66,46 @@ export interface ReliquaryHubHandle {
    * after the hub process has started, since it runs as its own short-lived
    * `reliquary` invocation against the same data dir (sqlite handles
    * concurrent access from a second short-lived process fine).
+   *
+   * deliberately kept CLI-based rather than switched over to the real
+   * remote `iroh/skein-hub-admin/1` protocol (`hubAdminRequest` on
+   * `SkeinP2PBridge`, see `src/dev/test-bridge.ts`), even though that
+   * protocol now has solid e2e mileage of its own
+   * (`tests/hub-admin.spec.ts`, both the admin-success and
+   * non-admin-rejected paths). reasoning, reconsidered explicitly for this
+   * task rather than just carried over from an earlier note:
+   *
+   * - every current call site (`reliquary-hub.spec.ts`, `blob-sync.spec.ts`,
+   *   `friendz-hub.spec.ts`) has exactly one browser peer in scope at the
+   *   point it calls `friendAllow(peer.nodeId)` — that peer is the one
+   *   being granted friend status, and none of these tests are *about* the
+   *   admin protocol. making this real would mean spinning up a second
+   *   "admin" peer in each of them (bootstrapped via `adminAllow()`'s CLI
+   *   call anyway, since the protocol has no self-service way to grant
+   *   admin rights), purely to relay a call that itself still bottoms out
+   *   in the same `reliquary admin allow` CLI invocation one layer up. that
+   *   doesn't remove any CLI dependency, it just adds an extra live
+   *   iroh dial + CBOR round trip (with its own relay-discovery-lag retry
+   *   needs, see `hubAdminRequestWithRetry` in hub-admin.spec.ts) on the
+   *   critical path of three otherwise-simple connectivity/protocol smoke
+   *   tests, for a proof that already exists elsewhere.
+   * - test-overlap cost: `hub-admin.spec.ts` already covers "an admin's
+   *   remote allow request mutates friendz and the newly-allowed peer can
+   *   then sync" end to end. re-exercising that same wire path inside
+   *   every consumer test doesn't add coverage, it adds a second place a
+   *   flake in the admin protocol can surface, making it harder to tell
+   *   "friendAllow's bootstrap broke" from "the thing under test broke".
+   * - CLI-based setup is a legitimate, common test-shortcut pattern (same
+   *   category as e.g. directly seeding a database row instead of going
+   *   through a full API call to set up fixture state) as long as the
+   *   thing it's shortcutting is independently verified elsewhere — which
+   *   it now is.
+   *
+   * if `friendAllow` itself ever needs to prove the real protocol (as
+   * opposed to `hub-admin.spec.ts` proving the protocol exists and works),
+   * revisit this — but that's a distinct goal from "make existing
+   * connectivity/sync/blob tests pass reliably", which is what this helper
+   * is for.
    */
   friendAllow: (peerNodeId: string) => Promise<void>;
   /**

@@ -9,6 +9,7 @@
 //! `snatch`) talks to those stores plus iroh-blobs `FsStore` directly.
 
 pub mod adminz;
+pub mod blob_acl;
 pub mod blobz;
 pub mod db;
 pub mod documents;

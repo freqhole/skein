@@ -499,6 +499,31 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     return this.ensureMidden();
   }
 
+  /**
+   * restrict a blob (by blake3 hex hash) so only the given peer node ids may
+   * fetch it from this peer over the `iroh-blobs/*` ALPN — see
+   * `MiddenNode::restrict_blob_to_peers` in `midden/src/lib.rs`.
+   *
+   * this REPLACES the allow-list for the hash, it is not additive — always
+   * call it with the full, current list of node ids that should have
+   * access, not just newly-added ones, so a peer that's been removed from
+   * the list actually loses access rather than lingering from an earlier
+   * call. see `../canvas/blob-acl-sync.ts` (the production caller) for how
+   * the full list is recomputed from a canvas's `.acl` on every change.
+   *
+   * a no-op if the underlying transport doesn't expose this method (e.g.
+   * Tauri mode, which serves blobs through a separate native path that
+   * this gate doesn't cover).
+   */
+  async restrictBlobToPeers(blake3Hash: string, peerNodeIds: string[]): Promise<void> {
+    const node = await this.ensureMidden();
+    const nodeAny = node as unknown as {
+      restrict_blob_to_peers?: (blake3: string, peerNodeIds: string[]) => void;
+    };
+    if (typeof nodeAny.restrict_blob_to_peers !== "function") return;
+    nodeAny.restrict_blob_to_peers(blake3Hash, peerNodeIds);
+  }
+
   // --- internals ---
 
   private async checkIdentityAndStart(): Promise<void> {

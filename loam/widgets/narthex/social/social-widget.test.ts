@@ -35,6 +35,7 @@ describe("socialSchema", () => {
       },
       friends: [],
       groups: [],
+      shareGroups: [],
       pendingRequests: [],
       outboundRequests: [],
       profileVisibility: "friends",
@@ -85,6 +86,14 @@ describe("socialSchema", () => {
           toUsername: "dave",
           sentAt: "2025-06-01",
           status: "pending" as const,
+        },
+      ],
+      shareGroups: [
+        {
+          id: "share-group-1",
+          name: "book club",
+          memberNodeIds: ["a".repeat(64), "b".repeat(64)],
+          createdAt: "2025-01-01",
         },
       ],
       profileVisibility: "everyone" as const,

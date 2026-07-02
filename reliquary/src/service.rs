@@ -193,10 +193,21 @@ impl Service {
             config.username.clone(),
         );
 
-        // iroh-blobs FsStore + blob-proxy
+        // iroh-blobs FsStore + blob-proxy.
+        //
+        // gated by `blob_acl`'s friend-only mode: `Service` (unlike
+        // `hub::HubPeerService`) tracks no canvases at all, so it can't
+        // check per-canvas `.acl` membership — this is a strictly weaker
+        // gate than the hub's, but still closes the "any stranger who
+        // knows a hash can fetch it" hole for this peer variant too. see
+        // `blob_acl`'s module doc comment.
         let store = fs_store(&config.data_dir).await?;
         let blobs_downloader = Downloader::new(store, &endpoint);
-        let blobs_protocol = BlobsProtocol::new(store, None);
+        let blob_acl_gate = crate::blob_acl::BlobAclGate::friend_only(friendz_store.clone());
+        let blobs_protocol = BlobsProtocol::new(
+            store,
+            Some(crate::blob_acl::build_gated_blobs_events(blob_acl_gate)),
+        );
         let blob_proxy = BlobProxyHandler::new(store, blobz.clone());
 
         // router

@@ -6,6 +6,7 @@ import type { SkeinTheme } from "../theme/skein-theme";
 import { defaultTheme } from "../theme/skein-theme";
 import { KeyboardDriver } from "../widgets/keyboard-driver";
 import type { WidgetRegistry } from "../widgets/widget-registry";
+import { CanvasBlobAclSync } from "./blob-acl-sync";
 import { CanvasStore } from "./canvas-store";
 import { ConnectionStatus } from "./connection-status";
 import { InputRouter } from "./input-router";
@@ -58,6 +59,16 @@ export interface InitCanvasOptions {
   /** optional per-widget doc overrides — lets callers inject a custom doc (e.g.
    *  SqliteSocialDoc) for specific widget IDs instead of the automerge-backed one */
   docOverrides?: Map<string, import("../widgets/widget-types").WidgetDoc<any>>;
+  /**
+   * optional hook that restricts a blob (by blake3 hash) to a given set of
+   * peer node ids at the `iroh-blobs/*` transport layer — see
+   * `IrohNetworkAdapter.restrictBlobToPeers()`. when provided, the canvas
+   * keeps every file widget's blob allow-list in sync with this canvas's
+   * `.acl` (see `blob-acl-sync.ts`) for as long as the canvas stays open.
+   * omitted in test harnesses/narthex init that have no real blob transport
+   * to gate, or nothing worth gating (the narthex has no file widgets).
+   */
+  restrictBlobToPeers?: (blake3Hash: string, peerNodeIds: string[]) => Promise<void>;
 }
 
 export interface SkeinCanvas {
@@ -139,6 +150,16 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     store = await CanvasStore.open(repo, canvasDocId as DocumentId);
   } else {
     store = CanvasStore.create(repo);
+  }
+
+  // step 3b: keep this canvas's file-widget blobs gated to its current
+  // `.acl` for as long as the canvas is open (see blob-acl-sync.ts). skipped
+  // when no gating hook was provided (test harnesses with no real blob
+  // transport) or on the narthex (never has file widgets, nothing to gate).
+  let blobAclSync: CanvasBlobAclSync | null = null;
+  if (options.restrictBlobToPeers && !options.isNarthex) {
+    blobAclSync = new CanvasBlobAclSync(store, repo, options.restrictBlobToPeers);
+    blobAclSync.start();
   }
 
   // step 4: create and initialize pixi application
@@ -415,6 +436,8 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     destroy() {
       // best-effort offline broadcast before teardown
       presenceManager.broadcastOffline();
+
+      blobAclSync?.destroy();
 
       if (onPointerMove) {
         canvasEl.removeEventListener("pointermove", onPointerMove);

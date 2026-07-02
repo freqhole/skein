@@ -20,7 +20,7 @@ import { PresenceManager } from "../canvas/presence-manager";
 import { Viewport } from "../canvas/viewport";
 import { createSkeinHarness } from "../harness/skein-harness";
 import { FriendzProtocol } from "../p2p/friends-protocol";
-import { FRIENDZ_ALPN } from "../p2p/iroh-network-adapter";
+import { FRIENDZ_ALPN, type IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
 import { createWidgetDoc } from "../widgets/widget-doc";
 import { buildFriendzTestBridge, buildP2PBridge } from "./test-bridge";
 
@@ -44,6 +44,7 @@ interface P2PTestInitResult {
 // can reuse the same repo/mountElement without recreating the iroh endpoint.
 let sharedRepo: Repo | null = null;
 let sharedMountElement: HTMLElement | null = null;
+let sharedIrohAdapter: IrohNetworkAdapter | null = null;
 
 /**
  * initialize a skein canvas with real iroh p2p for playwright tests.
@@ -67,6 +68,7 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
   });
   sharedRepo = harness.repo;
   sharedMountElement = document.getElementById("canvas-root")!;
+  sharedIrohAdapter = harness.iroh!;
 
   // pass the already-resolved doc id so initCanvas does not create its own
   const canvas = await initCanvas({
@@ -74,6 +76,8 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
     canvasDocId: harness.store.handle.documentId,
     registry: createTestRegistry(),
     repo: harness.repo,
+    restrictBlobToPeers: (blake3Hash, peerNodeIds) =>
+      harness.iroh!.restrictBlobToPeers(blake3Hash, peerNodeIds),
   });
 
   const irohAdapter = harness.iroh!;
@@ -156,6 +160,9 @@ async function joinCanvasForTest(docId: string): Promise<{ canvasDocId: string }
         canvasDocId: docId,
         registry: createTestRegistry(),
         repo: sharedRepo,
+        restrictBlobToPeers: sharedIrohAdapter
+          ? (blake3Hash, peerNodeIds) => sharedIrohAdapter!.restrictBlobToPeers(blake3Hash, peerNodeIds)
+          : undefined,
       });
       break;
     } catch (err) {

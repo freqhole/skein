@@ -1138,14 +1138,18 @@ async fn consume_download_progress(
 ///
 /// canvases have a `widgets` map and usually a `peers` map. file widget
 /// state docs have a `blake3` field at the root. anything else is unknown.
+///
+/// `pub(crate)`: also used by `blob_acl`'s canvas-membership resolver, which
+/// needs to tell canvas docs apart from widget-state docs the same way this
+/// module does, without duplicating the classification logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DocKind {
+pub(crate) enum DocKind {
     Canvas,
     WidgetState,
     Unknown,
 }
 
-fn classify_doc(handle: &crate::hub_repo::DocHandle) -> DocKind {
+pub(crate) fn classify_doc(handle: &crate::hub_repo::DocHandle) -> DocKind {
     use automerge::ReadDoc;
     let mut kind = DocKind::Unknown;
     handle.with_document(|doc| {
@@ -1176,7 +1180,12 @@ fn classify_doc(handle: &crate::hub_repo::DocHandle) -> DocKind {
 ///
 /// returns placeholder BlobRefs (only canvas_doc_id + widget_doc_id populated)
 /// plus the list of peer node IDs from the canvas peers map.
-fn read_canvas_for_file_widgets(
+///
+/// `pub(crate)`: also used by `blob_acl`'s canvas-membership resolver to
+/// find which widget docs a canvas references, read-only (it never snatches
+/// anything) — reusing this instead of a second, drifting copy of the same
+/// widgets-map walk.
+pub(crate) fn read_canvas_for_file_widgets(
     handle: &crate::hub_repo::DocHandle,
     canvas_doc_id: &str,
     local_node_id: &str,
@@ -1261,7 +1270,11 @@ fn read_canvas_for_file_widgets(
 }
 
 /// read a file widget state doc to extract blob reference fields.
-fn read_widget_state(
+///
+/// `pub(crate)`: also used by `blob_acl`'s canvas-membership resolver to
+/// read a widget doc's `blake3` field when checking whether a given blob is
+/// referenced by a given canvas.
+pub(crate) fn read_widget_state(
     handle: &crate::hub_repo::DocHandle,
     canvas_doc_id: &str,
     widget_doc_id: &str,

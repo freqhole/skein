@@ -94,11 +94,21 @@ export class CanvasStore {
     });
   }
 
-  /** remove a peer from the canvas document. used to revoke access from the share dialog. */
+  /**
+   * remove a peer from the canvas document. used to revoke access from the
+   * share dialog — also clears their `.acl` entry (if any), not just their
+   * `.peers` reconnect-list entry, so a revoked peer's effective role
+   * actually goes away rather than lingering. anything keyed off `.acl`
+   * (role-gated UI, the blob allow-list sync in `p2p/blob-acl-sync.ts`)
+   * needs this to see the peer's access end here, not just their presence.
+   */
   removePeer(nodeId: string): void {
     this.handle.change((doc) => {
       if (doc.peers && doc.peers[nodeId]) {
         delete doc.peers[nodeId];
+      }
+      if (doc.acl && doc.acl[nodeId]) {
+        delete doc.acl[nodeId];
       }
     });
   }

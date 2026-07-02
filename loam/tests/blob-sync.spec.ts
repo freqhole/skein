@@ -72,6 +72,27 @@ test.describe("cross-peer blob snatch @hub", () => {
     await addPeer(peer.page, hub.nodeId);
     await waitForPeerCount(peer.page, 1, 30_000);
 
+    // stamp the browser peer as this canvas's admin (matching real canvas
+    // creation, see CanvasStore.create() + stampAdmin() in
+    // standalone/boot.ts's createCanvasFromNarthex()) and grant the hub a
+    // canvas role too, matching the real "share this canvas with a
+    // reliquary hub peer" flow (see ROADMAP.md's north-star scenario step
+    // 2: sharing with a hub goes through the same admin/member/viewer ACL
+    // as sharing with a friend). without this, `.acl` stays empty and
+    // `CanvasBlobAclSync` (wired into this test's harness via
+    // `p2p-test-bootstrap.ts`) restricts every blob to an empty allow-list
+    // — denying even the hub itself, not just uninvited strangers.
+    await peer.page.evaluate(
+      async ([hubNodeId]) => {
+        const bridge = (window as any).__skeinTest;
+        const store = bridge.canvas.store;
+        const ownNodeId: string = await bridge.p2p.getNodeId();
+        store.stampAdmin(ownNodeId);
+        store.setRole(hubNodeId, "member");
+      },
+      [hub.nodeId] as const
+    );
+
     const marker = `blob-sync-spec ${Date.now()}`;
 
     const { blake3, size } = await peer.page.evaluate(async (content: string) => {

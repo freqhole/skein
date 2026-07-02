@@ -190,8 +190,20 @@ impl HubPeerService {
             config.username.clone(),
         );
 
-        // iroh-blobs: serve verified blob data + accept blob-proxy requests
-        let blobs_protocol = BlobsProtocol::new(fs_store, None);
+        // iroh-blobs: serve verified blob data + accept blob-proxy requests.
+        //
+        // gated by `blob_acl`: a peer must be a hub friend *and* have a
+        // `.acl` entry on at least one canvas that references the requested
+        // blob (see `blob_acl`'s module doc comment for the full design and
+        // what this replaces — previously `events: None` here meant any
+        // peer who could open a connection and knew a blake3 hash could
+        // fetch it, with zero access control of any kind).
+        let blob_acl_gate =
+            crate::blob_acl::BlobAclGate::for_hub(friendz_store.clone(), hub_repo.clone());
+        let blobs_protocol = BlobsProtocol::new(
+            fs_store,
+            Some(crate::blob_acl::build_gated_blobs_events(blob_acl_gate)),
+        );
         let blob_proxy = BlobProxyHandler::new(fs_store, blobz.clone());
 
         // remote hub administration: lets a privileged remote peer manage

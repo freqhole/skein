@@ -4,8 +4,14 @@
 // § "proposed: SkeinHarness" and § "migration path — phase 2"). step 1
 // (done) covered the pieces `test-bootstrap.ts` and `sync-test-bootstrap.ts`
 // hand-built themselves: an automerge `Repo` and a `CanvasStore`
-// opened/created on it. step 4 (this revision) adds real iroh p2p
-// networking, mirroring what `p2p-test-bootstrap.ts` used to hand-build.
+// opened/created on it. step 4 added real iroh p2p networking, mirroring
+// what `p2p-test-bootstrap.ts` used to hand-build. step 5 (this revision)
+// makes the iroh transport pluggable (browser midden WASM vs. tauri's
+// rust-backed transport), lets a caller wrap the raw iroh adapter before it
+// reaches the repo's network list (ACL filtering), lets a caller skip the
+// eager `ensureIdentity()` call, and lets a caller skip building a
+// `CanvasStore` entirely — all needed to migrate `standalone/boot.ts` (the
+// real app) onto the harness.
 //
 // deliberately does NOT yet own `PresenceManager`, `identity` (as a general
 // seam — iroh's own identity is wired up internally), or `blobs` — those get
@@ -19,7 +25,7 @@ import { Repo } from "@automerge/automerge-repo";
 import { BroadcastChannelNetworkAdapter } from "@automerge/automerge-repo-network-broadcastchannel";
 import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb";
 import { CanvasStore } from "../canvas/canvas-store";
-import { ensureIdentity, getMiddenNode } from "../p2p/identity";
+import { ensureIdentity, getMiddenNode as getDefaultMiddenNode } from "../p2p/identity";
 import { IrohNetworkAdapter, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
 import { handleSkeinStream } from "../p2p/skein-handler";
 
@@ -62,6 +68,41 @@ export interface SkeinHarnessOptions {
    * are ignored, and `harness.iroh` stays `null`.
    */
   repo?: Repo;
+  /**
+   * transport-node factory used to build the iroh adapter (only consulted
+   * when `network` is `"iroh"` or `"both"`). defaults to the browser midden
+   * WASM node (`getMiddenNode()` from `p2p/identity.ts`). callers that need
+   * a different transport — e.g. the real app under tauri, which routes p2p
+   * through the rust backend's iroh endpoint instead of midden WASM — pass
+   * their own factory here instead.
+   */
+  getMiddenNode?: () => Promise<MiddenStreamNode>;
+  /**
+   * wrap the raw iroh adapter before it's added to the repo's network list
+   * (e.g. the real app's ACL filtering). `harness.iroh` still returns the
+   * *unwrapped* adapter — callers need direct access to it for things like
+   * `registerAlpnHandler` and connection-state introspection — only the
+   * repo's network array sees the wrapped version.
+   */
+  wrapNetworkAdapter?: (adapter: IrohNetworkAdapter) => NetworkAdapter;
+  /**
+   * skip the `await ensureIdentity()` call this module normally makes
+   * before constructing the iroh adapter. `IrohNetworkAdapter` itself
+   * already lazily checks for a stored identity and starts once one shows
+   * up (`checkIdentityAndStart`/`onIdentityChange` in
+   * `iroh-network-adapter.ts`), so callers that don't want to force-create
+   * a P2P identity just by building a harness — the real app should only
+   * generate an identity when the user actually shares/joins a canvas —
+   * should set this to `true`.
+   */
+  skipEnsureIdentity?: boolean;
+  /**
+   * skip creating/opening a `CanvasStore` entirely — `harness.store` is
+   * `null`. for callers (like the real app's router) that manage many
+   * canvas docs lazily per-navigation and don't want a fresh, unused
+   * automerge doc created as a side effect of building a harness.
+   */
+  skipStore?: boolean;
 }
 
 export interface SkeinHarness {
@@ -83,17 +124,36 @@ export interface SkeinHarness {
 }
 
 /**
+ * variant returned when `skipStore: true` is passed — no `CanvasStore` is
+ * created/opened, so `store` is `null`. used by callers that manage many
+ * canvas docs lazily instead of wanting one fresh/opened automerge doc
+ * built for them on every harness construction (see `skipStore` above).
+ */
+export interface SkeinHarnessNoStore {
+  readonly repo: Repo;
+  readonly store: null;
+  readonly iroh: IrohNetworkAdapter | null;
+  destroy(): void;
+}
+
+/**
  * build the non-presentation half of a skein canvas: a `Repo` (storage +
- * network), a `CanvasStore` opened or created on it, and (optionally) an
- * `IrohNetworkAdapter` for real p2p networking.
+ * network), a `CanvasStore` opened or created on it (unless `skipStore` is
+ * set), and (optionally) an `IrohNetworkAdapter` for real p2p networking.
  *
  * this is a straight extraction of what `test-bootstrap.ts`,
  * `sync-test-bootstrap.ts`, and `p2p-test-bootstrap.ts` each used to build
  * by hand — see those files for the code this is meant to replace.
  */
+export function createSkeinHarness(
+  options?: SkeinHarnessOptions & { skipStore?: false }
+): Promise<SkeinHarness>;
+export function createSkeinHarness(
+  options: SkeinHarnessOptions & { skipStore: true }
+): Promise<SkeinHarnessNoStore>;
 export async function createSkeinHarness(
   options: SkeinHarnessOptions = {}
-): Promise<SkeinHarness> {
+): Promise<SkeinHarness | SkeinHarnessNoStore> {
   let repo: Repo;
   let iroh: IrohNetworkAdapter | null = null;
 
@@ -114,10 +174,17 @@ export async function createSkeinHarness(
 
     if (mode === "iroh" || mode === "both") {
       // ensure a P2P identity exists — creates one the first time, restores
-      // on subsequent calls (identity is persisted in IndexedDB).
-      await ensureIdentity();
-      const getMidden = async (): Promise<MiddenStreamNode> =>
-        (await getMiddenNode()) as unknown as MiddenStreamNode;
+      // on subsequent calls (identity is persisted in IndexedDB). skippable
+      // (see `skipEnsureIdentity`) for callers whose iroh adapter already
+      // handles identity lazily and don't want a harness construction to
+      // force-create one.
+      if (!options.skipEnsureIdentity) {
+        await ensureIdentity();
+      }
+      const getMidden =
+        options.getMiddenNode ??
+        (async (): Promise<MiddenStreamNode> =>
+          (await getDefaultMiddenNode()) as unknown as MiddenStreamNode);
       iroh = new IrohNetworkAdapter(getMidden);
 
       // register the skein/1 handler so this peer can serve blobs (and
@@ -127,7 +194,7 @@ export async function createSkeinHarness(
       // streams (see iroh-network-adapter.ts's accept loop), which broke
       // the hub's blob-snatch pipeline in e2e tests.
       iroh.registerAlpnHandler("skein/1", handleSkeinStream);
-      network.push(iroh);
+      network.push(options.wrapNetworkAdapter ? options.wrapNetworkAdapter(iroh) : iroh);
     }
 
     repo = new Repo({
@@ -136,9 +203,11 @@ export async function createSkeinHarness(
     });
   }
 
-  const store = options.canvasDocId
-    ? await CanvasStore.open(repo, options.canvasDocId as DocumentId)
-    : CanvasStore.create(repo);
+  const store = options.skipStore
+    ? null
+    : options.canvasDocId
+      ? await CanvasStore.open(repo, options.canvasDocId as DocumentId)
+      : CanvasStore.create(repo);
 
   return {
     repo,
@@ -147,5 +216,5 @@ export async function createSkeinHarness(
     destroy() {
       iroh?.disconnect();
     },
-  };
+  } as SkeinHarness | SkeinHarnessNoStore;
 }
