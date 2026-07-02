@@ -432,4 +432,154 @@ mod tests {
             other => panic!("expected Allowed, got {other:?}"),
         }
     }
+
+    /// the existing `non_admin_is_rejected_for_all_operations` test only
+    /// checks the response variant. a rejected request must also have zero
+    /// side effects — confirm the friendz table is untouched, not just that
+    /// the wire response looks right.
+    #[tokio::test]
+    async fn non_admin_requests_have_no_side_effects_on_friendz_table() {
+        let (handler, _adminz, friendz_store, userz_dir) = make_handler().await;
+        let stranger = "stranger-node";
+
+        let allow = handle_request(
+            &handler,
+            stranger,
+            AdminRequest::Allow {
+                node_id: "target".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(allow, AdminResponse::NotAdmin));
+        assert!(
+            friendz_store.get("target").await.unwrap().is_none(),
+            "a rejected Allow must not create a friendz row"
+        );
+
+        // seed a real friendz row directly (bypassing the handler) so we can
+        // confirm a rejected Remove doesn't touch it either.
+        userz_dir.touch("existing-friend").await.unwrap();
+        friendz_store
+            .upsert("existing-friend", friendz::FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+
+        let remove = handle_request(
+            &handler,
+            stranger,
+            AdminRequest::Remove {
+                node_id: "existing-friend".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(remove, AdminResponse::NotAdmin));
+        assert!(
+            friendz_store.get("existing-friend").await.unwrap().is_some(),
+            "a rejected Remove must not delete an existing friendz row"
+        );
+
+        let list = handle_request(&handler, stranger, AdminRequest::List).await;
+        assert!(matches!(list, AdminResponse::NotAdmin));
+    }
+
+    /// admin/friendz status are independent per `adminz`'s own doc comment;
+    /// this test confirms it specifically through the wire protocol: an
+    /// admin `Remove` request only ever deletes a `friendz` row (there is no
+    /// remote way to mutate `hub_adminz` at all — see `AdminRequest`'s
+    /// variants), so it must never affect the caller's own admin rights.
+    #[tokio::test]
+    async fn admin_remove_never_touches_the_adminz_table() {
+        let (handler, adminz_store, friendz_store, userz_dir) = make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+        userz_dir.touch(admin_node).await.unwrap();
+        friendz_store
+            .upsert(admin_node, friendz::FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+
+        // an admin can "remove" their own node id from friendz (self is not
+        // special-cased) without losing admin rights.
+        let remove = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::Remove {
+                node_id: admin_node.to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(remove, AdminResponse::Removed { .. }));
+        assert!(!friendz_store.is_friend(admin_node).await);
+        assert!(
+            adminz_store.is_admin(admin_node).await,
+            "removing a friendz row must never revoke admin rights"
+        );
+    }
+
+    /// `Remove` on a node id with no friendz row is a no-op delete (matches
+    /// `friendz::Store::delete`'s documented idempotent-delete convention
+    /// used throughout this codebase, e.g. `blobz`/`adminz`), so it still
+    /// reports `Removed` rather than an error. documenting this explicitly:
+    /// it's an intentional "delete is idempotent" convention, not a bug.
+    #[tokio::test]
+    async fn admin_remove_of_nonexistent_friend_reports_removed_not_error() {
+        let (handler, adminz_store, _friendz, _userz) = make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let remove = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::Remove {
+                node_id: "never-existed".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(remove, AdminResponse::Removed { .. }));
+    }
+
+    /// whitespace-only node ids must be rejected the same way empty ones
+    /// are (`node_id.trim()` runs before the emptiness check) for both
+    /// mutating request variants.
+    #[tokio::test]
+    async fn allow_and_remove_reject_whitespace_only_node_id() {
+        let (handler, adminz_store, _friendz, _userz) = make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let allow = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::Allow {
+                node_id: "   ".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(allow, AdminResponse::Error { .. }));
+
+        let remove = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::Remove {
+                node_id: "  \t ".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(remove, AdminResponse::Error { .. }));
+    }
+
+    /// `handle_stream` decodes the request with `ciborium::from_reader`
+    /// before ever consulting `adminz` — malformed bytes on the wire (a
+    /// truncated frame, a non-admin-protocol payload accidentally dialed at
+    /// this ALPN, etc.) must fail cleanly rather than panic. `handle_stream`
+    /// itself needs a live iroh stream to exercise end-to-end (no fake
+    /// `SendStream`/`RecvStream` exists in this crate — see
+    /// `sync::tests`'s doc comment for why), so this exercises the same
+    /// decode call directly.
+    #[test]
+    fn malformed_cbor_bytes_fail_to_decode_without_panicking() {
+        let garbage = [0xff_u8; 32];
+        let result: Result<AdminRequest, _> = ciborium::from_reader(garbage.as_slice());
+        assert!(result.is_err());
+    }
 }

@@ -52,25 +52,21 @@ test.describe("cross-peer blob snatch @hub", () => {
     hub = undefined;
   });
 
-  // known-failing as of 2026-07-01: the snatcher finds the missing blob
-  // ("found missing blob in file widget" logs at info level), but the
-  // subsequent probe/download attempt fails or hangs silently — the actual
-  // failure reason is only logged at `tracing::debug!` inside `snatch_blob()`
-  // (see `snatch_refs()`'s error arm in reliquary/src/snatch.rs), which
-  // `RUST_LOG=info` (this fixture's default) doesn't surface. `test.fail()`
-  // keeps this test's real (currently red) status visible in reports instead
-  // of silently passing or being skipped — flip back to a plain `test(...)`
-  // once the snatch pipeline is fixed. see PROGRESS.md's backlog for the
-  // tracking entry.
-  test.fail(
-    true,
-    "cross-peer blob snatch pipeline doesn't complete — probe/download step fails silently, needs debug-level investigation (see comment above)"
-  );
   test("hub snatches a blob referenced by a peer's file widget @hub", async ({ p2pPage }) => {
     test.setTimeout(120_000);
 
     hub = await startReliquaryHub();
     const peer = await p2pPage();
+    peer.page.on("console", (msg) => {
+      if (
+        msg.text().includes("file-widget") ||
+        msg.text().includes("skein.handler") ||
+        msg.text().includes("test-debug")
+      ) {
+        // eslint-disable-next-line no-console -- temporary debug aid
+        console.log("[browser]", msg.text());
+      }
+    });
 
     await hub.friendAllow(peer.nodeId);
     await addPeer(peer.page, hub.nodeId);
@@ -82,10 +78,15 @@ test.describe("cross-peer blob snatch @hub", () => {
       const bridge = (window as any).__skeinTest;
       const bytes = new TextEncoder().encode(content);
 
-      // register the bytes with this peer's own iroh-blobs store so it can
-      // actually serve them when the hub probes/downloads — mirrors what
-      // widgets/file.ts does on upload via midden's `import_blob`.
-      const blake3Hash: string = await bridge.p2p.importBlob(bytes);
+      // register the bytes with this peer's own iroh-blobs store AND its
+      // local blob record — mirrors what widgets/file.ts does on upload
+      // (see importBlob()'s doc comment in test-bridge.ts for why both
+      // matter: the file widget's own locality check only looks at the
+      // local blob record, not midden's in-memory iroh-blobs store).
+      const blake3Hash: string = await bridge.p2p.importBlob(bytes, {
+        filename: "blob-sync-test.txt",
+        mime: "text/plain",
+      });
       const nodeId: string = await bridge.p2p.getNodeId();
 
       const repo = bridge.canvas.repo;
@@ -108,6 +109,12 @@ test.describe("cross-peer blob snatch @hub", () => {
         // snatch.rs.
         doc.snatchedBy = [nodeId];
       });
+
+      // eslint-disable-next-line no-console -- temporary debug aid
+      console.log(
+        "[test-debug] widgetHandle.doc() after change:",
+        JSON.stringify(widgetHandle.doc())
+      );
 
       // canvas doc: register the file widget entry + ourselves as a canvas
       // peer (so the hub's canvas scan has someone to probe).

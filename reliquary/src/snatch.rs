@@ -439,9 +439,7 @@ impl BlobSnatcher {
                 let (refs, peers) = self.scan_canvas_resolved(doc_id).await;
                 self.snatch_refs(refs, peers).await
             }
-            DocKind::WidgetState => {
-                self.snatch_widget_state(doc_id).await
-            }
+            DocKind::WidgetState => self.snatch_widget_state(doc_id).await,
             DocKind::Unknown => {
                 tracing::trace!(doc_id, "doc-change for unrecognized doc shape, ignoring");
                 0
@@ -701,11 +699,7 @@ impl BlobSnatcher {
                         // create the list via transact
                         match doc.transact::<_, _, automerge::AutomergeError>(|tx| {
                             use automerge::transaction::Transactable;
-                            tx.put_object(
-                                automerge::ROOT,
-                                "snatchedBy",
-                                automerge::ObjType::List,
-                            )
+                            tx.put_object(automerge::ROOT, "snatchedBy", automerge::ObjType::List)
                         }) {
                             Ok(result) => result.result,
                             Err(e) => {
@@ -1285,16 +1279,31 @@ fn read_widget_state(
             return;
         }
 
-        // read snatchedBy — an automerge list of string node IDs
+        // read snatchedBy — an automerge list of string node IDs.
+        //
+        // list elements may be stored either as plain scalar strings or as
+        // automerge Text objects (the JS automerge proxy stores array-of-string
+        // assignments like `doc.snatchedBy = [nodeId]` as Text elements, not
+        // scalars) — handle both, mirroring read_str()'s scalar-vs-Text
+        // handling for top-level fields.
         let snatched_by = {
             let mut items = Vec::new();
             if let Ok(Some((automerge::Value::Object(automerge::ObjType::List), list_id))) =
                 doc.get(automerge::ROOT, "snatchedBy")
             {
                 for i in 0..doc.length(&list_id) {
-                    if let Ok(Some((v, _))) = doc.get(&list_id, i) {
-                        if let Some(s) = v.to_str() {
-                            items.push(s.to_string());
+                    if let Ok(Some((v, item_id))) = doc.get(&list_id, i) {
+                        match v {
+                            automerge::Value::Object(automerge::ObjType::Text) => {
+                                if let Ok(s) = doc.text(&item_id) {
+                                    items.push(s);
+                                }
+                            }
+                            _ => {
+                                if let Some(s) = v.to_str() {
+                                    items.push(s.to_string());
+                                }
+                            }
                         }
                     }
                 }

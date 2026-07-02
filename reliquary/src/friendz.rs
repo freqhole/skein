@@ -431,4 +431,77 @@ mod tests {
         let res = store.upsert("orphan", FriendStatus::Allowed, None).await;
         assert!(matches!(res, Err(FriendError::Sqlx(_))));
     }
+
+    /// a `Blocked` peer that gets re-`Allowed` (e.g. an operator changes
+    /// their mind) must actually unblock — `is_friend()` should flip back to
+    /// true and no stale "blocked" state should linger anywhere. `upsert`
+    /// writes `status` unconditionally (`status = excluded.status`, not a
+    /// COALESCE), so there's no separate "unblock" path to forget to wire up,
+    /// but this is worth a real assertion rather than trusting the SQL by
+    /// inspection.
+    #[tokio::test]
+    async fn blocked_peer_can_be_reallowed_and_becomes_a_friend_again() {
+        let store = make_store_with_peer("peer-e").await;
+        store
+            .upsert("peer-e", FriendStatus::Blocked, None)
+            .await
+            .unwrap();
+        assert!(!store.is_friend("peer-e").await);
+
+        let unblocked = store
+            .upsert("peer-e", FriendStatus::Allowed, None)
+            .await
+            .unwrap();
+        assert_eq!(unblocked.status, FriendStatus::Allowed);
+        assert!(store.is_friend("peer-e").await);
+
+        // and the reverse direction: Accepted -> Blocked must also take
+        // effect immediately.
+        store
+            .upsert("peer-e", FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+        assert!(store.is_friend("peer-e").await);
+        store
+            .upsert("peer-e", FriendStatus::Blocked, None)
+            .await
+            .unwrap();
+        assert!(!store.is_friend("peer-e").await);
+    }
+
+    /// `upsert_full`'s `INSERT ... ON CONFLICT DO UPDATE` is a single atomic
+    /// statement (unlike blobz.rs's old check-then-insert pattern), so
+    /// concurrent upserts for the *same* node id from different tasks (e.g.
+    /// two racing `FriendRequest`/hub_admin `Allow` calls for the same peer)
+    /// should never surface a sqlite-level error, and must always converge
+    /// on exactly one row. uses a real file-backed pool (multiple
+    /// connections) + a multi-thread runtime so the race is actually
+    /// exercised, unlike `open_in_memory()`'s single-connection pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_upsert_same_node_id_resolves_to_single_row() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open(tmp.path()).await.expect("open db");
+        let users = userz::Directory::new(pool.clone());
+        users.touch("racing-peer").await.unwrap();
+        let store = Store::new(pool);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .upsert("racing-peer", FriendStatus::Allowed, None)
+                    .await
+            }));
+        }
+        for h in handles {
+            h.await
+                .expect("task panicked")
+                .expect("upsert must not error on a race");
+        }
+
+        let all = store.list(false).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].friend_node_id, "racing-peer");
+    }
 }

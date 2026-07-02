@@ -146,6 +146,21 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for LoggingIo<T> {
 /// other authorization gate in this codebase (`skein-friendz/1`'s canvas
 /// invite handling, `HubPeerService::is_friend`) exists downstream of this
 /// same check.
+///
+/// known gap: the `is_friend` check only runs once, at `accept()` time. if
+/// an operator blocks or removes a peer's `friendz` row *after* their
+/// connection has already been accepted, nothing tears the live connection
+/// down — the already-spawned `hub_repo::handle_connection` task keeps
+/// syncing until the peer disconnects on their own. `hub_repo::HubRepo`'s
+/// `connected_peers` map is read-only bookkeeping (peer id + connect time),
+/// not a cancellation registry, so there's currently no handle to signal.
+/// fixing this properly needs new cross-cutting infra (e.g. a
+/// `CancellationToken` per connected peer, threaded through `handle_connection`
+/// and wired up from every friendz-mutating call site: `main.rs`'s CLI
+/// `friend remove`, and `protocol::hub_admin`'s remote `Remove` handler) —
+/// deliberately not attempted as a partial fix here. see
+/// `sync::tests::revoking_friendz_status_does_not_tear_down_an_already_accepted_connection`
+/// for a test that documents the current (gap-having) behavior precisely.
 #[derive(Clone)]
 pub struct IrohRepo {
     /// kept for future outbound dialing (hub-to-hub sync).
@@ -275,5 +290,45 @@ mod tests {
     async fn blocked_peer_is_rejected() {
         let friendz_store = make_repo().await;
         assert!(!friendz_store.is_friend("friend-blocked").await);
+    }
+
+    /// documents a known architectural gap (see the `IrohRepo` doc comment
+    /// above): `IrohRepo::accept` only ever calls `is_friend()` once, at the
+    /// moment a connection is first accepted. `is_friend()` itself is
+    /// correctly real-time — revoking a friend takes effect immediately for
+    /// any *new* check — but there is no mechanism anywhere in this crate to
+    /// react to a status change by tearing down a connection that was
+    /// already accepted before the change. this test proves the first half
+    /// (real-time revocation) and calls out the second half (no live-teardown)
+    /// in prose, since the latter can't be demonstrated without a real,
+    /// already-accepted `iroh::endpoint::Connection` plus a running
+    /// `hub_repo::handle_connection` task — infrastructure this crate's unit
+    /// tests don't have (no test here spins up two live iroh endpoints; see
+    /// `make_repo`'s doc comment).
+    ///
+    /// ideal behavior: revoking a friendz row should also abort any
+    /// in-flight `handle_connection` task for that peer id, e.g. via a
+    /// `CancellationToken` stored alongside `hub_repo::PeerInfo` in
+    /// `connected_peers` and checked with `tokio::select!` in the frame-read
+    /// loop. not implemented; tracked here rather than silently missing.
+    #[tokio::test]
+    async fn revoking_friendz_status_does_not_tear_down_an_already_accepted_connection() {
+        let friendz_store = make_repo().await;
+
+        // this is exactly what `IrohRepo::accept` evaluates once, at
+        // connection-accept time.
+        assert!(friendz_store.is_friend("friend-accepted").await);
+
+        // operator revokes mid-session (`reliquary friend remove`, or a
+        // remote hub_admin `Remove` request).
+        friendz_store.delete("friend-accepted").await.unwrap();
+
+        // is_friend() is real-time and correctly flips for any *new* check...
+        assert!(!friendz_store.is_friend("friend-accepted").await);
+
+        // ...but nothing in this crate observes that flip and reacts to an
+        // already-accepted connection: there is no cancellation registry to
+        // check. this gap is real and is documented, not fixed, per the
+        // `IrohRepo` doc comment above.
     }
 }

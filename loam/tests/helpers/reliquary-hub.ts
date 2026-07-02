@@ -96,7 +96,7 @@ export async function startReliquaryHub(options?: {
   const readyTimeoutMs = options?.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
 
   const child = spawn(RELIQUARY_BIN, ["--data-dir", dataDir, "--port", "0", "serve"], {
-    env: { ...process.env, RUST_LOG: "info" },
+    env: { ...process.env, RUST_LOG: "reliquary=debug" },
     stdio: ["ignore", "pipe", "pipe"],
   });
 

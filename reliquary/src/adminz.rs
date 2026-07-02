@@ -176,4 +176,105 @@ mod tests {
             vec!["a", "b", "c"]
         );
     }
+
+    /// `hub_adminz` has no FK, no "self" concept, and no minimum-admin-count
+    /// guard — `remove()` doesn't know or care whether `node_id` is the
+    /// caller's own id or the last remaining admin. removing yourself (or
+    /// the last admin) is allowed and leaves zero admins. this is judged
+    /// acceptable rather than a bug: `adminz` mutations are only reachable
+    /// via local CLI (`reliquary admin allow/remove`, see `main.rs`) — the
+    /// remote `iroh/skein-hub-admin/1` protocol only ever mutates `friendz`
+    /// (see `protocol::hub_admin::AdminRequest`), never `hub_adminz` itself
+    /// — so a "lockout" is always recoverable by whoever already has
+    /// filesystem/CLI access to the hub, never a remote-only footgun.
+    #[tokio::test]
+    async fn removing_the_last_admin_leaves_zero_admins_no_built_in_protection() {
+        let pool = db::open_in_memory().await;
+        let store = Store::new(pool);
+        store.allow("only-admin").await.unwrap();
+        assert!(store.is_admin("only-admin").await);
+
+        // an admin removing their own node id (self-lockout) succeeds; the
+        // store has no notion of "caller identity" to special-case.
+        store.remove("only-admin").await.unwrap();
+        assert!(!store.is_admin("only-admin").await);
+        assert!(store.list().await.unwrap().is_empty());
+    }
+
+    /// `adminz` and `friendz` are documented as orthogonal concepts (see
+    /// module doc comment): a node can be an admin, a friend, both, or
+    /// neither, and mutating one table must never touch the other. verify
+    /// this rather than trusting the comment.
+    #[tokio::test]
+    async fn admin_status_and_friend_status_are_independent() {
+        let pool = db::open_in_memory().await;
+        let admin_store = Store::new(pool.clone());
+        let friend_store = crate::friendz::Store::new(pool.clone());
+        let users = crate::userz::Directory::new(pool);
+
+        users.touch("both-roles").await.unwrap();
+        admin_store.allow("both-roles").await.unwrap();
+        friend_store
+            .upsert("both-roles", crate::friendz::FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+
+        // a node can hold both roles simultaneously.
+        assert!(admin_store.is_admin("both-roles").await);
+        assert!(friend_store.is_friend("both-roles").await);
+
+        // removing admin rights must not touch the friendz row.
+        admin_store.remove("both-roles").await.unwrap();
+        assert!(!admin_store.is_admin("both-roles").await);
+        assert!(
+            friend_store.is_friend("both-roles").await,
+            "removing admin rights must not affect friend status"
+        );
+
+        // and the reverse: deleting the friendz row must not touch adminz.
+        admin_store.allow("both-roles").await.unwrap();
+        friend_store.delete("both-roles").await.unwrap();
+        assert!(!friend_store.is_friend("both-roles").await);
+        assert!(
+            admin_store.is_admin("both-roles").await,
+            "removing a friendz row must not affect admin status"
+        );
+    }
+
+    /// `allow()`'s `INSERT ... ON CONFLICT(node_id) DO NOTHING` followed by
+    /// a separate `get()` (rather than trusting a locally-built `Admin`
+    /// value) means a concurrent call for the same node id from two
+    /// different requests should always converge on the same row — whoever
+    /// wins the INSERT race, every caller re-reads the actual row afterward.
+    /// uses a real file-backed pool (multiple connections) + a multi-thread
+    /// runtime so the race is actually exercised, unlike `open_in_memory()`'s
+    /// single-connection pool used by the rest of this module's tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_allow_same_node_id_never_errors_and_converges() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open(tmp.path()).await.expect("open db");
+        let store = Store::new(pool);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            handles.push(tokio::spawn(
+                async move { store.allow("racing-admin").await },
+            ));
+        }
+
+        let mut created_ats = std::collections::HashSet::new();
+        for h in handles {
+            let admin = h
+                .await
+                .expect("task panicked")
+                .expect("allow must not error on a race");
+            created_ats.insert(admin.created_at);
+        }
+
+        // every racing caller must have converged on the same row.
+        assert_eq!(created_ats.len(), 1);
+        let admins = store.list().await.unwrap();
+        assert_eq!(admins.len(), 1);
+    }
 }
