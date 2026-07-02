@@ -236,8 +236,12 @@ pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkStat
         .upsert_self(&node_id, Some(&state.username), None, None)
         .await?;
 
-    let streams =
-        crate::streams::StreamRegistry::start_with_blobs(endpoint.clone(), state.fs_store).await?;
+    let streams = crate::streams::StreamRegistry::start_with_blobs(
+        endpoint.clone(),
+        state.fs_store,
+        state.friendz_store.clone(),
+    )
+    .await?;
 
     // pre-warm the FsStore for every blob already in blobz. without this,
     // the first peer to ask for a pre-existing blob has to wait for

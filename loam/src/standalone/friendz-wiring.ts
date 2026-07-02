@@ -1735,6 +1735,17 @@ export async function approveKnock(
   role: InvitableRole
 ): Promise<void> {
   const { protocol, store, socialDoc, localNodeId } = deps;
+
+  // only an admin may decide a knock — previously unenforced anywhere
+  // (any peer viewing the canvas, including a mere viewer, could grant
+  // access to a stranger). defense in depth: the messagez widget's own
+  // approve/reject/ignore buttons are also hidden for non-admins (see
+  // `messagez-widget.ts`), but this is the real chokepoint since it's the
+  // function that actually grants the role.
+  if (!store.isAdmin(localNodeId)) {
+    throw new Error(TAG + " approveKnock: local peer is not an admin on this canvas");
+  }
+
   const knock = store.doc().pendingKnocks?.[requesterNodeId];
 
   store.setRole(requesterNodeId, role);
@@ -1815,6 +1826,11 @@ export async function declineKnock(
   requesterNodeId: string
 ): Promise<void> {
   const { protocol, store, localNodeId } = deps;
+
+  // same admin-only gate as approveKnock() above.
+  if (!store.isAdmin(localNodeId)) {
+    throw new Error(TAG + " declineKnock: local peer is not an admin on this canvas");
+  }
 
   store.addKnockDecision(requesterNodeId, localNodeId, "decline");
 

@@ -1187,6 +1187,28 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         const btnH = 22;
         const gap = 8;
 
+        // only the canvas's admin may approve/reject a knock (previously
+        // unenforced anywhere — any peer viewing the canvas could grant a
+        // stranger access). "ignore" stays available to everyone since
+        // it's a purely local dismissal, not a real decision — see its own
+        // comment below. defense in depth: `friendz-wiring.ts`'s
+        // `approveKnock()`/`declineKnock()` also enforce this — this is
+        // just the UI-level gate so a non-admin doesn't see buttons that
+        // would fail anyway.
+        const isAdminHere = store.isAdmin(localNodeId);
+
+        if (!isAdminHere) {
+          const adminOnlyLabel = new Text({
+            text: "only the canvas admin can decide",
+            style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          adminOnlyLabel.eventMode = "none";
+          adminOnlyLabel.x = textX;
+          adminOnlyLabel.y = actionsY + (btnH - ROW_SUB_SIZE) / 2;
+          rowContainer.addChild(adminOnlyLabel);
+        }
+
         // role picker — member <-> viewer, same idea as share-dialog.ts's
         // invite-friend role toggle (buildRoleToggle()); reimplemented
         // locally since that helper isn't exported from that file.
@@ -1223,7 +1245,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
           knockRowRoles.set(knock.requesterNodeId, currentRole);
           drawRoleToggle();
         });
-        rowContainer.addChild(roleToggleBtn);
+        if (isAdminHere) rowContainer.addChild(roleToggleBtn);
 
         // approve button
         const approveW = 56;
@@ -1250,7 +1272,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         approveLabel.x = approveW / 2;
         approveLabel.y = btnH / 2;
         approveBtn.addChild(approveLabel);
-        rowContainer.addChild(approveBtn);
+        if (isAdminHere) rowContainer.addChild(approveBtn);
 
         // reject button — a real, synced decline (section 3.1a), distinct
         // from "ignore" below.
@@ -1278,17 +1300,19 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         rejectLabel.x = rejectW / 2;
         rejectLabel.y = btnH / 2;
         rejectBtn.addChild(rejectLabel);
-        rowContainer.addChild(rejectBtn);
+        if (isAdminHere) rowContainer.addChild(rejectBtn);
 
         // ignore button — purely local dismissal (section 3.1a): does NOT
         // call CanvasStore/the protocol at all, just hides this knock from
         // this admin's own view (see getDismissedKnocks()/addDismissedKnock()).
+        // available to everyone (not just the canvas admin) since it has no
+        // effect on the actual knock decision, just this viewer's own list.
         const ignoreW = 52;
         const ignoreBtn = new Container();
         ignoreBtn.eventMode = "static";
         ignoreBtn.cursor = "pointer";
         ignoreBtn.hitArea = new Rectangle(0, 0, ignoreW, btnH);
-        ignoreBtn.x = rejectBtn.x + rejectW + gap;
+        ignoreBtn.x = isAdminHere ? rejectBtn.x + rejectW + gap : textX;
         ignoreBtn.y = actionsY;
 
         const ignoreBg = new Graphics();

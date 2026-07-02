@@ -39,6 +39,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
+use reliquary::{blob_acl, friendz};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
@@ -132,16 +133,26 @@ impl StreamRegistry {
     /// can then download verified blob bytes from us once the bytes have
     /// been ensured into the FsStore (see the `blob_iroh_ensure` dispatch
     /// action in `commands.rs`).
+    ///
+    /// gated by `blob_acl`'s friend-only mode (same as `reliquary::service::
+    /// Service`, the other peer variant with no canvas tracking) — a peer
+    /// must be a friend of this tauri instance's own identity to fetch any
+    /// blob. this used to be `events: None` (fully public: any peer that
+    /// could open a connection and knew a blake3 hash could fetch it,
+    /// zero access control) — that was the one remaining ungated blob path
+    /// in this codebase (reliquary's own hub/service peers were already
+    /// gated, see `blob_acl`'s module doc comment) and has been fixed.
     pub async fn start_with_blobs(
         endpoint: Endpoint,
         fs_store: &'static FsStore,
+        friendz_store: friendz::Store,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::start_inner(endpoint, Some(fs_store)).await
+        Self::start_inner(endpoint, Some((fs_store, friendz_store))).await
     }
 
     async fn start_inner(
         endpoint: Endpoint,
-        fs_store: Option<&'static FsStore>,
+        blobs: Option<(&'static FsStore, friendz::Store)>,
     ) -> anyhow::Result<Arc<Self>> {
         let (tx, rx) = mpsc::channel(ACCEPT_BUFFER);
         let mut builder = Router::builder(endpoint);
@@ -152,14 +163,16 @@ impl StreamRegistry {
             };
             builder = builder.accept(*alpn, handler);
         }
-        if let Some(fs_store) = fs_store {
+        if let Some((fs_store, friendz_store)) = blobs {
             // serve verified blob bytes over iroh-blobs/4. this is what
             // browser peers (midden) reach for first when they see we own a
             // blob — see `download_verified_with_ensure_progress` in
             // `midden/src/lib.rs`. handled fully in rust; no JS dispatch.
-            let blobs_protocol = BlobsProtocol::new(fs_store, None);
+            let gate = blob_acl::BlobAclGate::friend_only(friendz_store);
+            let blobs_protocol =
+                BlobsProtocol::new(fs_store, Some(blob_acl::build_gated_blobs_events(gate)));
             builder = builder.accept(iroh_blobs::ALPN, blobs_protocol);
-            tracing::info!("frontend router: registered iroh_blobs::ALPN");
+            tracing::info!("frontend router: registered iroh_blobs::ALPN (friend-gated)");
         }
         let router = builder.spawn();
         Ok(Arc::new(Self {

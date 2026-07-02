@@ -89,6 +89,24 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
 
   const nodeId = await p2pBridge.getNodeId();
 
+  // the harness's CanvasStore.create()/open() never sets a local node id or
+  // stamps an admin the way production's real canvas-creation flow does
+  // (see standalone/boot.ts) — without this, every canvas built through
+  // this harness has an empty `.acl`, so `store.isAdmin()`/`isLocalAdmin()`
+  // always default to `false` for everyone, including the creator. this bit
+  // knock-flow.spec.ts once real admin-only gating was added to
+  // approveKnock()/declineKnock() (friendz-wiring.ts).
+  canvas.store.setLocalNodeId(nodeId);
+  if (!options.canvasDocId) {
+    // only stamp when this peer created the canvas itself — a peer that
+    // joined an existing canvas via `options.canvasDocId` shouldn't
+    // self-stamp as admin before the real admin's `.acl` has synced over
+    // (stampAdmin() is a no-op once *any* admin exists, but a race where
+    // the join happens before that sync completes could otherwise create
+    // two admins on the same canvas).
+    canvas.store.stampAdmin(nodeId);
+  }
+
   // wire up a real FriendzProtocol instance so tests can drive the
   // skein-friendz/1 handshake (friend requests, accepts) against another
   // browser peer or a real reliquary hub — production wiring for this lives
