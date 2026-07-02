@@ -19,6 +19,7 @@ import {
   initKnockSocialDocBridge,
   recordKnockAck,
   recordKnockRelay,
+  sendAclChange,
   sendCanvasInvite,
   sendFriendRequest,
   setOutboundRequestHook,
@@ -753,8 +754,17 @@ class SkeinRouter {
           const shareStr = encodeShareString(identity.node_id, docId);
           const shareUrl = window.location.origin + window.location.pathname + "#share/" + shareStr;
 
+          // recomputes the full options object fresh from current doc state
+          // each time it's called — see the onChange subscriptions below
+          // `showShareDialog()`'s call site, which call this again (and
+          // rebuild the dialog) whenever the canvas doc or messagez outbox
+          // changes, instead of leaving the dialog showing a stale snapshot
+          // until the user manually closes and reopens it (a real reported
+          // bug: pending-invite/role/accepted-state changes never showed up
+          // in an already-open share dialog).
+          const buildShareOptions = (): ShareDialogOptions => {
           // build peer list from canvas doc (exclude self)
-          const peersRecord = this.currentCanvas.store.peers();
+          const peersRecord = this.currentCanvas!.store.peers();
           const peerList = Object.values(peersRecord)
             .filter((p) => {
               // guard: automerge may return non-string nodeId from Rust-written entries
@@ -926,8 +936,8 @@ class SkeinRouter {
           // onCancelInvite the real dialog uses \u2014 see ShareTestHooks in
           // src/dev/test-bridge.ts.
           const shareOptions: ShareDialogOptions = {
-            app: this.currentCanvas.app,
-            theme: this.currentCanvas.theme,
+            app: this.currentCanvas!.app,
+            theme: this.currentCanvas!.theme,
             shareString: shareStr,
             shareUrl,
             peers: peerList,
@@ -937,10 +947,47 @@ class SkeinRouter {
               this.currentCanvas?.store.removePeer(nodeId);
               // tell the adapter to stop reconnecting to this peer
               this.irohAdapter.forgetPeer(nodeId);
+              // best-effort live notification so the removed peer's own
+              // narthex card reflects the revocation immediately, instead
+              // of only finding out the next time they happen to sync this
+              // canvas doc directly (see onAclChange in friendz-wiring.ts).
+              // sendAclChange/onAclChange already existed, fully built and
+              // tested, but were never wired into production before this
+              // fix — a real gap, not a new mechanism.
+              void getStoredIdentity().then((localIdentity) => {
+                if (!localIdentity || !this.currentCanvas) return;
+                sendAclChange(nodeId, {
+                  canvasDocId: docId,
+                  canvasTitle: this.currentCanvas.store.metadata().title,
+                  targetNodeId: nodeId,
+                  newRole: "removed",
+                  changedBy: localIdentity.node_id,
+                  changedByUsername: this.friendzProtocol?.getLocalUsername() ?? "",
+                }).catch((err) => {
+                  log.warn(TAG, "failed to send ACL removal notification:", err);
+                });
+              });
               log.debug(TAG, "revoked access for peer:", nodeId.slice(0, 16) + "...");
             },
             onChangeRole: (nodeId: string, role: InvitableRole) => {
               this.currentCanvas?.store.setRole(nodeId, role);
+              // best-effort live notification (see onRemovePeer above for
+              // why this matters — otherwise a peer's own narthex card
+              // keeps showing their old role until they happen to
+              // reconnect to this specific canvas doc directly).
+              void getStoredIdentity().then((localIdentity) => {
+                if (!localIdentity || !this.currentCanvas) return;
+                sendAclChange(nodeId, {
+                  canvasDocId: docId,
+                  canvasTitle: this.currentCanvas.store.metadata().title,
+                  targetNodeId: nodeId,
+                  newRole: role,
+                  changedBy: localIdentity.node_id,
+                  changedByUsername: this.friendzProtocol?.getLocalUsername() ?? "",
+                }).catch((err) => {
+                  log.warn(TAG, "failed to send ACL change notification:", err);
+                });
+              });
               log.debug(TAG, "changed role for peer:", nodeId.slice(0, 16) + "...", "->", role);
             },
             onAddFriend: async (nodeId: string) => {
@@ -1085,8 +1132,51 @@ class SkeinRouter {
               log.debug(TAG, "cancelled pending invite for:", targetNodeId.slice(0, 16) + "...");
             },
           };
+            return shareOptions;
+          };
 
-          const shareHandle = showShareDialog(shareOptions);
+          // live-refresh: rebuild the dialog (and its options snapshot)
+          // whenever the canvas doc or messagez outbox changes, instead of
+          // leaving a stale snapshot on screen until the user manually
+          // closes and reopens it. `shareOptions`/`shareHandle` are mutable
+          // so the DEV test bridge below always reads the latest instance.
+          let shareActive = true;
+          let isRebuilding = false;
+          let shareOptions = buildShareOptions();
+          let shareHandle = showShareDialog(shareOptions);
+
+          let rebuildQueued = false;
+          const rebuild = () => {
+            if (!shareActive || rebuildQueued) return;
+            rebuildQueued = true;
+            queueMicrotask(() => {
+              rebuildQueued = false;
+              if (!shareActive) return;
+              // `shareHandle.remove()` fires the OLD dialog's `onClose`
+              // (`teardownSubscriptions`) as a side effect of tearing down
+              // its pixi/DOM state — `isRebuilding` tells that handler this
+              // is just an internal dialog swap, not the user actually
+              // closing the share panel, so it shouldn't unsubscribe.
+              isRebuilding = true;
+              shareHandle.remove();
+              isRebuilding = false;
+              shareOptions = buildShareOptions();
+              shareOptions.onClose = teardownSubscriptions;
+              shareHandle = showShareDialog(shareOptions);
+            });
+          };
+
+          const unsubStore = this.currentCanvas.store.onChange(() => rebuild());
+          const messagezListener = () => rebuild();
+          this.messagezDocHandle?.on("change", messagezListener);
+
+          const teardownSubscriptions = (): void => {
+            if (isRebuilding) return;
+            shareActive = false;
+            unsubStore();
+            this.messagezDocHandle?.off("change", messagezListener);
+          };
+          shareOptions.onClose = teardownSubscriptions;
 
           if (import.meta.env.DEV) {
             const bridge: Record<string, unknown> = ((window as any).__skeinTest ??= {});
@@ -1292,6 +1382,17 @@ class SkeinRouter {
     canvasColor: number;
     canvasPreviewUrl: string;
     fromUsername: string;
+    /** node id of the hub (or other peer) that relayed this invite via
+     *  gossip, if any — see `canvasInviteSchema`'s `relayedBy` field.
+     *  used as a connection fallback below when `fromNodeId` (the
+     *  original inviter) is offline, which is exactly the case a
+     *  gossip-relayed invite exists to handle in the first place. */
+    relayedBy?: string;
+    /** the role actually offered by this invite — see
+     *  `canvasInviteSchema`'s `role` field. defaults to "member" only for
+     *  backward compatibility with an already-in-flight event that
+     *  predates this field, not as an intended default. */
+    role?: InvitableRole;
   }): Promise<void> {
     log.debug(
       TAG,
@@ -1303,13 +1404,57 @@ class SkeinRouter {
 
     // ensure we have an identity (generates one if needed, starts midden)
     await ensureIdentity();
+    const identity = await getStoredIdentity();
 
-    // connect to the inviter's peer via the iroh adapter
+    // connect to the inviter's peer via the iroh adapter. if that fails
+    // and this invite was relayed through a hub, also try the hub directly
+    // — the hub already holds a synced copy of the canvas doc (that's how
+    // it was able to relay the invite at all), so it's a reachable source
+    // for the doc write below even while the original inviter stays
+    // offline. without this fallback, a hub-relayed invite's accept could
+    // never be recorded anywhere: the direct dial to a still-offline
+    // inviter fails, and there was no other way to reach the doc.
+    let connected = false;
     try {
       await this.irohAdapter.addPeer(detail.fromNodeId);
+      connected = true;
     } catch (err) {
       log.error(TAG, "failed to connect to invite peer:", err);
       // continue anyway — the peer might become reachable later
+    }
+    if (!connected && detail.relayedBy && detail.relayedBy !== detail.fromNodeId) {
+      try {
+        await this.irohAdapter.addPeer(detail.relayedBy);
+        connected = true;
+      } catch (err) {
+        log.error(TAG, "failed to connect to relaying hub:", err);
+      }
+    }
+
+    // durably record acceptance on the shared canvas doc itself, not just
+    // via a live wire message to the (possibly still-offline) inviter —
+    // this is what fixes invites getting stuck "pending" forever: once
+    // this write lands, ordinary automerge sync carries it to the inviter,
+    // the hub, and any other admin whenever they next connect, regardless
+    // of whether the direct accept message above ever got through. NOT
+    // gated on `connected` above: an already-locally-known doc (e.g. a
+    // canvas this peer already has a copy of) resolves via `repo.find()`
+    // from local storage with no network involved at all, so requiring a
+    // successful dial first would needlessly skip the durable write in
+    // that case too. bounded with a short timeout instead, so a doc that's
+    // genuinely unreachable from any known peer can't hang this handler.
+    if (identity) {
+      try {
+        const canvasStore = await Promise.race([
+          CanvasStore.open(this.repo, detail.canvasDocId as DocumentId),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("canvas doc open timed out")), 5000)
+          ),
+        ]);
+        canvasStore.markInviteAccepted(identity.node_id);
+      } catch (err) {
+        log.warn(TAG, "failed to record invite acceptance on canvas doc:", err);
+      }
     }
 
     // check if a canvas-card already exists for this docId on the narthex.
@@ -1371,12 +1516,12 @@ class SkeinRouter {
             // real ACL lives in the shared canvas doc's `.acl` map (see
             // CanvasStore.setRole/getRole), which an admin already writes
             // at invite-send time and which syncs to this peer automatically
-            // once they join the canvas. this field is hardcoded to
-            // "member" because the invite-accept event (see
-            // messagez-widget.ts's `canvasInviteSchema`) doesn't currently
-            // carry the actual chosen role through to this point — a
-            // cosmetic-only gap, tracked as a follow-up, not a security gap.
-            role: "member",
+            // once they join the canvas. now carries the actual role the
+            // invite offered (see messagez-widget.ts's `canvasInviteSchema`
+            // — used to be hardcoded to "member" regardless of what was
+            // actually offered, a real cosmetic bug fixed alongside
+            // onAclChange's live role-update wiring, see friendz-wiring.ts).
+            role: detail.role ?? "member",
             accessRevoked: false,
             lastVisitedAt: "",
           },

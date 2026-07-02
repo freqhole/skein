@@ -204,6 +204,43 @@ test.describe("share dialog", () => {
       .toContain(friendNodeId);
   });
 
+  test("share dialog live-refreshes without needing a manual close/reopen (bug fix)", async ({
+    page,
+  }) => {
+    // real user report this covers: inviting a friend (or any other canvas-
+    // doc/messagez change) while the share dialog is already open never
+    // showed up until the user closed and reopened the panel \u2014 boot.ts's
+    // onShare handler built a one-time snapshot with no live subscription.
+    await setup(page, "live refresh test canvas");
+
+    const friendNodeId = "d".repeat(64);
+    await seedFriend(page, { nodeId: friendNodeId, alias: "liverefresh", isHub: false });
+
+    // open the dialog once and leave it open for the rest of this test \u2014
+    // no second openShareDialog() call, unlike the bug-fix test above which
+    // explicitly reopens to prove the *old* (pre-fix) re-open behavior.
+    await openShareDialog(page);
+    await waitForShareHooks(page);
+
+    // the friend starts out rendered in the "invite friends" list.
+    await expect.poll(() => getShareFriendRowText(page, friendNodeId)).toBe("liverefresh");
+
+    // invite them \u2014 mutates the canvas doc (pendingInvites) and the
+    // messagez outbox, exactly as a real invite click would. the dialog is
+    // NEVER reopened after this.
+    await inviteFriendViaShareDialog(page, friendNodeId, "member");
+
+    // the already-open dialog should live-rebuild and drop the now-invited
+    // friend from its rendered "invite friends" rows on its own \u2014 before
+    // the fix, this row stayed rendered forever until a manual reopen.
+    await expect.poll(() => getShareFriendRowText(page, friendNodeId)).toBeNull();
+
+    // cancelling the invite (still without ever reopening the dialog)
+    // should live-rebuild it back to showing the friend as invitable again.
+    await cancelInviteViaShareDialog(page, friendNodeId);
+    await expect.poll(() => getShareFriendRowText(page, friendNodeId)).toBe("liverefresh");
+  });
+
   test("a hub friend and a non-hub friend carry the correct isHub flag into the invite list", async ({
     page,
   }) => {
@@ -323,5 +360,78 @@ test.describe("share dialog", () => {
 
     // a node id that was never rendered (not seeded) has no row at all.
     expect(await getShareFriendRowText(page, "9".repeat(64))).toBeNull();
+  });
+
+  test("accepting a canvas invite durably records acceptance even when the original inviter is unreachable (bug fix)", async ({
+    page,
+  }) => {
+    // real user report this covers: a hub-relayed invite's "pending" state
+    // in the share dialog never flipped to "accepted", staying pending
+    // forever. root cause: acceptCanvasInvite() (boot.ts) only ever sent a
+    // live wire "canvas-invite-accept" message straight to the original
+    // inviter and never durably wrote acceptance into the shared canvas
+    // doc itself \u2014 so if that inviter was offline (exactly the case a
+    // hub relay exists to handle), the accept vanished with nothing to
+    // show for it, even after the target came back online later.
+    const canvasDocId = await setup(page, "accept-durable test canvas");
+    const identity = await page.evaluate(async () => {
+      const social = (window as any).__skeinTest?.social;
+      return (await social.ensureIdentity()).node_id as string;
+    });
+
+    // a node id that will never be dialable in this test (no such peer
+    // exists) — stands in for "the original inviter is offline".
+    const unreachableInviter = "e".repeat(64);
+
+    // seed a pending invite for ourselves, as if an (offline/unreachable)
+    // peer had invited us to this very canvas \u2014 lets the test exercise
+    // acceptCanvasInvite()'s real logic without needing a second real,
+    // connected browser peer just to originate the invite.
+    await page.evaluate(
+      ({ selfId, inviter }) => {
+        (window as any).__skein.store.addPendingInvite(selfId, {
+          invitedBy: inviter,
+          invitedByUsername: "ghost",
+          role: "member",
+          invitedAt: new Date().toISOString(),
+        });
+      },
+      { selfId: identity, inviter: unreachableInviter }
+    );
+
+    // dispatch the real accept event, exactly as messagez-widget.ts's
+    // "accept" button does, with fromNodeId pointing at the unreachable
+    // peer and no relaying hub.
+    await page.evaluate(
+      ({ canvasDocId, inviter }) => {
+        window.dispatchEvent(
+          new CustomEvent("skein:accept-canvas-invite", {
+            detail: {
+              canvasDocId,
+              fromNodeId: inviter,
+              canvasTitle: "accept-durable test canvas",
+              canvasDescription: "",
+              canvasColor: 0,
+              canvasPreviewUrl: "",
+              fromUsername: "ghost",
+              relayedBy: "",
+            },
+          })
+        );
+      },
+      { canvasDocId, inviter: unreachableInviter }
+    );
+
+    // the fix: acceptance gets durably recorded on the canvas doc itself
+    // (via CanvasStore.open + markInviteAccepted), independent of whether
+    // the live wire message to the (unreachable) inviter ever landed.
+    await expect
+      .poll(async () =>
+        page.evaluate(
+          (selfId) => (window as any).__skein.store.pendingInvites()[selfId]?.accepted ?? null,
+          identity
+        )
+      )
+      .toBe(true);
   });
 });

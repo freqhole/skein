@@ -458,13 +458,17 @@ impl HubPeerService {
             FriendzMessage::GossipDigest {
                 canvas_updates,
                 pending_invites,
+                pending_knocks,
                 shared_canvas_ids,
+                profiles,
             } => {
                 self.handle_gossip_digest(
                     from_node_id,
                     canvas_updates,
                     pending_invites,
+                    pending_knocks,
                     shared_canvas_ids,
+                    profiles,
                 )
                 .await;
             }

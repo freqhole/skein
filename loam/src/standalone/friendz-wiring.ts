@@ -360,6 +360,7 @@ export async function initFriendzWiring(
         fromNodeId: msg.originNodeId,
         fromUsername: msg.originUsername ?? "unknown",
         relayedBy: fromNodeId !== msg.originNodeId ? fromNodeId : "",
+        role: msg.role,
         receivedAt: new Date().toISOString(),
         status: "pending" as const,
       };
@@ -523,12 +524,19 @@ export async function initFriendzWiring(
     }
   };
 
+  // ACL-change (role update / access revocation) handling — exported as a
+  // standalone function (mirrors `wireKnockHandlers`/`wireFriendHandlers`
+  // below) so it can be exercised directly in tests without the full
+  // narthex/social/messagez setup this function requires.
+  wireAclChangeHandlers({ protocol, repo, narthexDocId });
+
   // knock (access request) handling — mirrors the canvas-invite handlers
   // above; see `wireKnockHandlers()`'s doc comment for the full behavior.
   // exported as a standalone function (rather than inlined here) so it can
   // also be exercised directly in tests without needing the full narthex/
   // social/messagez setup this function requires.
   wireKnockHandlers({ protocol, repo, irohAdapter, localNodeId });
+
 
   // wire outbound requests through the bridge
   initBridge(protocol);
@@ -1100,6 +1108,17 @@ export async function initFriendzWiring(
 
   // handle incoming gossip digests from peers that just came online
   protocol.onGossipDigest = (msg, fromNodeId) => {
+    // defensive: normalize every array field up front. a digest
+    // constructed by a peer running mismatched code (e.g. reliquary's
+    // hub-constructed GossipDigest messages omitted `pendingKnocks`
+    // entirely before that field was added to the Rust wire struct) must
+    // degrade to "nothing to do for that field", not throw and abort
+    // processing of the OTHER fields in the same digest.
+    if (!Array.isArray(msg.canvasUpdates)) msg.canvasUpdates = [];
+    if (!Array.isArray(msg.pendingInvites)) msg.pendingInvites = [];
+    if (!Array.isArray(msg.pendingKnocks)) msg.pendingKnocks = [];
+    if (!Array.isArray(msg.profiles)) msg.profiles = [];
+
     // process canvas update notifications
     for (const update of msg.canvasUpdates) {
       // skip our own edits
@@ -1212,6 +1231,7 @@ export async function initFriendzWiring(
           fromNodeId: invite.invitedBy,
           fromUsername: invite.invitedByUsername ?? "unknown",
           relayedBy: fromNodeId,
+          role: invite.role,
           receivedAt: new Date().toISOString(),
           status: "pending" as const,
         });
@@ -1373,6 +1393,74 @@ export async function initFriendzWiring(
 // exercised directly in tests without the full narthex/social/messagez setup
 // `initFriendzWiring()` requires.
 // ---------------------------------------------------------------------------
+
+export interface AclChangeHandlersDeps {
+  protocol: FriendzProtocol;
+  repo: Repo;
+  narthexDocId: string;
+}
+
+/**
+ * wire the `acl-change` message handler onto `protocol` — an admin changed
+ * our role (or revoked access entirely) on a canvas.
+ *
+ * `sendAclChange`/`onAclChange` (friends-protocol.ts) already existed fully
+ * built and tested before this function, but were never actually wired
+ * into production. the underlying permission enforcement doesn't depend on
+ * this message at all — `.acl` is regular canvas-doc data, so ordinary
+ * automerge sync already carries a role change to any peer connected to
+ * that doc. this is purely a live UI notification so our own narthex
+ * canvas-card's role pill / revoked-overlay updates immediately, instead of
+ * staying stale until we happen to reconnect to that specific canvas doc
+ * directly (a real reported bug: a demoted peer kept seeing their old
+ * "member" pill on the narthex indefinitely).
+ *
+ * exported as a standalone function (mirrors `wireFriendHandlers`/
+ * `wireKnockHandlers`) so it can be exercised directly in tests without the
+ * full narthex/social/messagez setup `initFriendzWiring()` requires.
+ */
+export function wireAclChangeHandlers(deps: AclChangeHandlersDeps): void {
+  const { protocol, repo, narthexDocId } = deps;
+
+  protocol.onAclChange = (msg, fromNodeId) => {
+    log.debug(
+      TAG,
+      "received ACL change from:",
+      fromNodeId.slice(0, 16) + "...",
+      "canvas:",
+      msg.canvasDocId.slice(0, 16) + "...",
+      "newRole:",
+      msg.newRole
+    );
+
+    try {
+      const narthexHandle = repo.handles[narthexDocId as any];
+      const narthexDoc = narthexHandle?.doc();
+      if (!narthexDoc?.widgets) return;
+
+      for (const [_cardId, card] of Object.entries(narthexDoc.widgets) as any[]) {
+        if (card?.type !== "canvas-card") continue;
+        if ((card.props as any)?.canvasDocId !== msg.canvasDocId) continue;
+        if (!card.docId) continue;
+
+        const cardHandle = repo.handles[card.docId as any];
+        if (!cardHandle) continue;
+
+        cardHandle.change((draft: any) => {
+          if (msg.newRole === "removed") {
+            draft.accessRevoked = true;
+          } else {
+            draft.role = msg.newRole;
+            draft.accessRevoked = false;
+          }
+        });
+        break;
+      }
+    } catch (err) {
+      log.warn(TAG, "failed to apply ACL change to local canvas card:", err);
+    }
+  };
+}
 
 export interface FriendHandlersDeps {
   protocol: FriendzProtocol;
@@ -1747,6 +1835,16 @@ export async function mergeGossipDigestKnocks(
   fromNodeId: string,
   onKnockRelayed?: (info: KnockRelayInfo) => void
 ): Promise<void> {
+  // defensive: a digest missing this field entirely (rather than an empty
+  // array) should degrade to "nothing to merge", not crash — this exact
+  // gap (reliquary's hub-constructed GossipDigest messages omitted
+  // `pendingKnocks` until it was added to that Rust struct) used to throw
+  // "msg.pendingKnocks is not iterable" here and abort the whole digest,
+  // even the parts (canvasUpdates/pendingInvites/profiles) that were fine.
+  if (!Array.isArray(msg.pendingKnocks)) {
+    log.warn(TAG, "gossip digest: pendingKnocks missing or not an array, skipping knock merge");
+    return;
+  }
   for (const knock of msg.pendingKnocks) {
     try {
       const store = await CanvasStore.open(repo, knock.canvasDocId as DocumentId);

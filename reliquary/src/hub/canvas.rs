@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use crate::protocol::messages::{
-    FriendzMessage, GossipDigestCanvasUpdate, GossipDigestPendingInvite,
+    FriendzMessage, GossipDigestCanvasUpdate, GossipDigestPendingInvite, GossipDigestPendingKnock,
 };
 
 use super::HubPeerService;
@@ -36,6 +36,7 @@ impl HubPeerService {
 
         let mut canvas_updates: Vec<GossipDigestCanvasUpdate> = Vec::new();
         let mut pending_invites: Vec<GossipDigestPendingInvite> = Vec::new();
+        let mut pending_knocks: Vec<GossipDigestPendingKnock> = Vec::new();
         let mut shared_canvas_ids: Vec<String> = Vec::new();
 
         let hub_repo = self.hub_repo.clone();
@@ -53,7 +54,7 @@ impl HubPeerService {
 
             // read the automerge doc to extract metadata
             let peer_id = peer_node_id_owned.clone();
-            let (update, invite, peer_is_participant, is_deleted) =
+            let (update, invite, knocks, peer_is_participant, is_deleted) =
                 tokio::task::spawn_blocking(move || read_canvas_for_gossip(&handle, &peer_id))
                     .await
                     .unwrap_or_default();
@@ -84,15 +85,16 @@ impl HubPeerService {
             if let Some(i) = invite {
                 pending_invites.push(i);
             }
+            pending_knocks.extend(knocks);
         }
 
         // only share canvas IDs where the peer is a participant
 
-        if canvas_updates.is_empty() && pending_invites.is_empty() {
+        if canvas_updates.is_empty() && pending_invites.is_empty() && pending_knocks.is_empty() {
             tracing::debug!(
                 peer = %peer_node_id,
                 canvas_count = doc_ids.len(),
-                "gossip digest: no updates or invites, but sending shared canvas IDs"
+                "gossip digest: no updates, invites, or knocks, but sending shared canvas IDs"
             );
         }
 
@@ -100,6 +102,7 @@ impl HubPeerService {
             peer = %peer_node_id,
             updates = canvas_updates.len(),
             invites = pending_invites.len(),
+            knocks = pending_knocks.len(),
             shared_canvases = shared_canvas_ids.len(),
             "sending gossip digest"
         );
@@ -107,7 +110,11 @@ impl HubPeerService {
         let digest = FriendzMessage::GossipDigest {
             canvas_updates,
             pending_invites,
+            pending_knocks,
             shared_canvas_ids,
+            // the hub doesn't track profile docs at all — see
+            // `GossipDigestProfileEntry`'s doc comment in `protocol/messages.rs`.
+            profiles: Vec::new(),
         };
 
         if let Err(e) = self.friendz.send_message(peer_node_id, &digest).await {
@@ -587,11 +594,22 @@ impl HubPeerService {
 
     /// handle an incoming gossip digest from a peer that just came online.
     ///
-    /// processes two categories:
+    /// processes:
     /// - canvas_updates: for canvases the hub knows about, log the update
     ///   (the hub sees changes via automerge sync anyway)
     /// - pending_invites: for canvases the hub doesn't know about yet, treat
     ///   as a new invite — track the doc and start writing ourselves in
+    /// - pending_knocks: for canvases the hub already tracks, merge each
+    ///   relayed knock into the hub's own copy of the canvas doc (same
+    ///   idempotent `record_knock_in_canvas_doc` helper `handle_canvas_knock`
+    ///   uses) — this is what actually makes the hub a real relay for
+    ///   knocks: once merged into the hub's doc, ordinary automerge sync
+    ///   carries it to every other peer connected to the hub, including
+    ///   ones that come online later and were never directly connected to
+    ///   the original requester.
+    /// - profiles: not yet handled — the hub has no profile-doc tracking of
+    ///   its own (see `GossipDigestProfileEntry`'s doc comment in
+    ///   `protocol/messages.rs`). logged for visibility, not acted on.
     ///
     /// hub_repo receives docs passively via sync — no explicit request needed.
     pub(crate) async fn handle_gossip_digest(
@@ -599,14 +617,26 @@ impl HubPeerService {
         from_node_id: &str,
         canvas_updates: Vec<GossipDigestCanvasUpdate>,
         pending_invites: Vec<GossipDigestPendingInvite>,
+        pending_knocks: Vec<GossipDigestPendingKnock>,
         shared_canvas_ids: Vec<String>,
+        profiles: Vec<crate::protocol::messages::GossipDigestProfileEntry>,
     ) {
         tracing::info!(
             peer = %from_node_id,
             updates = canvas_updates.len(),
             invites = pending_invites.len(),
+            knocks = pending_knocks.len(),
+            profiles = profiles.len(),
             "received gossip digest"
         );
+
+        if !profiles.is_empty() {
+            tracing::debug!(
+                peer = %from_node_id,
+                count = profiles.len(),
+                "gossip: profile-doc pointers received, hub does not track profile docs — ignoring"
+            );
+        }
 
         // process canvas update notifications
         for update in &canvas_updates {
@@ -705,6 +735,48 @@ impl HubPeerService {
                 trigger.notify_one();
                 tracing::info!("triggered blob snatcher scan after gossip digest invite");
             });
+        }
+
+        // process relayed pending knocks — merge each one into the hub's own
+        // copy of the referenced canvas doc (if the hub tracks it). once
+        // merged, ordinary automerge sync carries it to every other peer
+        // connected to the hub, including ones that come online later and
+        // were never directly connected to the original requester. best
+        // effort per entry: silently skipped if the hub doesn't hold that
+        // canvas doc at all.
+        for knock in &pending_knocks {
+            let handle = match self.hub_repo.find(&knock.canvas_doc_id).await {
+                Some(h) => h,
+                None => {
+                    tracing::debug!(
+                        canvas_doc_id = %knock.canvas_doc_id,
+                        peer = %from_node_id,
+                        "gossip: relayed knock for a canvas the hub doesn't hold — skipping"
+                    );
+                    continue;
+                }
+            };
+            let requester_node_id = knock.requester_node_id.clone();
+            let requester_username = knock.requester_username.clone();
+            let message = knock.message.clone();
+            let recorded = tokio::task::spawn_blocking(move || {
+                record_knock_in_canvas_doc(
+                    &handle,
+                    &requester_node_id,
+                    &requester_username,
+                    &message,
+                )
+            })
+            .await
+            .unwrap_or(false);
+            if recorded {
+                tracing::info!(
+                    peer = %from_node_id,
+                    canvas_doc_id = %knock.canvas_doc_id,
+                    requester = %knock.requester_node_id,
+                    "gossip: merged relayed knock into hub's canvas doc"
+                );
+            }
         }
 
         // process shared canvas IDs — discover canvases we should be on but aren't
@@ -1186,6 +1258,7 @@ fn read_canvas_for_gossip(
 ) -> (
     Option<GossipDigestCanvasUpdate>,
     Option<GossipDigestPendingInvite>,
+    Vec<GossipDigestPendingKnock>,
     bool, // peer_is_participant: true if peer is in peers or pendingInvites
     bool, // is_deleted: true if canvas has been tombstoned
 ) {
@@ -1253,12 +1326,13 @@ fn read_canvas_for_gossip(
                         deleted: Some(true),
                     }),
                     None,
+                    Vec::new(),
                     true,
                     true,
                 );
             }
 
-            return (None, None, false, true);
+            return (None, None, Vec::new(), false, true);
         }
 
         // read lastModified
@@ -1268,9 +1342,11 @@ fn read_canvas_for_gossip(
         let last_modified_by: String = read_str(doc, &automerge::ROOT, "lastModifiedBy");
 
         // check if peer is on this canvas and has stale state
+        let mut peer_is_full_member = false;
         if let Ok(Some((_, peers_obj))) = doc.get(automerge::ROOT, "peers") {
             if let Ok(Some((_, peer_entry_obj))) = doc.get(peers_obj, peer_node_id) {
                 peer_is_participant = true;
+                peer_is_full_member = true;
                 // peer is on this canvas — check if they have stale data
                 let peer_last_seen = read_str(doc, &peer_entry_obj, "lastSeenAt");
 
@@ -1280,6 +1356,42 @@ fn read_canvas_for_gossip(
                         last_modified_at: last_modified.clone(),
                         last_modified_by: last_modified_by.clone(),
                         deleted: None,
+                    });
+                }
+            }
+        }
+
+        // check for pending knocks this peer can see and potentially relay
+        // onward — mirrors the JS `computeAndSendGossipDigest()` exactly:
+        // unlike pendingInvites (keyed by the invite's target), pendingKnocks
+        // is keyed by the *requester*'s node id, so "is this entry for
+        // peerNodeId" doesn't apply here. instead, gossip every open knock
+        // on canvases the peer already fully participates in (only full
+        // members/admins are in a position to act on or relay a knock
+        // further) — hence gating on `peer_is_full_member`, not the more
+        // permissive `peer_is_participant` (which also includes a peer who
+        // merely has a pending invite here, not yet a real member).
+        let mut pending_knocks: Vec<GossipDigestPendingKnock> = Vec::new();
+        if peer_is_full_member {
+            if let Ok(Some((_, pending_knocks_obj))) = doc.get(automerge::ROOT, "pendingKnocks") {
+                let keys: Vec<String> = doc.keys(&pending_knocks_obj).collect();
+                for requester_node_id in keys {
+                    if requester_node_id == peer_node_id {
+                        continue;
+                    }
+                    let knock_obj = match doc.get(&pending_knocks_obj, requester_node_id.as_str()) {
+                        Ok(Some((_, obj_id))) => obj_id,
+                        _ => continue,
+                    };
+                    let requester_username = read_str(doc, &knock_obj, "requesterUsername");
+                    let message = read_str(doc, &knock_obj, "message");
+                    let knocked_at = read_str(doc, &knock_obj, "knockedAt");
+                    pending_knocks.push(GossipDigestPendingKnock {
+                        canvas_doc_id: canvas_doc_id.clone(),
+                        requester_node_id,
+                        requester_username,
+                        message,
+                        knocked_at,
                     });
                 }
             }
@@ -1344,7 +1456,7 @@ fn read_canvas_for_gossip(
             }
         }
 
-        (update, invite, peer_is_participant, false)
+        (update, invite, pending_knocks, peer_is_participant, false)
     })
 }
 
@@ -1384,6 +1496,160 @@ mod tests {
         HubRepo::new("hub-node".to_string(), db_path)
             .await
             .expect("HubRepo::new (reload) should succeed")
+    }
+
+    /// seed a canvas doc with a `peers` entry for `member_node_id` and,
+    /// optionally, a `pendingKnocks` entry for `requester_node_id` — for
+    /// exercising `read_canvas_for_gossip`'s knock-scanning gate (only
+    /// gossips knocks to peers who are full `peers` members).
+    async fn seed_canvas_with_peer_and_knock(
+        db_path: &std::path::Path,
+        canvas_doc_id: &str,
+        member_node_id: &str,
+        knock: Option<(&str, &str, &str)>, // (requester_node_id, username, message)
+    ) -> HubRepo {
+        let storage = crate::hub_repo::HubDocStorage::new(db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            tx.put(automerge::ROOT, "version", 1_i64)?;
+            tx.put_object(automerge::ROOT, "widgets", automerge::ObjType::Map)?;
+            tx.put(automerge::ROOT, "title", "test canvas")?;
+
+            let peers = tx.put_object(automerge::ROOT, "peers", automerge::ObjType::Map)?;
+            let peer_entry = tx.put_object(&peers, member_node_id, automerge::ObjType::Map)?;
+            tx.put(&peer_entry, "lastSeenAt", "2025-01-01T00:00:00Z")?;
+
+            if let Some((requester_node_id, username, message)) = knock {
+                let pending =
+                    tx.put_object(automerge::ROOT, "pendingKnocks", automerge::ObjType::Map)?;
+                let knock_obj =
+                    tx.put_object(&pending, requester_node_id, automerge::ObjType::Map)?;
+                tx.put(&knock_obj, "requesterNodeId", requester_node_id)?;
+                tx.put(&knock_obj, "requesterUsername", username)?;
+                tx.put(&knock_obj, "message", message)?;
+                tx.put(&knock_obj, "knockedAt", "2025-06-01T00:00:00Z")?;
+                tx.put_object(&knock_obj, "decisions", automerge::ObjType::List)?;
+            }
+            Ok(())
+        })
+        .expect("canvas doc transact should succeed");
+        storage.save_doc(canvas_doc_id, &doc.save()).await;
+
+        HubRepo::new("hub-node".to_string(), db_path)
+            .await
+            .expect("HubRepo::new (reload) should succeed")
+    }
+
+    #[tokio::test]
+    async fn read_canvas_for_gossip_includes_pending_knocks_for_a_full_member() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        let hub_repo = seed_canvas_with_peer_and_knock(
+            &db_path,
+            "canvas-1",
+            "member-node",
+            Some(("requester-1", "alice", "let me in")),
+        )
+        .await;
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+
+        let (_, _, knocks, peer_is_participant, is_deleted) =
+            tokio::task::spawn_blocking(move || read_canvas_for_gossip(&handle, "member-node"))
+                .await
+                .expect("spawn_blocking should not panic");
+
+        assert!(peer_is_participant);
+        assert!(!is_deleted);
+        assert_eq!(knocks.len(), 1);
+        assert_eq!(knocks[0].canvas_doc_id, "canvas-1");
+        assert_eq!(knocks[0].requester_node_id, "requester-1");
+        assert_eq!(knocks[0].requester_username, "alice");
+        assert_eq!(knocks[0].message, "let me in");
+    }
+
+    #[tokio::test]
+    async fn read_canvas_for_gossip_excludes_the_requesters_own_knock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        // the requester is ALSO a full member here (an edge case, but the
+        // gate should still exclude gossiping a peer their own knock back
+        // to them) — mirrors the JS `computeAndSendGossipDigest()`'s
+        // `if (knock.requesterNodeId === peerNodeId) continue;`.
+        let hub_repo = seed_canvas_with_peer_and_knock(
+            &db_path,
+            "canvas-1",
+            "requester-1",
+            Some(("requester-1", "alice", "let me in")),
+        )
+        .await;
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+
+        let (_, _, knocks, _, _) =
+            tokio::task::spawn_blocking(move || read_canvas_for_gossip(&handle, "requester-1"))
+                .await
+                .expect("spawn_blocking should not panic");
+
+        assert!(knocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_canvas_for_gossip_excludes_knocks_for_a_non_member_peer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        let hub_repo = seed_canvas_with_peer_and_knock(
+            &db_path,
+            "canvas-1",
+            "member-node",
+            Some(("requester-1", "alice", "let me in")),
+        )
+        .await;
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+
+        // "stranger-node" isn't in the `peers` map at all — only full
+        // members should ever be gossiped a canvas's pending knocks.
+        let (_, _, knocks, peer_is_participant, _) =
+            tokio::task::spawn_blocking(move || read_canvas_for_gossip(&handle, "stranger-node"))
+                .await
+                .expect("spawn_blocking should not panic");
+
+        assert!(!peer_is_participant);
+        assert!(knocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_canvas_for_gossip_returns_empty_knocks_when_none_pending() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        let hub_repo =
+            seed_canvas_with_peer_and_knock(&db_path, "canvas-1", "member-node", None).await;
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+
+        let (_, _, knocks, peer_is_participant, _) =
+            tokio::task::spawn_blocking(move || read_canvas_for_gossip(&handle, "member-node"))
+                .await
+                .expect("spawn_blocking should not panic");
+
+        assert!(peer_is_participant);
+        assert!(
+            knocks.is_empty(),
+            "a canvas with no pendingKnocks map at all must produce an empty vec, not panic"
+        );
     }
 
     #[tokio::test]

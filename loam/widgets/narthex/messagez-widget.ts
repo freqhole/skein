@@ -13,7 +13,7 @@ import {
 } from "../../src/p2p/friendz-bridge";
 import { getStoredIdentity } from "../../src/p2p/identity";
 import { approveKnock, declineKnock } from "../../src/standalone/friendz-wiring";
-import type { InvitableRole, PendingCanvasKnock } from "../../src/canvas/canvas-doc";
+import { invitableRoleSchema, type InvitableRole, type PendingCanvasKnock } from "../../src/canvas/canvas-doc";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import { defaultTheme } from "../../src/theme/skein-theme";
 import {
@@ -38,6 +38,12 @@ const canvasInviteSchema = z.object({
   fromNodeId: z.string(),
   fromUsername: z.string().default(""),
   relayedBy: z.string().catch(""),
+  // the role actually offered by the invite — falls back to "member" for
+  // any already-persisted invite written before this field existed, not as
+  // a design default (see boot.ts's acceptCanvasInvite, which used to
+  // hardcode "member" unconditionally on the resulting canvas-card; a real,
+  // now-fixed bug — see docs comment there).
+  role: invitableRoleSchema.catch("member"),
   receivedAt: z.string(),
   status: z.enum(["pending", "accepted", "declined"]).default("pending"),
 });
@@ -907,7 +913,13 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
 
             window.addEventListener("skein:accept-canvas-invite-done", onDone as EventListener);
 
-            // dispatch the accept event to boot.ts
+            // dispatch the accept event to boot.ts. `relayedBy` (the hub
+            // that relayed this invite, if any — see canvasInviteSchema) is
+            // included so boot.ts can fall back to connecting through the
+            // hub when the original inviter (`fromNodeId`) is still offline
+            // — otherwise a hub-relayed invite's accept can never durably
+            // record itself anywhere (see boot.ts's acceptCanvasInvite doc
+            // comment for the full "stuck pending forever" bug this fixes).
             window.dispatchEvent(
               new CustomEvent("skein:accept-canvas-invite", {
                 detail: {
@@ -918,6 +930,8 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
                   canvasColor: invite.canvasColor ?? 0,
                   canvasPreviewUrl: invite.canvasPreviewUrl ?? "",
                   fromUsername: invite.fromUsername ?? "",
+                  relayedBy: invite.relayedBy || "",
+                  role: invite.role,
                 },
               })
             );
@@ -1066,6 +1080,8 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
                   canvasColor: invite.canvasColor ?? 0,
                   canvasPreviewUrl: invite.canvasPreviewUrl ?? "",
                   fromUsername: invite.fromUsername ?? "",
+                  relayedBy: invite.relayedBy || "",
+                  role: invite.role,
                 },
               })
             );

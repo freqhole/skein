@@ -60,6 +60,43 @@ pub struct GossipDigestPendingInvite {
     pub invited_at: String,
 }
 
+/// a pending knock entry in a gossip digest — mirrors
+/// `GossipDigestPendingKnock` in `loam/src/p2p/friends-protocol.ts` exactly
+/// (field-for-field). this struct was missing from this enum entirely
+/// until now: the JS side added `pendingKnocks` to its wire shape when the
+/// knock feature landed, but this crate's `FriendzMessage::GossipDigest`
+/// variant (which the hub itself constructs in `hub::canvas::send_gossip_digest`
+/// and relays in `hub::messages`) was never updated to match — meaning any
+/// digest that passed through this crate silently dropped pending-knock
+/// data, and worse, decoded on the JS side as `undefined` rather than `[]`,
+/// crashing `mergeGossipDigestKnocks`'s `for (const knock of msg.pendingKnocks)`
+/// with "is not iterable". fixed by adding the field here and populating it
+/// at both call sites.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GossipDigestPendingKnock {
+    pub canvas_doc_id: String,
+    pub requester_node_id: String,
+    pub requester_username: String,
+    pub message: String,
+    pub knocked_at: String,
+}
+
+/// a profile-doc pointer entry in a gossip digest — mirrors
+/// `GossipDigestProfileEntry` in `loam/src/p2p/friends-protocol.ts`
+/// (docs/hub-and-profile-plan.md section 6). like `GossipDigestPendingKnock`
+/// above, this crate has no producer for it yet (the hub doesn't track
+/// profile docs at all) — added purely so this struct can round-trip a
+/// browser-originated digest that includes one without losing the field,
+/// the same way `sharedCanvasIds` is optional/omit-if-empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GossipDigestProfileEntry {
+    pub peer_node_id: String,
+    pub profile_doc_id: String,
+    pub updated_at: String,
+}
+
 // ---------------------------------------------------------------------------
 // the 15 friendz message types
 // ---------------------------------------------------------------------------
@@ -247,12 +284,22 @@ pub enum FriendzMessage {
         canvas_updates: Vec<GossipDigestCanvasUpdate>,
         #[serde(rename = "pendingInvites")]
         pending_invites: Vec<GossipDigestPendingInvite>,
+        /// see `GossipDigestPendingKnock`'s doc comment — this field was
+        /// missing entirely until now.
+        #[serde(rename = "pendingKnocks")]
+        #[serde(default)]
+        pending_knocks: Vec<GossipDigestPendingKnock>,
         /// sender's canvas doc IDs — lets the receiver compare and discover
         /// canvases they should be on but aren't tracking yet.
         #[serde(rename = "sharedCanvasIds")]
         #[serde(default)]
         #[serde(skip_serializing_if = "Vec::is_empty")]
         shared_canvas_ids: Vec<String>,
+        /// see `GossipDigestProfileEntry`'s doc comment.
+        #[serde(rename = "profiles")]
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        profiles: Vec<GossipDigestProfileEntry>,
     },
 
     /// batch blob availability query — "i need these blobs, which do you have?"
@@ -696,7 +743,9 @@ mod tests {
                 role: "member".to_string(),
                 invited_at: "2025-01-01T00:00:00Z".to_string(),
             }],
+            pending_knocks: vec![],
             shared_canvas_ids: vec![],
+            profiles: vec![],
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -779,10 +828,22 @@ mod tests {
             FriendzMessage::GossipDigest {
                 canvas_updates,
                 pending_invites,
+                pending_knocks,
                 shared_canvas_ids,
+                profiles,
             } => {
                 assert_eq!(canvas_updates.len(), 1);
                 assert!(pending_invites.is_empty());
+                // real regression case: a digest whose JSON simply omits
+                // "pendingKnocks"/"profiles" entirely (e.g. from a peer
+                // running older code, or the hub's own pre-fix construction
+                // that never set these fields at all) must decode as empty
+                // vecs, not fail or leave the field unreadable — this is
+                // exactly the gap that used to crash
+                // `mergeGossipDigestKnocks`'s `for (const knock of
+                // msg.pendingKnocks)` on the JS side with "is not iterable".
+                assert!(pending_knocks.is_empty());
+                assert!(profiles.is_empty());
                 assert!(shared_canvas_ids.is_empty());
             }
             _ => panic!("expected GossipDigest"),
@@ -834,7 +895,9 @@ mod tests {
         let msg = FriendzMessage::GossipDigest {
             canvas_updates: vec![],
             pending_invites: vec![],
+            pending_knocks: vec![],
             shared_canvas_ids: vec!["doc123".to_string(), "doc456".to_string()],
+            profiles: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"sharedCanvasIds\""));

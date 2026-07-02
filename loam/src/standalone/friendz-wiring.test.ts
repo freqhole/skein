@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 import { createTestRepo } from "../test-helpers/automerge-helpers";
-import { docHandleAsSocialDoc, wireFriendHandlers } from "./friendz-wiring";
+import { docHandleAsSocialDoc, wireAclChangeHandlers, wireFriendHandlers } from "./friendz-wiring";
 import { FriendzProtocol, type FriendzProtocolOptions } from "../p2p/friends-protocol";
 import type { MiddenStreamNode } from "../p2p/iroh-network-adapter";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
@@ -249,5 +249,132 @@ describe("wireFriendHandlers — onFriendAccept", () => {
 
     const friend = sDoc.current.friends.find((f) => f.nodeIds.some((n) => n.nodeId === BOB));
     expect(friend!.isHub).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// wireAclChangeHandlers — onAclChange
+//
+// covers the real, previously-unwired bug: sendAclChange/onAclChange
+// existed fully built and tested in friends-protocol.ts, but nothing ever
+// called wireAclChangeHandlers() in production, so a demoted/revoked
+// peer's own narthex canvas-card never reflected the change.
+// ---------------------------------------------------------------------------
+
+describe("wireAclChangeHandlers — onAclChange", () => {
+  const TARGET_CANVAS_DOC_ID = "canvas-doc-1";
+
+  /** seed a narthex doc with a single canvas-card widget (on its own doc,
+   *  same two-doc shape production uses) referencing TARGET_CANVAS_DOC_ID,
+   *  with the given initial role/accessRevoked. returns both handles. */
+  function seedNarthexWithCard(role: string, accessRevoked: boolean) {
+    const repo = createTestRepo();
+    const cardHandle = repo.create<any>({
+      canvasDocId: TARGET_CANVAS_DOC_ID,
+      isRemote: true,
+      role,
+      accessRevoked,
+    });
+    const narthexHandle = repo.create<any>({
+      widgets: {
+        "widget-1": {
+          type: "canvas-card",
+          docId: cardHandle.documentId,
+          props: { canvasDocId: TARGET_CANVAS_DOC_ID },
+        },
+      },
+    });
+    return { repo, narthexHandle, cardHandle };
+  }
+
+  it("updates the matching narthex card's role when newRole is a real role", () => {
+    const { repo, narthexHandle, cardHandle } = seedNarthexWithCard("member", false);
+    const protocol = createTestProtocol();
+    wireAclChangeHandlers({ protocol, repo, narthexDocId: narthexHandle.documentId });
+
+    protocol.onAclChange!(
+      {
+        type: "acl-change",
+        canvasDocId: TARGET_CANVAS_DOC_ID,
+        canvasTitle: "shared canvas",
+        targetNodeId: "me",
+        newRole: "viewer",
+        changedBy: BOB,
+        changedByUsername: "bob",
+      },
+      BOB
+    );
+
+    expect(cardHandle.doc().role).toBe("viewer");
+    expect(cardHandle.doc().accessRevoked).toBe(false);
+  });
+
+  it("sets accessRevoked on the matching narthex card when newRole is 'removed'", () => {
+    const { repo, narthexHandle, cardHandle } = seedNarthexWithCard("member", false);
+    const protocol = createTestProtocol();
+    wireAclChangeHandlers({ protocol, repo, narthexDocId: narthexHandle.documentId });
+
+    protocol.onAclChange!(
+      {
+        type: "acl-change",
+        canvasDocId: TARGET_CANVAS_DOC_ID,
+        canvasTitle: "shared canvas",
+        targetNodeId: "me",
+        newRole: "removed",
+        changedBy: BOB,
+        changedByUsername: "bob",
+      },
+      BOB
+    );
+
+    expect(cardHandle.doc().accessRevoked).toBe(true);
+    // the last real role is left in place — accessRevoked, not the role
+    // itself, is what canvas-card.ts's drawRevokedOverlay() gates on.
+    expect(cardHandle.doc().role).toBe("member");
+  });
+
+  it("re-admitting after a revocation (a real role arriving again) clears accessRevoked", () => {
+    const { repo, narthexHandle, cardHandle } = seedNarthexWithCard("viewer", true);
+    const protocol = createTestProtocol();
+    wireAclChangeHandlers({ protocol, repo, narthexDocId: narthexHandle.documentId });
+
+    protocol.onAclChange!(
+      {
+        type: "acl-change",
+        canvasDocId: TARGET_CANVAS_DOC_ID,
+        canvasTitle: "shared canvas",
+        targetNodeId: "me",
+        newRole: "member",
+        changedBy: BOB,
+        changedByUsername: "bob",
+      },
+      BOB
+    );
+
+    expect(cardHandle.doc().role).toBe("member");
+    expect(cardHandle.doc().accessRevoked).toBe(false);
+  });
+
+  it("ignores an ACL change for a canvas this peer has no matching narthex card for", () => {
+    const { repo, narthexHandle, cardHandle } = seedNarthexWithCard("member", false);
+    const protocol = createTestProtocol();
+    wireAclChangeHandlers({ protocol, repo, narthexDocId: narthexHandle.documentId });
+
+    protocol.onAclChange!(
+      {
+        type: "acl-change",
+        canvasDocId: "some-other-canvas",
+        canvasTitle: "unrelated canvas",
+        targetNodeId: "me",
+        newRole: "viewer",
+        changedBy: BOB,
+        changedByUsername: "bob",
+      },
+      BOB
+    );
+
+    // untouched — no card matches "some-other-canvas"
+    expect(cardHandle.doc().role).toBe("member");
+    expect(cardHandle.doc().accessRevoked).toBe(false);
   });
 });
