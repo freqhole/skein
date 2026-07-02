@@ -247,6 +247,99 @@ impl HubPeerService {
         });
     }
 
+    /// handle an incoming canvas knock — a request for canvas access from a
+    /// peer who is not yet a friend/collaborator on the canvas.
+    ///
+    /// unlike [`Self::handle_canvas_invite`], this does **not** gate on
+    /// friendship: a knock's entire purpose is to let a stranger ask for
+    /// access, so requiring `is_friend` first would make the feature
+    /// impossible to use. the hub instead requires that it already holds a
+    /// live copy of the referenced canvas doc (via the existing "share
+    /// canvas with hub" flow, see `handle_canvas_invite`) — if it doesn't,
+    /// this is a graceful no-op (logged, no ack sent), not a panic or an
+    /// error response, since there is no doc to record the knock into.
+    ///
+    /// on success: records (or idempotently confirms an existing)
+    /// `pendingKnocks` entry directly in the hub's copy of the canvas doc
+    /// (see [`record_knock_in_canvas_doc`] for the exact idempotency
+    /// rules, mirroring `CanvasStore.recordKnock()`'s TS-side logic), then
+    /// sends a `canvas-knock-ack` back immediately (plan doc section 5.2) —
+    /// normal automerge sync then propagates the new entry to every
+    /// admin's device, no further push logic needed.
+    pub(crate) async fn handle_canvas_knock(
+        &self,
+        from_node_id: &str,
+        knock_id: &str,
+        canvas_doc_id: &str,
+        requester_node_id: &str,
+        requester_username: &str,
+        message: &str,
+    ) {
+        tracing::info!(
+            peer = %from_node_id,
+            knock_id = %knock_id,
+            canvas_doc_id = %canvas_doc_id,
+            requester = %requester_node_id,
+            requester_username = %requester_username,
+            "received canvas knock"
+        );
+
+        let handle = match self.hub_repo.find(canvas_doc_id).await {
+            Some(h) => h,
+            None => {
+                tracing::info!(
+                    peer = %from_node_id,
+                    canvas_doc_id = %canvas_doc_id,
+                    "ignoring canvas knock for a canvas doc the hub doesn't hold"
+                );
+                return;
+            }
+        };
+
+        let requester_node_id_owned = requester_node_id.to_string();
+        let requester_username_owned = requester_username.to_string();
+        let message_owned = message.to_string();
+
+        let recorded = tokio::task::spawn_blocking(move || {
+            record_knock_in_canvas_doc(
+                &handle,
+                &requester_node_id_owned,
+                &requester_username_owned,
+                &message_owned,
+            )
+        })
+        .await
+        .unwrap_or(false);
+
+        if !recorded {
+            tracing::info!(
+                canvas_doc_id = %canvas_doc_id,
+                "canvas knock not recorded — doc has no content yet (not synced)"
+            );
+            return;
+        }
+
+        let ack = FriendzMessage::CanvasKnockAck {
+            knock_id: knock_id.to_string(),
+            canvas_doc_id: canvas_doc_id.to_string(),
+            acker_node_id: self.node_id_str.clone(),
+        };
+        if let Err(e) = self.friendz.send_message(from_node_id, &ack).await {
+            tracing::warn!(
+                peer = %from_node_id,
+                error = %e,
+                "failed to send canvas knock ack"
+            );
+        } else {
+            tracing::info!(
+                peer = %from_node_id,
+                knock_id = %knock_id,
+                canvas_doc_id = %canvas_doc_id,
+                "canvas knock ack sent"
+            );
+        }
+    }
+
     /// schedule a background task to write the hub peer into a canvas doc's
     /// `peers` map and remove from `pendingInvites`.
     ///
@@ -981,6 +1074,103 @@ fn write_self_to_canvas_doc(
     })
 }
 
+/// record a knock into a canvas doc's `pendingKnocks` map, or leave it
+/// unchanged if an entry for this requester already exists.
+///
+/// mirrors `CanvasStore.recordKnock()`'s TS-side idempotency rules (see
+/// `canvas-doc.ts`'s `PendingCanvasKnock` doc comment and
+/// `docs/knock-and-hub-relay-plan.md` section 3.2) — tomb's
+/// `UNIQUE(node_id)` + idempotent-retry + silent-rejection behavior,
+/// adapted to an automerge map instead of a SQL constraint. in every
+/// "entry already exists" case (still fully pending, already declined, or
+/// already approved) the existing entry is left untouched — no update, no
+/// duplicate — so this function only ever needs two branches: "insert a
+/// fresh entry" or "no-op, it's already there."
+///
+/// returns `true` if the knock is now recorded (either freshly inserted or
+/// already present from an earlier attempt), `false` if the canvas doc has
+/// no content yet (not synced) and nothing could be written — same
+/// "is this doc actually synced" gate `write_self_to_canvas_doc` uses.
+///
+/// runs inside `spawn_blocking` because doc access holds a lock.
+fn record_knock_in_canvas_doc(
+    handle: &crate::hub_repo::DocHandle,
+    requester_node_id: &str,
+    requester_username: &str,
+    message: &str,
+) -> bool {
+    use automerge::ReadDoc;
+
+    handle.with_document_mut(|doc| {
+        let has_version = doc.get(automerge::ROOT, "version").ok().flatten().is_some();
+        let has_widgets = doc.get(automerge::ROOT, "widgets").ok().flatten().is_some();
+        let has_title = doc.get(automerge::ROOT, "title").ok().flatten().is_some();
+        if !has_version && !has_widgets && !has_title {
+            tracing::info!("record_knock_in_canvas_doc: doc has no content yet — not synced");
+            return false;
+        }
+
+        // idempotent: an entry already exists for this requester (pending,
+        // approved, or declined) — leave it untouched, this is just a retry.
+        if let Ok(Some((_, pending_obj))) = doc.get(automerge::ROOT, "pendingKnocks") {
+            if doc
+                .get(&pending_obj, requester_node_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                tracing::debug!(
+                    requester = %requester_node_id,
+                    "record_knock_in_canvas_doc: knock already recorded, idempotent no-op"
+                );
+                return true;
+            }
+        }
+
+        let knocked_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+
+        let nid = requester_node_id.to_string();
+        let uname = requester_username.to_string();
+        let msg = message.to_string();
+
+        match doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+
+            let pending_obj = match tx.get(automerge::ROOT, "pendingKnocks")? {
+                Some((_, obj_id)) => obj_id,
+                None => tx.put_object(automerge::ROOT, "pendingKnocks", automerge::ObjType::Map)?,
+            };
+
+            // re-check inside the transaction: another writer may have
+            // recorded this same knock between the read above and here.
+            if tx.get(&pending_obj, nid.as_str())?.is_some() {
+                return Ok(());
+            }
+
+            let knock_obj = tx.put_object(&pending_obj, nid.as_str(), automerge::ObjType::Map)?;
+            tx.put(&knock_obj, "requesterNodeId", nid.as_str())?;
+            tx.put(&knock_obj, "requesterUsername", uname.as_str())?;
+            tx.put(&knock_obj, "message", msg.as_str())?;
+            tx.put(&knock_obj, "knockedAt", knocked_at.as_str())?;
+            tx.put_object(&knock_obj, "decisions", automerge::ObjType::List)?;
+
+            Ok(())
+        }) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    requester = %requester_node_id,
+                    error = ?e,
+                    "record_knock_in_canvas_doc: transact FAILED"
+                );
+                false
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // automerge doc reading helpers
 // ---------------------------------------------------------------------------
@@ -1157,4 +1347,177 @@ fn read_canvas_for_gossip(
 
         (update, invite, peer_is_participant, false)
     })
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub_repo::HubRepo;
+
+    /// seed a canvas doc with "synced" content (`version`/`widgets`/`title`
+    /// present — the same fields `record_knock_in_canvas_doc`'s and
+    /// `write_self_to_canvas_doc`'s "has this doc actually synced any
+    /// content yet" gate checks for) via `HubDocStorage`, then construct a
+    /// `HubRepo` against the same backing sqlite file so `find()` sees it.
+    /// mirrors `blob_acl.rs`'s `seed_canvas_and_widget` seeding pattern —
+    /// `HubRepo` has no public "insert this doc and make it immediately
+    /// findable" method outside of applying a real automerge sync message.
+    async fn seed_synced_canvas_doc(db_path: &std::path::Path, canvas_doc_id: &str) -> HubRepo {
+        let storage = crate::hub_repo::HubDocStorage::new(db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            tx.put(automerge::ROOT, "version", 1_i64)?;
+            tx.put_object(automerge::ROOT, "widgets", automerge::ObjType::Map)?;
+            tx.put(automerge::ROOT, "title", "test canvas")?;
+            Ok(())
+        })
+        .expect("canvas doc transact should succeed");
+        storage.save_doc(canvas_doc_id, &doc.save()).await;
+
+        HubRepo::new("hub-node".to_string(), db_path)
+            .await
+            .expect("HubRepo::new (reload) should succeed")
+    }
+
+    #[tokio::test]
+    async fn record_knock_creates_a_pending_knocks_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        let hub_repo = seed_synced_canvas_doc(&db_path, "canvas-1").await;
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+
+        // `DocHandle::with_document`/`record_knock_in_canvas_doc` use
+        // blocking RwLock calls — always run inside `spawn_blocking`, same
+        // as every production call site.
+        tokio::task::spawn_blocking(move || {
+            let recorded =
+                record_knock_in_canvas_doc(&handle, "requester-1", "alice", "hello, let me in");
+            assert!(recorded, "a knock into a synced doc should be recorded");
+
+            use automerge::ReadDoc;
+            handle.with_document(|doc| {
+                let (_, pending_obj) = doc
+                    .get(automerge::ROOT, "pendingKnocks")
+                    .unwrap()
+                    .expect("pendingKnocks map should exist");
+                let (_, knock_obj) = doc
+                    .get(&pending_obj, "requester-1")
+                    .unwrap()
+                    .expect("knock entry should exist");
+
+                let (username_val, _) = doc.get(&knock_obj, "requesterUsername").unwrap().unwrap();
+                assert_eq!(username_val.to_str(), Some("alice"));
+                let (message_val, _) = doc.get(&knock_obj, "message").unwrap().unwrap();
+                assert_eq!(message_val.to_str(), Some("hello, let me in"));
+                let (node_id_val, _) = doc.get(&knock_obj, "requesterNodeId").unwrap().unwrap();
+                assert_eq!(node_id_val.to_str(), Some("requester-1"));
+
+                let (_, decisions_obj) = doc
+                    .get(&knock_obj, "decisions")
+                    .unwrap()
+                    .expect("decisions list should exist");
+                assert_eq!(
+                    doc.length(&decisions_obj),
+                    0,
+                    "a fresh knock has no decisions yet"
+                );
+            });
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+    }
+
+    #[tokio::test]
+    async fn record_knock_retry_is_idempotent_and_does_not_overwrite() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        let hub_repo = seed_synced_canvas_doc(&db_path, "canvas-1").await;
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+
+        tokio::task::spawn_blocking(move || {
+            assert!(record_knock_in_canvas_doc(
+                &handle,
+                "requester-1",
+                "alice",
+                "first message"
+            ));
+            // retry with a different username/message — a legitimate retry
+            // (e.g. the requester never got an ack) must NOT overwrite the
+            // original entry, mirroring `CanvasStore.recordKnock()`'s
+            // "already pending, no decisions yet -> return unchanged" rule.
+            assert!(record_knock_in_canvas_doc(
+                &handle,
+                "requester-1",
+                "mallory",
+                "second message"
+            ));
+
+            use automerge::ReadDoc;
+            handle.with_document(|doc| {
+                let (_, pending_obj) = doc.get(automerge::ROOT, "pendingKnocks").unwrap().unwrap();
+                let keys: Vec<String> = doc.keys(&pending_obj).collect();
+                assert_eq!(keys.len(), 1, "retry must not create a duplicate entry");
+
+                let (_, knock_obj) = doc.get(&pending_obj, "requester-1").unwrap().unwrap();
+                let (username_val, _) = doc.get(&knock_obj, "requesterUsername").unwrap().unwrap();
+                assert_eq!(
+                    username_val.to_str(),
+                    Some("alice"),
+                    "retry must not overwrite the original requesterUsername"
+                );
+                let (message_val, _) = doc.get(&knock_obj, "message").unwrap().unwrap();
+                assert_eq!(
+                    message_val.to_str(),
+                    Some("first message"),
+                    "retry must not overwrite the original message"
+                );
+            });
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+    }
+
+    #[tokio::test]
+    async fn record_knock_returns_false_when_doc_has_no_content_yet() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+
+        // an empty doc (no version/widgets/title) — mirrors the "not synced
+        // yet" state a canvas doc can be in right after the hub starts
+        // tracking it, before any content has arrived.
+        let storage = crate::hub_repo::HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+        let empty_doc = automerge::Automerge::new();
+        storage.save_doc("canvas-empty", &empty_doc.save()).await;
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new should succeed");
+        let handle = hub_repo
+            .find("canvas-empty")
+            .await
+            .expect("doc should be found");
+
+        let recorded = tokio::task::spawn_blocking(move || {
+            record_knock_in_canvas_doc(&handle, "requester-1", "alice", "hi")
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+        assert!(!recorded, "an unsynced doc must not be written to");
+    }
 }

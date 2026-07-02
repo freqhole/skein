@@ -663,3 +663,223 @@ test("onEphemeral receives broadcast messages from the same peer", async ({ canv
     .poll(() => peerB.page.evaluate(() => (window as any).__lastEphemeral), { timeout: 5000 })
     .toEqual([1, 2, 3]);
 });
+
+// ---------------------------------------------------------------------------
+// knock requests
+// ---------------------------------------------------------------------------
+
+test("recordKnock on a fresh node id creates a new entry with empty decisions", async ({
+  canvasPage,
+}) => {
+  const { page } = await canvasPage();
+
+  const knock = await page.evaluate(() =>
+    (window as any).__skein.store.recordKnock("requester-1", "alice", "hi, it's alice")
+  );
+
+  expect(knock.requesterNodeId).toBe("requester-1");
+  expect(knock.requesterUsername).toBe("alice");
+  expect(knock.message).toBe("hi, it's alice");
+  expect(knock.decisions).toEqual([]);
+  expect(knock.knockedAt).toBeTruthy();
+});
+
+test("recordKnock is idempotent for a still-pending retry", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  const first = await page.evaluate(() =>
+    (window as any).__skein.store.recordKnock("requester-1", "alice", "first message")
+  );
+  const second = await page.evaluate(() =>
+    (window as any).__skein.store.recordKnock("requester-1", "alice-retry", "different message")
+  );
+
+  // the existing entry is returned unchanged — not overwritten with the
+  // retry's (possibly different) username/message, and decisions/knockedAt
+  // aren't reset.
+  expect(second).toEqual(first);
+  expect(second.requesterUsername).toBe("alice");
+  expect(second.message).toBe("first message");
+});
+
+test("recordKnock returns the existing entry unchanged once approved", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() =>
+    (window as any).__skein.store.recordKnock("requester-1", "alice", "hi")
+  );
+  await page.evaluate(() =>
+    (window as any).__skein.store.addKnockDecision("requester-1", "admin-1", "approve", "member")
+  );
+
+  const resolved = await page.evaluate(() =>
+    (window as any).__skein.store.recordKnock("requester-1", "someone-else", "a new message")
+  );
+
+  expect(resolved.decisions.length).toBe(1);
+  expect(resolved.decisions[0].decision).toBe("approve");
+  // not overwritten by the second call's (different) args
+  expect(resolved.requesterUsername).toBe("alice");
+  expect(resolved.message).toBe("hi");
+});
+
+test("recordKnock returns the existing entry unchanged once declined", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() =>
+    (window as any).__skein.store.recordKnock("requester-1", "alice", "hi")
+  );
+  await page.evaluate(() =>
+    (window as any).__skein.store.addKnockDecision("requester-1", "admin-1", "decline")
+  );
+
+  const resolved = await page.evaluate(() =>
+    (window as any).__skein.store.recordKnock("requester-1", "someone-else", "a new message")
+  );
+
+  expect(resolved.decisions.length).toBe(1);
+  expect(resolved.decisions[0].decision).toBe("decline");
+  // not overwritten, and no second pending entry is created — the map is
+  // still keyed by node id, so there's nothing else to create.
+  expect(resolved.requesterUsername).toBe("alice");
+  expect(resolved.message).toBe("hi");
+});
+
+test("resolveKnockDecision returns pending for a knock with zero decisions", async ({
+  canvasPage,
+}) => {
+  const { page } = await canvasPage();
+
+  const outcome = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    const knock = store.recordKnock("requester-1", "alice", "hi");
+    return store.resolveKnockDecision(knock);
+  });
+
+  expect(outcome).toEqual({ outcome: "pending" });
+});
+
+test("resolveKnockDecision returns approved with the correct role", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  const outcome = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    store.recordKnock("requester-1", "alice", "hi");
+    store.addKnockDecision("requester-1", "admin-1", "approve", "viewer");
+    const knock = store.doc().pendingKnocks["requester-1"];
+    return store.resolveKnockDecision(knock);
+  });
+
+  expect(outcome).toEqual({ outcome: "approved", decidedBy: "admin-1", role: "viewer" });
+});
+
+test("resolveKnockDecision returns declined", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  const outcome = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    store.recordKnock("requester-1", "alice", "hi");
+    store.addKnockDecision("requester-1", "admin-1", "decline");
+    const knock = store.doc().pendingKnocks["requester-1"];
+    return store.resolveKnockDecision(knock);
+  });
+
+  expect(outcome).toEqual({ outcome: "declined", decidedBy: "admin-1", role: undefined });
+});
+
+test("resolveKnockDecision: first-decision-wins when approve is recorded before a late decline", async ({
+  canvasPage,
+}) => {
+  const { page } = await canvasPage();
+
+  const result = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    store.recordKnock("requester-1", "alice", "hi");
+    store.addKnockDecision("requester-1", "admin-1", "approve", "member");
+    // simulate a late admin declining after the first decision already
+    // resolved things
+    store.addKnockDecision("requester-1", "admin-2", "decline");
+    const knock = store.doc().pendingKnocks["requester-1"];
+    return {
+      outcome: store.resolveKnockDecision(knock),
+      decisions: knock.decisions,
+    };
+  });
+
+  expect(result.outcome).toEqual({ outcome: "approved", decidedBy: "admin-1", role: "member" });
+  // nothing lost from the audit log — both decisions are still present
+  expect(result.decisions).toHaveLength(2);
+  expect(result.decisions[0]).toMatchObject({ byNodeId: "admin-1", decision: "approve" });
+  expect(result.decisions[1]).toMatchObject({ byNodeId: "admin-2", decision: "decline" });
+});
+
+test("resolveKnockDecision: first-decision-wins when decline is recorded before a late approve", async ({
+  canvasPage,
+}) => {
+  const { page } = await canvasPage();
+
+  const result = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    store.recordKnock("requester-1", "alice", "hi");
+    store.addKnockDecision("requester-1", "admin-1", "decline");
+    // simulate a late admin approving after the first decision already
+    // resolved things
+    store.addKnockDecision("requester-1", "admin-2", "approve", "viewer");
+    const knock = store.doc().pendingKnocks["requester-1"];
+    return {
+      outcome: store.resolveKnockDecision(knock),
+      decisions: knock.decisions,
+    };
+  });
+
+  expect(result.outcome).toEqual({ outcome: "declined", decidedBy: "admin-1", role: undefined });
+  expect(result.decisions).toHaveLength(2);
+  expect(result.decisions[0]).toMatchObject({ byNodeId: "admin-1", decision: "decline" });
+  expect(result.decisions[1]).toMatchObject({ byNodeId: "admin-2", decision: "approve" });
+});
+
+test("addKnockDecision is a no-op for a nonexistent knock", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() =>
+    (window as any).__skein.store.addKnockDecision("no-such-node", "admin-1", "approve", "member")
+  );
+
+  const doc = await page.evaluate(() => (window as any).__skein.store.doc());
+  expect(doc.pendingKnocks?.["no-such-node"]).toBeUndefined();
+});
+
+// ---------------------------------------------------------------------------
+// hub relay
+// ---------------------------------------------------------------------------
+
+test("addHubNodeId/isHubNode: added node ids are recognized, others aren't", async ({
+  canvasPage,
+}) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => (window as any).__skein.store.addHubNodeId("hub-node-1"));
+
+  const results = await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    return {
+      hub: store.isHubNode("hub-node-1"),
+      notHub: store.isHubNode("some-other-node"),
+    };
+  });
+  expect(results.hub).toBe(true);
+  expect(results.notHub).toBe(false);
+});
+
+test("addHubNodeId does not create a duplicate entry", async ({ canvasPage }) => {
+  const { page } = await canvasPage();
+
+  await page.evaluate(() => {
+    const store = (window as any).__skein.store;
+    store.addHubNodeId("hub-node-1");
+    store.addHubNodeId("hub-node-1");
+  });
+
+  const hubNodeIds = await page.evaluate(() => (window as any).__skein.store.doc().hubNodeIds);
+  expect(hubNodeIds).toEqual(["hub-node-1"]);
+});

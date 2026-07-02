@@ -1,7 +1,21 @@
 import { Assets, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
-import { sendCanvasInviteAccept, sendCanvasInviteDecline } from "../../src/p2p/friendz-bridge";
+import {
+  getKnockRelayedBy,
+  getKnockSocialDoc,
+  getProtocol,
+  onKnockAcked,
+  onKnockRelayed,
+  recordKnockAck,
+  recordKnockRelay,
+  sendCanvasInviteAccept,
+  sendCanvasInviteDecline,
+} from "../../src/p2p/friendz-bridge";
 import { getStoredIdentity } from "../../src/p2p/identity";
+import { approveKnock, declineKnock } from "../../src/standalone/friendz-wiring";
+import type { InvitableRole, PendingCanvasKnock } from "../../src/canvas/canvas-doc";
+import type { CanvasStore } from "../../src/canvas/canvas-store";
+import { defaultTheme } from "../../src/theme/skein-theme";
 import {
   isTransparent,
   safeColor,
@@ -67,6 +81,58 @@ export type CanvasShare = z.infer<typeof canvasShareSchema>;
 export type CanvasDeletedNotif = z.infer<typeof canvasDeletedNotifSchema>;
 export type MessagezState = z.infer<typeof messagezSchema>;
 
+/**
+ * pixi container refs for a rendered knock row's action controls — kept
+ * around (per requester node id, rebuilt every render) purely so the
+ * dev-only test bridge (see `testHooks` in `create()`) can compute real
+ * screen positions to click for e2e coverage, without hardcoding layout
+ * math that would silently drift out of sync with the actual rendering.
+ */
+interface KnockRowRefs {
+  roleToggleBtn: Container;
+  approveBtn: Container;
+  rejectBtn: Container;
+  ignoreBtn: Container;
+}
+
+/**
+ * dev-only hooks exposed on the widget controller (see boot.ts's
+ * `mountMessagesOverlay()`, which copies this onto `window.__skeinTest.messagez`
+ * under a DEV guard) so e2e tests can drive the knock row without brittle,
+ * hand-computed pixel math.
+ */
+export interface MessagezTestHooks {
+  /** global (screen-space) center position of a knock row's action button,
+   *  or null if that knock isn't currently rendered. */
+  getKnockActionGlobalPos(
+    requesterNodeId: string,
+    action: "roleToggle" | "approve" | "reject" | "ignore"
+  ): { x: number; y: number } | null;
+  /** requester node ids of every currently-visible pending-knock row. */
+  getVisibleKnockRequesterIds(): string[];
+  /** the rendered metadata line's text + hub-relay flag for a knock row,
+   *  alongside the row's title ("{username} wants access") and free-text
+   *  message — everything an e2e test needs to assert on rendered row
+   *  content without reaching into pixi internals. */
+  getKnockMetaInfo(
+    requesterNodeId: string
+  ): { text: string; isHub: boolean; title: string; message: string } | null;
+  /** the currently-displayed late-admin-conflict notice text for a knock row
+   *  (section 3.1/5.3), or null if no notice is showing. */
+  getKnockNoticeText(requesterNodeId: string): string | null;
+  /** the role currently selected in a knock row's member/viewer picker,
+   *  or null if that knock isn't currently rendered. */
+  getKnockRole(requesterNodeId: string): InvitableRole | null;
+  /** simulate a `canvas-knock-ack` arriving this session (bypasses the real
+   *  wire protocol) — used to test the requester's status banner. */
+  simulateKnockAck(canvasDocId: string): void;
+  /** simulate a knock having been relayed to us by `relayedBy` this session
+   *  (bypasses the real wire protocol) — used to test the "via hub" vs.
+   *  plain "relayed" attribution styling deterministically, without needing
+   *  a real second relay peer. */
+  simulateKnockRelay(canvasDocId: string, requesterNodeId: string, relayedBy: string): void;
+}
+
 // ---------------------------------------------------------------------------
 // visual constants
 // ---------------------------------------------------------------------------
@@ -100,6 +166,19 @@ const ACTION_BTN_SIZE = 22;
 const FONT = "system-ui, sans-serif";
 const RESOLUTION = 3;
 
+// knock (access-request) row — docs/knock-and-hub-relay-plan.md section 7.2.
+// a distinct accent (violet, not reused from anywhere else in this file)
+// keeps a knock row visually distinguishable from a canvas-invite row at a
+// glance, even though it's structurally the same template.
+const KNOCK_ACCENT = 0x8b5cf6;
+const KNOCK_ROW_HEIGHT = 108;
+// "via hub" attribution — section 7.3. reuses the theme's warning amber
+// (see theme/skein-theme.ts's `hubRelayed` token doc comment for why).
+const HUB_RELAYED_COLOR = defaultTheme.hubRelayed;
+// how long a late-admin-conflict notice ("already approved/declined by...")
+// stays on screen before the row is re-evaluated and (usually) disappears.
+const KNOCK_NOTICE_DURATION_MS = 5000;
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -117,6 +196,76 @@ function relativeTime(iso: string): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
+}
+
+// ---------------------------------------------------------------------------
+// ignore (local-only dismissal) — docs/knock-and-hub-relay-plan.md section
+// 3.1a. purely client-side: does NOT write to the canvas doc at all, just
+// hides a knock from THIS admin's own view of the pending list, persisted
+// across reloads via localStorage. no existing localStorage-wrapper utility
+// in this codebase to reuse (checked — only utils/log.ts touches
+// localStorage directly, with the same plain get/set-item style used here).
+// ---------------------------------------------------------------------------
+
+function dismissedKnocksKey(canvasDocId: string): string {
+  return `skein.dismissedKnocks.${canvasDocId}`;
+}
+
+function getDismissedKnocks(canvasDocId: string): Set<string> {
+  try {
+    const raw = localStorage.getItem(dismissedKnocksKey(canvasDocId));
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    return new Set(Array.isArray(parsed) ? parsed : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function addDismissedKnock(canvasDocId: string, requesterNodeId: string): void {
+  const dismissed = getDismissedKnocks(canvasDocId);
+  dismissed.add(requesterNodeId);
+  try {
+    localStorage.setItem(dismissedKnocksKey(canvasDocId), JSON.stringify([...dismissed]));
+  } catch {
+    // best effort — if localStorage is unavailable or full, the knock just
+    // won't stay dismissed across a reload, a safe fallback either way.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// knock actions — call through the friendz bridge (friendz-bridge.ts) to
+// reach approveKnock()/declineKnock() (standalone/friendz-wiring.ts, phase
+// 2, not modified here). exported for a later UI task originally; this is
+// the first real caller.
+// ---------------------------------------------------------------------------
+
+async function callApproveKnock(
+  store: CanvasStore,
+  requesterNodeId: string,
+  role: InvitableRole,
+  localNodeId: string
+): Promise<void> {
+  const protocol = getProtocol();
+  const socialDoc = getKnockSocialDoc();
+  if (!protocol || !socialDoc) {
+    console.warn("[messagez] cannot approve knock — friendz bridge not ready yet");
+    return;
+  }
+  await approveKnock({ protocol, store, socialDoc, localNodeId }, requesterNodeId, role);
+}
+
+async function callDeclineKnock(
+  store: CanvasStore,
+  requesterNodeId: string,
+  localNodeId: string
+): Promise<void> {
+  const protocol = getProtocol();
+  if (!protocol) {
+    console.warn("[messagez] cannot decline knock — friendz bridge not ready yet");
+    return;
+  }
+  await declineKnock({ protocol, store, localNodeId }, requesterNodeId);
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +311,76 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
     let localNodeId = "";
     getStoredIdentity().then((id) => {
       if (id) localNodeId = id.node_id;
+    });
+
+    // -----------------------------------------------------------------------
+    // knock (access-request) row state — docs/knock-and-hub-relay-plan.md
+    // section 7.2/7.3.
+    // -----------------------------------------------------------------------
+
+    // button refs per requester node id, rebuilt on every rebuildKnockRows()
+    // call — used by the dev-only test bridge (see `testHooks` below) to
+    // compute real screen positions to click.
+    const knockRowRefs = new Map<string, KnockRowRefs>();
+    // requester node id -> the role currently selected in that row's
+    // member/viewer picker — read by the test bridge (`getKnockRole()`) so
+    // e2e tests can verify the picker renders/toggles correctly.
+    const knockRowRoles = new Map<string, InvitableRole>();
+    // requester node id -> current row's metadata line text/hub-ness, for
+    // the test bridge to assert on without re-deriving the same logic.
+    const knockMetaInfo = new Map<
+      string,
+      { text: string; isHub: boolean; title: string; message: string }
+    >();
+    // late-admin-conflict notices (section 3.1/5.3), keyed by requester node
+    // id — displayed in place of the action row for a few seconds, see
+    // `setKnockNotice()`.
+    const activeKnockNotices = new Map<string, string>();
+    const knockNoticeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+    function setKnockNotice(requesterNodeId: string, text: string): void {
+      const existingTimer = knockNoticeTimers.get(requesterNodeId);
+      if (existingTimer) clearTimeout(existingTimer);
+      activeKnockNotices.set(requesterNodeId, text);
+      const timer = setTimeout(() => {
+        activeKnockNotices.delete(requesterNodeId);
+        knockNoticeTimers.delete(requesterNodeId);
+        layout(currentWidth, currentHeight);
+      }, KNOCK_NOTICE_DURATION_MS);
+      knockNoticeTimers.set(requesterNodeId, timer);
+      layout(currentWidth, currentHeight);
+    }
+
+    // requester's own status view (section 7.1) — canvas doc ids for which a
+    // canvas-knock-ack has arrived this session (live-only, see
+    // friendz-bridge.ts's `hasKnockAckForCanvas()` doc comment). rendered as
+    // a small banner in the outbox tab, reusing the outbox's existing
+    // "delivered" visual language per the plan doc's guidance.
+    const ackedKnockCanvasIds = new Set<string>();
+    const unsubKnockAcked = onKnockAcked((info) => {
+      if (!ackedKnockCanvasIds.has(info.canvasDocId)) {
+        ackedKnockCanvasIds.add(info.canvasDocId);
+        layout(currentWidth, currentHeight);
+      }
+    });
+
+    // live "via hub"/"relayed" attribution (section 7.3) — relay info arrives
+    // via `recordKnockRelay()` *after* the knock itself was already recorded
+    // (and already triggered its own doc-change render, see
+    // `wireKnockHandlers()`'s `onCanvasKnock` handler in friendz-wiring.ts),
+    // so without this subscription a relayed knock's row would render once
+    // with no attribution and never refresh to show it.
+    const unsubKnockRelayed = onKnockRelayed(() => {
+      layout(currentWidth, currentHeight);
+    });
+
+    // re-render whenever the currently-open canvas's own doc changes —
+    // pendingKnocks lives there, not in the messagez doc this widget's
+    // `ctx.doc` wraps (see docs/knock-and-hub-relay-plan.md section 1's
+    // table for the asymmetry), so the existing `ctx.doc.on("change", ...)`
+    // subscription below doesn't cover it.
+    const unsubCanvasStore = ctx.canvasStore?.onChange(() => {
+      layout(currentWidth, currentHeight);
     });
 
     // -----------------------------------------------------------------------
@@ -376,6 +595,21 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
     outboxEmptyText.eventMode = "none";
     container.addChild(outboxEmptyText);
 
+    // requester's own knock status view (section 7.1) — a small banner
+    // shown once a canvas-knock-ack arrives, reusing the outbox's existing
+    // "delivered" visual language (per the plan doc's guidance) rather than
+    // inventing a new status state. per the silent-rejection policy, this
+    // never distinguishes "declined" from "still pending" — an ack just
+    // means "your request was received," nothing more.
+    const knockAckBannerText = new Text({
+      text: "",
+      style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: DELIVERED_COLOR },
+      resolution: RESOLUTION,
+    });
+    knockAckBannerText.eventMode = "none";
+    knockAckBannerText.visible = false;
+    container.addChild(knockAckBannerText);
+
     outboxListContainer.on("wheel", (e: WheelEvent) => {
       const canScroll = totalOutboxHeight > outboxAreaHeight;
       if (!canScroll) return; // let the event pass through to the canvas viewport
@@ -544,14 +778,28 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
           rowContainer.addChild(descText);
         }
 
-        // line 3: from: username  ·  time
+        // line 3: from: username  ·  time  ·  relayed/via hub
         const displayName = invite.fromUsername || invite.fromNodeId.slice(0, 8);
+        // hub-ness (section 7.3) is only knowable for the currently-open
+        // canvas's own CanvasStore (`hubNodeIds` lives per-canvas-doc) — an
+        // invite for a different canvas than the one currently open falls
+        // back to the plain "relayed" suffix, same as before this feature.
+        const isHubInvite =
+          !!invite.relayedBy &&
+          !!ctx.canvasStore &&
+          ctx.canvasStore.handle.documentId === invite.canvasDocId &&
+          ctx.canvasStore.isHubNode(invite.relayedBy);
         let metaLabel = `from: ${displayName}  \u00b7  ${relativeTime(invite.receivedAt)}`;
-        if (invite.relayedBy) metaLabel += " (relayed)";
+        if (isHubInvite) metaLabel += " \u00b7 via hub";
+        else if (invite.relayedBy) metaLabel += " \u00b7 relayed";
 
         const metaText = new Text({
           text: metaLabel,
-          style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+          style: {
+            fontFamily: FONT,
+            fontSize: ROW_SUB_SIZE,
+            fill: isHubInvite ? HUB_RELAYED_COLOR : MUTED_TEXT,
+          },
           resolution: RESOLUTION,
         });
         metaText.eventMode = "none";
@@ -768,6 +1016,374 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
       }
 
       totalInboxHeight = sorted.length * ROW_HEIGHT;
+    };
+
+    // -----------------------------------------------------------------------
+    // rebuild pending-knock rows (docs/knock-and-hub-relay-plan.md section 7.2)
+    //
+    // structurally the same template as an invite row (identity area, a
+    // metadata line, action buttons) but reads from the currently-open
+    // canvas's own `CanvasStore` rather than this widget's own `ctx.doc` —
+    // see the asymmetry note above `visibleKnocks` in layout().
+    // -----------------------------------------------------------------------
+
+    const rebuildKnockRows = (
+      knocks: PendingCanvasKnock[],
+      contentW: number,
+      startY: number
+    ): number => {
+      const store = ctx.canvasStore;
+      knockRowRefs.clear();
+      knockMetaInfo.clear();
+      knockRowRoles.clear();
+      if (!store) return 0;
+      const canvasDocId = store.handle.documentId;
+
+      // newest first
+      const sorted = [...knocks].sort(
+        (a, b) => new Date(b.knockedAt).getTime() - new Date(a.knockedAt).getTime()
+      );
+
+      const leftW = COLOR_STRIPE_WIDTH + 4 + THUMB_SIZE + THUMB_MARGIN;
+      const textX = leftW;
+      const maxMsgChars = Math.max(10, Math.floor((contentW - leftW - 20) / (ROW_SUB_SIZE * 0.55)));
+
+      for (let i = 0; i < sorted.length; i++) {
+        const knock = sorted[i];
+        const rowY = startY + i * KNOCK_ROW_HEIGHT;
+
+        const rowContainer = new Container();
+        rowContainer.eventMode = "static";
+        rowContainer.y = rowY;
+        inboxListInner.addChild(rowContainer);
+
+        const rowBg = new Graphics();
+        rowBg.eventMode = "none";
+        if (i % 2 === 1) {
+          rowBg.rect(0, 0, contentW, KNOCK_ROW_HEIGHT);
+          rowBg.fill({ color: ROW_ALT_BG, alpha: 0.5 });
+        }
+        rowContainer.addChild(rowBg);
+
+        // color stripe — a distinct accent (not reused elsewhere in this
+        // file) so a knock row reads as visually different from a
+        // canvas-invite row at a glance.
+        const stripe = new Graphics();
+        stripe.eventMode = "none";
+        stripe.rect(0, 0, COLOR_STRIPE_WIDTH, KNOCK_ROW_HEIGHT);
+        stripe.fill({ color: KNOCK_ACCENT });
+        rowContainer.addChild(stripe);
+
+        // identity area — no canvas thumbnail makes sense here (a knock has
+        // no canvas preview to show), so this slot shows the requester's
+        // own identity instead: an initial-letter avatar.
+        const displayName = knock.requesterUsername || knock.requesterNodeId.slice(0, 8);
+        const avatarX = COLOR_STRIPE_WIDTH + 4;
+        const avatarY = (KNOCK_ROW_HEIGHT - THUMB_SIZE) / 2;
+
+        const avatarBg = new Graphics();
+        avatarBg.eventMode = "none";
+        avatarBg.circle(avatarX + THUMB_SIZE / 2, avatarY + THUMB_SIZE / 2, THUMB_SIZE / 2);
+        avatarBg.fill({ color: KNOCK_ACCENT, alpha: 0.25 });
+        rowContainer.addChild(avatarBg);
+
+        const avatarLetter = new Text({
+          text: (displayName.charAt(0) || "?").toUpperCase(),
+          style: {
+            fontFamily: FONT,
+            fontSize: 14,
+            fontWeight: "bold",
+            fill: KNOCK_ACCENT,
+            align: "center",
+          },
+          resolution: RESOLUTION,
+        });
+        avatarLetter.eventMode = "none";
+        avatarLetter.anchor.set(0.5);
+        avatarLetter.x = avatarX + THUMB_SIZE / 2;
+        avatarLetter.y = avatarY + THUMB_SIZE / 2;
+        rowContainer.addChild(avatarLetter);
+
+        // line 1: "{username} wants access"
+        const titleText = new Text({
+          text: `${displayName} wants access`,
+          style: {
+            fontFamily: FONT,
+            fontSize: ROW_NAME_SIZE,
+            fontWeight: "bold",
+            fill: TEXT_COLOR,
+          },
+          resolution: RESOLUTION,
+        });
+        titleText.eventMode = "none";
+        titleText.x = textX;
+        titleText.y = 8;
+        rowContainer.addChild(titleText);
+
+        // line 2: the knock's free-text message — new content, no existing
+        // row shows a message body today.
+        const msgText = new Text({
+          text: truncate(knock.message, maxMsgChars),
+          style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        msgText.eventMode = "none";
+        msgText.x = textX;
+        msgText.y = 25;
+        rowContainer.addChild(msgText);
+
+        // line 3: from: username · time · relayed/via hub (section 7.3)
+        const relayedBy = getKnockRelayedBy(canvasDocId, knock.requesterNodeId);
+        const isHub = !!relayedBy && store.isHubNode(relayedBy);
+        let metaLabel = `from: ${displayName}  \u00b7  ${relativeTime(knock.knockedAt)}`;
+        if (isHub) metaLabel += " \u00b7 via hub";
+        else if (relayedBy) metaLabel += " \u00b7 relayed";
+        knockMetaInfo.set(knock.requesterNodeId, {
+          text: metaLabel,
+          isHub,
+          title: titleText.text,
+          message: msgText.text,
+        });
+
+        const metaText = new Text({
+          text: metaLabel,
+          style: {
+            fontFamily: FONT,
+            fontSize: ROW_SUB_SIZE,
+            fill: isHub ? HUB_RELAYED_COLOR : MUTED_TEXT,
+          },
+          resolution: RESOLUTION,
+        });
+        metaText.eventMode = "none";
+        metaText.x = textX;
+        metaText.y = 41;
+        rowContainer.addChild(metaText);
+
+        const actionsY = KNOCK_ROW_HEIGHT - 30;
+
+        // late-admin conflict notice (section 3.1/5.3) — shown in place of
+        // the action row for a few seconds instead of the buttons.
+        const notice = activeKnockNotices.get(knock.requesterNodeId);
+        if (notice) {
+          const noticeText = new Text({
+            text: notice,
+            style: {
+              fontFamily: FONT,
+              fontSize: ROW_SUB_SIZE,
+              fontWeight: "bold",
+              fill: defaultTheme.warning,
+            },
+            resolution: RESOLUTION,
+          });
+          noticeText.eventMode = "none";
+          noticeText.x = textX;
+          noticeText.y = actionsY + 4;
+          rowContainer.addChild(noticeText);
+          continue;
+        }
+
+        let currentRole: InvitableRole = "member";
+        knockRowRoles.set(knock.requesterNodeId, currentRole);
+        const btnH = 22;
+        const gap = 8;
+
+        // role picker — member <-> viewer, same idea as share-dialog.ts's
+        // invite-friend role toggle (buildRoleToggle()); reimplemented
+        // locally since that helper isn't exported from that file.
+        const roleToggleW = 52;
+        const roleToggleBtn = new Container();
+        roleToggleBtn.eventMode = "static";
+        roleToggleBtn.cursor = "pointer";
+        roleToggleBtn.hitArea = new Rectangle(0, 0, roleToggleW, btnH);
+        roleToggleBtn.x = textX;
+        roleToggleBtn.y = actionsY;
+
+        const roleToggleBg = new Graphics();
+        const roleToggleLabel = new Text({
+          text: currentRole,
+          style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: 0xcbd5e1 },
+          resolution: RESOLUTION,
+        });
+        roleToggleLabel.eventMode = "none";
+        const drawRoleToggle = () => {
+          roleToggleBg.clear();
+          roleToggleBg.roundRect(0, 0, roleToggleW, btnH, 4);
+          roleToggleBg.fill({ color: 0x27272a });
+          roleToggleBg.stroke({ color: 0x3f3f46, width: 1 });
+          roleToggleLabel.text = currentRole;
+          roleToggleLabel.x = (roleToggleW - roleToggleLabel.width) / 2;
+          roleToggleLabel.y = (btnH - roleToggleLabel.height) / 2;
+        };
+        drawRoleToggle();
+        roleToggleBtn.addChild(roleToggleBg);
+        roleToggleBtn.addChild(roleToggleLabel);
+        roleToggleBtn.on("pointertap", (e) => {
+          e.stopPropagation();
+          currentRole = currentRole === "member" ? "viewer" : "member";
+          knockRowRoles.set(knock.requesterNodeId, currentRole);
+          drawRoleToggle();
+        });
+        rowContainer.addChild(roleToggleBtn);
+
+        // approve button
+        const approveW = 56;
+        const approveBtn = new Container();
+        approveBtn.eventMode = "static";
+        approveBtn.cursor = "pointer";
+        approveBtn.hitArea = new Rectangle(0, 0, approveW, btnH);
+        approveBtn.x = roleToggleBtn.x + roleToggleW + gap;
+        approveBtn.y = actionsY;
+
+        const approveBg = new Graphics();
+        approveBg.roundRect(0, 0, approveW, btnH, 4);
+        approveBg.fill({ color: 0x111118 });
+        approveBg.stroke({ color: ACCEPT_COLOR, width: 1.5 });
+        approveBtn.addChild(approveBg);
+
+        const approveLabel = new Text({
+          text: "approve",
+          style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: ACCEPT_COLOR },
+          resolution: RESOLUTION,
+        });
+        approveLabel.eventMode = "none";
+        approveLabel.anchor.set(0.5);
+        approveLabel.x = approveW / 2;
+        approveLabel.y = btnH / 2;
+        approveBtn.addChild(approveLabel);
+        rowContainer.addChild(approveBtn);
+
+        // reject button — a real, synced decline (section 3.1a), distinct
+        // from "ignore" below.
+        const rejectW = 52;
+        const rejectBtn = new Container();
+        rejectBtn.eventMode = "static";
+        rejectBtn.cursor = "pointer";
+        rejectBtn.hitArea = new Rectangle(0, 0, rejectW, btnH);
+        rejectBtn.x = approveBtn.x + approveW + gap;
+        rejectBtn.y = actionsY;
+
+        const rejectBg = new Graphics();
+        rejectBg.roundRect(0, 0, rejectW, btnH, 4);
+        rejectBg.fill({ color: 0x111118 });
+        rejectBg.stroke({ color: DECLINE_COLOR, width: 1.5 });
+        rejectBtn.addChild(rejectBg);
+
+        const rejectLabel = new Text({
+          text: "reject",
+          style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: DECLINE_COLOR },
+          resolution: RESOLUTION,
+        });
+        rejectLabel.eventMode = "none";
+        rejectLabel.anchor.set(0.5);
+        rejectLabel.x = rejectW / 2;
+        rejectLabel.y = btnH / 2;
+        rejectBtn.addChild(rejectLabel);
+        rowContainer.addChild(rejectBtn);
+
+        // ignore button — purely local dismissal (section 3.1a): does NOT
+        // call CanvasStore/the protocol at all, just hides this knock from
+        // this admin's own view (see getDismissedKnocks()/addDismissedKnock()).
+        const ignoreW = 52;
+        const ignoreBtn = new Container();
+        ignoreBtn.eventMode = "static";
+        ignoreBtn.cursor = "pointer";
+        ignoreBtn.hitArea = new Rectangle(0, 0, ignoreW, btnH);
+        ignoreBtn.x = rejectBtn.x + rejectW + gap;
+        ignoreBtn.y = actionsY;
+
+        const ignoreBg = new Graphics();
+        ignoreBg.roundRect(0, 0, ignoreW, btnH, 4);
+        ignoreBg.fill({ color: 0x111118 });
+        ignoreBg.stroke({ color: MUTED_TEXT, width: 1.5 });
+        ignoreBtn.addChild(ignoreBg);
+
+        const ignoreLabel = new Text({
+          text: "ignore",
+          style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        ignoreLabel.eventMode = "none";
+        ignoreLabel.anchor.set(0.5);
+        ignoreLabel.x = ignoreW / 2;
+        ignoreLabel.y = btnH / 2;
+        ignoreBtn.addChild(ignoreLabel);
+        rowContainer.addChild(ignoreBtn);
+
+        knockRowRefs.set(knock.requesterNodeId, {
+          roleToggleBtn,
+          approveBtn,
+          rejectBtn,
+          ignoreBtn,
+        });
+
+        const disableActions = () => {
+          roleToggleBtn.eventMode = "none";
+          approveBtn.eventMode = "none";
+          rejectBtn.eventMode = "none";
+          ignoreBtn.eventMode = "none";
+        };
+
+        const requesterNodeId = knock.requesterNodeId;
+
+        approveBtn.on("pointertap", (e) => {
+          e.stopPropagation();
+          disableActions();
+          approveLabel.text = "approving\u2026";
+          approveLabel.x = approveW / 2;
+          const chosenRole = currentRole;
+          (async () => {
+            await callApproveKnock(store, requesterNodeId, chosenRole, localNodeId);
+            const updated = store.doc().pendingKnocks?.[requesterNodeId];
+            if (updated) {
+              const resolved = store.resolveKnockDecision(updated);
+              if (resolved.outcome !== "approved" || resolved.decidedBy !== localNodeId) {
+                const verb = resolved.outcome === "approved" ? "approved" : "declined";
+                const decidedBy = resolved.decidedBy
+                  ? resolved.decidedBy.slice(0, 10)
+                  : "another admin";
+                setKnockNotice(requesterNodeId, `already ${verb} by ${decidedBy}`);
+                return;
+              }
+            }
+            layout(currentWidth, currentHeight);
+          })().catch((err) => {
+            console.warn("[messagez] approveKnock failed:", err);
+          });
+        });
+
+        rejectBtn.on("pointertap", (e) => {
+          e.stopPropagation();
+          disableActions();
+          rejectLabel.text = "rejecting\u2026";
+          rejectLabel.x = rejectW / 2;
+          (async () => {
+            await callDeclineKnock(store, requesterNodeId, localNodeId);
+            const updated = store.doc().pendingKnocks?.[requesterNodeId];
+            if (updated) {
+              const resolved = store.resolveKnockDecision(updated);
+              if (resolved.outcome !== "declined" || resolved.decidedBy !== localNodeId) {
+                const verb = resolved.outcome === "approved" ? "approved" : "declined";
+                const decidedBy = resolved.decidedBy
+                  ? resolved.decidedBy.slice(0, 10)
+                  : "another admin";
+                setKnockNotice(requesterNodeId, `already ${verb} by ${decidedBy}`);
+                return;
+              }
+            }
+            layout(currentWidth, currentHeight);
+          })().catch((err) => {
+            console.warn("[messagez] declineKnock failed:", err);
+          });
+        });
+
+        ignoreBtn.on("pointertap", (e) => {
+          e.stopPropagation();
+          addDismissedKnock(canvasDocId, requesterNodeId);
+          layout(currentWidth, currentHeight);
+        });
+      }
+
+      return sorted.length * KNOCK_ROW_HEIGHT;
     };
 
     // -----------------------------------------------------------------------
@@ -1057,9 +1673,29 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
       const invites = state.invites ?? [];
       const shares = state.shares ?? [];
       const deletions = state.deletions ?? [];
+
+      // pendingKnocks lives on the currently-open canvas's own document, not
+      // this messagez doc (see docs/knock-and-hub-relay-plan.md section 1's
+      // table for the asymmetry) — read it straight from `ctx.canvasStore`.
+      const canvasStore = ctx.canvasStore;
+      const canvasDocId = canvasStore?.handle.documentId ?? "";
+      const dismissedKnocks = canvasDocId ? getDismissedKnocks(canvasDocId) : new Set<string>();
+      const visibleKnocks: PendingCanvasKnock[] = canvasStore
+        ? Object.values(canvasStore.doc().pendingKnocks ?? {}).filter((k) => {
+            if (dismissedKnocks.has(k.requesterNodeId)) return false;
+            if (activeKnockNotices.has(k.requesterNodeId)) return true;
+            return canvasStore.resolveKnockDecision(k).outcome === "pending";
+          })
+        : [];
+      const pendingKnockCount = canvasStore
+        ? visibleKnocks.filter((k) => canvasStore.resolveKnockDecision(k).outcome === "pending")
+            .length
+        : 0;
+
       const pendingCount =
         invites.filter((inv: CanvasInvite) => inv.status === "pending").length +
-        deletions.filter((d: CanvasDeletedNotif) => d.status === "unread").length;
+        deletions.filter((d: CanvasDeletedNotif) => d.status === "unread").length +
+        pendingKnockCount;
       const contentW = w - PADDING_X * 2;
       let y = PADDING_Y;
 
@@ -1098,6 +1734,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
       inboxEmptyText.visible = false;
       outboxListContainer.visible = false;
       outboxEmptyText.visible = false;
+      knockAckBannerText.visible = false;
 
       if (viewMode === "inbox") {
         inboxListContainer.visible = true;
@@ -1127,6 +1764,11 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
 
         // rebuild rows
         rebuildInboxRows(visibleInvites, contentW);
+
+        // append pending-knock rows below invites (docs/knock-and-hub-relay-plan.md
+        // section 7.2) — read from the currently-open canvas's own doc, not
+        // this messagez doc, see the asymmetry note above `visibleKnocks`.
+        totalInboxHeight += rebuildKnockRows(visibleKnocks, contentW, totalInboxHeight);
 
         // append deletion notification rows below invites
         if (visibleDeletions.length > 0) {
@@ -1289,7 +1931,11 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         inboxListInner.y = -scrollY;
 
         // empty state
-        if (visibleInvites.length === 0 && visibleDeletions.length === 0) {
+        if (
+          visibleInvites.length === 0 &&
+          visibleDeletions.length === 0 &&
+          visibleKnocks.length === 0
+        ) {
           inboxEmptyText.text =
             invites.length > 0 || deletions.length > 0 ? "all resolved" : "no messages yet";
           inboxEmptyText.visible = true;
@@ -1299,8 +1945,24 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
       } else {
         outboxListContainer.visible = true;
 
-        outboxAreaY = y;
-        outboxAreaHeight = h - y - PADDING_Y;
+        // requester's own status banner (section 7.1) — see
+        // `knockAckBannerText`'s doc comment above.
+        let bannerHeight = 0;
+        if (ackedKnockCanvasIds.size > 0) {
+          const count = ackedKnockCanvasIds.size;
+          knockAckBannerText.text = `\u2713  request received, waiting for a response${
+            count > 1 ? ` (${count})` : ""
+          }`;
+          knockAckBannerText.visible = true;
+          knockAckBannerText.x = PADDING_X;
+          knockAckBannerText.y = y;
+          bannerHeight = knockAckBannerText.height + 8;
+        } else {
+          knockAckBannerText.visible = false;
+        }
+
+        outboxAreaY = y + bannerHeight;
+        outboxAreaHeight = h - outboxAreaY - PADDING_Y;
 
         // update mask
         outboxListMask.clear();
@@ -1346,11 +2008,52 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
     // controller
     // -----------------------------------------------------------------------
 
-    return {
+    const testHooks: MessagezTestHooks = {
+      getKnockActionGlobalPos(requesterNodeId, action) {
+        const refs = knockRowRefs.get(requesterNodeId);
+        if (!refs) return null;
+        const btn =
+          action === "roleToggle"
+            ? refs.roleToggleBtn
+            : action === "approve"
+              ? refs.approveBtn
+              : action === "reject"
+                ? refs.rejectBtn
+                : refs.ignoreBtn;
+        const pos = btn.getGlobalPosition();
+        return { x: pos.x + btn.width / 2, y: pos.y + btn.height / 2 };
+      },
+      getVisibleKnockRequesterIds() {
+        return [...knockRowRefs.keys()];
+      },
+      getKnockMetaInfo(requesterNodeId) {
+        return knockMetaInfo.get(requesterNodeId) ?? null;
+      },
+      getKnockNoticeText(requesterNodeId) {
+        return activeKnockNotices.get(requesterNodeId) ?? null;
+      },
+      getKnockRole(requesterNodeId) {
+        return knockRowRoles.get(requesterNodeId) ?? null;
+      },
+      simulateKnockAck(canvasDocId) {
+        recordKnockAck({ knockId: "test-simulated", canvasDocId, ackerNodeId: "test-acker" });
+      },
+      simulateKnockRelay(canvasDocId, requesterNodeId, relayedBy) {
+        recordKnockRelay({ canvasDocId, requesterNodeId, relayedBy });
+      },
+    };
+
+    const controller: WidgetController & { testHooks: MessagezTestHooks } = {
       container,
+      testHooks,
 
       destroy() {
         unsub();
+        unsubKnockAcked();
+        unsubKnockRelayed();
+        unsubCanvasStore?.();
+        for (const timer of knockNoticeTimers.values()) clearTimeout(timer);
+        knockNoticeTimers.clear();
         container.destroy({ children: true });
       },
 
@@ -1360,5 +2063,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         layout(width, height);
       },
     };
+
+    return controller;
   },
 };

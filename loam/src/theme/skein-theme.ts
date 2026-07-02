@@ -13,6 +13,12 @@ export interface SkeinTheme {
   accent: number;
   error: number;
   warning: number;
+  /** color tint for "this came via a reliquary hub" attribution — used
+   *  anywhere the existing `relayedBy` pattern is shown (canvas invites,
+   *  knocks), so hub-relayed activity reads as a real, legible distinction
+   *  rather than a suffix easy to scan past. see
+   *  docs/knock-and-hub-relay-plan.md section 7.3. */
+  hubRelayed: number;
   toolbarBg: number;
   toolbarBorder: number;
   fontFamily: string;
@@ -45,6 +51,10 @@ export const defaultTheme: SkeinTheme = {
   accent: 0xd946ef,
   error: 0xef4444,
   warning: 0xf59e0b,
+  // reuses the warning amber — a hub relay isn't a warning, but the same
+  // color reads clearly as "notable, pay attention" without introducing a
+  // second amber-ish tone into the palette.
+  hubRelayed: 0xf59e0b,
   toolbarBg: 0x0a0a0a,
   toolbarBorder: 0x1f1f1f,
   fontFamily: "system-ui, -apple-system, sans-serif",

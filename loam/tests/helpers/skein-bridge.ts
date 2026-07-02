@@ -103,6 +103,20 @@ export async function addPeer(page: Page, nodeId: string): Promise<void> {
 }
 
 /**
+ * stop maintaining this page's automerge-repo-level connection to a peer
+ * added via `addPeer()` above \u2014 closes the existing stream and stops
+ * reconnecting. only works on pages loaded from test-harness-p2p.html.
+ *
+ * use this to prove some other delivery path (e.g. a friendz-protocol
+ * gossip digest) works on its own, independent of ordinary automerge doc
+ * sync: once this link is severed, the automerge `Repo` genuinely has no
+ * way left to sync changes with that peer.
+ */
+export async function forgetPeer(page: Page, nodeId: string): Promise<void> {
+  return page.evaluate((id) => (window as any).__skeinTest.p2p.forgetPeer(id), nodeId);
+}
+
+/**
  * get the current iroh endpoint state.
  * returns "off" | "starting" | "online" | "error"
  */
@@ -178,6 +192,81 @@ export async function joinCanvas(page: Page, docId: string): Promise<string> {
   return page.evaluate(
     (id) => (window as any).__joinCanvasForTest(id).then((r: { canvasDocId: string }) => r.canvasDocId),
     docId
+  );
+}
+
+// --- knock (access request) ---
+// only work on pages loaded from test-harness-p2p.html — see
+// src/dev/test-bridge.ts's buildKnockTestBridge() for what these wrap.
+
+/** send a `canvas-knock` message from this page directly to a peer. */
+export async function sendKnock(
+  page: Page,
+  peerNodeId: string,
+  knock: { knockId: string; canvasDocId: string; requesterUsername: string; message: string }
+): Promise<void> {
+  return page.evaluate(
+    ([id, k]) => (window as any).__skeinTest.knock.sendKnock(id, k),
+    [peerNodeId, knock] as const
+  );
+}
+
+/** approve a pending knock from this page (grants access + records the
+ *  decision + establishes friendship + notifies the requester). */
+export async function approveKnock(page: Page, requesterNodeId: string, role: string): Promise<void> {
+  return page.evaluate(
+    ([id, r]) => (window as any).__skeinTest.knock.approveKnock(id, r),
+    [requesterNodeId, role] as const
+  );
+}
+
+/** decline a pending knock from this page (records the decision + notifies
+ *  the requester). */
+export async function declineKnock(page: Page, requesterNodeId: string): Promise<void> {
+  return page.evaluate((id) => (window as any).__skeinTest.knock.declineKnock(id), requesterNodeId);
+}
+
+/** relay-attribution events ({ canvasDocId, requesterNodeId, relayedBy })
+ *  observed so far on this page. */
+export async function getRelayedKnocks(
+  page: Page
+): Promise<Array<{ canvasDocId: string; requesterNodeId: string; relayedBy: string }>> {
+  return page.evaluate(() => (window as any).__skeinTest.knock.getRelayedKnocks());
+}
+
+/** `canvas-knock-ack` events received so far on this page — a deterministic
+ *  "the knock was actually processed by someone" signal. */
+export async function getReceivedKnockAcks(
+  page: Page
+): Promise<Array<{ knockId: string; canvasDocId: string; ackerNodeId: string }>> {
+  return page.evaluate(() => (window as any).__skeinTest.knock.getReceivedKnockAcks());
+}
+
+/** manually send a gossip digest carrying this page's own pending knocks
+ *  for `canvasDocId` to a peer — triggers relay delivery deterministically
+ *  instead of waiting on the real heartbeat timer. */
+export async function sendKnocksGossipDigest(
+  page: Page,
+  peerNodeId: string,
+  canvasDocId: string
+): Promise<void> {
+  return page.evaluate(
+    ([id, docId]) => (window as any).__skeinTest.knock.sendKnocksGossipDigest(id, docId),
+    [peerNodeId, canvasDocId] as const
+  );
+}
+
+/** read a node id's role from a canvas doc's `.acl`, opening/syncing the doc
+ *  first if this page doesn't already hold it. null if unreachable or no
+ *  ACL entry. */
+export async function getCanvasAcl(
+  page: Page,
+  canvasDocId: string,
+  nodeId: string
+): Promise<string | null> {
+  return page.evaluate(
+    ([docId, id]) => (window as any).__skeinTest.knock.getCanvasAcl(docId, id),
+    [canvasDocId, nodeId] as const
   );
 }
 

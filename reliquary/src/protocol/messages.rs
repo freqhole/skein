@@ -269,6 +269,62 @@ pub enum FriendzMessage {
         /// blake3 hashes (from the original BlobSeek.needed) that the sender has.
         available: Vec<String>,
     },
+
+    /// send a canvas access request (a "knock") from a peer who is not yet
+    /// a friend/collaborator on the canvas, or relay one via gossip.
+    ///
+    /// see `docs/knock-and-hub-relay-plan.md` section 4 for the full design
+    /// this mirrors — `knockId` is a stable id for this specific knock
+    /// attempt (used for acking), distinct from `canvasDocId`'s
+    /// `pendingKnocks` map, which is keyed by `requesterNodeId` instead.
+    CanvasKnock {
+        #[serde(rename = "knockId")]
+        knock_id: String,
+        #[serde(rename = "canvasDocId")]
+        canvas_doc_id: String,
+        #[serde(rename = "requesterNodeId")]
+        requester_node_id: String,
+        #[serde(rename = "requesterUsername")]
+        requester_username: String,
+        message: String,
+    },
+
+    /// acknowledge receipt of a canvas knock — sent by whoever recorded the
+    /// knock into a `pendingKnocks` map they hold (a direct peer, or a hub).
+    CanvasKnockAck {
+        #[serde(rename = "knockId")]
+        knock_id: String,
+        #[serde(rename = "canvasDocId")]
+        canvas_doc_id: String,
+        #[serde(rename = "ackerNodeId")]
+        acker_node_id: String,
+    },
+
+    /// approve a canvas knock. `role` is a plain string ("member"/"viewer",
+    /// see `canvas-doc.ts`'s `InvitableRole`) rather than the `CanvasRole`
+    /// enum above — that enum's variants predate this project's
+    /// admin/member/viewer role rename and no longer match the wire values
+    /// the TS side actually sends, and fixing that mismatch is out of scope
+    /// here (a bigger, separate rename).
+    CanvasKnockApprove {
+        #[serde(rename = "knockId")]
+        knock_id: String,
+        #[serde(rename = "canvasDocId")]
+        canvas_doc_id: String,
+        #[serde(rename = "approverNodeId")]
+        approver_node_id: String,
+        role: String,
+    },
+
+    /// decline a canvas knock.
+    CanvasKnockDecline {
+        #[serde(rename = "knockId")]
+        knock_id: String,
+        #[serde(rename = "canvasDocId")]
+        canvas_doc_id: String,
+        #[serde(rename = "declinerNodeId")]
+        decliner_node_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +856,109 @@ mod tests {
                 assert!(shared_canvas_ids.is_empty());
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_canvas_knock_round_trip() {
+        let msg = FriendzMessage::CanvasKnock {
+            knock_id: "knock-1".to_string(),
+            canvas_doc_id: "doc-1".to_string(),
+            requester_node_id: "node-stranger".to_string(),
+            requester_username: "stranger".to_string(),
+            message: "say who you are".to_string(),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "canvas-knock");
+        assert_eq!(parsed["knockId"], "knock-1");
+        assert_eq!(parsed["canvasDocId"], "doc-1");
+        assert_eq!(parsed["requesterNodeId"], "node-stranger");
+        assert_eq!(parsed["requesterUsername"], "stranger");
+        assert_eq!(parsed["message"], "say who you are");
+
+        let deserialized: FriendzMessage = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            FriendzMessage::CanvasKnock {
+                requester_node_id, ..
+            } => assert_eq!(requester_node_id, "node-stranger"),
+            _ => panic!("expected CanvasKnock"),
+        }
+    }
+
+    #[test]
+    fn test_canvas_knock_ack_round_trip() {
+        let msg = FriendzMessage::CanvasKnockAck {
+            knock_id: "knock-1".to_string(),
+            canvas_doc_id: "doc-1".to_string(),
+            acker_node_id: "node-hub".to_string(),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "canvas-knock-ack");
+        assert_eq!(parsed["ackerNodeId"], "node-hub");
+    }
+
+    #[test]
+    fn test_canvas_knock_approve_round_trip() {
+        let msg = FriendzMessage::CanvasKnockApprove {
+            knock_id: "knock-1".to_string(),
+            canvas_doc_id: "doc-1".to_string(),
+            approver_node_id: "node-admin".to_string(),
+            role: "member".to_string(),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "canvas-knock-approve");
+        assert_eq!(parsed["approverNodeId"], "node-admin");
+        assert_eq!(parsed["role"], "member");
+
+        let deserialized: FriendzMessage = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            FriendzMessage::CanvasKnockApprove { role, .. } => assert_eq!(role, "member"),
+            _ => panic!("expected CanvasKnockApprove"),
+        }
+    }
+
+    #[test]
+    fn test_canvas_knock_decline_round_trip() {
+        let msg = FriendzMessage::CanvasKnockDecline {
+            knock_id: "knock-1".to_string(),
+            canvas_doc_id: "doc-1".to_string(),
+            decliner_node_id: "node-admin".to_string(),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "canvas-knock-decline");
+        assert_eq!(parsed["declinerNodeId"], "node-admin");
+    }
+
+    /// validates wire compatibility with the JS-produced shape from
+    /// `docs/knock-and-hub-relay-plan.md` section 4's `CanvasKnockMessage`.
+    #[test]
+    fn test_deserialize_js_canvas_knock() {
+        let js_json = r#"{"type":"canvas-knock","knockId":"knock-abc","canvasDocId":"doc-123","requesterNodeId":"node-stranger","requesterUsername":"stranger","message":"say who you are and mention something only the admin would know"}"#;
+
+        let msg: FriendzMessage = serde_json::from_str(js_json).unwrap();
+        match msg {
+            FriendzMessage::CanvasKnock {
+                knock_id,
+                canvas_doc_id,
+                requester_node_id,
+                requester_username,
+                message,
+            } => {
+                assert_eq!(knock_id, "knock-abc");
+                assert_eq!(canvas_doc_id, "doc-123");
+                assert_eq!(requester_node_id, "node-stranger");
+                assert_eq!(requester_username, "stranger");
+                assert!(message.starts_with("say who you are"));
+            }
+            _ => panic!("expected CanvasKnock"),
         }
     }
 }

@@ -22,7 +22,7 @@ import { createSkeinHarness } from "../harness/skein-harness";
 import { FriendzProtocol } from "../p2p/friends-protocol";
 import { FRIENDZ_ALPN, type IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
 import { createWidgetDoc } from "../widgets/widget-doc";
-import { buildFriendzTestBridge, buildP2PBridge } from "./test-bridge";
+import { buildFriendzTestBridge, buildKnockTestBridge, buildP2PBridge } from "./test-bridge";
 
 // a simple zod schema exercised by createWidgetDoc in tests
 const testWidgetSchema = z.object({
@@ -111,8 +111,28 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
   });
   const friendzBridge = buildFriendzTestBridge(friendzProtocol, acceptedFriends);
 
+  // knock (access-request) test bridge — wires the real `canvas-knock*`
+  // message handlers and gossip-digest merge logic
+  // (`standalone/friendz-wiring.ts`'s `wireKnockHandlers`/
+  // `mergeGossipDigestKnocks`) onto the same protocol instance. `getStore`
+  // reads back through `window.__skeinTest.canvas` (rather than closing
+  // over `canvas` directly) so it keeps working after `joinCanvasForTest`
+  // below swaps the active canvas out.
+  const knockBridge = buildKnockTestBridge({
+    protocol: friendzProtocol,
+    getStore: () => (window as any).__skeinTest.canvas.store,
+    repo: harness.repo,
+    irohAdapter,
+    localNodeId: nodeId,
+  });
+
   // expose the typed bridge as the single window test entry point
-  (window as any).__skeinTest = { canvas, p2p: p2pBridge, friendz: friendzBridge };
+  (window as any).__skeinTest = {
+    canvas,
+    p2p: p2pBridge,
+    friendz: friendzBridge,
+    knock: knockBridge,
+  };
 
   // backward-compat aliases used by existing tests
   (window as any).__skein = canvas;

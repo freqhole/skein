@@ -1,6 +1,6 @@
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
-import type { CanvasDocument } from "../canvas/canvas-doc";
-import type { CanvasStore } from "../canvas/canvas-store";
+import type { CanvasDocument, InvitableRole } from "../canvas/canvas-doc";
+import { CanvasStore } from "../canvas/canvas-store";
 import {
   FriendzProtocol,
   type BlobSeekMessage,
@@ -641,6 +641,13 @@ export async function initFriendzWiring(
     }
   };
 
+  // knock (access request) handling — mirrors the canvas-invite handlers
+  // above; see `wireKnockHandlers()`'s doc comment for the full behavior.
+  // exported as a standalone function (rather than inlined here) so it can
+  // also be exercised directly in tests without needing the full narthex/
+  // social/messagez setup this function requires.
+  wireKnockHandlers({ protocol, repo, irohAdapter, localNodeId });
+
   // wire outbound requests through the bridge
   initBridge(protocol);
 
@@ -883,6 +890,7 @@ export async function initFriendzWiring(
   async function computeAndSendGossipDigest(peerNodeId: string): Promise<void> {
     const canvasUpdates: GossipDigestMessage["canvasUpdates"] = [];
     const pendingInvites: GossipDigestMessage["pendingInvites"] = [];
+    const pendingKnocks: GossipDigestMessage["pendingKnocks"] = [];
     const sharedCanvasIds: string[] = [];
 
     const narthexHandle = repo.handles[narthexDocId as any];
@@ -950,12 +958,37 @@ export async function initFriendzWiring(
             invitedAt: pendingInvite.invitedAt,
           });
         }
+
+        // check for pending knocks this peer can see and potentially relay
+        // onward. unlike pendingInvites (keyed by the invite's target),
+        // pendingKnocks is keyed by the *requester*'s node id — so "is this
+        // entry for peerNodeId" doesn't apply here. instead, gossip every
+        // open knock on canvases the peer already fully participates in
+        // (only full members/admins are in a position to act on or relay a
+        // knock further).
+        if (canvasDoc.peers?.[peerNodeId]) {
+          for (const knock of Object.values(canvasDoc.pendingKnocks ?? {})) {
+            if (knock.requesterNodeId === peerNodeId) continue;
+            pendingKnocks.push({
+              canvasDocId,
+              requesterNodeId: knock.requesterNodeId,
+              requesterUsername: knock.requesterUsername,
+              message: knock.message,
+              knockedAt: knock.knockedAt,
+            });
+          }
+        }
       } catch {
         // canvas doc not synced yet — skip
       }
     }
 
-    if (canvasUpdates.length === 0 && pendingInvites.length === 0 && sharedCanvasIds.length === 0)
+    if (
+      canvasUpdates.length === 0 &&
+      pendingInvites.length === 0 &&
+      pendingKnocks.length === 0 &&
+      sharedCanvasIds.length === 0
+    )
       return;
 
     log.debug(
@@ -966,6 +999,8 @@ export async function initFriendzWiring(
       canvasUpdates.length,
       "invites:",
       pendingInvites.length,
+      "knocks:",
+      pendingKnocks.length,
       "canvases:",
       sharedCanvasIds.length
     );
@@ -973,6 +1008,7 @@ export async function initFriendzWiring(
     await protocol.sendGossipDigest(peerNodeId, {
       canvasUpdates,
       pendingInvites,
+      pendingKnocks,
       ...(sharedCanvasIds.length > 0 ? { sharedCanvasIds } : {}),
     });
   }
@@ -1264,6 +1300,15 @@ export async function initFriendzWiring(
         );
       });
     }
+
+    // process pending knock notifications — merges directly into the
+    // referenced canvas doc's own `pendingKnocks` map (canvas-doc state
+    // every admin needs a synced copy of), not a messagez inbox record like
+    // pendingInvites above. best-effort per canvas: silently skipped if we
+    // don't hold that canvas doc at all.
+    mergeGossipDigestKnocks(repo, msg, fromNodeId).catch((err) => {
+      log.warn(TAG, "failed to merge gossip-relayed knocks:", err);
+    });
   };
 
   // handle incoming blob-seek queries from the hub — check local blob
@@ -1386,4 +1431,354 @@ export async function initFriendzWiring(
     unsubs,
     flushCanvasUpdates: flushDirtyCanvasUpdates,
   };
+}
+
+// ---------------------------------------------------------------------------
+// knock (access request) handling — docs/knock-and-hub-relay-plan.md
+//
+// exported as standalone functions (rather than inlined into
+// `initFriendzWiring()` above) so they can be exercised directly in tests
+// without needing the full narthex/social/messagez setup that function
+// requires, and so a later UI task can call `approveKnock()`/`declineKnock()`
+// directly once a messagez inbox row exists for knocks.
+// ---------------------------------------------------------------------------
+
+/**
+ * relay-attribution info for a knock that was recorded on this peer as a
+ * result of someone else's action — either a directly-received
+ * `canvas-knock` message whose sender isn't the requester themselves, or a
+ * knock merged in from a gossip digest (which is *always* relayed, by
+ * construction — the digest sender is never the requester). `PendingCanvasKnock`
+ * (canvas-doc.ts, phase 1) deliberately has no persisted `relayedBy` field,
+ * so this is surfaced as an optional callback instead — good enough for a
+ * future hub-relay UI (or, today, tests) to observe attribution without
+ * needing a bigger identity/attribution model yet (see the plan doc's
+ * "known, deliberately-deferred gap" note on multi-device identity).
+ */
+export interface KnockRelayInfo {
+  canvasDocId: string;
+  requesterNodeId: string;
+  /** node id that actually delivered this knock to us. */
+  relayedBy: string;
+}
+
+export interface KnockHandlersDeps {
+  protocol: FriendzProtocol;
+  repo: Repo;
+  irohAdapter: IrohNetworkAdapter;
+  localNodeId: string;
+  /** see `KnockRelayInfo`'s doc comment. only fires for the *direct*
+   *  `canvas-knock` relay case (sender != requester); gossip-digest-merged
+   *  knocks fire it via `mergeGossipDigestKnocks()`'s own parameter instead,
+   *  since that's a separate entry point not wired through here (see
+   *  `initFriendzWiring()`'s `onGossipDigest` handler). */
+  onKnockRelayed?: (info: KnockRelayInfo) => void;
+  /** fires on the requester's side when a `canvas-knock-ack` arrives — the
+   *  delivery confirmation `CanvasKnockAckMessage` exists for (section 4).
+   *  no persisted UI state to update yet (section 7.1 is a later phase),
+   *  so this is the only way to observe it today — useful for tests that
+   *  need a deterministic "the knock was actually processed" signal
+   *  instead of an arbitrary wait. */
+  onKnockAcked?: (info: { knockId: string; canvasDocId: string; ackerNodeId: string }) => void;
+}
+
+/**
+ * wire the four `canvas-knock*` message handlers onto `protocol`. mirrors
+ * the existing `onCanvasInvite`/`onCanvasInviteAccept`/`onCanvasInviteDecline`
+ * handlers in `initFriendzWiring()` above — see docs/knock-and-hub-relay-plan.md
+ * sections 4-6 for the full message/behavior spec.
+ */
+export function wireKnockHandlers(deps: KnockHandlersDeps): void {
+  const { protocol, repo, irohAdapter, localNodeId, onKnockRelayed, onKnockAcked } = deps;
+
+  // admin (or relay peer)'s side: record the knock into whichever canvas
+  // doc it refers to, then ack whoever actually sent us this message — that
+  // may be a relay hop, not the original requester, since that's who we
+  // have a live stream to right now.
+  protocol.onCanvasKnock = (msg, fromNodeId) => {
+    (async () => {
+      log.debug(
+        TAG,
+        "received canvas knock from:",
+        fromNodeId.slice(0, 16) + "...",
+        "requester:",
+        msg.requesterNodeId.slice(0, 16) + "...",
+        "canvas:",
+        msg.canvasDocId.slice(0, 16) + "..."
+      );
+
+      let store: CanvasStore;
+      try {
+        store = await CanvasStore.open(repo, msg.canvasDocId as DocumentId);
+      } catch (err) {
+        log.warn(
+          TAG,
+          "cannot open canvas doc for knock, dropping:",
+          msg.canvasDocId.slice(0, 16) + "...",
+          err
+        );
+        return;
+      }
+
+      store.recordKnock(msg.requesterNodeId, msg.requesterUsername, msg.message);
+
+      if (fromNodeId !== msg.requesterNodeId) {
+        onKnockRelayed?.({
+          canvasDocId: msg.canvasDocId,
+          requesterNodeId: msg.requesterNodeId,
+          relayedBy: fromNodeId,
+        });
+      }
+
+      protocol
+        .sendCanvasKnockAck(fromNodeId, {
+          knockId: msg.knockId,
+          canvasDocId: msg.canvasDocId,
+          ackerNodeId: localNodeId,
+        })
+        .catch((err) => {
+          log.warn(TAG, "failed to send knock ack:", err);
+        });
+    })();
+  };
+
+  // requester's side: a delivery confirmation. no UI to update yet (see
+  // section 7.1 — the requester's status view is a later phase), so this
+  // just logs for now.
+  protocol.onCanvasKnockAck = (msg, fromNodeId) => {
+    log.debug(
+      TAG,
+      "received knock ack from:",
+      fromNodeId.slice(0, 16) + "...",
+      "acker:",
+      msg.ackerNodeId.slice(0, 16) + "...",
+      "canvas:",
+      msg.canvasDocId.slice(0, 16) + "..."
+    );
+    onKnockAcked?.({ knockId: msg.knockId, canvasDocId: msg.canvasDocId, ackerNodeId: msg.ackerNodeId });
+  };
+
+  // requester's side: a notification, NOT a grant. the approving admin
+  // already wrote our new role into *their* copy of the canvas doc via
+  // `CanvasStore.setRole()` (see `approveKnock()` below) — that's the real
+  // grant, and it reaches us via normal automerge sync, never by acting on
+  // this message's contents (granting ourselves access here would mean
+  // trusting our own unverified claim, exactly what this design avoids —
+  // see docs/knock-and-hub-relay-plan.md section 6). all this handler does
+  // is make sure we're connected to whoever can give us the doc, so that
+  // sync actually has a path to deliver the real `.acl` change.
+  protocol.onCanvasKnockApprove = (msg, fromNodeId) => {
+    log.debug(
+      TAG,
+      "received knock approve from:",
+      fromNodeId.slice(0, 16) + "...",
+      "canvas:",
+      msg.canvasDocId.slice(0, 16) + "...",
+      "role:",
+      msg.role
+    );
+
+    irohAdapter.addPeer(fromNodeId).catch(() => {
+      // best effort — the requester may not be able to dial back yet
+    });
+    if (msg.approverNodeId && msg.approverNodeId !== fromNodeId) {
+      irohAdapter.addPeer(msg.approverNodeId).catch(() => {
+        // best effort
+      });
+    }
+    repo.find(msg.canvasDocId as DocumentId).catch(() => {
+      // best effort — sync will catch up once a connection lands
+    });
+  };
+
+  // requester's side: per tomb's silent-rejection policy (section 3.2/7.1),
+  // the requester's UI deliberately does not distinguish "declined" from
+  // "still pending" — so there's nothing to write here yet. this handler
+  // exists so a future UI task has somewhere to hook a (privacy-preserving)
+  // status update.
+  protocol.onCanvasKnockDecline = (msg, fromNodeId) => {
+    log.debug(
+      TAG,
+      "received knock decline from:",
+      fromNodeId.slice(0, 16) + "...",
+      "canvas:",
+      msg.canvasDocId.slice(0, 16) + "..."
+    );
+  };
+}
+
+/**
+ * merge a gossip digest's pending-knock entries into our own local copies
+ * of the referenced canvas docs. best-effort per entry — silently skips any
+ * canvas we don't hold (mirrors the try/catch-per-canvas pattern used
+ * throughout `computeAndSendGossipDigest`/`onGossipDigest` above). safe to
+ * call repeatedly with overlapping entries: `CanvasStore.recordKnock()` is
+ * itself idempotent on the requester's node id.
+ *
+ * exported (not just inlined into `initFriendzWiring()`'s `onGossipDigest`
+ * handler) so it can be exercised directly in tests without needing the
+ * full narthex/social/messagez setup that function requires.
+ */
+export async function mergeGossipDigestKnocks(
+  repo: Repo,
+  msg: Pick<GossipDigestMessage, "pendingKnocks">,
+  fromNodeId: string,
+  onKnockRelayed?: (info: KnockRelayInfo) => void
+): Promise<void> {
+  for (const knock of msg.pendingKnocks) {
+    try {
+      const store = await CanvasStore.open(repo, knock.canvasDocId as DocumentId);
+      store.recordKnock(knock.requesterNodeId, knock.requesterUsername, knock.message);
+      log.debug(
+        TAG,
+        "gossip digest: merged pending knock for canvas:",
+        knock.canvasDocId.slice(0, 16) + "...",
+        "requester:",
+        knock.requesterNodeId.slice(0, 16) + "...",
+        "relayed via:",
+        fromNodeId.slice(0, 16) + "..."
+      );
+      onKnockRelayed?.({
+        canvasDocId: knock.canvasDocId,
+        requesterNodeId: knock.requesterNodeId,
+        relayedBy: fromNodeId,
+      });
+    } catch (err) {
+      log.warn(TAG, "failed to merge gossip-relayed knock:", err);
+    }
+  }
+}
+
+export interface ApproveKnockDeps {
+  protocol: FriendzProtocol;
+  store: CanvasStore;
+  socialDoc: SocialDoc;
+  localNodeId: string;
+}
+
+/**
+ * approve a pending knock: grants canvas access, records the decision, and
+ * establishes a friend relationship with the requester — "approving a knock
+ * does two things at once" (docs/knock-and-hub-relay-plan.md section 6).
+ *
+ * exported for a later UI task to call directly (e.g. a messagez inbox
+ * "approve" button, not built yet) — nothing calls this yet.
+ *
+ * - `store.setRole()` grants access on *our own* copy of the doc; the
+ *   requester's side receives it via normal automerge sync, not by acting
+ *   on the `canvas-knock-approve` message this sends (see
+ *   `onCanvasKnockApprove` above — that's a notification, not a grant).
+ * - the friend relationship reuses the existing `friend-accept` message and
+ *   handler (`protocol.onFriendAccept`, already wired for ordinary friend
+ *   requests) rather than inventing a knock-specific mechanism, per section
+ *   6's guidance. we add the requester to our own friends list directly
+ *   (mirrors what `onFriendAccept` does for the *other* side of a normal
+ *   handshake, since we're not reacting to an incoming accept here) and
+ *   send them a `friend-accept` — their existing `onFriendAccept` handler
+ *   adds us back, with no knock-specific code needed on their side.
+ * - sends `canvas-knock-approve` to the requester best-effort (direct if
+ *   reachable; otherwise it just doesn't land yet and relies on the normal
+ *   gossip-relay path, same as invite accept/decline notifications) — the
+ *   real grant already happened in step 1 and doesn't depend on this
+ *   message landing.
+ */
+export async function approveKnock(
+  deps: ApproveKnockDeps,
+  requesterNodeId: string,
+  role: InvitableRole
+): Promise<void> {
+  const { protocol, store, socialDoc, localNodeId } = deps;
+  const knock = store.doc().pendingKnocks?.[requesterNodeId];
+
+  store.setRole(requesterNodeId, role);
+  store.addKnockDecision(requesterNodeId, localNodeId, "approve", role);
+
+  const alreadyFriend = (socialDoc.current.friends ?? []).some((f) =>
+    f.nodeIds?.some((n) => n.nodeId === requesterNodeId)
+  );
+  if (!alreadyFriend) {
+    const requesterUsername = knock?.requesterUsername ?? "";
+    socialDoc.change((draft) => {
+      if (!draft.friends) draft.friends = [];
+      draft.friends.push({
+        id: crypto.randomUUID(),
+        alias: "",
+        username: requesterUsername,
+        group: "default",
+        nodeIds: [
+          {
+            nodeId: requesterNodeId,
+            addedAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+            username: requesterUsername,
+            bio: "",
+            avatarDataUrl: "",
+          },
+        ],
+        createdAt: new Date().toISOString(),
+      });
+    });
+  }
+
+  await protocol.sendFriendAccept(requesterNodeId).catch((err) => {
+    log.warn(
+      TAG,
+      "approveKnock: sendFriendAccept failed for",
+      requesterNodeId.slice(0, 16) + "...",
+      err
+    );
+  });
+
+  await protocol
+    .sendCanvasKnockApprove(requesterNodeId, {
+      knockId: crypto.randomUUID(),
+      canvasDocId: store.handle.documentId,
+      approverNodeId: localNodeId,
+      role,
+    })
+    .catch((err) => {
+      log.warn(
+        TAG,
+        "approveKnock: sendCanvasKnockApprove failed for",
+        requesterNodeId.slice(0, 16) + "...",
+        err
+      );
+    });
+}
+
+export interface DeclineKnockDeps {
+  protocol: FriendzProtocol;
+  store: CanvasStore;
+  localNodeId: string;
+}
+
+/**
+ * decline a pending knock: records a real, deliberate "reject" (section
+ * 3.1a — distinct from the client-local "ignore" dismissal, which isn't
+ * built in this pass at all) and notifies the requester.
+ *
+ * exported for a later UI task to call directly — nothing calls this yet.
+ */
+export async function declineKnock(
+  deps: DeclineKnockDeps,
+  requesterNodeId: string
+): Promise<void> {
+  const { protocol, store, localNodeId } = deps;
+
+  store.addKnockDecision(requesterNodeId, localNodeId, "decline");
+
+  await protocol
+    .sendCanvasKnockDecline(requesterNodeId, {
+      knockId: crypto.randomUUID(),
+      canvasDocId: store.handle.documentId,
+      declinerNodeId: localNodeId,
+    })
+    .catch((err) => {
+      log.warn(
+        TAG,
+        "declineKnock: sendCanvasKnockDecline failed for",
+        requesterNodeId.slice(0, 16) + "...",
+        err
+      );
+    });
 }

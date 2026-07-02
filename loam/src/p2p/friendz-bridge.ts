@@ -14,6 +14,7 @@
 
 import type { FriendzProtocol } from "./friends-protocol";
 import type { CanvasRoleOrRemoved, InvitableRole } from "../canvas/canvas-doc";
+import type { SocialDoc } from "../../widgets/narthex/social/types";
 
 // ---------------------------------------------------------------------------
 // module state
@@ -22,6 +23,48 @@ import type { CanvasRoleOrRemoved, InvitableRole } from "../canvas/canvas-doc";
 let protocol: FriendzProtocol | null = null;
 let bridgeReadyListeners: Array<() => void> = [];
 let outboundRequestHook: ((toNodeId: string) => void) | null = null;
+
+// ---------------------------------------------------------------------------
+// knock (access-request) bridge state — docs/knock-and-hub-relay-plan.md
+// section 7.2/7.3. `approveKnock()`/`declineKnock()` (friendz-wiring.ts) need
+// a `SocialDoc` alongside the protocol, which this bridge doesn't otherwise
+// hold — `initKnockSocialDocBridge()` lets boot.ts register it once the
+// social doc is ready, same lifecycle as `initBridge()` above.
+// ---------------------------------------------------------------------------
+
+let knockSocialDoc: SocialDoc | null = null;
+
+export interface KnockAckInfo {
+  knockId: string;
+  canvasDocId: string;
+  ackerNodeId: string;
+}
+
+export interface KnockRelayAttribution {
+  canvasDocId: string;
+  requesterNodeId: string;
+  relayedBy: string;
+}
+
+/**
+ * live-session-only knock relay attribution, keyed by `canvasDocId:requesterNodeId`.
+ * `PendingCanvasKnock` (canvas-doc.ts) deliberately has no persisted
+ * `relayedBy` field (see its doc comment) — this is the "good enough for a
+ * future hub-relay UI" stand-in the plan doc anticipated: populated live by
+ * re-invoking `wireKnockHandlers()`'s `onKnockRelayed` callback (see
+ * boot.ts's `initFriendzProtocol()`), lost on reload.
+ */
+const knockRelayInfo = new Map<string, KnockRelayAttribution>();
+let knockRelayListeners: Array<(info: KnockRelayAttribution) => void> = [];
+
+/** canvas doc ids for which a `canvas-knock-ack` has been observed this
+ *  session (requester's side) — see `onKnockAcked()`/`hasKnockAckForCanvas()`. */
+const knockAckedCanvasIds = new Set<string>();
+let knockAckListeners: Array<(info: KnockAckInfo) => void> = [];
+
+function knockRelayKey(canvasDocId: string, requesterNodeId: string): string {
+  return `${canvasDocId}:${requesterNodeId}`;
+}
 
 // ---------------------------------------------------------------------------
 // initialization (called by boot.ts)
@@ -49,6 +92,11 @@ export function destroyBridge(): void {
   bridgeReadyListeners = [];
   outboundRequestHook = null;
   acceptAndJoinHandler = null;
+  knockSocialDoc = null;
+  knockRelayInfo.clear();
+  knockRelayListeners = [];
+  knockAckedCanvasIds.clear();
+  knockAckListeners = [];
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +330,91 @@ export async function sendCanvasDeleted(
 export async function sendFriendAcceptAck(peerNodeId: string): Promise<void> {
   if (!protocol) throw new Error("friendz bridge not initialized");
   await protocol.sendFriendAcceptAck(peerNodeId);
+}
+
+// ---------------------------------------------------------------------------
+// knock (access-request) actions — docs/knock-and-hub-relay-plan.md
+// ---------------------------------------------------------------------------
+
+/**
+ * the raw `FriendzProtocol` instance, for callers (the messagez widget's
+ * knock row) that need to invoke `approveKnock()`/`declineKnock()`
+ * (friendz-wiring.ts) directly — those take a `protocol` dependency this
+ * bridge already holds but doesn't otherwise expose.
+ */
+export function getProtocol(): FriendzProtocol | null {
+  return protocol;
+}
+
+/** register the social doc so `approveKnock()` can be called from a widget.
+ *  called once boot.ts's social doc is ready — mirrors `initBridge()`'s
+ *  lifecycle. pass `null` on teardown. */
+export function initKnockSocialDocBridge(doc: SocialDoc | null): void {
+  knockSocialDoc = doc;
+}
+
+/** the social doc registered via `initKnockSocialDocBridge()`, or null if
+ *  not ready yet. */
+export function getKnockSocialDoc(): SocialDoc | null {
+  return knockSocialDoc;
+}
+
+/** record that `info.requesterNodeId`'s knock (on `info.canvasDocId`) was
+ *  relayed to us via `info.relayedBy` this session. see `knockRelayInfo`'s
+ *  doc comment for why this isn't persisted.
+ *
+ *  notifies subscribers (see `onKnockRelayed()`) so a currently-rendered
+ *  knock row can refresh its "via hub"/"relayed" attribution immediately —
+ *  this is called from `wireKnockHandlers()`'s `onCanvasKnock` handler
+ *  *after* `store.recordKnock()` has already fired its own doc-change
+ *  render, so without this notification the row would render once with no
+ *  attribution and never update again until some unrelated change happened
+ *  to redraw it. */
+export function recordKnockRelay(info: KnockRelayAttribution): void {
+  knockRelayInfo.set(knockRelayKey(info.canvasDocId, info.requesterNodeId), info);
+  for (const listener of knockRelayListeners) listener(info);
+}
+
+/** the node id that relayed a knock to us this session, or `""` if we have
+ *  no live relay attribution for it (either it arrived directly, or it was
+ *  already pending before this session started — see `knockRelayInfo`'s
+ *  doc comment). */
+export function getKnockRelayedBy(canvasDocId: string, requesterNodeId: string): string {
+  return knockRelayInfo.get(knockRelayKey(canvasDocId, requesterNodeId))?.relayedBy ?? "";
+}
+
+/** subscribe to live knock-relay-attribution events (see `recordKnockRelay()`).
+ *  returns an unsubscribe function. */
+export function onKnockRelayed(handler: (info: KnockRelayAttribution) => void): () => void {
+  knockRelayListeners.push(handler);
+  return () => {
+    knockRelayListeners = knockRelayListeners.filter((h) => h !== handler);
+  };
+}
+
+/** record a `canvas-knock-ack` observed this session (requester's side) and
+ *  notify subscribers — see `onKnockAcked()`. */
+export function recordKnockAck(info: KnockAckInfo): void {
+  knockAckedCanvasIds.add(info.canvasDocId);
+  for (const listener of knockAckListeners) listener(info);
+}
+
+/** subscribe to knock-ack events (requester's side, section 7.1's status
+ *  view). returns an unsubscribe function. */
+export function onKnockAcked(handler: (info: KnockAckInfo) => void): () => void {
+  knockAckListeners.push(handler);
+  return () => {
+    knockAckListeners = knockAckListeners.filter((h) => h !== handler);
+  };
+}
+
+/** true if a knock-ack for `canvasDocId` has been observed this session.
+ *  session-only (see `knockAckedCanvasIds`'s doc comment) — persisting this
+ *  across a reload (so the requester's "request received, waiting for a
+ *  response" status, section 7.1, survives a page reload) is out of scope
+ *  for this pass. */
+export function hasKnockAckForCanvas(canvasDocId: string): boolean {
+  return knockAckedCanvasIds.has(canvasDocId);
 }
 
 // ---------------------------------------------------------------------------

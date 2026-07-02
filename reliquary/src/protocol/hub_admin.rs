@@ -60,6 +60,30 @@ pub struct FriendSummary {
     pub updated_at: i64,
 }
 
+/// a single pending knock, aggregated across every canvas doc the hub
+/// holds, for the `ListPendingKnocks` request — see
+/// `docs/knock-and-hub-relay-plan.md` section 8.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HubKnockSummary {
+    pub canvas_doc_id: String,
+    /// a stable identifier for this knock in listings. the canvas doc's
+    /// `pendingKnocks` map (see `canvas-doc.ts`'s `PendingCanvasKnock`) has
+    /// no separate "knock id" field of its own — it's keyed directly by
+    /// the requester's node id (that's what gives "one outstanding knock
+    /// per node id" for free). this field is just that same map key,
+    /// exposed under its own name for this listing's convenience: this is
+    /// a read-only aggregation view (see this module's doc comment on
+    /// `AdminRequest::ListPendingKnocks`) — actually approving or
+    /// declining a knock always goes through the normal
+    /// `canvas-knock-approve`/`canvas-knock-decline` wire messages, which
+    /// carry their own real, wire-level `knockId`.
+    pub knock_id: String,
+    pub requester_node_id: String,
+    pub requester_username: String,
+    pub message: String,
+    pub knocked_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdminRequest {
     /// pre-approve a peer (mirrors `reliquary friend allow`).
@@ -68,6 +92,14 @@ pub enum AdminRequest {
     List,
     /// remove a peer from friendz entirely (mirrors `reliquary friend remove`).
     Remove { node_id: String },
+    /// list pending knocks the hub is holding across every canvas doc it
+    /// holds — a cross-canvas convenience view, mirroring tomb's
+    /// `PendingKnocksView` aggregation. read-only: actually
+    /// approving/declining a knock goes through the normal
+    /// `canvas-knock-approve`/`canvas-knock-decline` wire messages and
+    /// writes directly to the canvas doc's `pendingKnocks` map, not
+    /// through this admin protocol.
+    ListPendingKnocks,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +119,10 @@ pub enum AdminResponse {
     /// request-level failure (bad node_id, store error, etc).
     Error {
         message: String,
+    },
+    /// response to `AdminRequest::ListPendingKnocks`.
+    PendingKnocks {
+        knocks: Vec<HubKnockSummary>,
     },
 }
 
@@ -298,7 +334,116 @@ async fn handle_request(
                 },
             }
         }
+        AdminRequest::ListPendingKnocks => AdminResponse::PendingKnocks {
+            knocks: list_pending_knocks(&handler.inner.hub_repo).await,
+        },
     }
+}
+
+// ---------------------------------------------------------------------------
+// pending-knock aggregation
+// ---------------------------------------------------------------------------
+
+/// scan every doc the hub holds for `pendingKnocks` entries and return a
+/// flattened, cross-canvas summary list.
+///
+/// "every doc the hub holds" is [`HubRepo::all_doc_ids`] — the same
+/// enumeration `hub::canvas::send_blob_seek_to_peer` already uses to scan
+/// every doc for blob references — rather than a canvas-only tracking set,
+/// since this handler (unlike `hub::HubPeerService`) has no
+/// `canvas_doc_ids` set of its own to scan instead. widget-state docs the
+/// hub also holds simply have no `pendingKnocks` field at all, so they
+/// fall out of the scan for free without needing to distinguish doc kinds
+/// up front — the same reasoning `send_blob_seek_to_peer` already relies
+/// on for its own root-level field probe.
+async fn list_pending_knocks(hub_repo: &HubRepo) -> Vec<HubKnockSummary> {
+    let doc_ids = hub_repo.all_doc_ids().await;
+    let mut summaries = Vec::new();
+
+    for doc_id in doc_ids {
+        let handle = match hub_repo.find(&doc_id).await {
+            Some(h) => h,
+            None => continue,
+        };
+        let doc_id_owned = doc_id.clone();
+        let knocks =
+            tokio::task::spawn_blocking(move || read_pending_knocks(&handle, &doc_id_owned))
+                .await
+                .unwrap_or_default();
+        summaries.extend(knocks);
+    }
+
+    summaries
+}
+
+/// read a canvas doc's `pendingKnocks` map into a list of summaries, one
+/// per still-undecided entry (an entry with a non-empty `decisions` list
+/// has already been decided — see `PendingCanvasKnock.decisions` in
+/// `canvas-doc.ts` — so it's excluded: it's no longer "pending" even if it
+/// hasn't been cleaned up out of the map yet, see section 6 of the plan
+/// doc for why cleanup lags behind resolution).
+///
+/// runs inside `spawn_blocking` because doc access holds a lock.
+fn read_pending_knocks(
+    handle: &crate::hub_repo::DocHandle,
+    canvas_doc_id: &str,
+) -> Vec<HubKnockSummary> {
+    use automerge::ReadDoc;
+
+    fn read_str(doc: &automerge::Automerge, obj: &automerge::ObjId, key: &str) -> String {
+        match doc.get(obj, key) {
+            Ok(Some((automerge::Value::Object(automerge::ObjType::Text), text_id))) => {
+                doc.text(&text_id).unwrap_or_default()
+            }
+            Ok(Some((v, _))) => v.to_str().map(|s| s.to_string()).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    let mut summaries = Vec::new();
+
+    handle.with_document(|doc| {
+        let pending_obj = match doc.get(automerge::ROOT, "pendingKnocks") {
+            Ok(Some((_, obj_id))) => obj_id,
+            _ => return,
+        };
+
+        let keys: Vec<String> = doc.keys(&pending_obj).collect();
+        for requester_node_id in keys {
+            let knock_obj = match doc.get(&pending_obj, requester_node_id.as_str()) {
+                Ok(Some((_, obj_id))) => obj_id,
+                _ => continue,
+            };
+
+            // skip already-decided knocks — see this function's doc comment.
+            if let Ok(Some((_, decisions_obj))) = doc.get(&knock_obj, "decisions") {
+                if doc.length(&decisions_obj) > 0 {
+                    continue;
+                }
+            }
+
+            let requester_username = read_str(doc, &knock_obj, "requesterUsername");
+            let message = read_str(doc, &knock_obj, "message");
+            let knocked_at_str = read_str(doc, &knock_obj, "knockedAt");
+            let knocked_at = time::OffsetDateTime::parse(
+                &knocked_at_str,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .map(|dt| dt.unix_timestamp())
+            .unwrap_or(0);
+
+            summaries.push(HubKnockSummary {
+                canvas_doc_id: canvas_doc_id.to_string(),
+                knock_id: requester_node_id.clone(),
+                requester_node_id,
+                requester_username,
+                message,
+                knocked_at,
+            });
+        }
+    });
+
+    summaries
 }
 
 async fn send_response(
@@ -690,5 +835,201 @@ mod tests {
         let garbage = [0xff_u8; 32];
         let result: Result<AdminRequest, _> = ciborium::from_reader(garbage.as_slice());
         assert!(result.is_err());
+    }
+
+    // -- ListPendingKnocks ----------------------------------------------
+
+    /// seed a canvas doc's `pendingKnocks` map with the given entries (each
+    /// with an empty `decisions` list, matching a freshly-recorded knock)
+    /// and persist it via `HubDocStorage`, mirroring `blob_acl.rs`'s
+    /// `seed_canvas_and_widget` seeding pattern — `HubRepo` has no public
+    /// "insert this doc" method outside of a live sync message.
+    async fn seed_canvas_with_knocks(
+        db_path: &std::path::Path,
+        canvas_doc_id: &str,
+        knocks: &[(&str, &str, &str, &str)], // (requester_node_id, username, message, knocked_at)
+    ) {
+        let storage = crate::hub_repo::HubDocStorage::new(db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            let pending =
+                tx.put_object(automerge::ROOT, "pendingKnocks", automerge::ObjType::Map)?;
+            for (node_id, username, message, knocked_at) in knocks {
+                let entry = tx.put_object(&pending, *node_id, automerge::ObjType::Map)?;
+                tx.put(&entry, "requesterNodeId", *node_id)?;
+                tx.put(&entry, "requesterUsername", *username)?;
+                tx.put(&entry, "message", *message)?;
+                tx.put(&entry, "knockedAt", *knocked_at)?;
+                tx.put_object(&entry, "decisions", automerge::ObjType::List)?;
+            }
+            Ok(())
+        })
+        .expect("canvas doc transact should succeed");
+        storage.save_doc(canvas_doc_id, &doc.save()).await;
+    }
+
+    #[tokio::test]
+    async fn list_pending_knocks_aggregates_across_multiple_canvas_docs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+
+        seed_canvas_with_knocks(
+            &db_path,
+            "canvas-1",
+            &[("req-1", "alice", "hi", "2025-01-01T00:00:00Z")],
+        )
+        .await;
+        seed_canvas_with_knocks(
+            &db_path,
+            "canvas-2",
+            &[
+                ("req-2", "bob", "please let me in", "2025-01-02T00:00:00Z"),
+                ("req-3", "carol", "hey", "2025-01-03T00:00:00Z"),
+            ],
+        )
+        .await;
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new should succeed");
+        let pool = db::open_in_memory().await;
+        let adminz_store = adminz::Store::new(pool.clone());
+        let friendz_store = friendz::Store::new(pool.clone());
+        let userz_dir = userz::Directory::new(pool);
+        let handler =
+            HubAdminHandler::new(adminz_store.clone(), friendz_store, userz_dir, hub_repo);
+
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let response = handle_request(&handler, admin_node, AdminRequest::ListPendingKnocks).await;
+        match response {
+            AdminResponse::PendingKnocks { mut knocks } => {
+                knocks.sort_by(|a, b| a.requester_node_id.cmp(&b.requester_node_id));
+                assert_eq!(
+                    knocks.len(),
+                    3,
+                    "should aggregate knocks across both canvases"
+                );
+
+                assert_eq!(knocks[0].canvas_doc_id, "canvas-1");
+                assert_eq!(knocks[0].requester_node_id, "req-1");
+                assert_eq!(knocks[0].requester_username, "alice");
+                assert_eq!(knocks[0].message, "hi");
+                assert!(knocks[0].knocked_at > 0);
+
+                assert_eq!(knocks[1].canvas_doc_id, "canvas-2");
+                assert_eq!(knocks[1].requester_node_id, "req-2");
+                assert_eq!(knocks[1].requester_username, "bob");
+
+                assert_eq!(knocks[2].canvas_doc_id, "canvas-2");
+                assert_eq!(knocks[2].requester_node_id, "req-3");
+            }
+            other => panic!("expected PendingKnocks, got {other:?}"),
+        }
+    }
+
+    /// an already-decided knock (non-empty `decisions`) is excluded from
+    /// the listing — see `read_pending_knocks`'s doc comment.
+    #[tokio::test]
+    async fn list_pending_knocks_excludes_already_decided_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+
+        let storage = crate::hub_repo::HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            let pending =
+                tx.put_object(automerge::ROOT, "pendingKnocks", automerge::ObjType::Map)?;
+
+            let still_pending = tx.put_object(&pending, "req-pending", automerge::ObjType::Map)?;
+            tx.put(&still_pending, "requesterNodeId", "req-pending")?;
+            tx.put(&still_pending, "requesterUsername", "dave")?;
+            tx.put(&still_pending, "message", "hello")?;
+            tx.put(&still_pending, "knockedAt", "2025-01-01T00:00:00Z")?;
+            tx.put_object(&still_pending, "decisions", automerge::ObjType::List)?;
+
+            let decided = tx.put_object(&pending, "req-decided", automerge::ObjType::Map)?;
+            tx.put(&decided, "requesterNodeId", "req-decided")?;
+            tx.put(&decided, "requesterUsername", "erin")?;
+            tx.put(&decided, "message", "hi there")?;
+            tx.put(&decided, "knockedAt", "2025-01-01T00:00:00Z")?;
+            let decisions = tx.put_object(&decided, "decisions", automerge::ObjType::List)?;
+            let decision = tx.insert_object(&decisions, 0, automerge::ObjType::Map)?;
+            tx.put(&decision, "byNodeId", "admin-node")?;
+            tx.put(&decision, "decision", "approve")?;
+            tx.put(&decision, "role", "member")?;
+            tx.put(&decision, "at", "2025-01-01T01:00:00Z")?;
+
+            Ok(())
+        })
+        .expect("canvas doc transact should succeed");
+        storage.save_doc("canvas-1", &doc.save()).await;
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new should succeed");
+        let pool = db::open_in_memory().await;
+        let adminz_store = adminz::Store::new(pool.clone());
+        let friendz_store = friendz::Store::new(pool.clone());
+        let userz_dir = userz::Directory::new(pool);
+        let handler =
+            HubAdminHandler::new(adminz_store.clone(), friendz_store, userz_dir, hub_repo);
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let response = handle_request(&handler, admin_node, AdminRequest::ListPendingKnocks).await;
+        match response {
+            AdminResponse::PendingKnocks { knocks } => {
+                assert_eq!(
+                    knocks.len(),
+                    1,
+                    "the already-decided knock must be excluded"
+                );
+                assert_eq!(knocks[0].requester_node_id, "req-pending");
+            }
+            other => panic!("expected PendingKnocks, got {other:?}"),
+        }
+    }
+
+    /// a non-admin caller must get `NotAdmin` for `ListPendingKnocks`, with
+    /// no pending-knock data leaked in the response — mirrors
+    /// `non_admin_requests_have_no_side_effects_on_friendz_table`'s
+    /// "verify more than just the response variant" discipline, applied to
+    /// this read-only request (its only possible "side effect" is leaking
+    /// data it shouldn't).
+    #[tokio::test]
+    async fn non_admin_cannot_list_pending_knocks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        seed_canvas_with_knocks(
+            &db_path,
+            "canvas-1",
+            &[("req-1", "alice", "hi", "2025-01-01T00:00:00Z")],
+        )
+        .await;
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new should succeed");
+        let pool = db::open_in_memory().await;
+        let adminz_store = adminz::Store::new(pool.clone());
+        let friendz_store = friendz::Store::new(pool.clone());
+        let userz_dir = userz::Directory::new(pool);
+        let handler = HubAdminHandler::new(adminz_store, friendz_store, userz_dir, hub_repo);
+
+        let stranger = "stranger-node";
+        let response = handle_request(&handler, stranger, AdminRequest::ListPendingKnocks).await;
+        assert!(
+            matches!(response, AdminResponse::NotAdmin),
+            "non-admin must not receive pending-knock data"
+        );
     }
 }

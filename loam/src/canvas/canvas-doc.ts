@@ -110,6 +110,66 @@ export interface PendingCanvasInvite {
 }
 
 /**
+ * a knock request awaiting an admin's decision, keyed by the requester's
+ * node id — same shape/reasoning as `pendingInvites`: any peer (or the
+ * hub) that already holds this canvas doc can see and relay a knock, and
+ * it syncs to every admin's own devices via the normal CRDT sync path,
+ * not a live-only proxy call. the `Record` key being the requester's node
+ * id is what gives us "one outstanding knock per node id" for free — see
+ * `CanvasStore.recordKnock()`'s doc comment for the exact enforcement +
+ * idempotent-retry rules.
+ */
+export interface PendingCanvasKnock {
+  /** node id of the peer knocking. redundant with the map key, kept for
+   *  convenience when iterating values without the key. */
+  requesterNodeId: string;
+  /** pre-filled from the requester's local identity/profile, same as
+   *  tomb's knock form. */
+  requesterUsername: string;
+  /** free-text message — same placeholder copy as the existing knock-form
+   *  spec: "say who you are and mention something only the admin would
+   *  know (but no passwords or secrets!)" */
+  message: string;
+  /** ISO timestamp the knock was first recorded (by whichever peer first
+   *  wrote it into this map — may be later than when the requester
+   *  actually sent it, if it arrived via relay). */
+  knockedAt: string;
+  /**
+   * append-only decision log — every admin's response, in the order this
+   * peer became aware of them. NOT a single mutable status field: two
+   * admins can make conflicting decisions concurrently before either has
+   * synced the other's, and automerge's per-field last-write-wins
+   * semantics would silently pick one with no record of the conflict
+   * ever existing. logging every decision and resolving deterministically
+   * on read (see `CanvasStore.resolveKnockDecision()`) makes the conflict
+   * visible and auditable instead of silently losing one admin's action.
+   */
+  decisions: KnockDecision[];
+  /** set once the knock is fully approved and access has actually been
+   *  granted (see `CanvasStore.setRole()` in the approval flow — a later
+   *  phase, not implemented here). `resolveKnockDecision()` itself is a
+   *  pure, read-only function and does not write this field; it's the
+   *  approval flow's job. absent while still pending or mid-decision. */
+  resolvedRole?: InvitableRole;
+}
+
+/** a single admin's response to a knock — see `PendingCanvasKnock.decisions`
+ *  for why this is an append-only log rather than one mutable status field. */
+export interface KnockDecision {
+  /** node id of the admin who made this decision. */
+  byNodeId: string;
+  decision: "approve" | "decline";
+  /** role granted, if `decision === "approve"`. admin picks this at
+   *  approval time, same as the existing invite flow. */
+  role?: InvitableRole;
+  /** ISO timestamp this decision was made. NOT used to resolve conflicts
+   *  (see `PendingCanvasKnock.decisions` — resolution is by insertion
+   *  order, not wall-clock time, to avoid clock-skew ambiguity); kept for
+   *  display only. */
+  at: string;
+}
+
+/**
  * the top-level canvas document stored in Automerge.
  * contains the layout of all widgets on the canvas.
  */
@@ -136,9 +196,26 @@ export interface CanvasDocument {
    *  keyed by target node ID. used for gossip relay — any peer on the canvas
    *  can read this and relay the invite when the target comes online. */
   pendingInvites?: Record<string, PendingCanvasInvite>;
+  /**
+   * knock requests awaiting an admin's decision, keyed by the requester's
+   * node id — same shape/reasoning as `pendingInvites`: any peer (or the
+   * hub) that already holds this canvas doc can see and relay a knock, and
+   * it syncs to every admin's own devices via the normal CRDT sync path,
+   * not a live-only proxy call. **the `Record` key being the requester's
+   * node id is what gives us "one outstanding knock per node id" for
+   * free** — see `CanvasStore.recordKnock()`'s doc comment for the exact
+   * enforcement + idempotent-retry rules.
+   */
+  pendingKnocks?: Record<string, PendingCanvasKnock>;
   /** access control list — maps nodeId to role. see `CanvasRole` above for
    *  the semantics of each role. */
   acl?: Record<string, { role: CanvasRole }>;
+  /** node ids that are reliquary hubs this canvas has been shared with.
+   *  written once when the existing "share this canvas with a hub" flow
+   *  completes. lets any peer who later joins this canvas — not just the
+   *  one who did the sharing — recognize hub-relayed activity, since this
+   *  syncs like any other canvas doc field. */
+  hubNodeIds?: string[];
   /** tombstone: canvas has been deleted by owner */
   deleted?: boolean;
   /** ISO timestamp of when the canvas was deleted */

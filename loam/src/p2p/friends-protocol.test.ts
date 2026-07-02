@@ -238,6 +238,57 @@ describe("encodeMessage / decodeMessage", () => {
     expect(decoded).toEqual(msg);
   });
 
+  it("roundtrips a canvas-knock message", () => {
+    const msg: FriendzMessage = {
+      type: "canvas-knock",
+      knockId: "knock-123",
+      canvasDocId: "doc-456",
+      requesterNodeId: "a".repeat(64),
+      requesterUsername: "alice",
+      message: "hi, it's alice",
+    };
+    const encoded = encodeMessage(msg);
+    const decoded = decodeMessage(encoded);
+    expect(decoded).toEqual(msg);
+  });
+
+  it("roundtrips a canvas-knock-ack message", () => {
+    const msg: FriendzMessage = {
+      type: "canvas-knock-ack",
+      knockId: "knock-123",
+      canvasDocId: "doc-456",
+      ackerNodeId: "b".repeat(64),
+    };
+    const encoded = encodeMessage(msg);
+    const decoded = decodeMessage(encoded);
+    expect(decoded).toEqual(msg);
+  });
+
+  it("roundtrips a canvas-knock-approve message", () => {
+    const msg: FriendzMessage = {
+      type: "canvas-knock-approve",
+      knockId: "knock-123",
+      canvasDocId: "doc-456",
+      approverNodeId: "b".repeat(64),
+      role: "member",
+    };
+    const encoded = encodeMessage(msg);
+    const decoded = decodeMessage(encoded);
+    expect(decoded).toEqual(msg);
+  });
+
+  it("roundtrips a canvas-knock-decline message", () => {
+    const msg: FriendzMessage = {
+      type: "canvas-knock-decline",
+      knockId: "knock-123",
+      canvasDocId: "doc-456",
+      declinerNodeId: "b".repeat(64),
+    };
+    const encoded = encodeMessage(msg);
+    const decoded = decodeMessage(encoded);
+    expect(decoded).toEqual(msg);
+  });
+
   it("roundtrips an acl-change message", () => {
     const msg: FriendzMessage = {
       type: "acl-change",
@@ -1568,6 +1619,15 @@ describe("FriendzProtocol", () => {
             invitedAt: "2025-01-01T00:00:00Z",
           },
         ],
+        pendingKnocks: [
+          {
+            canvasDocId: "doc-3",
+            requesterNodeId: "c".repeat(64),
+            requesterUsername: "carol",
+            message: "let me in",
+            knockedAt: "2025-01-01T00:00:00Z",
+          },
+        ],
       };
       stream.pushMessage(encodeMessage(msg));
       await flush();
@@ -1578,6 +1638,9 @@ describe("FriendzProtocol", () => {
       expect(received[0].msg.canvasUpdates[0].canvasDocId).toBe("doc-1");
       expect(received[0].msg.pendingInvites).toHaveLength(1);
       expect(received[0].msg.pendingInvites[0].canvasDocId).toBe("doc-2");
+      expect(received[0].msg.pendingKnocks).toHaveLength(1);
+      expect(received[0].msg.pendingKnocks[0].canvasDocId).toBe("doc-3");
+      expect(received[0].msg.pendingKnocks[0].requesterUsername).toBe("carol");
     });
 
     it("sendGossipDigest sends correctly typed message", async () => {
@@ -1607,6 +1670,15 @@ describe("FriendzProtocol", () => {
             invitedAt: "2025-01-01T00:00:00Z",
           },
         ],
+        pendingKnocks: [
+          {
+            canvasDocId: "doc-3",
+            requesterNodeId: "c".repeat(64),
+            requesterUsername: "carol",
+            message: "let me in",
+            knockedAt: "2025-01-01T00:00:00Z",
+          },
+        ],
       });
 
       // should reuse the existing stream, not open a new one
@@ -1621,6 +1693,8 @@ describe("FriendzProtocol", () => {
       expect(parsed.pendingInvites).toHaveLength(1);
       expect(parsed.pendingInvites[0].canvasDocId).toBe("doc-2");
       expect(parsed.pendingInvites[0].role).toBe("viewer");
+      expect(parsed.pendingKnocks).toHaveLength(1);
+      expect(parsed.pendingKnocks[0].canvasDocId).toBe("doc-3");
     });
 
     it("destroy() nulls onGossipDigest and onPeerBecameOnline callbacks", () => {

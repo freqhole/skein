@@ -4,7 +4,9 @@ import type {
   CanvasPeer,
   CanvasRole,
   InvitableRole,
+  KnockDecision,
   PendingCanvasInvite,
+  PendingCanvasKnock,
   WidgetEntry,
 } from "./canvas-doc";
 import { canvasRoleSchema, emptyCanvasDoc } from "./canvas-doc";
@@ -163,6 +165,127 @@ export class CanvasStore {
         invite.acceptedAt = new Date().toISOString();
       }
     });
+  }
+
+  // -- knock requests ---------------------------------------------------------
+
+  /**
+   * record a knock from `requesterNodeId`, or return the existing one.
+   *
+   * mirrors tomb's UNIQUE(node_id) + idempotent-retry + silent-rejection
+   * behavior, adapted to an automerge map instead of a SQL constraint:
+   * - no existing entry: insert a fresh one, `decisions: []`.
+   * - existing entry still fully pending (no decisions yet): return it
+   *   unchanged — this is a legitimate retry (e.g. the first knock message
+   *   never actually reached a peer who could record it), not a new knock.
+   * - existing entry already resolved (approved or declined): return it
+   *   as-is — do not create a fresh pending entry or reset `decisions`.
+   *   per tomb's silent-rejection policy, a declined knock is handed back
+   *   the same way an approved one is; callers must not use this method's
+   *   return value alone to distinguish "declined" from "still pending" in
+   *   requester-facing UI — use `resolveKnockDecision()` for the real
+   *   state (see docs/knock-and-hub-relay-plan.md section 3.2 for the full
+   *   reasoning).
+   */
+  recordKnock(
+    requesterNodeId: string,
+    requesterUsername: string,
+    message: string
+  ): PendingCanvasKnock {
+    this.handle.change((doc) => {
+      if (!doc.pendingKnocks) doc.pendingKnocks = {} as Record<string, PendingCanvasKnock>;
+      if (!doc.pendingKnocks[requesterNodeId]) {
+        doc.pendingKnocks[requesterNodeId] = {
+          requesterNodeId,
+          requesterUsername,
+          message,
+          knockedAt: new Date().toISOString(),
+          decisions: [],
+        };
+      }
+    });
+    return this.doc().pendingKnocks![requesterNodeId];
+  }
+
+  /**
+   * pure function over a knock's decision log — resolves the *first*
+   * decision (by insertion order into `decisions`, not wall-clock time) as
+   * authoritative. see `PendingCanvasKnock.decisions`'s doc comment for why
+   * this reads a log instead of a single mutable status field: two admins
+   * can decide concurrently before either has synced the other's decision,
+   * and this function is what makes the outcome deterministic once both
+   * have synced to a given peer's view of the doc.
+   *
+   * a later decision (a late admin approving/declining after the first
+   * decision already resolved things) is never dropped from the log — see
+   * `addKnockDecision()` — it just doesn't change the outcome here. the UI
+   * is expected to surface this as a small warning next to the late
+   * decision ("this request was already approved/declined by ...") rather
+   * than an error (see docs/knock-and-hub-relay-plan.md section 5.3).
+   */
+  resolveKnockDecision(knock: PendingCanvasKnock): {
+    outcome: "pending" | "approved" | "declined";
+    decidedBy?: string;
+    role?: InvitableRole;
+  } {
+    const first = knock.decisions[0];
+    if (!first) {
+      return { outcome: "pending" };
+    }
+    return {
+      outcome: first.decision === "approve" ? "approved" : "declined",
+      decidedBy: first.byNodeId,
+      role: first.role,
+    };
+  }
+
+  /**
+   * append a decision to `pendingKnocks[requesterNodeId].decisions`.
+   * *always* appends — even if the knock is already resolved by an earlier
+   * decision (first-decision-wins, see `resolveKnockDecision()`) — so the
+   * log stays a complete audit trail; it's `resolveKnockDecision()`'s job
+   * to ignore later entries when computing the outcome, not this method's
+   * job to refuse to record them. no-op if the knock doesn't exist at all
+   * (e.g. it was already cleaned up after a full approval — see
+   * `PendingCanvasKnock`'s lifecycle notes).
+   */
+  addKnockDecision(
+    requesterNodeId: string,
+    byNodeId: string,
+    decision: "approve" | "decline",
+    role?: InvitableRole
+  ): void {
+    this.handle.change((doc) => {
+      const knock = doc.pendingKnocks?.[requesterNodeId];
+      if (!knock) return;
+      // automerge rejects an explicit `undefined` value being assigned/pushed
+      // (unlike a plain JS object) — omit `role` entirely rather than setting
+      // it to `undefined` when this is a decline (or an approve without a
+      // role, which shouldn't happen but isn't this method's job to enforce).
+      const entry: KnockDecision =
+        role === undefined
+          ? { byNodeId, decision, at: new Date().toISOString() }
+          : { byNodeId, decision, role, at: new Date().toISOString() };
+      knock.decisions.push(entry);
+    });
+  }
+
+  // -- hub relay ---------------------------------------------------------------
+
+  /** add a node id to `hubNodeIds` — dedupes, a no-op if already present. */
+  addHubNodeId(hubNodeId: string): void {
+    this.handle.change((doc) => {
+      if (!doc.hubNodeIds) doc.hubNodeIds = [];
+      if (!doc.hubNodeIds.includes(hubNodeId)) {
+        doc.hubNodeIds.push(hubNodeId);
+      }
+    });
+  }
+
+  /** convenience: true if `nodeId` is a recorded reliquary hub for this
+   *  canvas (see `CanvasDocument.hubNodeIds`). */
+  isHubNode(nodeId: string): boolean {
+    return (this.doc().hubNodeIds ?? []).includes(nodeId);
   }
 
   // -- access control ----------------------------------------------------------

@@ -15,6 +15,9 @@ import { handleSkeinStream } from "../p2p/skein-handler";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
 import {
   destroyBridge,
+  initKnockSocialDocBridge,
+  recordKnockAck,
+  recordKnockRelay,
   sendCanvasInvite,
   sendFriendRequest,
   setOutboundRequestHook,
@@ -35,7 +38,7 @@ import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
 import { createSkeinHarness, type SkeinHarnessNoStore } from "../harness/skein-harness";
 import { syncCanvasMetadataToCards, watchCanvasDocsForUpdates } from "./canvas-watchers";
-import { initFriendzWiring, docHandleAsSocialDoc } from "./friendz-wiring";
+import { initFriendzWiring, docHandleAsSocialDoc, wireKnockHandlers } from "./friendz-wiring";
 import {
   createNarthexWithSeed,
   ensureSingletonWidgets,
@@ -656,6 +659,30 @@ class SkeinRouter {
     if (result.messagezDocHandle) this.messagezDocHandle = result.messagezDocHandle;
     this.friendzDocUnsubs.push(...result.unsubs);
     this.flushCanvasUpdates = result.flushCanvasUpdates;
+
+    // let widgets (the messagez knock row) call approveKnock()/declineKnock()
+    // (friendz-wiring.ts) directly via the friendz bridge — see
+    // friendz-bridge.ts's "knock (access-request) actions" section.
+    initKnockSocialDocBridge(this.socialDoc);
+
+    // re-register the knock message handlers with the live-attribution
+    // callbacks wired in. `wireKnockHandlers()` is exported specifically to
+    // be called directly like this (see its doc comment in
+    // friendz-wiring.ts) — this re-assigns the same four
+    // `protocol.onCanvasKnock*` handlers `initFriendzWiring()` already set
+    // up above, with identical core behavior, just also firing
+    // `onKnockRelayed`/`onKnockAcked` so the messagez widget's "via hub"
+    // attribution (section 7.3) and requester status view (section 7.1)
+    // have live data to read — see `recordKnockRelay()`/`recordKnockAck()`'s
+    // doc comments for why this is session-only, not persisted.
+    wireKnockHandlers({
+      protocol: result.protocol,
+      repo: this.repo,
+      irohAdapter: this.irohAdapter,
+      localNodeId: this.localNodeId,
+      onKnockRelayed: (info) => recordKnockRelay(info),
+      onKnockAcked: (info) => recordKnockAck(info),
+    });
   }
 
   /** navigate to a specific canvas by document id */
@@ -1543,10 +1570,19 @@ class SkeinRouter {
       keyboard: canvas.keyboard,
       widgetId: MESSAGEZ_WIDGET_ID,
       canvasElement: canvas.app.canvas as HTMLCanvasElement,
+      // pendingKnocks lives on the currently-open canvas's own document
+      // (canvas-doc.ts), not the messagez doc above — see
+      // docs/knock-and-hub-relay-plan.md section 1's table for the
+      // asymmetry. the messagez widget reads it straight from here.
+      canvasStore: canvas.store,
     };
 
     try {
       const ctrl = messagezWidget.create(ctx);
+      if (import.meta.env.DEV) {
+        const bridge: Record<string, unknown> = ((window as any).__skeinTest ??= {});
+        bridge.messagez = (ctrl as unknown as { testHooks?: unknown }).testHooks;
+      }
       return new WidgetOverlay(
         canvas.app,
         ctrl,

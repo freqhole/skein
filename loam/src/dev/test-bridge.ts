@@ -1,8 +1,20 @@
 import { cbor } from "@automerge/automerge-repo";
+import type { DocumentId, Repo } from "@automerge/automerge-repo";
 
 import type { SkeinCanvas } from "../canvas/init";
+import type { InvitableRole } from "../canvas/canvas-doc";
+import type { CanvasStore } from "../canvas/canvas-store";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
 import type { EndpointState, IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
+import {
+  approveKnock,
+  declineKnock,
+  mergeGossipDigestKnocks,
+  wireKnockHandlers,
+  type KnockRelayInfo,
+} from "../standalone/friendz-wiring";
+import type { SocialDoc } from "../../widgets/narthex/social/types";
+import type { SocialState } from "../../widgets/narthex/social/schema";
 import { storeBlob, classifyDomain } from "../storage/skein-blob-store";
 
 /**
@@ -108,6 +120,16 @@ export interface SkeinP2PBridge {
   getNodeId(): Promise<string>;
   /** dial a peer by node ID and keep the connection alive */
   addPeer(nodeId: string): Promise<void>;
+  /**
+   * stop maintaining the automerge-repo-level connection to a peer added via
+   * `addPeer()` — closes the existing stream and stops reconnecting.
+   * delegates to `IrohNetworkAdapter.forgetPeer()`. useful for tests that
+   * need to prove some *other* delivery path (e.g. the skein-friendz/1
+   * gossip-digest message) works on its own, independent of ordinary
+   * automerge doc-sync — severing this link means the automerge-repo
+   * `Repo` genuinely has no way left to sync changes with that peer.
+   */
+  forgetPeer(nodeId: string): Promise<void>;
   /** read the current endpoint lifecycle state synchronously */
   getEndpointState(): EndpointState;
   /**
@@ -235,6 +257,12 @@ export interface SkeinTestBridge {
    * null for ordinary BroadcastChannel-only test pages.
    */
   friendz?: SkeinFriendzTestBridge | null;
+  /**
+   * knock (access-request) helpers — present only when the page was
+   * bootstrapped via test-harness-p2p.html / p2p-test-bootstrap.ts.
+   * null for ordinary BroadcastChannel-only test pages.
+   */
+  knock?: SkeinKnockTestBridge | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +282,10 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
 
     addPeer(nodeId: string): Promise<void> {
       return adapter.addPeer(nodeId);
+    },
+
+    async forgetPeer(nodeId: string): Promise<void> {
+      adapter.forgetPeer(nodeId);
     },
 
     getEndpointState(): EndpointState {
@@ -377,6 +409,166 @@ export function buildFriendzTestBridge(
 
     getFriends(): string[] {
       return [...acceptedFriends];
+    },
+  };
+}
+
+/**
+ * knock (access-request) test bridge — methods only available when the
+ * page was bootstrapped with a real FriendzProtocol + CanvasStore + Repo
+ * (test-harness-p2p.html).
+ *
+ * wraps the real knock plumbing from `standalone/friendz-wiring.ts`
+ * (`wireKnockHandlers`, `approveKnock`, `declineKnock`,
+ * `mergeGossipDigestKnocks`) so e2e tests can drive the actual production
+ * message flow without needing the full narthex/social/messagez setup
+ * `initFriendzWiring()` normally requires — same reasoning as
+ * `buildFriendzTestBridge` above.
+ */
+export interface SkeinKnockTestBridge {
+  /** send a `canvas-knock` message directly to a peer — the low-level send
+   *  a real knock-form UI (not built yet) would eventually wrap. */
+  sendKnock(
+    peerNodeId: string,
+    knock: { knockId: string; canvasDocId: string; requesterUsername: string; message: string }
+  ): Promise<void>;
+  /** approve a pending knock — wraps `friendz-wiring.ts`'s `approveKnock()`. */
+  approveKnock(requesterNodeId: string, role: InvitableRole): Promise<void>;
+  /** decline a pending knock — wraps `friendz-wiring.ts`'s `declineKnock()`. */
+  declineKnock(requesterNodeId: string): Promise<void>;
+  /** relay-attribution events observed so far on this peer — see
+   *  `wireKnockHandlers`'s `onKnockRelayed` and `mergeGossipDigestKnocks`. */
+  getRelayedKnocks(): KnockRelayInfo[];
+  /** `canvas-knock-ack` events received so far on this peer — a
+   *  deterministic "the knock was actually processed by someone" signal,
+   *  useful for tests that need to wait past a specific knock attempt
+   *  before asserting on dedup/idempotency. */
+  getReceivedKnockAcks(): Array<{ knockId: string; canvasDocId: string; ackerNodeId: string }>;
+  /** manually send a gossip digest carrying this peer's own pending knocks
+   *  for `canvasDocId` to another peer — lets tests trigger relay delivery
+   *  deterministically instead of waiting on the real heartbeat timer. */
+  sendKnocksGossipDigest(peerNodeId: string, canvasDocId: string): Promise<void>;
+  /** read a node id's role from a canvas doc's `.acl`, opening/syncing the
+   *  doc first if this peer doesn't already hold it. returns null if the
+   *  doc can't be reached or the node has no ACL entry. */
+  getCanvasAcl(canvasDocId: string, nodeId: string): Promise<string | null>;
+}
+
+/**
+ * build a SkeinKnockTestBridge, wiring the real `canvas-knock*` message
+ * handlers (`wireKnockHandlers`) and gossip-digest merge logic
+ * (`mergeGossipDigestKnocks`) onto `protocol`.
+ *
+ * `getStore` is a thunk rather than a captured `CanvasStore` because the
+ * p2p test harness can swap the active canvas out from under a page (see
+ * `joinCanvasForTest` in `p2p-test-bootstrap.ts`, which replaces
+ * `window.__skeinTest.canvas`) — resolving the store fresh on every call
+ * keeps this bridge pointed at whichever canvas is actually current.
+ */
+export function buildKnockTestBridge(options: {
+  protocol: FriendzProtocol;
+  getStore: () => CanvasStore;
+  repo: Repo;
+  irohAdapter: IrohNetworkAdapter;
+  localNodeId: string;
+}): SkeinKnockTestBridge {
+  const { protocol, getStore, repo, irohAdapter, localNodeId } = options;
+  const relayedKnocks: KnockRelayInfo[] = [];
+  const receivedAcks: Array<{ knockId: string; canvasDocId: string; ackerNodeId: string }> = [];
+
+  wireKnockHandlers({
+    protocol,
+    repo,
+    irohAdapter,
+    localNodeId,
+    onKnockRelayed: (info) => relayedKnocks.push(info),
+    onKnockAcked: (info) => receivedAcks.push(info),
+  });
+
+  // the p2p test harness has no narthex/social doc for `approveKnock()`'s
+  // friend-establishment step to write into (same reasoning as
+  // `buildFriendzTestBridge`'s in-memory `acceptedFriends` set above) — a
+  // minimal in-memory stand-in satisfying the `SocialDoc` interface is
+  // enough for `approveKnock()` to run for real without throwing.
+  const socialState: SocialState = { friends: [] } as unknown as SocialState;
+  const socialDoc: SocialDoc = {
+    get current() {
+      return socialState;
+    },
+    change(fn) {
+      fn(socialState);
+    },
+    on() {
+      return () => {};
+    },
+  };
+
+  // gossip-digest knock merging is wired separately from
+  // `wireKnockHandlers` (which only sets the four `canvas-knock*` message
+  // handlers) — `onGossipDigest` is a single field, and production code
+  // (`initFriendzWiring`) combines its own canvas-update/invite processing
+  // with this same `mergeGossipDigestKnocks` call in one handler. the test
+  // harness has no canvas-update/invite gossip processing of its own, so
+  // this is the entire handler here.
+  protocol.onGossipDigest = (msg, fromNodeId) => {
+    mergeGossipDigestKnocks(repo, msg, fromNodeId, (info) => relayedKnocks.push(info)).catch(() => {
+      // best effort — logged inside mergeGossipDigestKnocks already
+    });
+  };
+
+  return {
+    async sendKnock(peerNodeId, knock) {
+      await protocol.sendCanvasKnock(peerNodeId, {
+        knockId: knock.knockId,
+        canvasDocId: knock.canvasDocId,
+        requesterNodeId: localNodeId,
+        requesterUsername: knock.requesterUsername,
+        message: knock.message,
+      });
+    },
+
+    async approveKnock(requesterNodeId, role) {
+      await approveKnock(
+        { protocol, store: getStore(), socialDoc, localNodeId },
+        requesterNodeId,
+        role
+      );
+    },
+
+    async declineKnock(requesterNodeId) {
+      await declineKnock({ protocol, store: getStore(), localNodeId }, requesterNodeId);
+    },
+
+    getRelayedKnocks(): KnockRelayInfo[] {
+      return [...relayedKnocks];
+    },
+
+    getReceivedKnockAcks() {
+      return [...receivedAcks];
+    },
+
+    async sendKnocksGossipDigest(peerNodeId, canvasDocId) {
+      const doc = getStore().doc();
+      const knocks = Object.values(doc.pendingKnocks ?? {})
+        .filter((k) => k.requesterNodeId !== peerNodeId)
+        .map((k) => ({
+          canvasDocId,
+          requesterNodeId: k.requesterNodeId,
+          requesterUsername: k.requesterUsername,
+          message: k.message,
+          knockedAt: k.knockedAt,
+        }));
+      await protocol.sendGossipDigest(peerNodeId, {
+        canvasUpdates: [],
+        pendingInvites: [],
+        pendingKnocks: knocks,
+      });
+    },
+
+    async getCanvasAcl(canvasDocId, nodeId) {
+      const handle = await repo.find(canvasDocId as DocumentId);
+      const doc = handle.doc() as { acl?: Record<string, { role: string }> } | undefined;
+      return doc?.acl?.[nodeId]?.role ?? null;
     },
   };
 }

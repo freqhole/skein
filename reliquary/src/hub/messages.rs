@@ -565,6 +565,64 @@ impl HubPeerService {
                 // where blobs might be available
                 self.snatch_trigger.notify_one();
             }
+            FriendzMessage::CanvasKnock {
+                knock_id,
+                canvas_doc_id,
+                requester_node_id,
+                requester_username,
+                message,
+            } => {
+                self.handle_canvas_knock(
+                    from_node_id,
+                    &knock_id,
+                    &canvas_doc_id,
+                    &requester_node_id,
+                    &requester_username,
+                    &message,
+                )
+                .await;
+            }
+            FriendzMessage::CanvasKnockAck {
+                knock_id,
+                canvas_doc_id,
+                acker_node_id,
+            } => {
+                tracing::info!(
+                    peer = %from_node_id,
+                    knock_id = %knock_id,
+                    canvas_doc_id = %canvas_doc_id,
+                    acker = %acker_node_id,
+                    "received canvas knock ack"
+                );
+            }
+            FriendzMessage::CanvasKnockApprove {
+                knock_id,
+                canvas_doc_id,
+                approver_node_id,
+                role,
+            } => {
+                tracing::info!(
+                    peer = %from_node_id,
+                    knock_id = %knock_id,
+                    canvas_doc_id = %canvas_doc_id,
+                    approver = %approver_node_id,
+                    role = %role,
+                    "received canvas knock approve"
+                );
+            }
+            FriendzMessage::CanvasKnockDecline {
+                knock_id,
+                canvas_doc_id,
+                decliner_node_id,
+            } => {
+                tracing::info!(
+                    peer = %from_node_id,
+                    knock_id = %knock_id,
+                    canvas_doc_id = %canvas_doc_id,
+                    decliner = %decliner_node_id,
+                    "received canvas knock decline"
+                );
+            }
         }
     }
 

@@ -455,6 +455,10 @@ fn msg_type_name(msg: &FriendzMessage) -> &'static str {
         FriendzMessage::GossipDigest { .. } => "gossip-digest",
         FriendzMessage::BlobSeek { .. } => "blob-seek",
         FriendzMessage::BlobOffer { .. } => "blob-offer",
+        FriendzMessage::CanvasKnock { .. } => "canvas-knock",
+        FriendzMessage::CanvasKnockAck { .. } => "canvas-knock-ack",
+        FriendzMessage::CanvasKnockApprove { .. } => "canvas-knock-approve",
+        FriendzMessage::CanvasKnockDecline { .. } => "canvas-knock-decline",
     }
 }
 

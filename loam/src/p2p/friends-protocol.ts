@@ -124,6 +124,51 @@ export interface CanvasInviteDeclineMessage {
   declinerNodeId: string;
 }
 
+/**
+ * send a knock (access request), or relay one — same structural shape as
+ * `CanvasInviteMessage`. see docs/knock-and-hub-relay-plan.md section 4.
+ */
+export interface CanvasKnockMessage {
+  type: "canvas-knock";
+  /** stable id for this specific knock attempt, for acking. a requester
+   *  retrying after a timeout should reuse a fresh id per attempt — dedup
+   *  happens on `requesterNodeId` (see `CanvasStore.recordKnock()`), not on
+   *  `knockId`. */
+  knockId: string;
+  canvasDocId: string;
+  requesterNodeId: string;
+  requesterUsername: string;
+  message: string;
+}
+
+/** acknowledge receipt of a canvas knock. */
+export interface CanvasKnockAckMessage {
+  type: "canvas-knock-ack";
+  knockId: string;
+  canvasDocId: string;
+  /** node id of whoever recorded the knock into `pendingKnocks` — lets the
+   *  requester's UI move from "sending…" to "request received, waiting for
+   *  an admin" with a real delivery confirmation. */
+  ackerNodeId: string;
+}
+
+/** approve a pending knock. */
+export interface CanvasKnockApproveMessage {
+  type: "canvas-knock-approve";
+  knockId: string;
+  canvasDocId: string;
+  approverNodeId: string;
+  role: InvitableRole;
+}
+
+/** decline a pending knock. */
+export interface CanvasKnockDeclineMessage {
+  type: "canvas-knock-decline";
+  knockId: string;
+  canvasDocId: string;
+  declinerNodeId: string;
+}
+
 /** notify a peer that their ACL role changed. */
 export interface AclChangeMessage {
   type: "acl-change";
@@ -183,13 +228,28 @@ export interface GossipDigestPendingInvite {
   invitedAt: string;
 }
 
+/** a pending knock entry in a gossip digest — mirrors
+ *  `GossipDigestPendingInvite` exactly. anything arriving via this path is
+ *  by definition relayed (the digest sender is never the requester
+ *  themselves in practice — a requester gossips its own knock nowhere), so
+ *  there's no `relayedBy` field here: the receiving peer already knows the
+ *  digest's `fromNodeId` is the relayer. */
+export interface GossipDigestPendingKnock {
+  canvasDocId: string;
+  requesterNodeId: string;
+  requesterUsername: string;
+  message: string;
+  knockedAt: string;
+}
+
 /** gossip digest sent when a peer comes online.
- *  bundles canvas updates and pending invites for the receiving peer,
- *  computed from the sender's local canvas doc state. */
+ *  bundles canvas updates, pending invites, and pending knocks for the
+ *  receiving peer, computed from the sender's local canvas doc state. */
 export interface GossipDigestMessage {
   type: "gossip-digest";
   canvasUpdates: GossipDigestCanvasUpdate[];
   pendingInvites: GossipDigestPendingInvite[];
+  pendingKnocks: GossipDigestPendingKnock[];
   sharedCanvasIds?: string[];
 }
 
@@ -222,6 +282,10 @@ export type FriendzMessage =
   | CanvasInviteAckMessage
   | CanvasInviteAcceptMessage
   | CanvasInviteDeclineMessage
+  | CanvasKnockMessage
+  | CanvasKnockAckMessage
+  | CanvasKnockApproveMessage
+  | CanvasKnockDeclineMessage
   | AclChangeMessage
   | CanvasUpdateMessage
   | CanvasDeletedMessage
@@ -288,6 +352,18 @@ export type OnCanvasInviteDecline = (
   decline: CanvasInviteDeclineMessage,
   fromNodeId: string
 ) => void;
+
+/** callback for when a canvas knock is received from a remote peer. */
+export type OnCanvasKnock = (knock: CanvasKnockMessage, fromNodeId: string) => void;
+
+/** callback for when a canvas knock ack is received from a remote peer. */
+export type OnCanvasKnockAck = (ack: CanvasKnockAckMessage, fromNodeId: string) => void;
+
+/** callback for when a canvas knock is approved by a remote peer. */
+export type OnCanvasKnockApprove = (approve: CanvasKnockApproveMessage, fromNodeId: string) => void;
+
+/** callback for when a canvas knock is declined by a remote peer. */
+export type OnCanvasKnockDecline = (decline: CanvasKnockDeclineMessage, fromNodeId: string) => void;
 
 /** callback for when an ACL change notification is received from a remote peer. */
 export type OnAclChange = (change: AclChangeMessage, fromNodeId: string) => void;
@@ -410,6 +486,18 @@ export class FriendzProtocol {
 
   /** called when a canvas invite is declined. */
   onCanvasInviteDecline: OnCanvasInviteDecline | null = null;
+
+  /** called when a canvas knock is received. */
+  onCanvasKnock: OnCanvasKnock | null = null;
+
+  /** called when a canvas knock ack is received. */
+  onCanvasKnockAck: OnCanvasKnockAck | null = null;
+
+  /** called when a canvas knock is approved. */
+  onCanvasKnockApprove: OnCanvasKnockApprove | null = null;
+
+  /** called when a canvas knock is declined. */
+  onCanvasKnockDecline: OnCanvasKnockDecline | null = null;
 
   /** called when an ACL change notification is received. */
   onAclChange: OnAclChange | null = null;
@@ -579,6 +667,22 @@ export class FriendzProtocol {
 
       case "canvas-invite-decline":
         this.onCanvasInviteDecline?.(msg, fromNodeId);
+        break;
+
+      case "canvas-knock":
+        this.onCanvasKnock?.(msg, fromNodeId);
+        break;
+
+      case "canvas-knock-ack":
+        this.onCanvasKnockAck?.(msg, fromNodeId);
+        break;
+
+      case "canvas-knock-approve":
+        this.onCanvasKnockApprove?.(msg, fromNodeId);
+        break;
+
+      case "canvas-knock-decline":
+        this.onCanvasKnockDecline?.(msg, fromNodeId);
         break;
 
       case "acl-change":
@@ -800,6 +904,39 @@ export class FriendzProtocol {
     decline: Omit<CanvasInviteDeclineMessage, "type">
   ): Promise<void> {
     const msg: CanvasInviteDeclineMessage = { type: "canvas-invite-decline", ...decline };
+    await this.sendMessage(peerNodeId, msg);
+  }
+
+  /** send a canvas knock to a peer (or relay one onward). */
+  async sendCanvasKnock(peerNodeId: string, knock: Omit<CanvasKnockMessage, "type">): Promise<void> {
+    const msg: CanvasKnockMessage = { type: "canvas-knock", ...knock };
+    await this.sendMessage(peerNodeId, msg);
+  }
+
+  /** send a canvas knock ack to a peer. */
+  async sendCanvasKnockAck(
+    peerNodeId: string,
+    ack: Omit<CanvasKnockAckMessage, "type">
+  ): Promise<void> {
+    const msg: CanvasKnockAckMessage = { type: "canvas-knock-ack", ...ack };
+    await this.sendMessage(peerNodeId, msg);
+  }
+
+  /** approve a canvas knock. */
+  async sendCanvasKnockApprove(
+    peerNodeId: string,
+    approve: Omit<CanvasKnockApproveMessage, "type">
+  ): Promise<void> {
+    const msg: CanvasKnockApproveMessage = { type: "canvas-knock-approve", ...approve };
+    await this.sendMessage(peerNodeId, msg);
+  }
+
+  /** decline a canvas knock. */
+  async sendCanvasKnockDecline(
+    peerNodeId: string,
+    decline: Omit<CanvasKnockDeclineMessage, "type">
+  ): Promise<void> {
+    const msg: CanvasKnockDeclineMessage = { type: "canvas-knock-decline", ...decline };
     await this.sendMessage(peerNodeId, msg);
   }
 
@@ -1119,6 +1256,10 @@ export class FriendzProtocol {
     this.onCanvasInviteAck = null;
     this.onCanvasInviteAccept = null;
     this.onCanvasInviteDecline = null;
+    this.onCanvasKnock = null;
+    this.onCanvasKnockAck = null;
+    this.onCanvasKnockApprove = null;
+    this.onCanvasKnockDecline = null;
     this.onAclChange = null;
     this.onCanvasActivity = null;
     this.onPeerConnected = null;
