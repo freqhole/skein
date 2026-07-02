@@ -9,29 +9,20 @@
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// shared enums
-// ---------------------------------------------------------------------------
-
-/// canvas collaborator role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CanvasRole {
-    Editor,
-    Viewer,
-}
-
-/// ACL role including the "removed" state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AclRole {
-    Editor,
-    Viewer,
-    Removed,
-}
-
-// ---------------------------------------------------------------------------
 // sub-types used within messages
 // ---------------------------------------------------------------------------
+//
+// note: canvas/ACL roles are plain `String` ("admin"/"member"/"viewer", or
+// "removed" for AclChange — see `canvas-doc.ts`'s `InvitableRole`/
+// `CanvasRoleOrRemoved`) rather than a dedicated enum. this crate used to
+// have `CanvasRole`/`AclRole` enums here (`Editor`/`Viewer`/`Removed`), but
+// those variants predated this project's admin/member/viewer role rename
+// and no longer matched the wire values the TS side actually sends —
+// `role: "member"` on a real canvas-invite would fail to deserialize
+// entirely (`unknown variant `member`, expected `editor` or `viewer``),
+// silently dropping the message. removed the enums and switched every
+// role-shaped wire field to `String` to match reality instead of
+// perpetuating the mismatch.
 
 /// lightweight activity summary for a shared canvas, piggybacked on heartbeat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +56,7 @@ pub struct GossipDigestPendingInvite {
     pub canvas_preview_url: String,
     pub invited_by: String,
     pub invited_by_username: String,
-    pub role: CanvasRole,
+    pub role: String,
     pub invited_at: String,
 }
 
@@ -163,7 +154,7 @@ pub enum FriendzMessage {
         origin_node_id: String,
         #[serde(rename = "originUsername")]
         origin_username: String,
-        role: CanvasRole,
+        role: String,
         targets: Vec<String>,
         acked: Vec<String>,
     },
@@ -207,7 +198,7 @@ pub enum FriendzMessage {
         #[serde(rename = "targetNodeId")]
         target_node_id: String,
         #[serde(rename = "newRole")]
-        new_role: AclRole,
+        new_role: String,
         #[serde(rename = "changedBy")]
         changed_by: String,
         #[serde(rename = "changedByUsername")]
@@ -313,11 +304,9 @@ pub enum FriendzMessage {
     },
 
     /// approve a canvas knock. `role` is a plain string ("member"/"viewer",
-    /// see `canvas-doc.ts`'s `InvitableRole`) rather than the `CanvasRole`
-    /// enum above — that enum's variants predate this project's
-    /// admin/member/viewer role rename and no longer match the wire values
-    /// the TS side actually sends, and fixing that mismatch is out of scope
-    /// here (a bigger, separate rename).
+    /// see `canvas-doc.ts`'s `InvitableRole`) — same convention every other
+    /// role-shaped field in this enum now uses (see the module-level note
+    /// above `GossipDigestCanvasUpdate`).
     CanvasKnockApprove {
         #[serde(rename = "knockId")]
         knock_id: String,
@@ -568,7 +557,7 @@ mod tests {
             canvas_preview_url: None,
             origin_node_id: "node-abc".to_string(),
             origin_username: "alice".to_string(),
-            role: CanvasRole::Editor,
+            role: "member".to_string(),
             targets: vec!["node-def".to_string()],
             acked: vec![],
         };
@@ -583,14 +572,14 @@ mod tests {
         assert_eq!(parsed["canvasColor"], 0xff0000);
         assert!(parsed.get("canvasPreviewUrl").is_none());
         assert_eq!(parsed["originNodeId"], "node-abc");
-        assert_eq!(parsed["role"], "editor");
+        assert_eq!(parsed["role"], "member");
         assert_eq!(parsed["targets"][0], "node-def");
 
         // round-trip
         let deserialized: FriendzMessage = serde_json::from_str(&json).unwrap();
         match deserialized {
             FriendzMessage::CanvasInvite { role, .. } => {
-                assert_eq!(role, CanvasRole::Editor);
+                assert_eq!(role, "member");
             }
             _ => panic!("expected CanvasInvite"),
         }
@@ -645,7 +634,7 @@ mod tests {
             canvas_doc_id: "doc-1".to_string(),
             canvas_title: "my canvas".to_string(),
             target_node_id: "node-def".to_string(),
-            new_role: AclRole::Removed,
+            new_role: "removed".to_string(),
             changed_by: "node-abc".to_string(),
             changed_by_username: "alice".to_string(),
         };
@@ -704,7 +693,7 @@ mod tests {
                 canvas_preview_url: "".to_string(),
                 invited_by: "node-abc".to_string(),
                 invited_by_username: "alice".to_string(),
-                role: CanvasRole::Editor,
+                role: "member".to_string(),
                 invited_at: "2025-01-01T00:00:00Z".to_string(),
             }],
             shared_canvas_ids: vec![],
@@ -718,7 +707,7 @@ mod tests {
         assert_eq!(parsed["pendingInvites"][0]["canvasTitle"], "shared canvas");
         assert_eq!(parsed["pendingInvites"][0]["canvasColor"], 0x6366f1);
         assert_eq!(parsed["pendingInvites"][0]["invitedByUsername"], "alice");
-        assert_eq!(parsed["pendingInvites"][0]["role"], "editor");
+        assert_eq!(parsed["pendingInvites"][0]["role"], "member");
     }
 
     /// test deserializing a JSON string that looks like what JS would produce.
@@ -745,7 +734,7 @@ mod tests {
             _ => panic!("expected Heartbeat"),
         }
 
-        // simulate a canvas-invite from JS
+        // simulate a canvas-invite from JS with role "viewer"
         let js_json = r#"{"type":"canvas-invite","inviteId":"inv-abc","canvasDocId":"doc-123","canvasTitle":"collab canvas","originNodeId":"node-alice","originUsername":"alice","role":"viewer","targets":["node-bob","node-carol"],"acked":["node-bob"]}"#;
 
         let msg: FriendzMessage = serde_json::from_str(js_json).unwrap();
@@ -756,11 +745,26 @@ mod tests {
                 acked,
                 ..
             } => {
-                assert_eq!(role, CanvasRole::Viewer);
+                assert_eq!(role, "viewer");
                 assert_eq!(targets.len(), 2);
                 assert_eq!(acked.len(), 1);
             }
             _ => panic!("expected CanvasInvite"),
+        }
+
+        // simulate a canvas-invite from JS with role "member" — this is the
+        // exact value real production code sends (`InvitableRole` is
+        // "member" | "viewer", never "editor") and the case that used to be
+        // silently dropped by the old `CanvasRole` enum ("unknown variant
+        // `member`, expected `editor` or `viewer`").
+        let js_json = r#"{"type":"canvas-invite","inviteId":"inv-def","canvasDocId":"doc-456","canvasTitle":"collab canvas","originNodeId":"node-alice","originUsername":"alice","role":"member","targets":["node-bob"],"acked":[]}"#;
+
+        let msg: FriendzMessage = serde_json::from_str(js_json).unwrap();
+        match msg {
+            FriendzMessage::CanvasInvite { role, .. } => {
+                assert_eq!(role, "member");
+            }
+            _ => panic!("expected CanvasInvite with role member"),
         }
 
         // simulate an offline-announcement from JS

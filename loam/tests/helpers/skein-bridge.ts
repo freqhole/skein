@@ -336,3 +336,107 @@ export async function waitForNodeId(page: Page, timeoutMs = 30_000): Promise<str
     () => (window as any).__skeinTest?.social?.doc?.current?.profile?.nodeId ?? ""
   );
 }
+
+// --- profile-tab "my canvases" (window.__skeinTest.social.profileTab) ---
+// see docs/hub-and-profile-plan.md section 6 / section 8 step 7.
+
+/** all canvases on the local peer's profile doc, per ProfileStore.canvases() directly. */
+export async function getProfileCanvasEntries(
+  page: Page
+): Promise<Array<{ canvasDocId: string; title: string; description?: string; color?: number }>> {
+  return page.evaluate(
+    () => (window as any).__skeinTest?.social?.profileTab?.getCanvasEntries?.() ?? []
+  );
+}
+
+/** whether the profile tab's "add current canvas" action is available in this mount. */
+export async function canAddCurrentCanvasToProfile(page: Page): Promise<boolean> {
+  return page.evaluate(
+    () => (window as any).__skeinTest?.social?.profileTab?.canAddCurrentCanvas?.() ?? false
+  );
+}
+
+/** add the currently-open canvas to the profile, as if the button were tapped. */
+export async function addCurrentCanvasToProfile(page: Page): Promise<void> {
+  await page.evaluate(() => (window as any).__skeinTest?.social?.profileTab?.addCurrentCanvas?.());
+}
+
+/** remove a canvas from the profile by its doc id, as if its row's remove button were tapped. */
+export async function removeCanvasFromProfile(page: Page, canvasDocId: string): Promise<void> {
+  await page.evaluate(
+    (id) => (window as any).__skeinTest?.social?.profileTab?.removeCanvas?.(id),
+    canvasDocId
+  );
+}
+
+/** titles currently rendered in the profile tab's "my canvases" list. */
+export async function getRenderedProfileCanvasTitles(page: Page): Promise<string[]> {
+  return page.evaluate(
+    () => (window as any).__skeinTest?.social?.profileTab?.getRenderedCanvasTitles?.() ?? []
+  );
+}
+
+// --- share dialog (window.__skeinTest.share) ---
+// see src/dev/test-bridge.ts's ShareTestHooks for what these wrap. only
+// present once the toolbar's real share button has been pressed at least
+// once for the current canvas (boot.ts's onShare handler registers it fresh
+// on every open, since the dialog itself is built ad hoc per click rather
+// than mounted once like messagez/friends-tab).
+
+/** click the toolbar's real share button, exactly as a user would \u2014 opens
+ *  (or refreshes) the share dialog and (re)populates window.__skeinTest.share
+ *  with a fresh snapshot of the friends-to-invite list. */
+export async function openShareDialog(page: Page): Promise<void> {
+  await page.evaluate(() => (window as any).__skein.toolbar.shareBtn.onPress.emit());
+}
+
+/** wait until window.__skeinTest.share has been registered (the share
+ *  dialog has been opened at least once). */
+export async function waitForShareHooks(page: Page, timeoutMs = 15_000): Promise<void> {
+  await page.waitForFunction(() => (window as any).__skeinTest?.share != null, {
+    timeout: timeoutMs,
+  });
+}
+
+/** the friend-invite list passed to the most recently opened share dialog
+ *  (a snapshot \u2014 call openShareDialog() again to refresh it). */
+export async function getFriendsForInvite(
+  page: Page
+): Promise<Array<{ friendId: string; username: string; nodeId: string; isHub?: boolean }>> {
+  return page.evaluate(() => (window as any).__skeinTest?.share?.getFriendsForInvite?.() ?? []);
+}
+
+/** pending invites on the current canvas doc, read live via
+ *  CanvasStore.pendingInvites(). */
+export async function getSharePendingInvites(
+  page: Page
+): Promise<Array<{ targetNodeId: string; invite: Record<string, unknown> }>> {
+  return page.evaluate(() => (window as any).__skeinTest?.share?.getPendingInvites?.() ?? []);
+}
+
+/** raw messagez outbox `shares` entries for the current canvas, read live
+ *  from the messagez doc. */
+export async function getShareMessagezShares(
+  page: Page
+): Promise<Array<{ toNodeId: string; canvasDocId: string; declined?: boolean; cancelled?: boolean }>> {
+  return page.evaluate(() => (window as any).__skeinTest?.share?.getMessagezShares?.() ?? []);
+}
+
+/** invite a friend by node id + role, calling the dialog's real
+ *  onInviteFriend handler exactly as if its "invite" button were pressed. */
+export async function inviteFriendViaShareDialog(
+  page: Page,
+  nodeId: string,
+  role: "member" | "viewer"
+): Promise<void> {
+  await page.evaluate(
+    ([id, r]) => (window as any).__skeinTest.share.inviteFriend(id, r),
+    [nodeId, role] as const
+  );
+}
+
+/** cancel a pending invite by target node id, calling the dialog's real
+ *  onCancelInvite handler exactly as if its "cancel" button were pressed. */
+export async function cancelInviteViaShareDialog(page: Page, nodeId: string): Promise<void> {
+  await page.evaluate((id) => (window as any).__skeinTest.share.cancelInvite(id), nodeId);
+}

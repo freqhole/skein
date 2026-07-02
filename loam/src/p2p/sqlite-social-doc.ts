@@ -87,6 +87,7 @@ interface RawPeerFriendDetail {
   bio: string;
   avatar_url: string;
   accent_color: number;
+  is_hub: boolean;
   node_ids: RawPeerNodeProfile[];
 }
 
@@ -204,12 +205,12 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
           })
         ),
         createdAt: unixToIso(f.created_at),
-        // the sqlite (tauri) social-doc backend has no isHub column yet —
         // hub flag recording (docs/hub-and-profile-plan.md section 3) is
-        // only wired up for the browser/automerge SocialDoc path
-        // (friendz-wiring.ts). defaults false until that backend gets the
-        // same treatment.
-        isHub: false,
+        // persisted on reliquary's userz.is_hub (peer identity, sticky —
+        // see reliquary/src/userz.rs::mark_as_hub) and surfaced by
+        // tauri/src/commands.rs's social_get_state as "is_hub" on each
+        // friend row.
+        isHub: f.is_hub,
       })
     ),
 

@@ -25,6 +25,10 @@ pub struct PeerRecord {
     pub first_seen_at: i64,
     pub last_seen_at: i64,
     pub is_self: bool,
+    /// true once this peer has told us (via a `FriendRequest`/`FriendAccept`
+    /// with `isHub: true`) that it's a reliquary hub. sticky — set by
+    /// `mark_as_hub`, never reset back to false.
+    pub is_hub: bool,
 }
 
 #[derive(Clone)]
@@ -151,13 +155,35 @@ impl Directory {
         Ok(())
     }
 
+    /// mark a peer as a reliquary hub. sticky — an `UPDATE ... SET is_hub = 1`
+    /// is a one-way ratchet, so calling this repeatedly (or on a message that
+    /// simply omits the flag, which callers should just not call this for)
+    /// never resets a peer back to non-hub. inserts a minimal row first if
+    /// the peer isn't known yet (mirrors `touch`'s upsert shape), so this can
+    /// be called before any other profile data has arrived for the peer.
+    pub async fn mark_as_hub(&self, node_id: &str) -> Result<(), UserError> {
+        let now = now_secs();
+        sqlx::query!(
+            r#"
+            INSERT INTO userz (node_id, first_seen_at, last_seen_at, is_self, is_hub)
+            VALUES (?1, ?2, ?2, 0, 1)
+            ON CONFLICT(node_id) DO UPDATE SET is_hub = 1
+            "#,
+            node_id,
+            now,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn get(&self, node_id: &str) -> Result<Option<PeerRecord>, UserError> {
         let row = sqlx::query_as!(
             PeerRow,
             r#"
             SELECT node_id as "node_id!", display_name, alias, bio, avatar_blake3,
                    accent_color as "accent_color!", first_seen_at as "first_seen_at!",
-                   last_seen_at as "last_seen_at!", is_self as "is_self!"
+                   last_seen_at as "last_seen_at!", is_self as "is_self!", is_hub as "is_hub!"
             FROM userz WHERE node_id = ?1
             "#,
             node_id,
@@ -174,7 +200,7 @@ impl Directory {
             r#"
             SELECT node_id as "node_id!", display_name, alias, bio, avatar_blake3,
                    accent_color as "accent_color!", first_seen_at as "first_seen_at!",
-                   last_seen_at as "last_seen_at!", is_self as "is_self!"
+                   last_seen_at as "last_seen_at!", is_self as "is_self!", is_hub as "is_hub!"
             FROM userz WHERE is_self = 1 LIMIT 1
             "#,
         )
@@ -194,6 +220,7 @@ struct PeerRow {
     first_seen_at: i64,
     last_seen_at: i64,
     is_self: i64,
+    is_hub: i64,
 }
 
 impl From<PeerRow> for PeerRecord {
@@ -208,6 +235,7 @@ impl From<PeerRow> for PeerRecord {
             first_seen_at: r.first_seen_at,
             last_seen_at: r.last_seen_at,
             is_self: r.is_self != 0,
+            is_hub: r.is_hub != 0,
         }
     }
 }
@@ -307,5 +335,54 @@ mod tests {
     async fn get_returns_none_for_unknown_node() {
         let dir = make_dir().await;
         assert!(dir.get("ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mark_as_hub_creates_row_if_unknown() {
+        let dir = make_dir().await;
+        dir.mark_as_hub("hub-1").await.unwrap();
+        let got = dir.get("hub-1").await.unwrap().expect("present");
+        assert!(got.is_hub);
+        assert!(!got.is_self);
+    }
+
+    #[tokio::test]
+    async fn mark_as_hub_sets_flag_on_existing_peer_without_touching_other_fields() {
+        let dir = make_dir().await;
+        dir.upsert_profile("p", Some("alice"), Some("hello"), Some("av-a"))
+            .await
+            .unwrap();
+        dir.mark_as_hub("p").await.unwrap();
+
+        let got = dir.get("p").await.unwrap().unwrap();
+        assert!(got.is_hub);
+        assert_eq!(got.display_name.as_deref(), Some("alice"));
+        assert_eq!(got.bio.as_deref(), Some("hello"));
+        assert_eq!(got.avatar_blake3.as_deref(), Some("av-a"));
+    }
+
+    #[tokio::test]
+    async fn mark_as_hub_is_sticky_across_subsequent_profile_updates() {
+        let dir = make_dir().await;
+        dir.mark_as_hub("p").await.unwrap();
+        assert!(dir.get("p").await.unwrap().unwrap().is_hub);
+
+        // a later profile update (as happens on every PeerOnline event) must
+        // not reset the flag back to false.
+        dir.upsert_profile("p", Some("alice"), None, None)
+            .await
+            .unwrap();
+        assert!(dir.get("p").await.unwrap().unwrap().is_hub);
+
+        // calling mark_as_hub again is idempotent.
+        dir.mark_as_hub("p").await.unwrap();
+        assert!(dir.get("p").await.unwrap().unwrap().is_hub);
+    }
+
+    #[tokio::test]
+    async fn peers_default_to_not_a_hub() {
+        let dir = make_dir().await;
+        dir.touch("p").await.unwrap();
+        assert!(!dir.get("p").await.unwrap().unwrap().is_hub);
     }
 }

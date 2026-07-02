@@ -1,0 +1,11 @@
+-- userz.is_hub: sticky "this peer told us they're a reliquary hub" flag.
+--
+-- set from the `isHub` field on an incoming FriendRequest/FriendAccept
+-- (see reliquary/src/protocol/messages.rs, docs/hub-and-profile-plan.md
+-- section 3). lives on userz (peer identity), not friendz (the friend-
+-- request relationship), since hub-ness is a property of the node itself,
+-- mirroring the browser/automerge side's isHub field on FriendEntry.
+--
+-- sticky: once set to true, never reset to false by a later message that
+-- omits the flag (see userz::Directory::mark_as_hub).
+ALTER TABLE userz ADD COLUMN is_hub INTEGER NOT NULL DEFAULT 0;

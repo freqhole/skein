@@ -7,8 +7,6 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::protocol::messages::CanvasRole;
-
 /// a single widget's entry in the canvas document.
 ///
 /// describes the widget's position, size, type, and props as seen by the
@@ -54,7 +52,10 @@ pub struct CanvasPeer {
 pub struct PendingCanvasInvite {
     pub invited_by: String,
     pub invited_by_username: String,
-    pub role: CanvasRole,
+    /// "admin"/"member"/"viewer" (see `canvas-doc.ts`'s `InvitableRole`) —
+    /// plain string, not a dedicated enum (see the note in
+    /// `protocol/messages.rs` above `GossipDigestCanvasUpdate`).
+    pub role: String,
     pub invited_at: String,
 }
 

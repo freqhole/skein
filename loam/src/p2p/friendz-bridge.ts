@@ -15,6 +15,10 @@
 import type { FriendzProtocol } from "./friends-protocol";
 import type { CanvasRoleOrRemoved, InvitableRole } from "../canvas/canvas-doc";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
+import { getMiddenNode } from "./identity";
+import { isTauriMode, TauriStreamNode } from "./tauri-transport";
+import type { HubAdminTransport } from "./hub-admin-client";
+import type { MiddenStreamNode } from "./iroh-network-adapter";
 
 // ---------------------------------------------------------------------------
 // module state
@@ -330,6 +334,27 @@ export async function sendCanvasDeleted(
 export async function sendFriendAcceptAck(peerNodeId: string): Promise<void> {
   if (!protocol) throw new Error("friendz bridge not initialized");
   await protocol.sendFriendAcceptAck(peerNodeId);
+}
+
+/**
+ * build a `HubAdminTransport` (see `hub-admin-client.ts`) for use by any UI
+ * that needs to talk to a hub's remote `iroh/skein-hub-admin/1` protocol —
+ * e.g. `friends-tab.ts`'s hub-profile-panel wiring.
+ *
+ * reuses the exact same tauri-vs-browser midden-node access
+ * `friendz-wiring.ts` already uses to build `FriendzProtocol`'s own
+ * transport (`TauriStreamNode.create()` in tauri mode, the browser's
+ * `getMiddenNode()` singleton otherwise) — not a second, parallel
+ * transport-construction path. doesn't require the friendz bridge itself
+ * to be initialized (`initBridge()`), since it talks directly to the
+ * midden node rather than through `FriendzProtocol`.
+ */
+export function getHubAdminTransport(): HubAdminTransport {
+  return {
+    getMidden: isTauriMode()
+      ? async () => (await TauriStreamNode.create()) as MiddenStreamNode
+      : async () => (await getMiddenNode()) as unknown as MiddenStreamNode,
+  };
 }
 
 // ---------------------------------------------------------------------------

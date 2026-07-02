@@ -119,6 +119,8 @@ export const socialWidget: WidgetFactory<typeof socialSchema> = {
       canvasElement: ctx.canvasElement,
       keyboard: ctx.keyboard,
       widgetId: ctx.widgetId,
+      canvasStore: ctx.canvasStore,
+      profileStore: ctx.profileStore,
     };
 
     const tabs: Record<TabName, TabController> = {

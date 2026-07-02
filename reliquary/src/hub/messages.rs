@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use crate::protocol::handler::FriendzEvent;
-use crate::protocol::messages::{AclRole, FriendzMessage};
+use crate::protocol::messages::FriendzMessage;
 
 use super::friendz_msg_type_name;
 use super::HubPeerService;
@@ -488,7 +488,7 @@ impl HubPeerService {
                 );
 
                 // if the hub was removed from this canvas, stop tracking it
-                if target_node_id == self.node_id_str && new_role == AclRole::Removed {
+                if target_node_id == self.node_id_str && new_role == "removed" {
                     tracing::info!(
                         canvas_doc_id = %canvas_doc_id,
                         canvas_title = %canvas_title,

@@ -494,6 +494,7 @@ async fn social_get_state(state: &AppState) -> Result<Value, DispatchError> {
             .unwrap_or_default();
         let accent = peer.as_ref().map(|p| p.accent_color).unwrap_or(0);
         let last_seen = peer.as_ref().map(|p| p.last_seen_at);
+        let is_hub = peer.as_ref().map(|p| p.is_hub).unwrap_or(false);
         let alias = f.alias.clone().unwrap_or_default();
         let group_name = f.group_name.clone().unwrap_or_default();
         if !group_name.is_empty() {
@@ -512,6 +513,7 @@ async fn social_get_state(state: &AppState) -> Result<Value, DispatchError> {
                     "bio": bio,
                     "avatar_url": avatar,
                     "accent_color": accent,
+                    "is_hub": is_hub,
                     "node_ids": [{
                         "node_id": f.friend_node_id,
                         "display_name": username,

@@ -5,11 +5,14 @@
 import { Assets, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
 import { log } from "../../../src/utils/log";
 import {
+  getHubAdminTransport,
   isOnline as bridgeIsOnline,
   isProtocolReady as bridgeIsProtocolReady,
   onOnlineChange,
   sendFriendRequest,
 } from "../../../src/p2p/friendz-bridge";
+import { createHubAdminClient } from "../../../src/p2p/hub-admin-client";
+import { registerSocialBridge } from "../../../src/dev/test-bridge-registry";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
 import {
   ACCENT,
@@ -73,6 +76,7 @@ import {
   isValidNodeId,
   truncate,
 } from "./helpers";
+import { mountHubProfilePanel, type HubProfilePanelHandle } from "./hub-profile-panel";
 import type { FriendEntry, FriendGroup } from "./schema";
 import type { TabContext, TabController } from "./types";
 
@@ -107,10 +111,14 @@ export function createFriendsTab(ctx: TabContext): TabController {
   let currentHeight = 0;
 
   // internal sub-view mode (managed entirely by this tab)
-  let viewMode: "list" | "detail" | "add" = "list";
+  let viewMode: "list" | "detail" | "add" | "hubProfile" = "list";
 
   // selected friend for detail view
   let selectedFriendId: string | null = null;
+
+  // hub-profile-panel state (docs/hub-and-profile-plan.md section 5/8 step 7)
+  let hubProfileHandle: HubProfilePanelHandle | null = null;
+  let hubProfileHubNodeId: string | null = null;
 
   // scroll state for the list view
   let scrollY = 0;
@@ -980,6 +988,81 @@ export function createFriendsTab(ctx: TabContext): TabController {
   detailContainer.visible = false;
   container.addChild(detailContainer);
 
+  // ---------------------------------------------------------------------------
+  // hub-profile-panel view — mounted for a friend-detail view where
+  // `friend.isHub === true`, docs/hub-and-profile-plan.md section 5/8 step 7.
+  // follows the exact same "inline replacement" navigation pattern the
+  // list/detail/add sub-views already use (a dedicated viewMode + container,
+  // not a floating overlay), for consistency.
+  // ---------------------------------------------------------------------------
+
+  const hubProfileContainer = new Container();
+  hubProfileContainer.eventMode = "static";
+  hubProfileContainer.visible = false;
+  container.addChild(hubProfileContainer);
+
+  const hubProfileBackBtn = new Container();
+  hubProfileBackBtn.eventMode = "static";
+  hubProfileBackBtn.cursor = "pointer";
+  const hubProfileBackText = new Text({
+    text: "\u2039 back",
+    style: { fontFamily: FONT, fontSize: TAB_FONT_SIZE, fill: ACCENT },
+    resolution: RESOLUTION,
+  });
+  hubProfileBackText.eventMode = "none";
+  hubProfileBackBtn.addChild(hubProfileBackText);
+  hubProfileBackBtn.hitArea = new Rectangle(0, 0, hubProfileBackText.width + 8, hubProfileBackText.height + 4);
+  hubProfileBackBtn.on("pointertap", (e) => {
+    e.stopPropagation();
+    closeHubProfilePanelView();
+  });
+  hubProfileContainer.addChild(hubProfileBackBtn);
+
+  const hubProfilePanelHost = new Container();
+  hubProfileContainer.addChild(hubProfilePanelHost);
+
+  const HUB_PROFILE_BACK_AREA_HEIGHT = hubProfileBackText.height + 12;
+
+  /** tear down the mounted hub-profile-panel (if any) and return to the friend-detail view. */
+  function closeHubProfilePanelView(): void {
+    if (hubProfileHandle) {
+      hubProfileHandle.destroy();
+      hubProfileHandle = null;
+    }
+    hubProfileHubNodeId = null;
+    viewMode = "detail";
+    layout(currentWidth, currentHeight);
+  }
+
+  /** mount (or, if already mounted for the same hub node id, just re-layout) the hub-profile-panel. */
+  function mountOrLayoutHubProfilePanel(hubNodeId: string, w: number, h: number): void {
+    hubProfileBackBtn.x = 0;
+    hubProfileBackBtn.y = 0;
+    hubProfilePanelHost.x = 0;
+    hubProfilePanelHost.y = HUB_PROFILE_BACK_AREA_HEIGHT;
+
+    const panelHeight = Math.max(0, h - HUB_PROFILE_BACK_AREA_HEIGHT);
+
+    if (hubProfileHandle && hubProfileHubNodeId === hubNodeId) {
+      hubProfileHandle.layout(w, panelHeight);
+      return;
+    }
+
+    if (hubProfileHandle) {
+      hubProfileHandle.destroy();
+      hubProfileHandle = null;
+    }
+
+    hubProfileHubNodeId = hubNodeId;
+    const client = createHubAdminClient(getHubAdminTransport());
+    hubProfileHandle = mountHubProfilePanel(hubProfilePanelHost, {
+      hubNodeId,
+      client,
+      canvasElement: ctx.canvasElement,
+    });
+    hubProfileHandle.layout(w, panelHeight);
+  }
+
   const rebuildDetailView = (friend: FriendEntry, contentW: number, areaHeight: number) => {
     // clean up any existing input handles before destroying children
     if (aliasInputHandle) {
@@ -1139,6 +1222,50 @@ export function createFriendsTab(ctx: TabContext): TabController {
     nameText.y = dy;
     detailContainer.addChild(nameText);
     dy += DETAIL_NAME_SIZE + 6;
+
+    // -----------------------------------------------------------------------
+    // manage hub — only shown for friends flagged as a reliquary hub
+    // (docs/hub-and-profile-plan.md section 5/8 step 7).
+    // -----------------------------------------------------------------------
+
+    if (friend.isHub) {
+      const hubNodeIdForFriend = friend.nodeIds[0]?.nodeId;
+
+      const manageHubBtn = new Container();
+      manageHubBtn.eventMode = "static";
+      manageHubBtn.cursor = "pointer";
+      manageHubBtn.hitArea = new Rectangle(0, 0, contentW, DETAIL_BTN_HEIGHT);
+      manageHubBtn.y = dy;
+      detailContainer.addChild(manageHubBtn);
+
+      const manageHubBg = new Graphics();
+      manageHubBg.eventMode = "none";
+      manageHubBg.roundRect(0, 0, contentW, DETAIL_BTN_HEIGHT, DETAIL_BTN_RADIUS);
+      manageHubBg.fill({ color: ACCENT });
+      manageHubBtn.addChild(manageHubBg);
+
+      const manageHubText = new Text({
+        text: "manage hub",
+        style: { fontFamily: FONT, fontSize: TEXT_SIZE, fill: 0xffffff },
+        resolution: RESOLUTION,
+      });
+      manageHubText.eventMode = "none";
+      manageHubText.x = (contentW - manageHubText.width) / 2;
+      manageHubText.y = (DETAIL_BTN_HEIGHT - TEXT_SIZE) / 2;
+      manageHubBtn.addChild(manageHubText);
+
+      manageHubBtn.on("pointertap", (e) => {
+        e.stopPropagation();
+        if (!hubNodeIdForFriend) {
+          log.warn("social.friends", "hub friend has no node id to administer:", friend.id);
+          return;
+        }
+        viewMode = "hubProfile";
+        layout(currentWidth, currentHeight);
+      });
+
+      dy += DETAIL_BTN_HEIGHT + 10;
+    }
 
     // -----------------------------------------------------------------------
     // alias section — inline editing
@@ -1935,6 +2062,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
     // hide all sub-view containers first
     listContainer.visible = false;
     detailContainer.visible = false;
+    hubProfileContainer.visible = false;
     addModeContainer.visible = false;
     addBtn.visible = false;
     emptyText.visible = false;
@@ -2018,6 +2146,23 @@ export function createFriendsTab(ctx: TabContext): TabController {
         break;
       }
 
+      case "hubProfile": {
+        const selectedFriend = friends.find((f) => f.id === selectedFriendId);
+        const hubNodeId = selectedFriend?.nodeIds[0]?.nodeId;
+        if (!selectedFriend?.isHub || !hubNodeId) {
+          // friend deleted, no longer a hub, or has no node id — bail back
+          // to the friend-detail view (or list, if the friend is gone too).
+          viewMode = selectedFriend ? "detail" : "list";
+          layout(w, h);
+          return;
+        }
+        hubProfileContainer.visible = true;
+        hubProfileContainer.x = 0;
+        hubProfileContainer.y = 0;
+        mountOrLayoutHubProfilePanel(hubNodeId, w, h);
+        break;
+      }
+
       case "add": {
         addModeContainer.visible = true;
         addModeContainer.x = 0;
@@ -2082,6 +2227,50 @@ export function createFriendsTab(ctx: TabContext): TabController {
   });
 
   // ---------------------------------------------------------------------------
+  // test hooks — docs/hub-and-profile-plan.md section 5/8 step 7. registered
+  // via registerSocialBridge(), same pattern profile-tab.ts already uses for
+  // pickAvatar. no-ops (never registered) outside DEV builds.
+  // ---------------------------------------------------------------------------
+
+  registerSocialBridge({
+    friendsTab: {
+      getViewMode: () => viewMode,
+      openFriendDetail: (friendId: string) => {
+        selectedFriendId = friendId;
+        viewMode = "detail";
+        editingAlias = false;
+        editingNewGroup = false;
+        layout(currentWidth, currentHeight);
+      },
+      closeFriendDetail: () => {
+        selectedFriendId = null;
+        viewMode = "list";
+        editingAlias = false;
+        editingNewGroup = false;
+        layout(currentWidth, currentHeight);
+      },
+      hasManageHubAction: () => {
+        if (viewMode !== "detail" || !selectedFriendId) return false;
+        const friend = ctx.doc.current.friends.find((f: FriendEntry) => f.id === selectedFriendId);
+        return Boolean(friend?.isHub);
+      },
+      openHubProfilePanel: () => {
+        if (viewMode !== "detail" || !selectedFriendId) return;
+        const friend = ctx.doc.current.friends.find((f: FriendEntry) => f.id === selectedFriendId);
+        if (!friend?.isHub) return;
+        viewMode = "hubProfile";
+        layout(currentWidth, currentHeight);
+      },
+      closeHubProfilePanel: () => {
+        closeHubProfilePanelView();
+      },
+      isHubProfilePanelOpen: () => viewMode === "hubProfile" && hubProfileHandle !== null,
+      getHubProfilePanelState: () => hubProfileHandle?.getState() ?? null,
+      refreshHubProfilePanel: () => hubProfileHandle?.refresh() ?? Promise.resolve(),
+    },
+  });
+
+  // ---------------------------------------------------------------------------
   // controller
   // ---------------------------------------------------------------------------
 
@@ -2106,6 +2295,10 @@ export function createFriendsTab(ctx: TabContext): TabController {
       if (groupRenameHandle) {
         groupRenameHandle.destroy();
         groupRenameHandle = null;
+      }
+      if (hubProfileHandle) {
+        hubProfileHandle.destroy();
+        hubProfileHandle = null;
       }
       if (dragState) {
         cancelDrag();

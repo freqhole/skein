@@ -26,6 +26,8 @@ export interface FriendInfo {
   nodeId: string;
   avatarDataUrl?: string;
   isOnline: boolean;
+  /** true if this friend is a known reliquary hub (see docs/hub-and-profile-plan.md). */
+  isHub?: boolean;
 }
 
 export interface ShareDialogOptions {
@@ -75,6 +77,25 @@ export interface ShareDialogOptions {
 
 export interface ShareDialogHandle {
   remove(): void;
+}
+
+/**
+ * split a friend-invite list into the regular "invite friends" group and the
+ * "hub nodes" group, per `FriendInfo.isHub` — mirrors the grouping rule
+ * `friends-tab.ts`'s `HUB_GROUP_KEY` section uses (see
+ * docs/hub-and-profile-plan.md section 4), just without the collapse/
+ * reserved-key machinery since this list is never dragged into. exported so
+ * tests can verify the grouping directly against real friend data, without
+ * needing to inspect rendered pixi rows.
+ */
+export function splitFriendsForInvite(friends: FriendInfo[]): {
+  regular: FriendInfo[];
+  hub: FriendInfo[];
+} {
+  return {
+    regular: friends.filter((f) => !f.isHub),
+    hub: friends.filter((f) => f.isHub),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -933,7 +954,10 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   const friendLabel = makeLabel("invite friends", theme);
   friendSection.addChild(friendLabel);
 
-  const friendList = options.friends ?? [];
+  // hub friends get their own section below, always last — see
+  // splitFriendsForInvite()'s doc comment for the grouping rule.
+  const allFriends = options.friends ?? [];
+  const { regular: friendList, hub: hubFriendList } = splitFriendsForInvite(allFriends);
 
   if (friendList.length === 0) {
     const noFriendsText = new Text({
@@ -962,6 +986,31 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
       friendRow.y = friendY;
       friendSection.addChild(friendRow);
       friendY += copyBtnH + 4;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // hub friends section — always last, only shown when non-empty
+  // -------------------------------------------------------------------------
+
+  const hubFriendSection = new Container();
+  if (hubFriendList.length > 0) {
+    const hubFriendLabel = makeLabel("hub nodes", theme);
+    hubFriendSection.addChild(hubFriendLabel);
+
+    let hubFriendY = hubFriendLabel.height + LABEL_GAP;
+    for (const friend of hubFriendList) {
+      const friendRow = buildFriendInviteRow(
+        friend,
+        theme,
+        scrollBoxWidth,
+        copyBtnH,
+        isRemoved,
+        options.onInviteFriend
+      );
+      friendRow.y = hubFriendY;
+      hubFriendSection.addChild(friendRow);
+      hubFriendY += copyBtnH + 4;
     }
   }
 
@@ -1106,15 +1155,20 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
     peerLabel.height + LABEL_GAP + Math.max(1, peerList.length) * (copyBtnH + 4);
   const friendSectionHeight =
     friendLabel.height + LABEL_GAP + Math.max(1, friendList.length) * (copyBtnH + 4);
+  const hubFriendSectionHeight =
+    hubFriendList.length > 0
+      ? hubFriendSection.getChildAt(0).height + LABEL_GAP + hubFriendList.length * (copyBtnH + 4)
+      : 0;
   const pendingSectionHeight =
     pendingLabel.height + LABEL_GAP + Math.max(1, pendingList.length) * (copyBtnH + 4);
   const declinedSectionHeight =
     declinedLabel.height + LABEL_GAP + Math.max(1, declinedList.length) * (copyBtnH + 4);
   const contentNeeded =
     rowHeight * 2 +
-    SECTION_GAP * 5 +
+    SECTION_GAP * (5 + (hubFriendList.length > 0 ? 1 : 0)) +
     peerSectionHeight +
     friendSectionHeight +
+    hubFriendSectionHeight +
     pendingSectionHeight +
     declinedSectionHeight;
   const DIALOG_HEIGHT =
@@ -1144,6 +1198,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
       row2.container,
       peerSection,
       friendSection,
+      ...(hubFriendList.length > 0 ? [hubFriendSection] : []),
       pendingSection,
       declinedSection,
     ],

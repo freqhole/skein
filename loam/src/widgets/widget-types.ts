@@ -1,6 +1,7 @@
 import type { Container } from "pixi.js";
 import { z } from "zod";
 import type { CanvasStore } from "../canvas/canvas-store";
+import type { ProfileStore } from "../canvas/profile-doc";
 import type { KeyboardDriver } from "./keyboard-driver";
 
 /**
@@ -168,6 +169,11 @@ export interface WidgetMountContext<S extends z.ZodType = z.ZodType> {
   /** the canvas store — provides read/write access to canvas-level metadata.
    *  available on regular canvases; may be undefined for headless or test contexts. */
   canvasStore?: CanvasStore;
+  /** the local peer's own profile doc store (docs/hub-and-profile-plan.md
+   *  section 6) — lets a widget read/edit the profile's curated canvas list.
+   *  only wired in for the social widget's overlay mount (boot.ts); undefined
+   *  for other widgets and for headless/test contexts. */
+  profileStore?: ProfileStore;
   /** dynamically update the custom header actions shown in the widget frame.
    *  call this whenever the action labels or set of actions changes (e.g. item
    *  count updated, snatch progress). provided by the widget manager at mount time. */

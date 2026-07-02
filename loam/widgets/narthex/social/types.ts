@@ -1,5 +1,7 @@
 import type { Container } from "pixi.js";
 import type { z } from "zod";
+import type { CanvasStore } from "../../../src/canvas/canvas-store";
+import type { ProfileStore } from "../../../src/canvas/profile-doc";
 import type { KeyboardDriver } from "../../../src/widgets/keyboard-driver";
 import type { socialSchema } from "./schema";
 
@@ -36,6 +38,16 @@ export interface TabContext {
   keyboard: KeyboardDriver;
   /** the widget's unique ID in the canvas store */
   widgetId: string;
+  /** the currently-open canvas's store (the canvas the social overlay is
+   *  mounted on top of — narthex included). used by profile-tab.ts to read
+   *  title/description/color for "add current canvas to profile". may be
+   *  undefined in contexts that don't thread it through (e.g. some test
+   *  harnesses). */
+  canvasStore?: CanvasStore;
+  /** the local peer's own profile doc store (docs/hub-and-profile-plan.md
+   *  section 6). used by profile-tab.ts to manage the profile's curated
+   *  canvas list. undefined until boot.ts has resolved it. */
+  profileStore?: ProfileStore;
 }
 
 /**

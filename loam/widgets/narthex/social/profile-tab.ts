@@ -27,9 +27,14 @@ import {
   LABEL_COLOR,
   LABEL_SIZE,
   MUTED_TEXT,
+  PROFILE_CANVAS_ROW_HEIGHT,
+  PROFILE_CANVAS_SWATCH_SIZE,
   RESOLUTION,
+  ROW_ALT_BG,
+  TEXT_COLOR,
   TEXT_SIZE,
 } from "./constants";
+import { truncate } from "./helpers";
 import type { TabContext, TabController } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -626,6 +631,170 @@ export function createProfileTab(ctx: TabContext): TabController {
   });
 
   // -------------------------------------------------------------------------
+  // "my canvases" — curated canvas list on the profile doc
+  // (docs/hub-and-profile-plan.md section 6 / section 8 step 7)
+  // -------------------------------------------------------------------------
+
+  const canvasSectionLabel = new Text({
+    text: "my canvases",
+    style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
+    resolution: RESOLUTION,
+  });
+  canvasSectionLabel.eventMode = "none";
+  container.addChild(canvasSectionLabel);
+
+  const addCanvasBtn = new Container();
+  addCanvasBtn.eventMode = "static";
+  addCanvasBtn.cursor = "pointer";
+  const addCanvasBtnBg = new Graphics();
+  addCanvasBtn.addChild(addCanvasBtnBg);
+  const addCanvasBtnText = new Text({
+    text: "+ add current canvas",
+    style: { fontFamily: FONT, fontSize: TEXT_SIZE, fontWeight: "bold", fill: 0xffffff },
+    resolution: RESOLUTION,
+  });
+  addCanvasBtnText.eventMode = "none";
+  addCanvasBtn.addChild(addCanvasBtnText);
+  container.addChild(addCanvasBtn);
+
+  const canvasListContainer = new Container();
+  canvasListContainer.eventMode = "static";
+  container.addChild(canvasListContainer);
+
+  const canvasEmptyText = new Text({
+    text: "no canvases on your profile yet",
+    style: { fontFamily: FONT, fontSize: 10, fill: MUTED_TEXT },
+    resolution: RESOLUTION,
+  });
+  canvasEmptyText.eventMode = "none";
+  canvasEmptyText.visible = false;
+  container.addChild(canvasEmptyText);
+
+  /** titles as actually rendered in the list (post-truncation) — exposed to
+   *  tests via the profileTab bridge hook so a UI assertion proves the
+   *  render actually reflects the doc, not just that the doc changed. */
+  let lastRenderedCanvasTitles: string[] = [];
+
+  const addCurrentCanvasToProfile = () => {
+    const canvasStore = ctx.canvasStore;
+    const profileStore = ctx.profileStore;
+    if (!canvasStore || !profileStore) return;
+    const doc = canvasStore.doc();
+    profileStore.addCanvasToProfile({
+      canvasDocId: canvasStore.handle.documentId,
+      title: doc.title || "untitled canvas",
+      description: doc.description || undefined,
+      color: doc.color || undefined,
+    });
+    layout(currentWidth, currentHeight);
+  };
+
+  addCanvasBtn.on("pointertap", (e) => {
+    e.stopPropagation();
+    addCurrentCanvasToProfile();
+  });
+
+  const removeCanvasFromProfile = (canvasDocId: string) => {
+    ctx.profileStore?.removeCanvasFromProfile(canvasDocId);
+    layout(currentWidth, currentHeight);
+  };
+
+  // rebuild the list rows from the profile doc's current canvases. tears down
+  // and recreates every row each call — the list is expected to stay small
+  // (a curated, manually-managed set), so a full rebuild is simplest and
+  // matches requests-tab.ts's own "rebuild on every change" convention.
+  const rebuildCanvasList = (w: number): number => {
+    while (canvasListContainer.children.length > 0) {
+      canvasListContainer.removeChildAt(0).destroy({ children: true });
+    }
+
+    const entries = ctx.profileStore?.canvases() ?? [];
+    canvasEmptyText.visible = entries.length === 0;
+    lastRenderedCanvasTitles = [];
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const rowY = i * PROFILE_CANVAS_ROW_HEIGHT;
+
+      const row = new Container();
+      row.eventMode = "static";
+      row.y = rowY;
+      canvasListContainer.addChild(row);
+
+      if (i % 2 === 1) {
+        const rowBg = new Graphics();
+        rowBg.eventMode = "none";
+        rowBg.rect(0, 0, w, PROFILE_CANVAS_ROW_HEIGHT);
+        rowBg.fill({ color: ROW_ALT_BG, alpha: 0.5 });
+        row.addChild(rowBg);
+      }
+
+      const swatch = new Graphics();
+      swatch.eventMode = "none";
+      const swatchY = (PROFILE_CANVAS_ROW_HEIGHT - PROFILE_CANVAS_SWATCH_SIZE) / 2;
+      swatch.roundRect(0, swatchY, PROFILE_CANVAS_SWATCH_SIZE, PROFILE_CANVAS_SWATCH_SIZE, 3);
+      swatch.fill({ color: entry.color ?? MUTED_TEXT });
+      row.addChild(swatch);
+
+      const titleText = truncate(entry.title || "untitled canvas", 28);
+      lastRenderedCanvasTitles.push(titleText);
+
+      const title = new Text({
+        text: titleText,
+        style: { fontFamily: FONT, fontSize: TEXT_SIZE, fill: TEXT_COLOR },
+        resolution: RESOLUTION,
+      });
+      title.eventMode = "none";
+      title.x = PROFILE_CANVAS_SWATCH_SIZE + 8;
+      title.y = 3;
+      row.addChild(title);
+
+      if (entry.description) {
+        const desc = new Text({
+          text: truncate(entry.description, 40),
+          style: { fontFamily: FONT, fontSize: 9, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        desc.eventMode = "none";
+        desc.x = PROFILE_CANVAS_SWATCH_SIZE + 8;
+        desc.y = 3 + TEXT_SIZE + 2;
+        row.addChild(desc);
+      }
+
+      const removeBtn = new Text({
+        text: "remove",
+        style: { fontFamily: FONT, fontSize: 9, fill: 0xef4444 },
+        resolution: RESOLUTION,
+      });
+      removeBtn.eventMode = "static";
+      removeBtn.cursor = "pointer";
+      removeBtn.x = w - removeBtn.width;
+      removeBtn.y = (PROFILE_CANVAS_ROW_HEIGHT - removeBtn.height) / 2;
+      removeBtn.hitArea = new Rectangle(-6, -4, removeBtn.width + 12, removeBtn.height + 8);
+      removeBtn.on("pointertap", (e) => {
+        e.stopPropagation();
+        removeCanvasFromProfile(entry.canvasDocId);
+      });
+      row.addChild(removeBtn);
+    }
+
+    return entries.length * PROFILE_CANVAS_ROW_HEIGHT;
+  };
+
+  // expose the tab's own handlers on the test bridge — same pattern this
+  // file already uses for `pickAvatar` (see registerSocialBridge() call
+  // above) and friends-tab.ts uses for `friendsTab`.
+  registerSocialBridge({
+    profileTab: {
+      getCanvasEntries: () => ctx.profileStore?.canvases() ?? [],
+      canAddCurrentCanvas: () => !!(ctx.canvasStore && ctx.profileStore),
+      addCurrentCanvas: addCurrentCanvasToProfile,
+      removeCanvas: removeCanvasFromProfile,
+      getRenderedCanvasTitles: () => [...lastRenderedCanvasTitles],
+    },
+  });
+
+  // -------------------------------------------------------------------------
   // layout
   // -------------------------------------------------------------------------
 
@@ -823,6 +992,37 @@ export function createProfileTab(ctx: TabContext): TabController {
         );
       }
     }
+
+    // -- "my canvases" section ----------------------------------------------
+
+    y += FIELD_GAP + 4;
+    canvasSectionLabel.x = 0;
+    canvasSectionLabel.y = y;
+    y += LABEL_SIZE + 6;
+
+    const canAddCurrentCanvas = !!(ctx.canvasStore && ctx.profileStore);
+    addCanvasBtn.visible = canAddCurrentCanvas;
+    if (canAddCurrentCanvas) {
+      addCanvasBtnBg.clear();
+      addCanvasBtnBg.roundRect(0, 0, w, BUTTON_HEIGHT, BUTTON_RADIUS);
+      addCanvasBtnBg.fill({ color: ACCENT });
+      addCanvasBtn.hitArea = new Rectangle(0, 0, w, BUTTON_HEIGHT);
+      addCanvasBtn.x = 0;
+      addCanvasBtn.y = y;
+      addCanvasBtnText.x = (w - addCanvasBtnText.width) / 2;
+      addCanvasBtnText.y = (BUTTON_HEIGHT - TEXT_SIZE) / 2;
+      y += BUTTON_HEIGHT + FIELD_GAP;
+    }
+
+    canvasListContainer.x = 0;
+    canvasListContainer.y = y;
+    y += rebuildCanvasList(w);
+
+    canvasEmptyText.x = 0;
+    canvasEmptyText.y = y;
+    if (canvasEmptyText.visible) {
+      y += canvasEmptyText.height + FIELD_GAP;
+    }
   };
 
   // -------------------------------------------------------------------------
@@ -876,6 +1076,12 @@ export function createProfileTab(ctx: TabContext): TabController {
     layout(currentWidth, currentHeight);
   });
 
+  // subscribe to profile-doc changes (e.g. another tab/device adding or
+  // removing a canvas from the profile) so the "my canvases" list re-renders.
+  const profileStoreUnsub = ctx.profileStore?.onChange(() => {
+    layout(currentWidth, currentHeight);
+  });
+
   // -------------------------------------------------------------------------
   // tab controller
   // -------------------------------------------------------------------------
@@ -892,6 +1098,7 @@ export function createProfileTab(ctx: TabContext): TabController {
       if (importInputHandle) importInputHandle.destroy();
       docUnsub();
       if (identityUnsub) identityUnsub();
+      if (profileStoreUnsub) profileStoreUnsub();
       if (avatarSprite) {
         avatarContainer.removeChild(avatarSprite);
         avatarSprite.mask = null;

@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use crate::protocol::messages::{
-    CanvasRole, FriendzMessage, GossipDigestCanvasUpdate, GossipDigestPendingInvite,
+    FriendzMessage, GossipDigestCanvasUpdate, GossipDigestPendingInvite,
 };
 
 use super::HubPeerService;
@@ -142,7 +142,7 @@ impl HubPeerService {
         canvas_title: &str,
         origin_node_id: &str,
         origin_username: &str,
-        role: &CanvasRole,
+        role: &str,
     ) {
         tracing::info!(
             peer = %from_node_id,
@@ -1301,11 +1301,10 @@ fn read_canvas_for_gossip(
                     let invited_by = read_str(doc, &invite_obj, "invitedBy");
                     let invited_by_username = read_str(doc, &invite_obj, "invitedByUsername");
 
-                    let role_str = read_str(doc, &invite_obj, "role");
-                    let role = match role_str.as_str() {
-                        "viewer" => CanvasRole::Viewer,
-                        _ => CanvasRole::Editor,
-                    };
+                    // "admin"/"member"/"viewer" straight from the doc, no
+                    // enum conversion (see the note in
+                    // `protocol/messages.rs` above `GossipDigestCanvasUpdate`).
+                    let role = read_str(doc, &invite_obj, "role");
 
                     let invited_at = read_str(doc, &invite_obj, "invitedAt");
 

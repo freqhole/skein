@@ -15,6 +15,9 @@ import {
 } from "../standalone/friendz-wiring";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
 import type { SocialState } from "../../widgets/narthex/social/schema";
+import type { HubProfilePanelState } from "../../widgets/narthex/social/hub-profile-panel";
+import type { ProfileCanvasEntry } from "../canvas/profile-doc";
+import type { FriendInfo } from "../canvas/share-dialog";
 import { storeBlob, classifyDomain } from "../storage/skein-blob-store";
 
 /**
@@ -214,6 +217,116 @@ export interface SkeinFriendzTestBridge {
 }
 
 /**
+ * test hooks for `friends-tab.ts`'s friend-detail view and its hub-profile-
+ * panel wiring (see docs/hub-and-profile-plan.md section 5 / section 8 step
+ * 7). registered via `registerSocialBridge({ friendsTab: ... })` from
+ * `friends-tab.ts` itself, same pattern `profile-tab.ts` already uses for
+ * `pickAvatar`.
+ *
+ * these call the tab's real internal handlers directly (not simulated pixi
+ * pointer clicks) — same precedent as `MessagezTestHooks`'s
+ * `simulateKnockAck` in `messagez-widget.ts`, since this repo has no
+ * existing infrastructure for driving pixi canvas UI via real pointer
+ * events in playwright.
+ */
+export interface FriendsTabTestHooks {
+  /** the tab's current internal sub-view. */
+  getViewMode(): "list" | "detail" | "add" | "hubProfile";
+  /** open the friend-detail view for the given friend id, as if the row were tapped. */
+  openFriendDetail(friendId: string): void;
+  /** return to the friends list view, as if the detail view's back button were tapped. */
+  closeFriendDetail(): void;
+  /** whether the "manage hub" action is shown in the currently-open detail view. */
+  hasManageHubAction(): boolean;
+  /** tap the "manage hub" action — mounts the hub-profile-panel. no-op unless
+   *  `hasManageHubAction()` is true. */
+  openHubProfilePanel(): void;
+  /** close the hub-profile-panel, returning to the friend-detail view. */
+  closeHubProfilePanel(): void;
+  /** whether the hub-profile-panel is currently mounted. */
+  isHubProfilePanelOpen(): boolean;
+  /** the mounted hub-profile-panel's current render state, or null if not open. */
+  getHubProfilePanelState(): HubProfilePanelState | null;
+  /** re-fetch the mounted hub-profile-panel's friendz + pending knocks. no-op if not open. */
+  refreshHubProfilePanel(): Promise<void>;
+}
+
+/**
+ * test hooks for `profile-tab.ts`'s "my canvases" section (see
+ * docs/hub-and-profile-plan.md section 8 step 7, second half). registered
+ * via `registerSocialBridge({ profileTab: ... })` from `profile-tab.ts`
+ * itself, same pattern used for `pickAvatar`/`friendsTab`.
+ *
+ * `getCanvasEntries()` reads `ProfileStore.canvases()` directly (not just
+ * pixi render state) so tests can verify the underlying doc, not only what
+ * got drawn. `addCurrentCanvas()`/`removeCanvas()` call the tab's real
+ * internal handlers directly, same precedent as `FriendsTabTestHooks`.
+ */
+export interface ProfileTabTestHooks {
+  /** all canvases currently on the local peer's profile doc, per
+   *  `ProfileStore.canvases()`. empty array if no profile store is mounted. */
+  getCanvasEntries(): ProfileCanvasEntry[];
+  /** whether "add current canvas" can act — false if this mount has no live
+   *  canvasStore/profileStore (e.g. some test harnesses). */
+  canAddCurrentCanvas(): boolean;
+  /** add the currently-open canvas to the profile, as if the button were tapped. */
+  addCurrentCanvas(): void;
+  /** remove a canvas from the profile by its doc id, as if its row's remove button were tapped. */
+  removeCanvas(canvasDocId: string): void;
+  /** titles currently rendered in the "my canvases" list — proves the UI
+   *  actually reflects the doc, not just that the doc was mutated. */
+  getRenderedCanvasTitles(): string[];
+}
+
+/**
+ * test hooks for the canvas share dialog's invite/cancel wiring (see
+ * boot.ts's `onShare` handler, `share-dialog.ts`). unlike `MessagezTestHooks`/
+ * `FriendsTabTestHooks` (registered once when a persistent widget mounts),
+ * the share dialog is built fresh every time the toolbar's share button is
+ * pressed — so `window.__skeinTest.share` is (re)assigned fresh on each
+ * open, not merged into an existing object.
+ *
+ * `getFriendsForInvite()` is a snapshot of the exact list passed to the
+ * currently-open dialog (recompute it by re-opening the dialog — e.g. after
+ * an invite/cancel — to see it reflect the new state). `getPendingInvites()`/
+ * `getMessagezShares()` read live from the canvas doc / messagez outbox, so
+ * they reflect the latest state without needing to reopen anything.
+ * `inviteFriend()`/`cancelInvite()` call the dialog's real `onInviteFriend`/
+ * `onCancelInvite` closures directly — the exact same code a real button
+ * press runs, not a re-implementation.
+ */
+export interface ShareTestHooks {
+  /** the friend-invite list passed to the currently-open share dialog
+   *  (already includes each friend's `isHub` flag — see
+   *  `splitFriendsForInvite()` in share-dialog.ts for the section grouping
+   *  this list feeds into). */
+  getFriendsForInvite(): FriendInfo[];
+  /** pending invites on the current canvas doc, read live from
+   *  `CanvasStore.pendingInvites()`. */
+  getPendingInvites(): Array<{ targetNodeId: string; invite: Record<string, unknown> }>;
+  /** raw messagez outbox `shares` entries for this canvas, read live from the
+   *  messagez doc — the data that actually gates the "already invited"
+   *  filter (see boot.ts's `alreadyInvited` set). */
+  getMessagezShares(): Array<{
+    toNodeId: string;
+    canvasDocId: string;
+    declined?: boolean;
+    cancelled?: boolean;
+  }>;
+  /** invite a friend by node id + role, calling the dialog's real
+   *  `onInviteFriend` handler exactly as if its "invite" button were
+   *  pressed. no-op if the friend isn't in the last `getFriendsForInvite()`
+   *  snapshot. */
+  inviteFriend(nodeId: string, role: InvitableRole): Promise<void>;
+  /** cancel a pending invite by target node id, calling the dialog's real
+   *  `onCancelInvite` handler exactly as if its "cancel" button were
+   *  pressed. */
+  cancelInvite(nodeId: string): void;
+  /** close the currently-open share dialog. */
+  closeShareDialog(): void;
+}
+
+/**
  * social test bridge — present on `window.__skeinTest.social` when the full
  * boot router has initialised (i.e. the page loaded index.html, not a test
  * harness page). populated in DEV builds only.
@@ -227,6 +340,10 @@ export interface SkeinTestBridgeSocial {
   toggleOverlay(): void;
   /** trigger the avatar file picker (set by profile-tab on mount) */
   pickAvatar?(): Promise<void>;
+  /** friends-tab test hooks (set by friends-tab.ts on mount) */
+  friendsTab?: FriendsTabTestHooks;
+  /** profile-tab "my canvases" test hooks (set by profile-tab.ts on mount) */
+  profileTab?: ProfileTabTestHooks;
 }
 
 /**
@@ -263,6 +380,12 @@ export interface SkeinTestBridge {
    * null for ordinary BroadcastChannel-only test pages.
    */
   knock?: SkeinKnockTestBridge | null;
+  /**
+   * share dialog test hooks — present once the toolbar's share button has
+   * been pressed at least once for the current canvas (index.html only).
+   * null/absent otherwise.
+   */
+  share?: ShareTestHooks | null;
 }
 
 // ---------------------------------------------------------------------------

@@ -7,9 +7,10 @@ import type { CanvasDocument, InvitableRole } from "../canvas/canvas-doc";
 import { CanvasStore } from "../canvas/canvas-store";
 import type { ConnectionStateSource } from "../canvas/connection-status";
 import { initCanvas, type SkeinCanvas } from "../canvas/init";
-import { showShareDialog, type FriendInfo } from "../canvas/share-dialog";
+import { ensureMyProfileDoc, type ProfileStore } from "../canvas/profile-doc";
+import { showShareDialog, type FriendInfo, type ShareDialogOptions } from "../canvas/share-dialog";
 import { registerSocialBridge } from "../dev/test-bridge-registry";
-import type { SkeinTestBridgeSocial } from "../dev/test-bridge";
+import type { SkeinTestBridgeSocial, ShareTestHooks } from "../dev/test-bridge";
 import { preloadFonts } from "../fonts/font-loader";
 import { handleSkeinStream } from "../p2p/skein-handler";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
@@ -87,6 +88,11 @@ class SkeinRouter {
   private friendzDocUnsubs: Array<() => void> = [];
   private socialDoc: SocialDoc | null = null;
   private messagezDocHandle: DocHandle<any> | null = null;
+  /** the local peer's own profile doc (docs/hub-and-profile-plan.md section 6).
+   *  created/opened once in boot() via ensureMyProfileDoc(); threaded into the
+   *  social overlay's mount context so profile-tab.ts can manage the profile's
+   *  curated canvas list. */
+  private profileStore: ProfileStore | null = null;
 
   private transportPresenceUnsubs: Array<() => void> = [];
   private canvasWatcherUnsubs: Array<() => void> = [];
@@ -255,6 +261,18 @@ class SkeinRouter {
           canvasInvitesFrom: "everyone",
         });
         await setMetaValue(MESSAGEZ_DOC_KEY, this.messagezDocHandle.documentId);
+      }
+    }
+
+    // create or find "my own" profile doc (docs/hub-and-profile-plan.md section 6).
+    // ensureMyProfileDoc() already handles the create-or-open + meta-key
+    // persistence internally (same singleton-doc-id pattern as narthex/social/
+    // messagez above), so this is just a thin call + a place to stash the result.
+    if (!this.profileStore) {
+      try {
+        this.profileStore = await ensureMyProfileDoc(this.repo);
+      } catch (err) {
+        log.warn(TAG, "failed to ensure profile doc:", err);
       }
     }
 
@@ -771,14 +789,24 @@ class SkeinRouter {
             // real bug: previously this checked canvasDocId only, so a
             // declined invite blocked re-inviting that friend forever, even
             // though the "declined" section below shows them as declined).
+            // also excludes cancelled shares (see onCancelInvite below) — a
+            // pending invite that the sharer themselves cancels must free
+            // the friend back up for re-inviting, same as a decline.
             const alreadyInvited = new Set<string>();
             if (this.messagezDocHandle) {
               const inboxDoc = this.messagezDocHandle.doc() as
-                | { shares?: Array<{ canvasDocId: string; toNodeId: string; declined?: boolean }> }
+                | {
+                    shares?: Array<{
+                      canvasDocId: string;
+                      toNodeId: string;
+                      declined?: boolean;
+                      cancelled?: boolean;
+                    }>;
+                  }
                 | undefined;
               if (inboxDoc?.shares) {
                 for (const share of inboxDoc.shares) {
-                  if (share.canvasDocId === docId && !share.declined) {
+                  if (share.canvasDocId === docId && !share.declined && !share.cancelled) {
                     alreadyInvited.add(share.toNodeId);
                   }
                 }
@@ -799,6 +827,7 @@ class SkeinRouter {
                     nodeId: n.nodeId,
                     avatarDataUrl: n.avatarDataUrl,
                     isOnline: this.friendzProtocol?.isOnline(n.nodeId) ?? false,
+                    isHub: friend.isHub === true,
                   });
                 }
               }
@@ -851,7 +880,11 @@ class SkeinRouter {
             }
           }
 
-          showShareDialog({
+          // named (not inlined into the showShareDialog() call below) so
+          // DEV-only test hooks can capture the exact friends/onInviteFriend/
+          // onCancelInvite the real dialog uses \u2014 see ShareTestHooks in
+          // src/dev/test-bridge.ts.
+          const shareOptions: ShareDialogOptions = {
             app: this.currentCanvas.app,
             theme: this.currentCanvas.theme,
             shareString: shareStr,
@@ -987,9 +1020,62 @@ class SkeinRouter {
             declinedInvites,
             onCancelInvite: (targetNodeId: string) => {
               this.currentCanvas?.store.removePendingInvite(targetNodeId);
+              // also clear the messagez outbox share entry for this canvas/
+              // peer pair — that outbox entry (not the canvas-doc pending
+              // invite alone) is what gates "already invited" in the friends-
+              // to-invite list above, so leaving it untouched permanently
+              // blocked re-inviting this friend after a cancel (a real bug:
+              // the two invite-tracking pieces of state weren't kept in
+              // sync). mark cancelled rather than deleting the entry
+              // outright, and rather than reusing `declined` (that field
+              // means the *recipient* declined, a different, real event —
+              // reusing it here would misrepresent a self-cancel as a
+              // decline anywhere `declined` is displayed).
+              if (this.messagezDocHandle) {
+                this.messagezDocHandle.change((draft: any) => {
+                  if (!draft.shares) return;
+                  for (const share of draft.shares) {
+                    if (share.canvasDocId === docId && share.toNodeId === targetNodeId) {
+                      share.cancelled = true;
+                    }
+                  }
+                });
+              }
               log.debug(TAG, "cancelled pending invite for:", targetNodeId.slice(0, 16) + "...");
             },
-          });
+          };
+
+          const shareHandle = showShareDialog(shareOptions);
+
+          if (import.meta.env.DEV) {
+            const bridge: Record<string, unknown> = ((window as any).__skeinTest ??= {});
+            bridge.share = {
+              getFriendsForInvite: () => shareOptions.friends ?? [],
+              getPendingInvites: () => {
+                const map = this.currentCanvas?.store.pendingInvites() ?? {};
+                return Object.entries(map).map(([targetNodeId, invite]) => ({
+                  targetNodeId,
+                  invite: invite as unknown as Record<string, unknown>,
+                }));
+              },
+              getMessagezShares: () =>
+                (((this.messagezDocHandle?.doc() as any)?.shares ?? []) as Array<{
+                  toNodeId: string;
+                  canvasDocId: string;
+                  declined?: boolean;
+                  cancelled?: boolean;
+                }>),
+              inviteFriend: async (nodeId: string, role: InvitableRole) => {
+                const friend = (shareOptions.friends ?? []).find((f) => f.nodeId === nodeId);
+                if (!friend) return;
+                await shareOptions.onInviteFriend?.(friend, role);
+              },
+              cancelInvite: (nodeId: string) => {
+                shareOptions.onCancelInvite?.(nodeId);
+              },
+              closeShareDialog: () => shareHandle.remove(),
+            } satisfies ShareTestHooks;
+          }
         },
         hasIdentity: !!this.localNodeId,
         avatarUrl: this.socialDoc?.current.profile?.avatarDataUrl || null,
@@ -1520,6 +1606,11 @@ class SkeinRouter {
       widgetId: SOCIAL_WIDGET_ID,
       canvasElement: canvas.app.canvas as HTMLCanvasElement,
       setHeaderActions: () => {}, // header actions not used in overlay context
+      // lets profile-tab.ts read the currently-open canvas's title/description/
+      // color for "add current canvas to profile", and read/edit the local
+      // peer's own profile doc's curated canvas list.
+      canvasStore: canvas.store,
+      profileStore: this.profileStore ?? undefined,
     };
 
     try {

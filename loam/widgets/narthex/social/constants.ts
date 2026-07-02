@@ -94,3 +94,7 @@ export const AVATAR_EXPORT_SIZE = 100;
 // color picker dots
 export const COLOR_DOT_RADIUS = 7;
 export const COLOR_DOT_GAP = 4;
+
+// profile tab — "my canvases" list
+export const PROFILE_CANVAS_ROW_HEIGHT = 40;
+export const PROFILE_CANVAS_SWATCH_SIZE = 12;

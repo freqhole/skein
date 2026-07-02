@@ -363,12 +363,22 @@ impl Service {
                     .upsert_profile(from, Some(&username), None, None)
                     .await?;
             }
-            FriendzMessage::FriendRequest { from_username, .. } => {
+            FriendzMessage::FriendRequest {
+                from_username,
+                is_hub,
+                ..
+            } => {
                 tracing::info!(peer = %from, username = %from_username, "friend request received");
                 // auto-accept for phase-1 prototype. real ACL flow comes later.
                 self.friendz_store
                     .upsert(from, friendz::FriendStatus::Accepted, None)
                     .await?;
+                // sticky: only ever set true, never reset to false when a
+                // later message omits the flag (docs/hub-and-profile-plan.md
+                // section 3.3).
+                if is_hub == Some(true) {
+                    self.userz.mark_as_hub(from).await?;
+                }
                 let ack = FriendzMessage::FriendAccept {
                     from_node_id: self.node_id_str.clone(),
                     from_username: self.local_username.clone(),
@@ -381,11 +391,18 @@ impl Service {
                     tracing::warn!(error = %e, peer = %from, "failed to send friend-accept");
                 }
             }
-            FriendzMessage::FriendAccept { from_username, .. } => {
+            FriendzMessage::FriendAccept {
+                from_username,
+                is_hub,
+                ..
+            } => {
                 tracing::info!(peer = %from, username = %from_username, "friend accept received");
                 self.friendz_store
                     .upsert(from, friendz::FriendStatus::Accepted, None)
                     .await?;
+                if is_hub == Some(true) {
+                    self.userz.mark_as_hub(from).await?;
+                }
             }
             FriendzMessage::FriendReject { .. } => {
                 self.friendz_store.delete(from).await?;
