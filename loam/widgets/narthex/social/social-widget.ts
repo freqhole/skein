@@ -65,6 +65,18 @@ export const socialWidget: WidgetFactory<typeof socialSchema> = {
     let currentWidth = ctx.width;
     let currentHeight = ctx.height;
     let activeTab: TabName = "friends";
+    // true only while activeTab has been force-set to "profile" because no
+    // identity exists yet (not while a user has genuinely clicked "profile"
+    // themselves) — lets us snap back to "friends" the moment identity
+    // appears, instead of leaving the user stranded on "profile" forever.
+    // real bug this fixes: without it, every OTHER tab's own currentWidth/
+    // currentHeight (each tab tracks these independently, initialized to 0)
+    // never receives a real layout() call until the user manually clicks
+    // that tab — since "friends" was never the active tab during the
+    // (however brief) no-identity window, anything relying on friends-tab's
+    // own real dimensions (e.g. a sub-view's rendered positions) would see
+    // stale zeros until a manual tab click happened to trigger one.
+    let forcedProfileForNoIdentity = false;
 
     // -----------------------------------------------------------------------
     // card background
@@ -100,6 +112,9 @@ export const socialWidget: WidgetFactory<typeof socialSchema> = {
         e.stopPropagation();
         if (activeTab !== tabName) {
           activeTab = tabName;
+          // a real, deliberate user click always overrides the no-identity
+          // auto-forcing behavior above.
+          forcedProfileForNoIdentity = false;
           layout(currentWidth, currentHeight);
         }
       });
@@ -121,6 +136,7 @@ export const socialWidget: WidgetFactory<typeof socialSchema> = {
       widgetId: ctx.widgetId,
       canvasStore: ctx.canvasStore,
       profileStore: ctx.profileStore,
+      narthexDocId: ctx.narthexDocId,
     };
 
     const tabs: Record<TabName, TabController> = {
@@ -154,9 +170,17 @@ export const socialWidget: WidgetFactory<typeof socialSchema> = {
 
       const hasIdentity = !!state.profile.nodeId;
 
-      // when there's no identity, force the profile tab and hide all tab labels
+      // when there's no identity, force the profile tab and hide all tab
+      // labels. once identity appears, snap back to "friends" — but only if
+      // we're the ones who forced "profile" in the first place; a user who
+      // genuinely chose to view "profile" (or any other tab) themselves
+      // keeps their own choice.
       if (!hasIdentity) {
         activeTab = "profile";
+        forcedProfileForNoIdentity = true;
+      } else if (forcedProfileForNoIdentity) {
+        activeTab = "friends";
+        forcedProfileForNoIdentity = false;
       }
 
       // -- tab bar ----------------------------------------------------------

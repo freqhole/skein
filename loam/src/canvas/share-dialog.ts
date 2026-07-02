@@ -28,6 +28,13 @@ export interface FriendInfo {
   isOnline: boolean;
   /** true if this friend is a known reliquary hub (see docs/hub-and-profile-plan.md). */
   isHub?: boolean;
+  /** true if this is still an in-progress friend request (inbound or
+   *  outbound), not yet a confirmed friend — see
+   *  docs/hub-and-profile-plan.md section 10.1. shown with a "(pending)"
+   *  marker so the invite is honest about the relationship's state, but
+   *  still invitable (the invite-write path tolerates unconfirmed
+   *  friendship gracefully). */
+  isPending?: boolean;
 }
 
 export interface ShareDialogOptions {
@@ -77,6 +84,14 @@ export interface ShareDialogOptions {
 
 export interface ShareDialogHandle {
   remove(): void;
+  /**
+   * dev/test-only: the rendered display-name text for a friend-invite row
+   * (regular or hub section), by node id, or null if that friend isn't
+   * currently rendered. proves the actual rendered row content reflects
+   * the right peer, not just that the right `FriendInfo` was passed in —
+   * see docs/hub-and-profile-plan.md section 10.3.
+   */
+  getFriendRowText(nodeId: string): string | null;
 }
 
 /**
@@ -484,7 +499,7 @@ function buildFriendInviteRow(
   rowHeight: number,
   isRemoved: () => boolean,
   onInvite?: (friend: FriendInfo, role: InvitableRole) => void | Promise<void>
-): Container {
+): { container: Container; nameText: Text } {
   const row = new Container();
 
   // avatar circle — colored based on username hash
@@ -524,14 +539,18 @@ function buildFriendInviteRow(
   statusDot.y = avatarBg.y + avatarSize - dotSize + 1;
   row.addChild(statusDot);
 
-  // username text
-  const displayName = friend.username || friend.nodeId.slice(0, 12) + "...";
+  // username text — a still-pending friend request gets a "(pending)"
+  // suffix so the invite is honest about the relationship not being
+  // confirmed yet (see docs/hub-and-profile-plan.md section 10.1), without
+  // hiding the row entirely.
+  const baseDisplayName = friend.username || friend.nodeId.slice(0, 12) + "...";
+  const displayName = friend.isPending ? baseDisplayName + " (pending)" : baseDisplayName;
   const nameText = new Text({
     text: displayName,
     style: {
       fontFamily: theme.fontFamily,
       fontSize: theme.fontSizeSmall,
-      fill: theme.frameHeaderText,
+      fill: friend.isPending ? 0x9ca3af : theme.frameHeaderText,
     },
     resolution: theme.textResolution,
   });
@@ -621,7 +640,7 @@ function buildFriendInviteRow(
     }, COPY_FEEDBACK_MS);
   });
 
-  return row;
+  return { container: row, nameText };
 }
 
 // ---------------------------------------------------------------------------
@@ -954,6 +973,10 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   const friendLabel = makeLabel("invite friends", theme);
   friendSection.addChild(friendLabel);
 
+  // dev/test-only: rendered display-name text for each friend-invite row,
+  // by node id — see ShareDialogHandle.getFriendRowText().
+  const friendRowNameTexts = new Map<string, Text>();
+
   // hub friends get their own section below, always last — see
   // splitFriendsForInvite()'s doc comment for the grouping rule.
   const allFriends = options.friends ?? [];
@@ -975,7 +998,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   } else {
     let friendY = friendLabel.height + LABEL_GAP;
     for (const friend of friendList) {
-      const friendRow = buildFriendInviteRow(
+      const { container: friendRow, nameText } = buildFriendInviteRow(
         friend,
         theme,
         scrollBoxWidth,
@@ -985,6 +1008,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
       );
       friendRow.y = friendY;
       friendSection.addChild(friendRow);
+      friendRowNameTexts.set(friend.nodeId, nameText);
       friendY += copyBtnH + 4;
     }
   }
@@ -1000,7 +1024,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
 
     let hubFriendY = hubFriendLabel.height + LABEL_GAP;
     for (const friend of hubFriendList) {
-      const friendRow = buildFriendInviteRow(
+      const { container: friendRow, nameText } = buildFriendInviteRow(
         friend,
         theme,
         scrollBoxWidth,
@@ -1010,6 +1034,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
       );
       friendRow.y = hubFriendY;
       hubFriendSection.addChild(friendRow);
+      friendRowNameTexts.set(friend.nodeId, nameText);
       hubFriendY += copyBtnH + 4;
     }
   }
@@ -1279,6 +1304,9 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   return {
     remove(): void {
       teardown();
+    },
+    getFriendRowText(nodeId: string): string | null {
+      return friendRowNameTexts.get(nodeId)?.text ?? null;
     },
   };
 }

@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use iroh::Endpoint;
-use reliquary::{blobz, friendz, service, userz};
+use reliquary::{blobz, friendz, identity, service, userz};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
@@ -24,15 +24,18 @@ use tokio_util::sync::CancellationToken;
 
 /// runtime state for the one-and-only tauri command.
 ///
-/// the endpoint, pool, and stores are always alive — they exist for the
-/// lifetime of the tauri process. `hub` is optional and can be toggled on
-/// and off at runtime via `hub_start` / `hub_stop`.
+/// the pool and stores are always alive — they exist for the lifetime of
+/// the tauri process. the iroh endpoint/streams (`network`) are NOT: they
+/// only come up once an identity exists, which only ever happens in
+/// response to something the user explicitly asked for (see
+/// [`ensure_network`]/[`build_network_state`]) — never merely because the
+/// process started. `hub` is optional and can be toggled on and off at
+/// runtime via `hub_start` / `hub_stop`.
 pub struct AppState {
-    pub endpoint: Endpoint,
+    pub network: Arc<Mutex<Option<NetworkState>>>,
     pub pool: SqlitePool,
     pub data_dir: PathBuf,
     pub username: String,
-    pub node_id: String,
 
     pub blobz: blobz::Store,
     pub friendz_store: friendz::Store,
@@ -42,12 +45,21 @@ pub struct AppState {
     pub app_config_path: PathBuf,
 
     pub hub: Arc<Mutex<Option<HubState>>>,
-    pub streams: Arc<crate::streams::StreamRegistry>,
     /// iroh-blobs FsStore — leaked at boot so `BlobsProtocol` (registered on
     /// `iroh-blobs/4` by [`crate::streams::StreamRegistry::start_with_blobs`])
     /// can hold a `'static` reference. used by the `blob_iroh_ensure`
     /// dispatch action to import blob bytes from `blobz` on demand.
     pub fs_store: &'static iroh_blobs::store::fs::FsStore,
+}
+
+/// the "network is up" half of `AppState`: the bound iroh endpoint, our own
+/// node id, and the stream registry. lives behind `AppState::network`'s
+/// mutex — `None` until [`ensure_network`] (or the boot-time restore path
+/// in `lib.rs`, for a returning user with an existing keypair) builds one.
+pub struct NetworkState {
+    pub endpoint: Endpoint,
+    pub node_id: String,
+    pub streams: Arc<crate::streams::StreamRegistry>,
 }
 
 /// bookkeeping for a running hub. kept in `Option<_>` — `Some` means the
@@ -177,6 +189,99 @@ enum DispatchError {
     User(#[from] userz::UserError),
     #[error("not found")]
     NotFound,
+    #[error("identity: {0}")]
+    Identity(String),
+}
+
+/// read the current node id without any side effects — never generates a
+/// keypair or binds an endpoint. returns an empty string if no identity has
+/// been created yet (a real, valid state: the frontend treats an empty
+/// `node_id` as "no identity" the same way it does in browser mode, e.g.
+/// `social-widget.ts`'s `hasIdentity` check).
+async fn current_node_id(state: &AppState) -> String {
+    state
+        .network
+        .lock()
+        .await
+        .as_ref()
+        .map(|n| n.node_id.clone())
+        .unwrap_or_default()
+}
+
+/// build a fresh [`NetworkState`]: loads the persisted keypair if one
+/// already exists on disk, otherwise generates a brand-new one (via
+/// `identity::load_or_generate_keypair`), binds the iroh endpoint, records
+/// ourselves in `userz`, starts the stream registry, and pre-warms the
+/// iroh-blobs FsStore with every blob already in `blobz`.
+///
+/// this is the only function that can ever cause a NEW keypair to be
+/// generated. callers control *when* that's allowed to happen by
+/// controlling *when this function is called at all*: `lib.rs`'s boot path
+/// only calls it when a keypair file already exists (a returning user, who
+/// already consented to P2P in an earlier session); [`ensure_network`]
+/// calls it lazily, the first time the frontend actually needs the
+/// network (sharing/joining a canvas, starting the hub, fetching a blob
+/// from a peer, or the user clicking "generate identity" in the profile
+/// widget) — never merely because the process started.
+pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkState> {
+    let secret = identity::load_or_generate_keypair(&state.data_dir)?;
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret)
+        .bind()
+        .await?;
+    let node_id = endpoint.id().to_string();
+
+    state
+        .userz
+        .upsert_self(&node_id, Some(&state.username), None, None)
+        .await?;
+
+    let streams =
+        crate::streams::StreamRegistry::start_with_blobs(endpoint.clone(), state.fs_store).await?;
+
+    // pre-warm the FsStore for every blob already in blobz. without this,
+    // the first peer to ask for a pre-existing blob has to wait for
+    // `add_path` (BAO tree compute) inside the dispatch handler, and for
+    // large files that easily exceeds the browser's snatch timeout.
+    // best-effort: errors are logged and ignored — the lazy
+    // `blob_iroh_ensure` path still works as a fallback.
+    match state.blobz.list(i64::MAX, 0).await {
+        Ok(blobs) => {
+            tracing::info!(count = blobs.len(), "pre-warming iroh-blobs FsStore");
+            for blob in blobs {
+                prewarm_fs_store(state, &blob).await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "prewarm: failed to list blobz, skipping FsStore seed");
+        }
+    }
+
+    tracing::info!(node_id = %node_id, "iroh endpoint bound");
+    Ok(NetworkState {
+        endpoint,
+        node_id,
+        streams,
+    })
+}
+
+/// ensure the iroh endpoint + streams exist, lazily building them (and
+/// generating a keypair if this is genuinely the first time) on first
+/// call. every dispatch action that actually needs the network calls this
+/// instead of reading `AppState` fields directly.
+async fn ensure_network(
+    state: &AppState,
+) -> Result<(Endpoint, String, Arc<crate::streams::StreamRegistry>), DispatchError> {
+    let mut guard = state.network.lock().await;
+    if let Some(net) = guard.as_ref() {
+        return Ok((net.endpoint.clone(), net.node_id.clone(), net.streams.clone()));
+    }
+    let net = build_network_state(state)
+        .await
+        .map_err(|e| DispatchError::Identity(e.to_string()))?;
+    let result = (net.endpoint.clone(), net.node_id.clone(), net.streams.clone());
+    *guard = Some(net);
+    Ok(result)
 }
 
 async fn dispatch(
@@ -187,7 +292,19 @@ async fn dispatch(
 ) -> Result<Value, DispatchError> {
     match action {
         // identity / status
-        "get_node_id" => Ok(json!({ "node_id": state.node_id })),
+        //
+        // `identity_status` is read-only — it never generates a keypair or
+        // binds an endpoint, so it's safe to call on every boot (e.g. to
+        // show/hide identity-gated UI). `get_node_id` is the "ensure"
+        // endpoint: it lazily generates a keypair and binds the iroh
+        // endpoint the first time it's actually needed (sharing/joining a
+        // canvas, the user clicking "generate identity", ...) — never
+        // merely because the process started.
+        "identity_status" => Ok(json!({ "node_id": current_node_id(state).await })),
+        "get_node_id" => {
+            let (_, node_id, _) = ensure_network(state).await?;
+            Ok(json!({ "node_id": node_id }))
+        }
         "status" => status(state).await,
 
         // friends
@@ -263,42 +380,48 @@ async fn dispatch(
         "hub_stop" => hub_stop_inner(state).await,
         "hub_status" => hub_status(state).await,
 
-        // bi-stream IPC
-        "open_bi" => crate::streams::open_bi(
-            decode("open_bi", payload)?,
-            &state.endpoint,
-            &state.streams,
-        )
-        .await
-        .map_err(stream_err),
-        "accept_stream" => crate::streams::accept_stream(&state.streams)
-            .await
-            .map_err(stream_err),
+        // bi-stream IPC — all of these need a live endpoint/streams, so
+        // they all lazily ensure the network first (see `ensure_network`).
+        "open_bi" => {
+            let (endpoint, _, streams) = ensure_network(state).await?;
+            crate::streams::open_bi(decode("open_bi", payload)?, &endpoint, &streams)
+                .await
+                .map_err(stream_err)
+        }
+        "accept_stream" => {
+            let (_, _, streams) = ensure_network(state).await?;
+            crate::streams::accept_stream(&streams).await.map_err(stream_err)
+        }
         "write_message" => {
-            crate::streams::write_message(decode("write_message", payload)?, &state.streams)
+            let (_, _, streams) = ensure_network(state).await?;
+            crate::streams::write_message(decode("write_message", payload)?, &streams)
                 .await
                 .map_err(stream_err)
         }
         "read_message" => {
-            crate::streams::read_message(decode("read_message", payload)?, &state.streams)
+            let (_, _, streams) = ensure_network(state).await?;
+            crate::streams::read_message(decode("read_message", payload)?, &streams)
                 .await
                 .map_err(stream_err)
         }
         "close_stream" => {
-            crate::streams::close_stream(decode("close_stream", payload)?, &state.streams)
+            let (_, _, streams) = ensure_network(state).await?;
+            crate::streams::close_stream(decode("close_stream", payload)?, &streams)
                 .await
                 .map_err(stream_err)
         }
         "write_raw_and_finish" => {
+            let (_, _, streams) = ensure_network(state).await?;
             crate::streams::write_raw_and_finish(
                 decode("write_raw_and_finish", payload)?,
-                &state.streams,
+                &streams,
             )
             .await
             .map_err(stream_err)
         }
         "read_to_end" => {
-            crate::streams::read_to_end(decode("read_to_end", payload)?, &state.streams)
+            let (_, _, streams) = ensure_network(state).await?;
+            crate::streams::read_to_end(decode("read_to_end", payload)?, &streams)
                 .await
                 .map_err(stream_err)
         }
@@ -391,7 +514,7 @@ async fn status(state: &AppState) -> Result<Value, DispatchError> {
     let friends = state.friendz_store.list(false).await?;
     let hub_running = state.hub.lock().await.is_some();
     let resp = StatusResponse {
-        node_id: state.node_id.clone(),
+        node_id: current_node_id(state).await,
         friend_count: friends.len(),
         uptime_s: state.process_started_at.elapsed().as_secs(),
         hub_running,
@@ -454,9 +577,10 @@ async fn friend_remove(
 async fn social_get_state(state: &AppState) -> Result<Value, DispatchError> {
     let cfg = AppConfig::load(&state.app_config_path);
     let me = state.userz.get_self().await?;
+    let node_id = current_node_id(state).await;
 
     let profile = json!({
-        "user_id": state.node_id,
+        "user_id": node_id,
         "username": me
             .as_ref()
             .and_then(|u| u.display_name.clone())
@@ -468,7 +592,7 @@ async fn social_get_state(state: &AppState) -> Result<Value, DispatchError> {
             .and_then(|u| u.avatar_blake3.clone())
             .unwrap_or_default(),
         "accent_color": me.as_ref().map(|u| u.accent_color).unwrap_or(0),
-        "node_id": state.node_id,
+        "node_id": node_id,
     });
 
     let rows = state.friendz_store.list(false).await?;
@@ -533,7 +657,7 @@ async fn social_get_state(state: &AppState) -> Result<Value, DispatchError> {
                 };
                 let req = json!({
                     "id": f.friend_node_id,
-                    "user_id": state.node_id,
+                    "user_id": node_id,
                     "remote_user_id": f.friend_node_id,
                     "direction": direction,
                     "status": "pending",
@@ -560,7 +684,7 @@ async fn social_get_state(state: &AppState) -> Result<Value, DispatchError> {
         .map(|name| {
             json!({
                 "id": name.clone(),
-                "user_id": state.node_id,
+                "user_id": node_id,
                 "name": name,
                 "color": 0,
             })
@@ -812,10 +936,21 @@ async fn social_update_profile(
     args: SocialUpdateProfileArgs,
     state: &AppState,
 ) -> Result<Value, DispatchError> {
+    let node_id = current_node_id(state).await;
+    if node_id.is_empty() {
+        // editing your own profile only makes sense once an identity
+        // exists; the frontend gates this UI behind identity already
+        // existing, so reaching here means a genuine caller error rather
+        // than something to silently paper over by generating one as a
+        // side effect of an unrelated settings write.
+        return Err(DispatchError::Identity(
+            "no identity yet — generate one before editing your profile".to_string(),
+        ));
+    }
     state
         .userz
         .upsert_self_full(
-            &state.node_id,
+            &node_id,
             None,
             args.alias.as_deref(),
             args.bio.as_deref(),
@@ -1117,7 +1252,8 @@ async fn blob_iroh_download(
         "blob_iroh_download: starting"
     );
 
-    let downloader = Downloader::new(state.fs_store, &state.endpoint);
+    let (endpoint, _, _) = ensure_network(state).await?;
+    let downloader = Downloader::new(state.fs_store, &endpoint);
     let progress = downloader.download(HashAndFormat::raw(hash), [node_id]);
     let mut stream = progress
         .stream()
@@ -1253,8 +1389,8 @@ async fn blob_iroh_probe(
         "blob_iroh_probe: connecting"
     );
 
-    let conn = state
-        .endpoint
+    let (endpoint, _, _) = ensure_network(state).await?;
+    let conn = endpoint
         .connect(iroh::EndpointAddr::from(node_id), b"skein/1")
         .await
         .map_err(|e| DispatchError::Stream(format!("connect: {e}")))?;
@@ -1325,13 +1461,24 @@ pub async fn hub_start(state: &AppState) -> Result<Value, String> {
 }
 
 async fn hub_start_inner(state: &AppState) -> Result<Value, DispatchError> {
+    let slot = state.hub.lock().await;
+    if slot.is_some() {
+        return Ok(json!({ "running": true, "already_running": true }));
+    }
+    drop(slot);
+
+    // starting the hub is itself an explicit, user-initiated action (the
+    // user flipped the "run hub" toggle) — legitimate to generate an
+    // identity here if none exists yet, same as sharing/joining a canvas.
+    let (endpoint, _, _) = ensure_network(state).await?;
+
     let mut slot = state.hub.lock().await;
     if slot.is_some() {
         return Ok(json!({ "running": true, "already_running": true }));
     }
 
     let svc = service::Service::start(
-        state.endpoint.clone(),
+        endpoint,
         state.pool.clone(),
         service::ServiceConfig {
             data_dir: state.data_dir.clone(),
@@ -1376,14 +1523,15 @@ async fn hub_stop_inner(state: &AppState) -> Result<Value, DispatchError> {
 }
 
 async fn hub_status(state: &AppState) -> Result<Value, DispatchError> {
+    let node_id = current_node_id(state).await;
     let slot = state.hub.lock().await;
     match &*slot {
         Some(hub) => Ok(json!({
             "running": true,
-            "node_id": state.node_id,
+            "node_id": node_id,
             "uptime_s": hub.started_at.elapsed().as_secs(),
         })),
-        None => Ok(json!({ "running": false, "node_id": state.node_id })),
+        None => Ok(json!({ "running": false, "node_id": node_id })),
     }
 }
 

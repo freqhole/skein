@@ -72,19 +72,20 @@ export async function initFriendzWiring(
 
   // in tauri mode, identity comes from the running iroh endpoint
   // in standalone mode, identity is stored in IndexedDB
-  let localNodeId: string;
-
-  if (isTauriMode()) {
-    const node = await TauriStreamNode.create();
-    localNodeId = node.node_id();
-  } else {
-    const identity = await getStoredIdentity();
-    if (!identity) {
-      log.warn(TAG, "aborting: no stored identity (browser mode)");
-      return null;
-    }
-    localNodeId = identity.node_id;
+  //
+  // both branches use the same cheap, side-effect-free getStoredIdentity()
+  // check and abort if no identity exists yet — this function is called
+  // unconditionally on every boot (see boot.ts's initFriendzProtocol()), so
+  // it must never be what causes a P2P identity to be generated. once the
+  // user does generate one (ensureIdentity(), triggered by an explicit
+  // action elsewhere), boot.ts's onIdentityChange retry logic calls this
+  // again and it proceeds normally.
+  const identity = await getStoredIdentity();
+  if (!identity) {
+    log.warn(TAG, "aborting: no stored identity yet");
+    return null;
   }
+  const localNodeId = identity.node_id;
 
   let sDoc: SocialDoc;
 

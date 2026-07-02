@@ -376,6 +376,64 @@ export async function getRenderedProfileCanvasTitles(page: Page): Promise<string
   );
 }
 
+// --- profile canvas-bin widget (window.__skeinTest.social.canvasBin) ---
+// see docs/hub-and-profile-plan.md section 10.2, widgets/narthex/social/canvas-bin.ts.
+
+export interface CanvasBinNodeSummary {
+  kind: "folder" | "canvas";
+  id: string;
+  title?: string;
+  canvasDocId?: string;
+}
+
+/** child nodes of the canvas-bin widget's currently-viewed folder (or root). */
+export async function getCanvasBinVisibleNodes(page: Page): Promise<CanvasBinNodeSummary[]> {
+  return page.evaluate(
+    () => (window as any).__skeinTest?.social?.canvasBin?.getVisibleNodes?.() ?? []
+  );
+}
+
+/** the canvas-bin widget's currently-viewed folder id, or null at root. */
+export async function getCanvasBinCurrentFolderId(page: Page): Promise<string | null> {
+  return page.evaluate(
+    () => (window as any).__skeinTest?.social?.canvasBin?.getCurrentFolderId?.() ?? null
+  );
+}
+
+/** enter a folder or navigate to a canvas, as if its card were tapped. */
+export async function activateCanvasBinNode(page: Page, nodeId: string): Promise<void> {
+  await page.evaluate(
+    (id) => (window as any).__skeinTest?.social?.canvasBin?.activateNode?.(id),
+    nodeId
+  );
+}
+
+/** return to the parent folder, as if the "‹ back" button were tapped. */
+export async function canvasBinGoBack(page: Page): Promise<void> {
+  await page.evaluate(() => (window as any).__skeinTest?.social?.canvasBin?.goBack?.());
+}
+
+/** create a new folder under the currently-viewed folder. returns its new id. */
+export async function addCanvasBinFolder(page: Page, title: string): Promise<string> {
+  return page.evaluate(
+    (t) => (window as any).__skeinTest?.social?.canvasBin?.addFolder?.(t) ?? "",
+    title
+  );
+}
+
+/** move a node to a new parent folder id (or root when null), as if dragged and dropped. */
+export async function moveCanvasBinNode(
+  page: Page,
+  nodeId: string,
+  newParentId: string | null
+): Promise<boolean> {
+  return page.evaluate(
+    ({ nodeId, newParentId }) =>
+      (window as any).__skeinTest?.social?.canvasBin?.moveNode?.(nodeId, newParentId) ?? false,
+    { nodeId, newParentId }
+  );
+}
+
 // --- share dialog (window.__skeinTest.share) ---
 // see src/dev/test-bridge.ts's ShareTestHooks for what these wrap. only
 // present once the toolbar's real share button has been pressed at least
@@ -402,7 +460,9 @@ export async function waitForShareHooks(page: Page, timeoutMs = 15_000): Promise
  *  (a snapshot \u2014 call openShareDialog() again to refresh it). */
 export async function getFriendsForInvite(
   page: Page
-): Promise<Array<{ friendId: string; username: string; nodeId: string; isHub?: boolean }>> {
+): Promise<
+  Array<{ friendId: string; username: string; nodeId: string; isHub?: boolean; isPending?: boolean }>
+> {
   return page.evaluate(() => (window as any).__skeinTest?.share?.getFriendsForInvite?.() ?? []);
 }
 
@@ -439,4 +499,15 @@ export async function inviteFriendViaShareDialog(
  *  onCancelInvite handler exactly as if its "cancel" button were pressed. */
 export async function cancelInviteViaShareDialog(page: Page, nodeId: string): Promise<void> {
   await page.evaluate((id) => (window as any).__skeinTest.share.cancelInvite(id), nodeId);
+}
+
+/** the rendered display-name text for a friend-invite row (regular or hub
+ *  section), by node id, or null if that friend isn't currently rendered.
+ *  proves the actual rendered row content, not just the FriendInfo passed
+ *  in \u2014 see docs/hub-and-profile-plan.md section 10.3. */
+export async function getShareFriendRowText(page: Page, nodeId: string): Promise<string | null> {
+  return page.evaluate(
+    (id) => (window as any).__skeinTest?.share?.getFriendRowText?.(id) ?? null,
+    nodeId
+  );
 }

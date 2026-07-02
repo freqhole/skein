@@ -34,6 +34,7 @@ import {
   cancelInviteViaShareDialog,
   ensureIdentityBridge,
   getFriendsForInvite,
+  getShareFriendRowText,
   getSharePendingInvites,
   getShareMessagezShares,
   inviteFriendViaShareDialog,
@@ -229,5 +230,98 @@ test.describe("share dialog", () => {
     // friend must not, so each lands in exactly one of the two sections.
     expect(hubEntry?.isHub).toBe(true);
     expect(regularEntry?.isHub).toBeFalsy();
+  });
+
+  test("a peer with only a pending inbound or outbound friend request never disappears from the invite list (section 10.1)", async ({
+    page,
+  }) => {
+    await setup(page, "pending relationship test canvas");
+
+    const inboundNodeId = "f".repeat(64);
+    const outboundNodeId = "1".repeat(64);
+
+    // seed a still-pending inbound request (they friended us, we haven't
+    // acted) and a still-pending outbound request (we friended them, no
+    // reply yet) — neither is in `friends`, so before this fix neither
+    // would ever appear anywhere in the share dialog.
+    await page.evaluate(
+      ({ inboundNodeId, outboundNodeId }) => {
+        (window as any).__skeinTest.social.doc.change((d: any) => {
+          if (!d.pendingRequests) d.pendingRequests = [];
+          d.pendingRequests.push({
+            fromNodeId: inboundNodeId,
+            fromUsername: "inbound-requester",
+            receivedAt: new Date().toISOString(),
+            status: "pending",
+          });
+          if (!d.outboundRequests) d.outboundRequests = [];
+          d.outboundRequests.push({
+            toNodeId: outboundNodeId,
+            toUsername: "outbound-target",
+            sentAt: new Date().toISOString(),
+            status: "pending",
+          });
+        });
+      },
+      { inboundNodeId, outboundNodeId }
+    );
+
+    await openShareDialog(page);
+    await waitForShareHooks(page);
+
+    await expect
+      .poll(async () => (await getFriendsForInvite(page)).map((f) => f.nodeId))
+      .toEqual(expect.arrayContaining([inboundNodeId, outboundNodeId]));
+
+    const friends = await getFriendsForInvite(page);
+    const inboundEntry = friends.find((f) => f.nodeId === inboundNodeId);
+    const outboundEntry = friends.find((f) => f.nodeId === outboundNodeId);
+
+    // both must be marked pending (not a confirmed friend yet) — the UI
+    // shows this honestly rather than pretending they're a real friend.
+    expect(inboundEntry?.isPending).toBe(true);
+    expect(outboundEntry?.isPending).toBe(true);
+    // isHub is unknowable for an unconfirmed relationship — must default
+    // false, never guessed true.
+    expect(inboundEntry?.isHub).toBeFalsy();
+    expect(outboundEntry?.isHub).toBeFalsy();
+  });
+
+  test("the hub-nodes section renders the actual node-id-derived row for a hub friend, not just correct isHub data", async ({
+    page,
+  }) => {
+    await setup(page, "hub node id rendering test canvas");
+
+    // no alias/username set, so buildFriendInviteRow() falls back to a
+    // node-id-derived label (friend.nodeId.slice(0, 12) + "...") — a
+    // distinguishable prefix (not a uniform-character id) proves the
+    // rendered row text is really derived from *this* friend's node id, not
+    // another row's or a placeholder (docs/hub-and-profile-plan.md section
+    // 10.3).
+    const hubNodeId = "cafef00d" + "3".repeat(56);
+    const regularNodeId = "b".repeat(64);
+    await seedFriend(page, { nodeId: hubNodeId, alias: "", isHub: true });
+    await seedFriend(page, { nodeId: regularNodeId, alias: "", isHub: false });
+
+    await openShareDialog(page);
+    await waitForShareHooks(page);
+
+    await expect
+      .poll(async () => (await getFriendsForInvite(page)).map((f) => f.nodeId))
+      .toEqual(expect.arrayContaining([hubNodeId, regularNodeId]));
+
+    const hubRowText = await getShareFriendRowText(page, hubNodeId);
+    expect(hubRowText).not.toBeNull();
+    expect(hubRowText).toBe(hubNodeId.slice(0, 12) + "...");
+    // not another row's content, and not the full raw node id (proves the
+    // renderer's own truncation, not something a test computed itself).
+    expect(hubRowText).not.toBe(regularNodeId.slice(0, 12) + "...");
+    expect(hubRowText).not.toBe(hubNodeId);
+
+    const regularRowText = await getShareFriendRowText(page, regularNodeId);
+    expect(regularRowText).toBe(regularNodeId.slice(0, 12) + "...");
+
+    // a node id that was never rendered (not seeded) has no row at all.
+    expect(await getShareFriendRowText(page, "9".repeat(64))).toBeNull();
   });
 });

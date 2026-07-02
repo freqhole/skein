@@ -10,7 +10,7 @@
 // ---------------------------------------------------------------------------
 
 import { deleteMetaRecord, getMetaRecord, setMetaRecord } from "../storage/meta-db";
-import { isTauriMode, TauriStreamNode } from "./tauri-transport";
+import { checkTauriIdentityStatus, isTauriMode, TauriStreamNode } from "./tauri-transport";
 import { MiddenNode } from "midden";
 import { log } from "../utils/log";
 
@@ -95,19 +95,24 @@ export function onIdentityChange(callback: IdentityChangeCallback): () => void {
 // ---------------------------------------------------------------------------
 
 /**
- * read the stored identity from IndexedDB.
+ * read the stored identity from IndexedDB (browser mode) or check the
+ * Rust backend's identity status (tauri mode).
  *
- * returns `null` if no identity has been created yet. this is a cheap
- * IndexedDB read and does NOT start the midden WASM endpoint, so it is
- * safe to call on boot (e.g. to display the node_id in a profile widget).
+ * returns `null` if no identity has been created yet. this is a cheap,
+ * side-effect-free read — it does NOT start the midden WASM endpoint, and
+ * in tauri mode it does NOT bind the iroh endpoint or generate a keypair
+ * (see `checkTauriIdentityStatus()`) — so it is safe to call on boot (e.g.
+ * to display the node_id in a profile widget, or gate identity-dependent
+ * UI) without side effects.
  */
 export async function getStoredIdentity(): Promise<P2PIdentity | null> {
   if (isTauriMode()) {
     try {
-      const node = await TauriStreamNode.create();
+      const nodeId = await checkTauriIdentityStatus();
+      if (!nodeId) return null; // no identity yet — deliberately not created here
       return {
         secret_key: new Uint8Array(), // not exposed in tauri mode
-        node_id: node.node_id(),
+        node_id: nodeId,
         created_at: 0,
       };
     } catch {
@@ -199,18 +204,35 @@ export async function getMiddenNode(): Promise<MiddenNodeLike> {
 // ---------------------------------------------------------------------------
 
 /**
- * ensure an identity exists, generating one via midden if needed.
+ * ensure an identity exists, generating one if needed.
  *
- * if a persisted identity is already present in IndexedDB this simply
- * returns it. otherwise it starts the midden endpoint (as a side effect)
- * to generate a keypair, persists it, and returns the new identity.
+ * if a persisted identity is already present (IndexedDB in browser mode,
+ * the Rust backend's keypair file in tauri mode) this simply returns it.
+ * otherwise it triggers identity generation as a side effect (starting
+ * midden in browser mode; binding the Rust iroh endpoint in tauri mode)
+ * and returns the new identity. only call this in response to something
+ * the user actually asked for (sharing/joining a canvas, starting the hub,
+ * clicking "generate identity") — never merely on boot.
  */
 export async function ensureIdentity(): Promise<P2PIdentity> {
-  // in tauri mode, identity always exists (from the running endpoint)
+  // in tauri mode, a cheap status check first avoids binding the iroh
+  // endpoint when an identity already exists; `TauriStreamNode.create()`
+  // is the actual "ensure" call on the Rust side (generates one if this is
+  // genuinely the first time).
   if (isTauriMode()) {
     const identity = await getStoredIdentity();
     if (identity) return identity;
-    throw new Error(TAG + " P2P endpoint not available in tauri mode");
+    const node = await TauriStreamNode.create();
+    const created: P2PIdentity = {
+      secret_key: new Uint8Array(),
+      node_id: node.node_id(),
+      created_at: 0,
+    };
+    // notify listeners (e.g. `IrohNetworkAdapter.checkIdentityAndStart()`,
+    // which subscribed instead of starting immediately when it found no
+    // identity yet) the same way the browser-mode path below does.
+    notifyListeners(created);
+    return created;
   }
 
   // cheap check first — avoids starting midden when we already have one

@@ -20,6 +20,7 @@ const HEAVY_TEST_FILES = [
   "friendz-hub.spec.ts",
   "hub-admin.spec.ts",
   "hub-profile-panel.spec.ts",
+  "friends-tab-hub-profile.spec.ts",
 ];
 
 const chromiumUse = {

@@ -48,6 +48,12 @@ export interface TabContext {
    *  section 6). used by profile-tab.ts to manage the profile's curated
    *  canvas list. undefined until boot.ts has resolved it. */
   profileStore?: ProfileStore;
+  /** the narthex's own document id \u2014 lets profile-tab.ts tell whether
+   *  `canvasStore` above IS the narthex meta-canvas (rather than a real
+   *  canvas), since the narthex should never be offered for "add to
+   *  profile" (it's a private per-user index, not something to publish or
+   *  share). undefined in contexts that don't thread it through. */
+  narthexDocId?: string;
 }
 
 /**

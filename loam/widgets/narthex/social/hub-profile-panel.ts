@@ -100,6 +100,22 @@ export interface HubProfilePanelHandle {
   refresh(): Promise<void>;
   /** current render state — see `HubProfilePanelState`. */
   getState(): HubProfilePanelState;
+  /**
+   * dev/test-only: global (screen-space) center position of the "allow"
+   * input field, or null if the panel isn't currently in its "ready" state
+   * (the allow section only renders then). lets e2e tests drive a real
+   * `page.mouse.click()` + `page.keyboard.type()` through the actual DOM
+   * input overlay this field creates on click — same `getGlobalPosition()`-
+   * based precedent as `messagez-widget.ts`'s `getKnockActionGlobalPos()`.
+   */
+  getAllowInputGlobalPos(): { x: number; y: number } | null;
+  /** dev/test-only: global center position of the "allow" button, or null
+   *  if not currently rendered. */
+  getAllowButtonGlobalPos(): { x: number; y: number } | null;
+  /** dev/test-only: global center position of a friend row's "remove"
+   *  button, by that friend's node id, or null if that row isn't currently
+   *  rendered (not in the friendz list, or the panel isn't ready). */
+  getRemoveButtonGlobalPos(nodeId: string): { x: number; y: number } | null;
   /** tear down all resources (event listeners, DOM overlays, textures). */
   destroy(): void;
 }
@@ -125,6 +141,16 @@ export function mountHubProfilePanel(
   let allowFeedback = "";
   let allowInFlight = false;
   const removeInFlight = new Set<string>();
+
+  // dev/test-only refs to rendered buttons — see getAllowButtonGlobalPos()/
+  // getRemoveButtonGlobalPos() below. reset at the top of every rebuild().
+  let allowButtonRef: Container | null = null;
+  const removeButtonRefs = new Map<string, Container>();
+
+  function globalCenter(c: Container): { x: number; y: number } {
+    const pos = c.getGlobalPosition();
+    return { x: pos.x + c.width / 2, y: pos.y + c.height / 2 };
+  }
 
   // -- scaffolding: scrollable, masked content area --------------------------
 
@@ -325,6 +351,9 @@ export function mountHubProfilePanel(
   function rebuild(): void {
     if (destroyed) return;
 
+    allowButtonRef = null;
+    removeButtonRefs.clear();
+
     if (allowInputHandle) {
       allowInputHandle.destroy();
       allowInputHandle = null;
@@ -469,6 +498,7 @@ export function mountHubProfilePanel(
     });
     allowBtn.x = inputW + 8;
     allowRow.addChild(allowBtn);
+    allowButtonRef = allowBtn;
     dy += FIELD_HEIGHT + 4;
 
     if (allowFeedback) {
@@ -572,6 +602,7 @@ export function mountHubProfilePanel(
         removeBtn.x = contentW - REMOVE_BTN_W - ROW_PADDING_X;
         removeBtn.y = (FRIEND_ROW_HEIGHT - REMOVE_BTN_H) / 2;
         row.addChild(removeBtn);
+        removeButtonRefs.set(friend.nodeId, removeBtn);
 
         dy += FRIEND_ROW_HEIGHT;
       }
@@ -706,6 +737,22 @@ export function mountHubProfilePanel(
     return state;
   }
 
+  function getAllowInputGlobalPos(): { x: number; y: number } | null {
+    if (!allowInputHandle) return null;
+    return globalCenter(allowInputHandle.input);
+  }
+
+  function getAllowButtonGlobalPos(): { x: number; y: number } | null {
+    if (!allowButtonRef) return null;
+    return globalCenter(allowButtonRef);
+  }
+
+  function getRemoveButtonGlobalPos(nodeId: string): { x: number; y: number } | null {
+    const btn = removeButtonRefs.get(nodeId);
+    if (!btn) return null;
+    return globalCenter(btn);
+  }
+
   function destroy(): void {
     destroyed = true;
     if (allowInputHandle) {
@@ -719,5 +766,14 @@ export function mountHubProfilePanel(
     log.warn(TAG, "initial refresh failed:", err);
   });
 
-  return { container, layout, refresh, getState, destroy };
+  return {
+    container,
+    layout,
+    refresh,
+    getState,
+    getAllowInputGlobalPos,
+    getAllowButtonGlobalPos,
+    getRemoveButtonGlobalPos,
+    destroy,
+  };
 }

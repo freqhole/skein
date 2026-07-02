@@ -192,16 +192,14 @@ class SkeinRouter {
       await ensureSingletonWidgets(this.repo, this.narthexDocId as DocumentId);
     }
 
-    // resolve local node ID early so hasIdentity is available at canvas init time
+    // resolve local node ID early so hasIdentity is available at canvas init time.
+    // uses getStoredIdentity() in BOTH modes — a cheap, side-effect-free
+    // check that never generates a keypair or binds the iroh endpoint, so
+    // simply booting the app never creates a P2P identity on its own.
     if (!this.localNodeId) {
       try {
-        if (isTauriMode()) {
-          const node = await TauriStreamNode.create();
-          this.localNodeId = node.node_id();
-        } else {
-          const identity = await getStoredIdentity();
-          this.localNodeId = identity?.node_id ?? "";
-        }
+        const identity = await getStoredIdentity();
+        this.localNodeId = identity?.node_id ?? "";
       } catch {
         // identity not ready yet
       }
@@ -832,6 +830,48 @@ class SkeinRouter {
                 }
               }
             }
+
+            // also include in-progress friend requests (not yet confirmed
+            // friends) so someone never just vanishes from the share dialog
+            // while a handshake is still pending — see
+            // docs/hub-and-profile-plan.md section 10.1. same exclusion
+            // filters as above; isHub is unknown until an accept message
+            // carrying the flag arrives, so default to false rather than
+            // guessing.
+            if (friendsState?.pendingRequests) {
+              for (const req of friendsState.pendingRequests) {
+                if (req.status !== "pending") continue;
+                if (!req.fromNodeId) continue;
+                if (peerNodeIds.has(req.fromNodeId)) continue;
+                if (alreadyInvited.has(req.fromNodeId)) continue;
+
+                friendsForInvite.push({
+                  friendId: req.fromNodeId,
+                  username: req.fromUsername || "",
+                  nodeId: req.fromNodeId,
+                  isOnline: this.friendzProtocol?.isOnline(req.fromNodeId) ?? false,
+                  isHub: false,
+                  isPending: true,
+                });
+              }
+            }
+            if (friendsState?.outboundRequests) {
+              for (const req of friendsState.outboundRequests) {
+                if (req.status !== "pending") continue;
+                if (!req.toNodeId) continue;
+                if (peerNodeIds.has(req.toNodeId)) continue;
+                if (alreadyInvited.has(req.toNodeId)) continue;
+
+                friendsForInvite.push({
+                  friendId: req.toNodeId,
+                  username: req.toUsername || "",
+                  nodeId: req.toNodeId,
+                  isOnline: this.friendzProtocol?.isOnline(req.toNodeId) ?? false,
+                  isHub: false,
+                  isPending: true,
+                });
+              }
+            }
           }
 
           // build a nodeId -> display name map from friends for the peer list
@@ -1074,6 +1114,7 @@ class SkeinRouter {
                 shareOptions.onCancelInvite?.(nodeId);
               },
               closeShareDialog: () => shareHandle.remove(),
+              getFriendRowText: (nodeId: string) => shareHandle.getFriendRowText(nodeId),
             } satisfies ShareTestHooks;
           }
         },
@@ -1611,6 +1652,7 @@ class SkeinRouter {
       // peer's own profile doc's curated canvas list.
       canvasStore: canvas.store,
       profileStore: this.profileStore ?? undefined,
+      narthexDocId: this.narthexDocId ?? undefined,
     };
 
     try {

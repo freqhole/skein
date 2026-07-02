@@ -129,6 +129,12 @@ export function createFriendsTab(ctx: TabContext): TabController {
   let editingNewGroup = false;
   let groupInputHandle: SkeinInputHandle | null = null;
 
+  // rendered hub-node-id text in the detail view (docs/hub-and-profile-
+  // plan.md section 10.3) — kept for the getFriendDetailNodeIdText() test
+  // hook, so tests can assert on the actual rendered content rather than
+  // just the underlying FriendEntry data.
+  let detailNodeIdTextRef: Text | null = null;
+
   // drag-and-drop state
   let dragState: null | {
     friendId: string;
@@ -1073,6 +1079,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
       groupInputHandle.destroy();
       groupInputHandle = null;
     }
+    detailNodeIdTextRef = null;
 
     while (detailContainer.children.length > 0) {
       detailContainer.removeChildAt(0).destroy({ children: true });
@@ -1265,6 +1272,32 @@ export function createFriendsTab(ctx: TabContext): TabController {
       });
 
       dy += DETAIL_BTN_HEIGHT + 10;
+
+      // rendered node id — docs/hub-and-profile-plan.md section 10.3, the
+      // user specifically asked for this to be verifiable in the friend-
+      // detail view, not just present in the underlying doc.
+      if (hubNodeIdForFriend) {
+        const hubNodeIdLabel = new Text({
+          text: "hub node id",
+          style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
+          resolution: RESOLUTION,
+        });
+        hubNodeIdLabel.eventMode = "none";
+        hubNodeIdLabel.y = dy;
+        detailContainer.addChild(hubNodeIdLabel);
+        dy += LABEL_SIZE + 4;
+
+        const hubNodeIdText = new Text({
+          text: truncate(hubNodeIdForFriend, 48),
+          style: { fontFamily: FONT, fontSize: DETAIL_NODEID_SIZE, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        hubNodeIdText.eventMode = "none";
+        hubNodeIdText.y = dy;
+        detailContainer.addChild(hubNodeIdText);
+        detailNodeIdTextRef = hubNodeIdText;
+        dy += hubNodeIdText.height + 8;
+      }
     }
 
     // -----------------------------------------------------------------------
@@ -2267,6 +2300,15 @@ export function createFriendsTab(ctx: TabContext): TabController {
       isHubProfilePanelOpen: () => viewMode === "hubProfile" && hubProfileHandle !== null,
       getHubProfilePanelState: () => hubProfileHandle?.getState() ?? null,
       refreshHubProfilePanel: () => hubProfileHandle?.refresh() ?? Promise.resolve(),
+      getHubProfileAllowInputGlobalPos: () => hubProfileHandle?.getAllowInputGlobalPos() ?? null,
+      getHubProfileAllowButtonGlobalPos: () => hubProfileHandle?.getAllowButtonGlobalPos() ?? null,
+      getHubProfileRemoveButtonGlobalPos: (nodeId: string) =>
+        hubProfileHandle?.getRemoveButtonGlobalPos(nodeId) ?? null,
+      getFriendDetailNodeIdText: () => detailNodeIdTextRef?.text ?? null,
+      getHubProfileBackButtonGlobalPos: () => {
+        const p = hubProfileBackBtn.getGlobalPosition();
+        return { x: p.x + hubProfileBackBtn.width / 2, y: p.y + hubProfileBackBtn.height / 2 };
+      },
     },
   });
 

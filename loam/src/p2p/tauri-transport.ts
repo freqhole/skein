@@ -44,6 +44,20 @@ export async function dispatch(
   return invoke("skein_dispatch", { action, payload });
 }
 
+/**
+ * read the current node id without any side effects — never generates a
+ * keypair or binds the iroh endpoint on the Rust side. returns `""` if no
+ * identity has been created yet.
+ *
+ * safe to call on every boot (e.g. to gate identity-dependent UI) — unlike
+ * `TauriStreamNode.create()`/`get_node_id`, which is the "ensure" call that
+ * lazily generates an identity the first time it's invoked.
+ */
+export async function checkTauriIdentityStatus(): Promise<string> {
+  const result = await dispatch("identity_status");
+  return typeof result?.node_id === "string" ? result.node_id : "";
+}
+
 // ---------------------------------------------------------------------------
 // base64 helpers (browser-native, no dependencies)
 // ---------------------------------------------------------------------------
@@ -166,7 +180,17 @@ export class TauriStreamNode implements MiddenStreamNode {
     this._nodeId = nodeId;
   }
 
-  /** create a TauriStreamNode using the running iroh endpoint's identity */
+  /**
+   * create a TauriStreamNode using the running iroh endpoint's identity.
+   *
+   * this is the "ensure" call — the Rust side (`commands::ensure_network`)
+   * will lazily bind the iroh endpoint (generating a keypair, if this is
+   * genuinely the first time) the moment this is invoked. only call this
+   * in response to something the user actually asked for (sharing/joining
+   * a canvas, starting the hub, clicking "generate identity"), never just
+   * to check whether an identity already exists — use
+   * `checkTauriIdentityStatus()` for that instead.
+   */
   static async create(): Promise<TauriStreamNode> {
     const result = await dispatch("get_node_id");
     log.debug(TAG, "node ID:", result.node_id.slice(0, 16) + "...");

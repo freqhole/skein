@@ -16,6 +16,7 @@ import {
 import type { SocialDoc } from "../../widgets/narthex/social/types";
 import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { HubProfilePanelState } from "../../widgets/narthex/social/hub-profile-panel";
+import type { CanvasBinNode } from "../canvas/canvas-bin-doc";
 import type { ProfileCanvasEntry } from "../canvas/profile-doc";
 import type { FriendInfo } from "../canvas/share-dialog";
 import { storeBlob, classifyDomain } from "../storage/skein-blob-store";
@@ -249,6 +250,30 @@ export interface FriendsTabTestHooks {
   getHubProfilePanelState(): HubProfilePanelState | null;
   /** re-fetch the mounted hub-profile-panel's friendz + pending knocks. no-op if not open. */
   refreshHubProfilePanel(): Promise<void>;
+  /**
+   * dev/test-only: global (screen-space) center position of the mounted
+   * hub-profile-panel's "allow" input field, or null if the panel isn't
+   * open or isn't in its "ready" state. same `getGlobalPosition()`-based
+   * precedent as `messagez-widget.ts`'s `getKnockActionGlobalPos()` — lets
+   * a test drive a real `page.mouse.click()` + `page.keyboard.type()`
+   * through the panel's actual DOM input overlay, not a bypass.
+   */
+  getHubProfileAllowInputGlobalPos(): { x: number; y: number } | null;
+  /** global center position of the mounted hub-profile-panel's "allow"
+   *  button, or null if not currently rendered. */
+  getHubProfileAllowButtonGlobalPos(): { x: number; y: number } | null;
+  /** global center position of the mounted hub-profile-panel's "remove"
+   *  button for a given friend node id, or null if that row isn't
+   *  currently rendered. */
+  getHubProfileRemoveButtonGlobalPos(nodeId: string): { x: number; y: number } | null;
+  /** the rendered node-id text in the currently-open friend-detail view
+   *  (only set for a hub friend — see docs/hub-and-profile-plan.md section
+   *  10.3), or null if not showing. proves the actual rendered content, not
+   *  just the underlying `FriendEntry.nodeIds` data. */
+  getFriendDetailNodeIdText(): string | null;
+  /** global center position of the hub-profile-panel's "‹ back" button,
+   *  or null if the panel isn't currently mounted. */
+  getHubProfileBackButtonGlobalPos(): { x: number; y: number } | null;
 }
 
 /**
@@ -276,6 +301,43 @@ export interface ProfileTabTestHooks {
   /** titles currently rendered in the "my canvases" list — proves the UI
    *  actually reflects the doc, not just that the doc was mutated. */
   getRenderedCanvasTitles(): string[];
+}
+
+/**
+ * test hooks for the profile canvas-bin widget (see
+ * docs/hub-and-profile-plan.md section 10.2,
+ * `widgets/narthex/social/canvas-bin.ts`). registered via
+ * `registerSocialBridge({ canvasBin: ... })` from the widget itself on
+ * mount, same pattern as `profileTab`/`friendsTab`.
+ *
+ * `getVisibleNodes()` reads the folder currently being viewed (root or a
+ * sub-folder) directly off `CanvasBinStore` — proves the tree, not just
+ * pixi render state. `enterFolder`/`goBack`/`addFolder`/`moveNode`/
+ * `activateNode` call the widget's real internal handlers directly, same
+ * precedent as `FriendsTabTestHooks` (no infra in this repo for simulated
+ * pixi pointer drags).
+ */
+export interface ProfileCanvasBinTestHooks {
+  /** child nodes of the currently-viewed folder (or root). */
+  getVisibleNodes(): CanvasBinNode[];
+  /** the currently-viewed folder's id, or null at root. */
+  getCurrentFolderId(): string | null;
+  /** enter a folder (as if its card were tapped) or navigate to a canvas
+   *  (as if a canvas card were tapped) — dispatches on the node's kind. */
+  enterFolder(nodeId: string): void;
+  /** return to the parent folder, as if the "‹ back" button were tapped. */
+  goBack(): void;
+  /** create a new folder under the currently-viewed folder. returns the new
+   *  folder's id, or "" if it couldn't be created. */
+  addFolder(title: string): string;
+  /** move a node (folder or canvas reference) to a new parent folder id, or
+   *  to root when null — as if it had been dragged and dropped there.
+   *  returns whether the move succeeded (see `CanvasBinStore.moveNode()`
+   *  for the cases it refuses). */
+  moveNode(nodeId: string, newParentId: string | null): boolean;
+  /** activate a node by id exactly as a real tap would (enter folder /
+   *  navigate to canvas), regardless of which folder is currently visible. */
+  activateNode(nodeId: string): void;
 }
 
 /**
@@ -324,6 +386,15 @@ export interface ShareTestHooks {
   cancelInvite(nodeId: string): void;
   /** close the currently-open share dialog. */
   closeShareDialog(): void;
+  /**
+   * the rendered display-name text for a friend-invite row (regular or hub
+   * section), by node id, or null if that friend isn't currently rendered
+   * (not in the invite list, already invited, or filtered out). proves the
+   * actual rendered row content reflects the right peer — not just that
+   * the right `FriendInfo` was passed in, which `getFriendsForInvite()`
+   * already covers (docs/hub-and-profile-plan.md section 10.3).
+   */
+  getFriendRowText(nodeId: string): string | null;
 }
 
 /**
@@ -344,6 +415,8 @@ export interface SkeinTestBridgeSocial {
   friendsTab?: FriendsTabTestHooks;
   /** profile-tab "my canvases" test hooks (set by profile-tab.ts on mount) */
   profileTab?: ProfileTabTestHooks;
+  /** profile canvas-bin widget test hooks (set by canvas-bin.ts on mount) */
+  canvasBin?: ProfileCanvasBinTestHooks;
 }
 
 /**

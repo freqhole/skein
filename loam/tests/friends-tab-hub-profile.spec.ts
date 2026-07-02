@@ -88,6 +88,21 @@ function friendsTabHooks(page: import("@playwright/test").Page) {
       page.evaluate(() => (window as any).__skeinTest.social.friendsTab.getHubProfilePanelState()),
     refreshHubProfilePanel: () =>
       page.evaluate(() => (window as any).__skeinTest.social.friendsTab.refreshHubProfilePanel()),
+    getFriendDetailNodeIdText: () =>
+      page.evaluate(() => (window as any).__skeinTest.social.friendsTab.getFriendDetailNodeIdText()),
+    getHubProfileAllowInputGlobalPos: () =>
+      page.evaluate(() =>
+        (window as any).__skeinTest.social.friendsTab.getHubProfileAllowInputGlobalPos()
+      ),
+    getHubProfileAllowButtonGlobalPos: () =>
+      page.evaluate(() =>
+        (window as any).__skeinTest.social.friendsTab.getHubProfileAllowButtonGlobalPos()
+      ),
+    getHubProfileRemoveButtonGlobalPos: (nodeId: string) =>
+      page.evaluate(
+        (id) => (window as any).__skeinTest.social.friendsTab.getHubProfileRemoveButtonGlobalPos(id),
+        nodeId
+      ),
   };
 }
 
@@ -181,6 +196,41 @@ test.describe("friends-tab hub-profile-panel wiring", () => {
     await hooks.closeFriendDetail();
     expect(await hooks.hasManageHubAction()).toBe(false);
   });
+
+  test("a hub friend's detail view renders their actual node id; a non-hub friend's shows none", async ({
+    page,
+  }) => {
+    const hooks = friendsTabHooks(page);
+
+    // deliberately not a uniform-character node id (e.g. "a".repeat(64)) —
+    // a distinguishable prefix proves the rendered text is really derived
+    // from this friend's actual nodeId, not a placeholder or another row's.
+    const hubNodeId = "deadbeef" + "9".repeat(56);
+    const hubFriendId = await seedFriend(page, {
+      nodeId: hubNodeId,
+      alias: "hub with visible node id",
+      isHub: true,
+    });
+    const normalFriendId = await seedFriend(page, {
+      nodeId: "f".repeat(64),
+      alias: "normal friend",
+      isHub: false,
+    });
+
+    await hooks.openFriendDetail(hubFriendId);
+    const nodeIdText = await hooks.getFriendDetailNodeIdText();
+    expect(nodeIdText).not.toBeNull();
+    // not truncated to the point of being wrong/useless — a real, long
+    // enough prefix of the actual node id, not just the first few chars.
+    expect(nodeIdText!.startsWith(hubNodeId.slice(0, 40))).toBe(true);
+    expect(nodeIdText).not.toBe(hubNodeId.slice(0, 4));
+
+    await hooks.closeFriendDetail();
+
+    // a non-hub friend's detail view has no hub node id to show at all.
+    await hooks.openFriendDetail(normalFriendId);
+    expect(await hooks.getFriendDetailNodeIdText()).toBeNull();
+  });
 });
 
 test.describe("friends-tab hub-profile-panel wiring @hub", () => {
@@ -198,14 +248,18 @@ test.describe("friends-tab hub-profile-panel wiring @hub", () => {
 
     await page.goto("/");
     await waitForNarthex(page);
-    await toggleSocialOverlay(page);
-    await waitForFriendsTabHooks(page);
 
     // ensureIdentityBridge starts the real midden/iroh endpoint this page
     // uses (getMiddenNode() singleton) — the exact same transport
     // getHubAdminTransport() (friendz-bridge.ts) reuses for the panel.
+    // must happen BEFORE toggleSocialOverlay(): without an identity yet,
+    // the social widget force-selects the profile tab (social-widget.ts's
+    // layout()), which would leave friends-tab's own container invisible.
     const localNodeId = await ensureIdentityBridge(page);
     await hub.adminAllow(localNodeId);
+
+    await toggleSocialOverlay(page);
+    await waitForFriendsTabHooks(page);
 
     const hooks = friendsTabHooks(page);
     const hubFriendId = await seedFriend(page, {
@@ -235,5 +289,169 @@ test.describe("friends-tab hub-profile-panel wiring @hub", () => {
     await hooks.closeHubProfilePanel();
     expect(await hooks.isHubProfilePanelOpen()).toBe(false);
     expect(await hooks.getViewMode()).toBe("detail");
+  });
+
+  // real root cause found and fixed (2026-07-02, docs/hub-and-profile-plan.md
+  // section 10.3): social-widget.ts force-selects the "profile" tab whenever
+  // no identity exists yet in the *social doc* (`state.profile.nodeId`) — a
+  // separate, asynchronously-synced field from the actual iroh keypair
+  // (synced in by profile-tab.ts's own mount-time effect, a `.then()` that
+  // doesn't complete synchronously). on a genuinely fresh browser context,
+  // `ensureIdentityBridge()` resolving does NOT mean the social doc's
+  // `profile.nodeId` is populated yet — so the very first (synchronous)
+  // `layout()` call inside `social-widget.ts`'s `create()` sees
+  // `hasIdentity === false` and force-sets `activeTab = "profile"`. that bug
+  // was real and two-fold: (1) `activeTab` never reset back to "friends"
+  // once identity *did* sync in moments later, and (2) each tab tracks its
+  // own `currentWidth`/`currentHeight` independently, initialized to 0 —
+  // since "friends" was never the active tab during its own first layout()
+  // pass, its dimensions stayed stuck at 0 forever (confirmed via a
+  // temporary debug hook: `mountOrLayoutHubProfilePanel` was receiving
+  // `w:0, h:0`), which is what actually broke every downstream
+  // getGlobalPosition()-based click coordinate in this describe block —
+  // not a pixi hit-testing or timing bug, a real dimensions-never-
+  // initialized bug. fixed directly in `social-widget.ts`: `activeTab`
+  // now snaps back to "friends" the moment identity appears, but only if
+  // it was auto-forced to "profile" in the first place (a genuine user
+  // click to "profile" is never overridden).
+  test("clicking the panel's real allow/remove buttons (through friends-tab) round-trips to a real hub and re-renders @hub", async ({
+    page,
+    browser,
+  }) => {
+    test.setTimeout(120_000);
+
+    hub = await startReliquaryHub();
+
+    await page.goto("/");
+    await waitForNarthex(page);
+
+    const localNodeId = await ensureIdentityBridge(page);
+    await hub.adminAllow(localNodeId);
+
+    await toggleSocialOverlay(page);
+    await waitForFriendsTabHooks(page);
+
+    // a second real peer, so the "allow" click has a genuine node id to
+    // target — mirrors hub-profile-panel.spec.ts's "target" peer pattern.
+    const targetContext = await browser.newContext();
+    const targetPage = await targetContext.newPage();
+    await targetPage.goto("/");
+    await waitForNarthex(targetPage);
+    const targetNodeId = await ensureIdentityBridge(targetPage);
+
+    const hooks = friendsTabHooks(page);
+    const hubFriendId = await seedFriend(page, {
+      nodeId: hub.nodeId,
+      alias: "real hub for click-through",
+      isHub: true,
+    });
+
+    await hooks.openFriendDetail(hubFriendId);
+    await hooks.openHubProfilePanel();
+    expect(await hooks.isHubProfilePanelOpen()).toBe(true);
+
+    // wait for the panel to settle into "ready" before touching its buttons
+    // (retry pattern mirrors hub-profile-panel.spec.ts's mountPanelAndWaitReady()).
+    let state: { status: string } | null = null;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      state = await hooks.getHubProfilePanelState();
+      if (state && state.status !== "loading" && state.status !== "error") break;
+      await hooks.refreshHubProfilePanel();
+      await page.waitForTimeout(750);
+    }
+    expect(state?.status).toBe("ready");
+
+    // real click on the panel's "allow" input + real keyboard typing —
+    // proves the DOM input overlay is actually positioned/focusable, not
+    // just that HubAdminClient works when called directly.
+    const inputPos = await hooks.getHubProfileAllowInputGlobalPos();
+    expect(inputPos, "expected the allow input to be rendered").not.toBeNull();
+    await page.mouse.click(inputPos!.x, inputPos!.y);
+    await page.keyboard.type(targetNodeId);
+
+    const allowBtnPos = await hooks.getHubProfileAllowButtonGlobalPos();
+    expect(allowBtnPos, "expected the allow button to be rendered").not.toBeNull();
+    await page.mouse.click(allowBtnPos!.x, allowBtnPos!.y);
+
+    // the panel's own real handleAllow() -> refresh() path re-renders the
+    // friendz list — poll the same rendered-state accessor the panel uses
+    // internally (getState()), not a fresh HubAdminClient call of our own.
+    await expect
+      .poll(
+        async () => {
+          const s = await hooks.getHubProfilePanelState();
+          return s?.status === "ready" ? s.friends.map((f: { nodeId: string }) => f.nodeId) : [];
+        },
+        { timeout: 20_000 }
+      )
+      .toContain(targetNodeId);
+
+    // -- real click on that friend row's "remove" button --
+    const removeBtnPos = await hooks.getHubProfileRemoveButtonGlobalPos(targetNodeId);
+    expect(removeBtnPos, "expected a rendered remove button for the allowed peer").not.toBeNull();
+    await page.mouse.click(removeBtnPos!.x, removeBtnPos!.y);
+
+    await expect
+      .poll(
+        async () => {
+          const s = await hooks.getHubProfilePanelState();
+          return s?.status === "ready" ? s.friends.map((f: { nodeId: string }) => f.nodeId) : [];
+        },
+        { timeout: 20_000 }
+      )
+      .not.toContain(targetNodeId);
+
+    await targetPage.close();
+    await targetContext.close();
+  });
+
+  test("the panel's real '‹ back' button (through friends-tab) returns to the friend-detail view @hub", async ({
+    page,
+  }) => {
+    test.setTimeout(60_000);
+
+    hub = await startReliquaryHub();
+
+    await page.goto("/");
+    await waitForNarthex(page);
+
+    const localNodeId = await ensureIdentityBridge(page);
+    await hub.adminAllow(localNodeId);
+
+    await toggleSocialOverlay(page);
+    await waitForFriendsTabHooks(page);
+
+    const hooks = friendsTabHooks(page);
+    const hubFriendId = await seedFriend(page, {
+      nodeId: hub.nodeId,
+      alias: "real hub for back-button click",
+      isHub: true,
+    });
+
+    await hooks.openFriendDetail(hubFriendId);
+    await hooks.openHubProfilePanel();
+    expect(await hooks.isHubProfilePanelOpen()).toBe(true);
+
+    // wait for the panel to settle into "ready" before computing the back
+    // button's position (see the root-cause note on the allow/remove test
+    // above — the real bug was friends-tab's own dimensions never being
+    // initialized, already fixed in social-widget.ts).
+    let state: { status: string } | null = null;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      state = await hooks.getHubProfilePanelState();
+      if (state && state.status !== "loading" && state.status !== "error") break;
+      await hooks.refreshHubProfilePanel();
+      await page.waitForTimeout(750);
+    }
+    expect(state?.status).toBe("ready");
+
+    const backPos = await page.evaluate(() =>
+      (window as any).__skeinTest.social.friendsTab.getHubProfileBackButtonGlobalPos()
+    );
+    expect(backPos, "expected the back button to be rendered").not.toBeNull();
+    await page.mouse.click(backPos.x, backPos.y);
+
+    await expect.poll(async () => hooks.isHubProfilePanelOpen()).toBe(false);
+    await expect.poll(async () => hooks.getViewMode()).toBe("detail");
   });
 });

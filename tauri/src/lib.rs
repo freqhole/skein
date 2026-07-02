@@ -1,9 +1,13 @@
 //! skein tauri backend.
 //!
-//! boots always-on parts (`iroh::Endpoint`, `SqlitePool`, stores) and exposes
-//! a single `skein_dispatch` tauri command. the hub peer can be started /
-//! stopped at runtime via `hub_start` / `hub_stop` IPC actions — the endpoint
-//! stays up across toggles.
+//! boots the always-on parts (`SqlitePool`, stores) and exposes a single
+//! `skein_dispatch` tauri command. the iroh endpoint is NOT always-on: it's
+//! bound eagerly at boot only for a returning user who already has a
+//! keypair on disk, and otherwise deferred until the frontend actually
+//! needs P2P (see `commands::ensure_network`) — never generated just
+//! because the process started. the hub peer can be started / stopped at
+//! runtime via `hub_start` / `hub_stop` IPC actions once the endpoint
+//! exists.
 
 mod commands;
 mod pdf;
@@ -54,38 +58,29 @@ fn default_data_dir() -> PathBuf {
 
 /// build the always-on `AppState`: endpoint, pool, stores, and an empty hub
 /// slot. the hub is started later if the persisted app config says so.
+///
+/// the iroh endpoint is NOT created here unconditionally -- that would
+/// generate a brand-new P2P identity the very first time the app is ever
+/// launched, before the user has done anything at all. instead: if a
+/// keypair already exists on disk (a returning user, who already
+/// consented to P2P in an earlier session), the endpoint is bound eagerly
+/// below, same as before. if no keypair exists yet, `network` is left
+/// `None` and stays that way until the frontend actually needs it --
+/// [`commands::ensure_network`] lazily builds it (generating a keypair for
+/// the first time, if needed) the moment the user shares/joins a canvas,
+/// starts the hub, fetches a blob from a peer, or clicks "generate
+/// identity" in the profile widget.
 async fn build_state() -> anyhow::Result<AppState> {
     let data_dir = std::env::var("SKEIN_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_data_dir());
     tokio::fs::create_dir_all(&data_dir).await?;
 
-    let secret = match identity::load_keypair(&data_dir) {
-        Ok(s) => s,
-        Err(identity::IdentityError::NotFound { .. }) => {
-            tracing::info!("no keypair found; generating a new one");
-            identity::generate_keypair(&data_dir)?
-        }
-        Err(e) => return Err(e.into()),
-    };
-
     let pool = db::open(&data_dir).await?;
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret)
-        .bind()
-        .await?;
-    let node_id = endpoint.id().to_string();
-
-    // record ourselves in the users table so hub + frontend both see it.
     let username = std::env::var("SKEIN_USERNAME").unwrap_or_else(|_| "skein".to_string());
-    let userz_dir = userz::Directory::new(pool.clone());
-    userz_dir
-        .upsert_self(&node_id, Some(&username), None, None)
-        .await?;
-
     let blobz_store = blobz::Store::new(pool.clone(), &data_dir);
     let friendz_store = friendz::Store::new(pool.clone());
-
+    let userz_dir = userz::Directory::new(pool.clone());
     let app_config_path = data_dir.join(APP_CONFIG_FILENAME);
 
     // boot the iroh-blobs FsStore that backs verified blob streaming. peers
@@ -93,54 +88,36 @@ async fn build_state() -> anyhow::Result<AppState> {
     // of this store; the `blob_iroh_ensure` dispatch action pre-loads the
     // requested blob from `blobz` so the FsStore has the bytes when the
     // peer asks for them. leaked to satisfy `BlobsProtocol`'s `&'static`
-    // requirement — there's only ever one of these per process.
+    // requirement -- there's only ever one of these per process. this is
+    // independent of the iroh endpoint/identity, so it's always built.
     let fs_store_dir = data_dir.join("iroh-blobs");
     tokio::fs::create_dir_all(&fs_store_dir).await?;
     let fs_store: &'static iroh_blobs::store::fs::FsStore =
         Box::leak(Box::new(iroh_blobs::store::fs::FsStore::load(&fs_store_dir).await?));
 
-    let streams = streams::StreamRegistry::start_with_blobs(endpoint.clone(), fs_store).await?;
-
-    // pre-warm the FsStore for every blob already in blobz. without this,
-    // the first browser peer to ask for a pre-existing blob has to wait
-    // for `add_path` (BAO tree compute) inside the dispatch handler, and
-    // for large files that easily exceeds the browser's snatch timeout.
-    // best-effort: errors are logged and ignored \u2014 the lazy
-    // `blob_iroh_ensure` path will still work as a fallback.
-    match blobz_store.list(i64::MAX, 0).await {
-        Ok(blobs) => {
-            tracing::info!(count = blobs.len(), "pre-warming iroh-blobs FsStore");
-            for blob in blobs {
-                let path = blobz_store.path_for(&blob);
-                if !path.exists() {
-                    tracing::warn!(blake3 = %blob.blake3, "prewarm: blob file missing on disk");
-                    continue;
-                }
-                if let Err(e) = fs_store.blobs().add_path(path).await {
-                    tracing::warn!(blake3 = %blob.blake3, error = %e, "prewarm: FsStore add_path failed");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "prewarm: failed to list blobz, skipping FsStore seed");
-        }
-    }
-
-    Ok(AppState {
-        endpoint,
+    let app_state = AppState {
+        network: Arc::new(Mutex::new(None)),
         pool,
         data_dir,
         username,
-        node_id,
         blobz: blobz_store,
         friendz_store,
         userz: userz_dir,
         process_started_at: Instant::now(),
         app_config_path,
         hub: Arc::new(Mutex::new(None)),
-        streams,
         fs_store,
-    })
+    };
+
+    if identity::keypair_path(&app_state.data_dir).exists() {
+        let net = commands::build_network_state(&app_state).await?;
+        tracing::info!(node_id = %net.node_id, "restored existing identity on boot");
+        *app_state.network.lock().await = Some(net);
+    } else {
+        tracing::info!("no identity yet -- P2P endpoint deferred until user-initiated");
+    }
+
+    Ok(app_state)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import { Assets, Circle, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
+import { ensureMyCanvasBinDoc } from "../../../src/canvas/canvas-bin-doc";
 import { registerSocialBridge } from "../../../src/dev/test-bridge-registry";
 import {
   ensureIdentity,
@@ -12,6 +13,11 @@ import {
 } from "../../../src/p2p/identity";
 import { pickImageAsDataUrl } from "../../../src/widgets/image-utils";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
+import {
+  createProfileCanvasBinWidget,
+  PROFILE_CANVAS_BIN_HEIGHT,
+  type ProfileCanvasBinController,
+} from "./canvas-bin";
 import {
   ACCENT,
   AVATAR_EXPORT_SIZE,
@@ -675,10 +681,32 @@ export function createProfileTab(ctx: TabContext): TabController {
    *  render actually reflects the doc, not just that the doc changed. */
   let lastRenderedCanvasTitles: string[] = [];
 
+  /** true if the "add current canvas" button should be shown: needs both a
+   *  canvas + profile store, must NOT be the narthex meta-canvas (a private
+   *  per-user index of canvas-card references — never something to publish
+   *  to a profile or share with a remote peer), and the current canvas must
+   *  not already be on the profile (no point offering to re-add it). shared
+   *  between layout() and the profileTab test-bridge hook so both agree on
+   *  exactly the same visibility rule. */
+  const computeCanAddCurrentCanvas = (): boolean => {
+    const canvasStore = ctx.canvasStore;
+    const profileStore = ctx.profileStore;
+    if (!canvasStore || !profileStore) return false;
+    if (ctx.narthexDocId && canvasStore.handle.documentId === ctx.narthexDocId) return false;
+    const alreadyOnProfile = profileStore
+      .canvases()
+      .some((c) => c.canvasDocId === canvasStore.handle.documentId);
+    return !alreadyOnProfile;
+  };
+
   const addCurrentCanvasToProfile = () => {
     const canvasStore = ctx.canvasStore;
     const profileStore = ctx.profileStore;
     if (!canvasStore || !profileStore) return;
+    // defense in depth: never let the narthex meta-canvas itself get added
+    // to a profile, even if this got called from somewhere other than the
+    // (already-hidden-on-narthex) button — see computeCanAddCurrentCanvas().
+    if (ctx.narthexDocId && canvasStore.handle.documentId === ctx.narthexDocId) return;
     const doc = canvasStore.doc();
     profileStore.addCanvasToProfile({
       canvasDocId: canvasStore.handle.documentId,
@@ -787,12 +815,46 @@ export function createProfileTab(ctx: TabContext): TabController {
   registerSocialBridge({
     profileTab: {
       getCanvasEntries: () => ctx.profileStore?.canvases() ?? [],
-      canAddCurrentCanvas: () => !!(ctx.canvasStore && ctx.profileStore),
+      canAddCurrentCanvas: () => computeCanAddCurrentCanvas(),
       addCurrentCanvas: addCurrentCanvasToProfile,
       removeCanvas: removeCanvasFromProfile,
       getRenderedCanvasTitles: () => [...lastRenderedCanvasTitles],
     },
   });
+
+  // -------------------------------------------------------------------------
+  // canvas bin — real narthex display widget for the profile's curated
+  // canvases, shown at the bottom of the profile view (docs/hub-and-profile-
+  // plan.md section 10.2). distinct from the "my canvases" list above: that
+  // list is the *management* affordance (add current / remove); this widget
+  // is the *display* surface, with recursive folders for organizing many
+  // canvases. mounted directly (not via the widget registry/palette — see
+  // canvas-bin.ts's module doc comment for why), once the local peer's own
+  // `CanvasBinStore` doc has resolved (async, so it may not be ready on the
+  // very first layout() call).
+  // -------------------------------------------------------------------------
+
+  let canvasBinController: ProfileCanvasBinController | null = null;
+  const canvasBinContainer = new Container();
+  container.addChild(canvasBinContainer);
+
+  if (ctx.profileStore) {
+    const profileStore = ctx.profileStore;
+    ensureMyCanvasBinDoc(profileStore.repo)
+      .then((canvasBinStore) => {
+        canvasBinController = createProfileCanvasBinWidget({
+          canvasBinStore,
+          profileStore,
+          width: currentWidth || 200,
+          height: PROFILE_CANVAS_BIN_HEIGHT,
+        });
+        canvasBinContainer.addChild(canvasBinController.container);
+        layout(currentWidth, currentHeight);
+      })
+      .catch((err) => {
+        console.warn("[skein:social:profile] failed to load canvas-bin doc:", err);
+      });
+  }
 
   // -------------------------------------------------------------------------
   // layout
@@ -994,34 +1056,54 @@ export function createProfileTab(ctx: TabContext): TabController {
     }
 
     // -- "my canvases" section ----------------------------------------------
+    // hidden entirely until an identity exists — there's nothing meaningful
+    // to add/show yet, and it's just clutter competing with the identity
+    // setup UI above (per user feedback while testing this live).
 
-    y += FIELD_GAP + 4;
-    canvasSectionLabel.x = 0;
-    canvasSectionLabel.y = y;
-    y += LABEL_SIZE + 6;
+    canvasSectionLabel.visible = !!nid;
+    addCanvasBtn.visible = false;
+    canvasListContainer.visible = !!nid;
+    canvasEmptyText.visible = false;
+    canvasBinContainer.visible = !!nid;
 
-    const canAddCurrentCanvas = !!(ctx.canvasStore && ctx.profileStore);
-    addCanvasBtn.visible = canAddCurrentCanvas;
-    if (canAddCurrentCanvas) {
-      addCanvasBtnBg.clear();
-      addCanvasBtnBg.roundRect(0, 0, w, BUTTON_HEIGHT, BUTTON_RADIUS);
-      addCanvasBtnBg.fill({ color: ACCENT });
-      addCanvasBtn.hitArea = new Rectangle(0, 0, w, BUTTON_HEIGHT);
-      addCanvasBtn.x = 0;
-      addCanvasBtn.y = y;
-      addCanvasBtnText.x = (w - addCanvasBtnText.width) / 2;
-      addCanvasBtnText.y = (BUTTON_HEIGHT - TEXT_SIZE) / 2;
-      y += BUTTON_HEIGHT + FIELD_GAP;
-    }
+    if (nid) {
+      y += FIELD_GAP + 4;
+      canvasSectionLabel.x = 0;
+      canvasSectionLabel.y = y;
+      y += LABEL_SIZE + 6;
 
-    canvasListContainer.x = 0;
-    canvasListContainer.y = y;
-    y += rebuildCanvasList(w);
+      const canAddCurrentCanvas = computeCanAddCurrentCanvas();
+      addCanvasBtn.visible = canAddCurrentCanvas;
+      if (canAddCurrentCanvas) {
+        addCanvasBtnBg.clear();
+        addCanvasBtnBg.roundRect(0, 0, w, BUTTON_HEIGHT, BUTTON_RADIUS);
+        addCanvasBtnBg.fill({ color: ACCENT });
+        addCanvasBtn.hitArea = new Rectangle(0, 0, w, BUTTON_HEIGHT);
+        addCanvasBtn.x = 0;
+        addCanvasBtn.y = y;
+        addCanvasBtnText.x = (w - addCanvasBtnText.width) / 2;
+        addCanvasBtnText.y = (BUTTON_HEIGHT - TEXT_SIZE) / 2;
+        y += BUTTON_HEIGHT + FIELD_GAP;
+      }
 
-    canvasEmptyText.x = 0;
-    canvasEmptyText.y = y;
-    if (canvasEmptyText.visible) {
-      y += canvasEmptyText.height + FIELD_GAP;
+      canvasListContainer.x = 0;
+      canvasListContainer.y = y;
+      y += rebuildCanvasList(w);
+
+      canvasEmptyText.x = 0;
+      canvasEmptyText.y = y;
+      if (canvasEmptyText.visible) {
+        y += canvasEmptyText.height + FIELD_GAP;
+      }
+
+      // -- canvas bin (display widget, section 10.2) -------------------------
+
+      canvasBinContainer.x = 0;
+      canvasBinContainer.y = y;
+      if (canvasBinController) {
+        canvasBinController.layout(w);
+        y += PROFILE_CANVAS_BIN_HEIGHT + FIELD_GAP;
+      }
     }
   };
 
@@ -1099,6 +1181,7 @@ export function createProfileTab(ctx: TabContext): TabController {
       docUnsub();
       if (identityUnsub) identityUnsub();
       if (profileStoreUnsub) profileStoreUnsub();
+      canvasBinController?.destroy();
       if (avatarSprite) {
         avatarContainer.removeChild(avatarSprite);
         avatarSprite.mask = null;

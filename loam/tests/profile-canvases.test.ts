@@ -11,6 +11,7 @@ import { expect, test } from "@playwright/test";
 import {
   addCurrentCanvasToProfile,
   canAddCurrentCanvasToProfile,
+  ensureIdentityBridge,
   getProfileCanvasEntries,
   getRenderedProfileCanvasTitles,
   removeCanvasFromProfile,
@@ -67,19 +68,29 @@ test.describe("profile tab — my canvases", () => {
     await waitForNarthex(page);
   });
 
-  test("add-current-canvas action is available once the social overlay is mounted", async ({
+  test("add-current-canvas is hidden while on the narthex meta-canvas, shown on a real canvas", async ({
     page,
   }) => {
-    // even while still on the narthex canvas, the overlay's mount context
-    // carries a real canvasStore (the narthex canvas itself) and a real
-    // profileStore, so the action is available — this proves the mount
-    // context wiring (boot.ts -> WidgetMountContext -> TabContext) reached
-    // profile-tab.ts at all.
+    // the narthex is a private per-user index of canvas-card references —
+    // it must never be offered for "add to profile" (see
+    // docs/hub-and-profile-plan.md section 10.2's follow-up fix).
     await toggleSocialOverlay(page);
     await page.waitForTimeout(300);
 
-    const canAdd = await canAddCurrentCanvasToProfile(page);
-    expect(canAdd).toBe(true);
+    const canAddOnNarthex = await canAddCurrentCanvasToProfile(page);
+    expect(canAddOnNarthex).toBe(false);
+
+    await toggleSocialOverlay(page); // close before navigating
+    await createCanvasAndWaitForNavigation(page, {
+      title: "a real canvas",
+      color: 0x6366f1,
+    });
+
+    await toggleSocialOverlay(page);
+    await page.waitForTimeout(300);
+
+    const canAddOnRealCanvas = await canAddCurrentCanvasToProfile(page);
+    expect(canAddOnRealCanvas).toBe(true);
   });
 
   test("adding the currently-open canvas writes a matching entry to the profile doc", async ({
@@ -111,6 +122,13 @@ test.describe("profile tab — my canvases", () => {
       color: 0x6366f1,
     });
 
+    // profile-tab.ts's "my canvases" section (and everything below it) is
+    // gated behind an identity existing (section 10 follow-up: this section
+    // shouldn't render at all before the user has generated one) — unlike
+    // sibling tests here that only assert against raw ProfileStore data
+    // (unaffected by that gate), this one needs the real rendered list, so
+    // it needs a real identity first.
+    await ensureIdentityBridge(page);
     await toggleSocialOverlay(page);
     await page.waitForTimeout(300);
     await addCurrentCanvasToProfile(page);
@@ -141,6 +159,24 @@ test.describe("profile tab — my canvases", () => {
     expect(entries).toHaveLength(1);
   });
 
+  test("add-current-canvas is hidden once the current canvas is already on the profile", async ({
+    page,
+  }) => {
+    await createCanvasAndWaitForNavigation(page, {
+      title: "already-added canvas",
+      color: 0x8b5cf6,
+    });
+
+    await toggleSocialOverlay(page);
+    await page.waitForTimeout(300);
+
+    expect(await canAddCurrentCanvasToProfile(page)).toBe(true);
+
+    await addCurrentCanvasToProfile(page);
+
+    expect(await canAddCurrentCanvasToProfile(page)).toBe(false);
+  });
+
   test("removing a canvas deletes it from the profile doc and the rendered list", async ({
     page,
   }) => {
@@ -149,12 +185,24 @@ test.describe("profile tab — my canvases", () => {
       color: 0xef4444,
     });
 
+    // needed so the "rendered list" assertions below are meaningful (see
+    // the "renders every entry" test's comment) — without an identity, the
+    // list never renders anything, which would make the final "not
+    // contain" check trivially true either way.
+    await ensureIdentityBridge(page);
     await toggleSocialOverlay(page);
     await page.waitForTimeout(300);
 
     await addCurrentCanvasToProfile(page);
     let entries = await getProfileCanvasEntries(page);
     expect(entries.map((e) => e.canvasDocId)).toContain(docId);
+
+    // prove the row genuinely rendered before removal, so the later "not
+    // contain" assertion is proof of removal, not just an empty list that
+    // was never populated in the first place.
+    await expect
+      .poll(async () => getRenderedProfileCanvasTitles(page))
+      .toContain("removable canvas");
 
     await removeCanvasFromProfile(page, docId);
 
