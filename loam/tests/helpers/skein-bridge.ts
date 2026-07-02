@@ -128,6 +128,42 @@ export async function waitForPeerCount(
   );
 }
 
+// --- friendz ---
+
+/**
+ * send a friend request from this page to a peer by node id — another
+ * browser peer or a real reliquary hub, the protocol doesn't distinguish.
+ * only works on pages loaded from test-harness-p2p.html.
+ */
+export async function sendFriendRequest(page: Page, peerNodeId: string): Promise<void> {
+  return page.evaluate(
+    (id) => (window as any).__skeinTest.friendz.sendFriendRequest(id),
+    peerNodeId
+  );
+}
+
+/**
+ * whether a peer's friend request has been accepted (mutual friendship
+ * established locally, tracked since the harness page loaded).
+ * only works on pages loaded from test-harness-p2p.html.
+ */
+export async function isFriend(page: Page, peerNodeId: string): Promise<boolean> {
+  return page.evaluate((id) => (window as any).__skeinTest.friendz.isFriend(id), peerNodeId);
+}
+
+/** wait until a peer is recorded as an accepted friend on this page. */
+export async function waitForFriend(
+  page: Page,
+  peerNodeId: string,
+  timeoutMs = 30_000
+): Promise<void> {
+  await page.waitForFunction(
+    (id) => (window as any).__skeinTest.friendz.isFriend(id),
+    peerNodeId,
+    { timeout: timeoutMs }
+  );
+}
+
 /**
  * open a canvas doc that lives on an already-connected peer.
  *

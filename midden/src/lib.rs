@@ -16,11 +16,16 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::Store;
 use iroh_blobs::api::TempTag;
+use iroh_blobs::provider::events::{
+    AbortReason, ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode,
+};
 use iroh_blobs::store::GcConfig;
 use iroh_blobs::{BlobsProtocol, Hash, HashAndFormat};
 use js_sys::{Function as JsFunction, Uint8Array};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
 use tracing_subscriber_wasm::MakeConsoleWriter;
@@ -347,6 +352,107 @@ fn parse_peer_addr(peer_addr: &str) -> Result<EndpointAddr, String> {
     Ok(EndpointAddr::from_parts(node_id, []))
 }
 
+/// per-hash allow-list for blob gets: maps a blob's blake3 hash to the set of
+/// peer node ids (hex strings) allowed to fetch it. a hash with no entry in
+/// this map is unrestricted (served to anyone) — this keeps existing/default
+/// behavior unchanged unless a hash is explicitly restricted, which is what
+/// lets `blob-acl.spec.ts`'s existing "no gating today" assertions keep
+/// passing while a NEW test exercises the gate on a hash that opts in.
+///
+/// PROTOTYPE NOTE: this is a stopgap, hardcoded allow-list plumbed in from
+/// JS via `MiddenNode::restrict_blob_to_peers`. it is NOT the real canvas-ACL
+/// integration — see the design notes in the accompanying report for what
+/// wiring real canvas ACL data into this map would require.
+type BlobAcl = Rc<RefCell<HashMap<Hash, HashSet<String>>>>;
+
+/// true if `peer` (already resolved to a hex node id string, or `None` if we
+/// couldn't identify the requester) may fetch `hash` under `acl`.
+fn blob_request_allowed(acl: &BlobAcl, hash: &Hash, peer: Option<&str>) -> bool {
+    match acl.borrow().get(hash) {
+        // no ACL entry for this hash at all: unrestricted (matches today's
+        // permissive default — see BlobAcl's doc comment above).
+        None => true,
+        Some(allowed) => match peer {
+            Some(peer) => allowed.contains(peer),
+            // request came in on a connection whose endpoint id we never
+            // resolved (shouldn't happen in practice, since iroh
+            // authenticates the remote endpoint id at the QUIC/TLS layer
+            // before any application data flows) — fail closed.
+            None => false,
+        },
+    }
+}
+
+/// build an `EventSender` that intercepts `iroh_blobs`' connect/get/get_many
+/// events and gates them against `acl`.
+///
+/// this is the extension point `iroh_blobs::BlobsProtocol::new(&store, events)`
+/// exposes for exactly this purpose (see `examples/limit.rs` in the
+/// `iroh-blobs` crate for the upstream reference implementation this
+/// mirrors). a connection is never rejected outright here — we only learn
+/// which hash is being requested once a get/get_many request comes in, so
+/// gating happens per-request, keyed by the requester's endpoint id
+/// (recorded from the `ClientConnected` event and looked up by connection id).
+fn build_gated_blobs_events(acl: BlobAcl) -> EventSender {
+    let mask = EventMask {
+        connected: ConnectMode::Intercept,
+        get: RequestMode::Intercept,
+        get_many: RequestMode::Intercept,
+        ..EventMask::DEFAULT
+    };
+    let (tx, mut rx) = EventSender::channel(32, mask);
+    let connections: Rc<RefCell<HashMap<u64, String>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    wasm_bindgen_futures::spawn_local(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ProviderMessage::ClientConnected(msg) => {
+                    if let Some(endpoint_id) = msg.endpoint_id {
+                        connections
+                            .borrow_mut()
+                            .insert(msg.connection_id, endpoint_id.to_string());
+                    }
+                    // always accept the connection itself — gating happens
+                    // per-request below, once we know which hash is asked for.
+                    msg.tx.send(Ok(())).await.ok();
+                }
+                ProviderMessage::ConnectionClosed(msg) => {
+                    connections.borrow_mut().remove(&msg.connection_id);
+                }
+                ProviderMessage::GetRequestReceived(msg) => {
+                    let peer = connections.borrow().get(&msg.connection_id).cloned();
+                    let hash = msg.request.hash;
+                    let allowed = blob_request_allowed(&acl, &hash, peer.as_deref());
+                    if !allowed {
+                        warn!(
+                            "blob-acl: denied get request for {} from peer {:?}",
+                            hash, peer
+                        );
+                    }
+                    let res = if allowed { Ok(()) } else { Err(AbortReason::Permission) };
+                    msg.tx.send(res).await.ok();
+                }
+                ProviderMessage::GetManyRequestReceived(msg) => {
+                    let peer = connections.borrow().get(&msg.connection_id).cloned();
+                    let allowed = msg
+                        .request
+                        .hashes
+                        .iter()
+                        .all(|hash| blob_request_allowed(&acl, hash, peer.as_deref()));
+                    if !allowed {
+                        warn!("blob-acl: denied get_many request from peer {:?}", peer);
+                    }
+                    let res = if allowed { Ok(()) } else { Err(AbortReason::Permission) };
+                    msg.tx.send(res).await.ok();
+                }
+                _ => {}
+            }
+        }
+    });
+
+    tx
+}
+
 /// browser P2P node for the skein canvas ecosystem.
 ///
 /// supports two protocols:
@@ -364,6 +470,10 @@ pub struct MiddenNode {
     /// capped at 3 entries; oldest evicted when full.
     #[wasm_bindgen(skip)]
     pub active_tags: RefCell<IndexMap<Hash, TempTag>>,
+    /// per-hash blob-get allow-list, see `BlobAcl`'s doc comment. PROTOTYPE:
+    /// a stopgap gate, not the real canvas-ACL integration.
+    #[wasm_bindgen(skip)]
+    pub blob_acl: BlobAcl,
 }
 
 #[wasm_bindgen]
@@ -419,7 +529,9 @@ impl MiddenNode {
             });
         let blobs_downloader = Downloader::new(&mem_store, &endpoint);
         let blobs_store = mem_store.as_ref().clone();
-        let blobs_protocol = BlobsProtocol::new(&blobs_store, None);
+        let blob_acl: BlobAcl = Rc::new(RefCell::new(HashMap::new()));
+        let blobs_protocol =
+            BlobsProtocol::new(&blobs_store, Some(build_gated_blobs_events(blob_acl.clone())));
 
         // wait for relay connection
         endpoint.online().await;
@@ -434,6 +546,7 @@ impl MiddenNode {
             blobs_downloader,
             blobs_protocol,
             active_tags: RefCell::new(IndexMap::new()),
+            blob_acl,
         })
     }
 
@@ -446,6 +559,48 @@ impl MiddenNode {
     /// get our node_id (iroh public key)
     pub fn node_id(&self) -> String {
         self.endpoint.secret_key().public().to_string()
+    }
+
+    /// PROTOTYPE: restrict a blob (by blake3 hex hash) so only the given
+    /// peer node ids may fetch it over the `iroh-blobs/*` ALPN. a hash with
+    /// no restriction registered is served to anyone (today's default
+    /// behavior, unchanged) — calling this is what opts a specific hash
+    /// into gating.
+    ///
+    /// this is a stopgap/demo hook, not the real canvas-ACL integration: it
+    /// has to be called explicitly, from JS, with an already-resolved list
+    /// of allowed peer node ids for this one hash. see the accompanying
+    /// design report for what real integration would need instead.
+    pub fn restrict_blob_to_peers(
+        &self,
+        blake3_hash: &str,
+        peer_node_ids: &js_sys::Array,
+    ) -> Result<(), JsError> {
+        let hash: Hash = blake3_hash
+            .parse()
+            .map_err(|e| JsError::new(&format!("invalid blake3 hash: {}", e)))?;
+
+        let mut allowed = HashSet::new();
+        for i in 0..peer_node_ids.length() {
+            let peer_id = peer_node_ids
+                .get(i)
+                .as_string()
+                .ok_or_else(|| JsError::new("each peer node id must be a string"))?;
+            allowed.insert(peer_id);
+        }
+
+        self.blob_acl.borrow_mut().insert(hash, allowed);
+        Ok(())
+    }
+
+    /// PROTOTYPE: remove a hash's restriction, returning it to the default
+    /// (served to anyone) state.
+    pub fn clear_blob_restriction(&self, blake3_hash: &str) -> Result<(), JsError> {
+        let hash: Hash = blake3_hash
+            .parse()
+            .map_err(|e| JsError::new(&format!("invalid blake3 hash: {}", e)))?;
+        self.blob_acl.borrow_mut().remove(&hash);
+        Ok(())
     }
 
     /// create a node from existing secret key with additional ALPN protocols.
@@ -496,7 +651,9 @@ impl MiddenNode {
             });
         let blobs_downloader = Downloader::new(&mem_store, &endpoint);
         let blobs_store = mem_store.as_ref().clone();
-        let blobs_protocol = BlobsProtocol::new(&blobs_store, None);
+        let blob_acl: BlobAcl = Rc::new(RefCell::new(HashMap::new()));
+        let blobs_protocol =
+            BlobsProtocol::new(&blobs_store, Some(build_gated_blobs_events(blob_acl.clone())));
 
         endpoint.online().await;
 
@@ -510,6 +667,7 @@ impl MiddenNode {
             blobs_downloader,
             blobs_protocol,
             active_tags: RefCell::new(IndexMap::new()),
+            blob_acl,
         })
     }
 

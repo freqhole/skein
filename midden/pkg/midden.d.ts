@@ -148,6 +148,11 @@ export class MiddenNode {
      */
     active_blob_count(): number;
     /**
+     * PROTOTYPE: remove a hash's restriction, returning it to the default
+     * (served to anyone) state.
+     */
+    clear_blob_restriction(blake3_hash: string): void;
+    /**
      * compute blake3 hash for a blob on demand
      *
      * use this when the client doesn't have the blake3 hash yet (not in API response).
@@ -295,6 +300,19 @@ export class MiddenNode {
      * blake3_hash should be the 64-char hex string returned by import_blob.
      */
     release_blob(blake3_hash: string): void;
+    /**
+     * PROTOTYPE: restrict a blob (by blake3 hex hash) so only the given
+     * peer node ids may fetch it over the `iroh-blobs/*` ALPN. a hash with
+     * no restriction registered is served to anyone (today's default
+     * behavior, unchanged) — calling this is what opts a specific hash
+     * into gating.
+     *
+     * this is a stopgap/demo hook, not the real canvas-ACL integration: it
+     * has to be called explicitly, from JS, with an already-resolved list
+     * of allowed peer node ids for this one hash. see the accompanying
+     * design report for what real integration would need instead.
+     */
+    restrict_blob_to_peers(blake3_hash: string, peer_node_ids: Array<any>): void;
     /**
      * get the secret key bytes for persistence (32 bytes)
      * store this in IndexedDB to maintain the same identity across sessions

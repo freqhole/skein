@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use automerge::sync::SyncDoc;
 use tokio::sync::{broadcast, RwLock};
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // CBOR message types (incoming)
@@ -145,6 +146,12 @@ impl DocHandle {
 pub struct PeerInfo {
     pub peer_id: String,
     pub connected_at: std::time::Instant,
+    /// signals `handle_connection`'s read loop to stop and close the stream.
+    /// cancelled by [`HubRepo::cancel_peer`] when something revokes this
+    /// peer's access (e.g. a `friendz` row being blocked/deleted) while the
+    /// connection is still open. see the `HubRepo::cancel_peer` doc comment
+    /// for the full story on who's expected to call it and when.
+    pub cancel: CancellationToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +506,13 @@ impl HubRepo {
         use futures::StreamExt;
         use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+        // cancellation token for this specific connection. anything holding
+        // a `HubRepo` clone can cancel it via `cancel_peer` (e.g. once a
+        // peer's `friendz` row is revoked mid-session) to stop this loop and
+        // close the stream promptly, instead of leaving it running until the
+        // peer disconnects on its own.
+        let cancel = CancellationToken::new();
+
         // track the peer
         {
             let mut peers = self.connected_peers.write().await;
@@ -507,6 +521,7 @@ impl HubRepo {
                 PeerInfo {
                     peer_id: peer_id_str.clone(),
                     connected_at: std::time::Instant::now(),
+                    cancel: cancel.clone(),
                 },
             );
         }
@@ -522,7 +537,16 @@ impl HubRepo {
         let hub_peer_id = self.peer_id.clone();
 
         loop {
-            let frame = match framed.next().await {
+            let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    tracing::info!(peer = %peer_id_str, "hub_repo: connection cancelled (access revoked)");
+                    break;
+                }
+                next = framed.next() => next,
+            };
+
+            let frame = match next {
                 Some(Ok(frame)) => frame,
                 Some(Err(e)) => {
                     tracing::warn!(peer = %peer_id_str, error = %e, "hub_repo: frame read error");
@@ -637,6 +661,43 @@ impl HubRepo {
         self.connected_peers.read().await.keys().cloned().collect()
     }
 
+    /// cancel a connected peer's active connection, if it has one.
+    ///
+    /// call this immediately after revoking a peer's access (e.g. deleting
+    /// or blocking their `friendz` row) so an already-accepted connection
+    /// doesn't keep syncing until the peer disconnects on its own.
+    /// `friendz::Store` deliberately has no knowledge of `HubRepo` (a lower-
+    /// level store shouldn't depend on networking/session state, and it
+    /// would create a circular dependency with `sync`/`hub_repo`, which
+    /// already depend on `friendz`), so it's the caller of the revoking
+    /// operation that's expected to do both steps: revoke in `friendz::Store`,
+    /// then call this. today the only caller that runs in the same process
+    /// as a live `HubRepo` is `protocol::hub_admin`'s remote `Remove` handler.
+    /// the CLI's `reliquary friend remove` always runs as a separate process
+    /// from a running `reliquary serve` (they only share the sqlite database,
+    /// not in-memory state), so it has no `HubRepo` handle to call this on,
+    /// see the comment on `main.rs`'s `FriendCommand::Remove` arm for that
+    /// limitation.
+    ///
+    /// returns `true` if a live connection was found and cancelled, `false`
+    /// if the peer has no active connection (a no-op, not an error, the
+    /// common case is revoking a peer that was never connected, or already
+    /// disconnected).
+    pub async fn cancel_peer(&self, peer_id: &str) -> bool {
+        let peers = self.connected_peers.read().await;
+        match peers.get(peer_id) {
+            Some(info) => {
+                info.cancel.cancel();
+                tracing::info!(peer = %peer_id, "hub_repo: cancelled active connection");
+                true
+            }
+            None => {
+                tracing::debug!(peer = %peer_id, "hub_repo: cancel_peer called, no active connection");
+                false
+            }
+        }
+    }
+
     /// number of documents currently held by the hub repo.
     pub async fn document_count(&self) -> usize {
         self.documents.read().await.len()
@@ -673,5 +734,94 @@ impl HubRepo {
     /// the payload is the doc_id string.
     pub fn subscribe_doc_changes(&self) -> broadcast::Receiver<String> {
         self.doc_notify.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// build a `HubRepo` backed by a fresh temp-dir sqlite file. the
+    /// returned `TempDir` must be kept alive for as long as the `HubRepo` is
+    /// used (dropping it deletes the backing file).
+    async fn make_hub_repo() -> (HubRepo, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new should succeed");
+        (hub_repo, tmp)
+    }
+
+    #[tokio::test]
+    async fn cancel_peer_with_no_active_connection_is_a_no_op() {
+        let (hub_repo, _tmp) = make_hub_repo().await;
+
+        // nobody has ever connected, so this must not panic and must report
+        // "nothing to cancel" rather than pretending it found something.
+        assert!(!hub_repo.cancel_peer("never-connected").await);
+        assert_eq!(hub_repo.connected_peer_count().await, 0);
+    }
+
+    /// this is the core regression test for the fix described on
+    /// `HubRepo::cancel_peer`'s doc comment: a peer with an active
+    /// connection (an in-flight `handle_connection` loop, here driven by an
+    /// in-memory `tokio::io::duplex` pair rather than a real iroh stream,
+    /// matching this crate's existing precedent for testing `hub_repo`/
+    /// `sync` logic without a live network - see `protocol::codec`'s tests
+    /// and `sync::tests`'s doc comments) can be cancelled from outside its
+    /// own loop, and the loop actually stops promptly rather than running
+    /// until the peer disconnects on its own.
+    #[tokio::test]
+    async fn cancel_peer_terminates_an_active_connection_promptly() {
+        let (hub_repo, _tmp) = make_hub_repo().await;
+        let peer_id = "revoked-peer".to_string();
+
+        let (client_side, server_side) = tokio::io::duplex(8192);
+
+        let repo_for_task = hub_repo.clone();
+        let peer_id_for_task = peer_id.clone();
+        let handle = tokio::spawn(async move {
+            repo_for_task
+                .handle_connection(peer_id_for_task, server_side)
+                .await;
+        });
+
+        // wait for the connection to register itself before cancelling it,
+        // otherwise we'd race the insert into `connected_peers`.
+        for _ in 0..100 {
+            if hub_repo.connected_peer_count().await == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            hub_repo.connected_peer_count().await,
+            1,
+            "connection should have registered itself in connected_peers"
+        );
+
+        // simulates what `protocol::hub_admin`'s `Remove` handler does after
+        // `friendz::Store::delete()`: look up the peer's active connection
+        // and cancel it.
+        assert!(
+            hub_repo.cancel_peer(&peer_id).await,
+            "cancel_peer should find and cancel the active connection"
+        );
+
+        // the spawned handle_connection task must actually return promptly
+        // (not hang until the client side is dropped/closed).
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("handle_connection should return promptly once cancelled")
+            .expect("handle_connection task should not panic");
+
+        assert_eq!(
+            hub_repo.connected_peer_count().await,
+            0,
+            "cancelled connection should have cleaned itself out of connected_peers"
+        );
+
+        drop(client_side);
     }
 }

@@ -212,7 +212,11 @@ async fn friend(data_dir: PathBuf, cmd: FriendCommand) -> anyhow::Result<()> {
             let friend = store
                 .upsert(node_id, friendz::FriendStatus::Allowed, None)
                 .await?;
-            println!("allowed {} (status = {})", friend.friend_node_id, friend.status.as_str());
+            println!(
+                "allowed {} (status = {})",
+                friend.friend_node_id,
+                friend.status.as_str()
+            );
         }
         FriendCommand::List => {
             let friends = store.list(false).await?;
@@ -237,6 +241,19 @@ async fn friend(data_dir: PathBuf, cmd: FriendCommand) -> anyhow::Result<()> {
             }
             store.delete(node_id).await?;
             println!("removed {node_id}");
+            // note: this only updates the friendz table in the sqlite
+            // database. if a `reliquary serve` process is currently running
+            // against this same data_dir and has an already-accepted
+            // connection from this peer, that connection is NOT torn down
+            // by this command: the cli and a running server are always
+            // separate os processes that share the sqlite file but nothing
+            // in-memory, so there's no `hub_repo::HubRepo` handle here to
+            // call `cancel_peer` on. removal still takes effect immediately
+            // for that peer's *next* new connection attempt (rejected by
+            // `is_friend()` in `sync::IrohRepo::accept`). the live,
+            // in-process revocation path is `protocol::hub_admin`'s remote
+            // `Remove` handler, which runs inside the same process as the
+            // hub's `HubRepo` and can cancel an active connection directly.
         }
     }
 

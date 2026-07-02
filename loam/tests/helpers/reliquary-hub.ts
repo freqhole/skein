@@ -69,6 +69,18 @@ export interface ReliquaryHubHandle {
    */
   friendAllow: (peerNodeId: string) => Promise<void>;
   /**
+   * grant a peer admin rights over this hub's friendz allow-list
+   * (`reliquary admin allow <node_id>`), so that peer can subsequently call
+   * the real remote `iroh/skein-hub-admin/1` protocol (see
+   * `SkeinP2PBridge.hubAdminRequest` in `src/dev/test-bridge.ts`) to manage
+   * friendz over the network instead of via local CLI. this bootstrapping
+   * step itself is still done locally/operator-side (mirroring how a real
+   * operator would grant admin rights) — the protocol has no way for a
+   * remote caller to grant themselves (or anyone else) admin rights, only
+   * to act as one once already granted.
+   */
+  adminAllow: (peerNodeId: string) => Promise<void>;
+  /**
    * the hub's accumulated stdout/stderr for its entire lifetime (ANSI
    * stripped), useful for debugging why an expected background operation
    * (e.g. a blob snatch) didn't happen.
@@ -186,10 +198,15 @@ export async function startReliquaryHub(options?: {
     await runReliquary(["--data-dir", dataDir, "friend", "allow", peerNodeId]);
   };
 
+  const adminAllow = async (peerNodeId: string): Promise<void> => {
+    await runReliquary(["--data-dir", dataDir, "admin", "allow", peerNodeId]);
+  };
+
   return {
     nodeId: resolvedNodeId,
     dataDir,
     friendAllow,
+    adminAllow,
     getLog: () => output,
     stop,
   };

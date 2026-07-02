@@ -19,8 +19,10 @@ import { initCanvas } from "../canvas/init";
 import { PresenceManager } from "../canvas/presence-manager";
 import { Viewport } from "../canvas/viewport";
 import { createSkeinHarness } from "../harness/skein-harness";
+import { FriendzProtocol } from "../p2p/friends-protocol";
+import { FRIENDZ_ALPN } from "../p2p/iroh-network-adapter";
 import { createWidgetDoc } from "../widgets/widget-doc";
-import { buildP2PBridge } from "./test-bridge";
+import { buildFriendzTestBridge, buildP2PBridge } from "./test-bridge";
 
 // a simple zod schema exercised by createWidgetDoc in tests
 const testWidgetSchema = z.object({
@@ -83,8 +85,30 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
 
   const nodeId = await p2pBridge.getNodeId();
 
+  // wire up a real FriendzProtocol instance so tests can drive the
+  // skein-friendz/1 handshake (friend requests, accepts) against another
+  // browser peer or a real reliquary hub — production wiring for this lives
+  // in standalone/friendz-wiring.ts, which writes into the real social
+  // automerge doc; this harness has no narthex/social doc, so accepted
+  // friends are tracked in a plain in-memory set instead (see
+  // buildFriendzTestBridge in test-bridge.ts).
+  const acceptedFriends = new Set<string>();
+  const friendzProtocol = new FriendzProtocol({
+    getMidden: () => irohAdapter.getNode(),
+    localNodeId: nodeId,
+    localUsername: "test-peer",
+    getLocalProfile: () => ({ username: "test-peer", bio: "", avatarDataUrl: "" }),
+    isFriend: (peerNodeId) => acceptedFriends.has(peerNodeId),
+    profileVisibility: "everyone",
+    friendRequestsFrom: "everyone",
+  });
+  irohAdapter.registerAlpnHandler(FRIENDZ_ALPN, (stream) => {
+    friendzProtocol.handleStream(stream);
+  });
+  const friendzBridge = buildFriendzTestBridge(friendzProtocol, acceptedFriends);
+
   // expose the typed bridge as the single window test entry point
-  (window as any).__skeinTest = { canvas, p2p: p2pBridge };
+  (window as any).__skeinTest = { canvas, p2p: p2pBridge, friendz: friendzBridge };
 
   // backward-compat aliases used by existing tests
   (window as any).__skein = canvas;

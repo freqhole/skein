@@ -15,6 +15,15 @@
 //! caller whose node id isn't in `adminz` gets back [`AdminResponse::NotAdmin`]
 //! and nothing is changed.
 //!
+//! `Remove` also cancels the target peer's already-accepted
+//! `iroh/automerge-repo/1` connection, if it has one open right now (see
+//! `hub_repo::HubRepo::cancel_peer`). this handler runs inside the same
+//! process as the live `HubRepo` (constructed once by
+//! `hub::HubPeerService::start`), so it's the one revocation call site that
+//! can actually reach a currently-connected peer's cancellation token; the
+//! CLI's `reliquary friend remove` (`main.rs`) always runs as a separate
+//! process from a running `reliquary serve` and has no such handle.
+//!
 //! wire format: one request/response pair per bidirectional stream, CBOR-
 //! encoded via `ciborium` (the same encoding `hub_repo` uses for automerge
 //! sync messages), no length prefix — the sender signals end-of-request by
@@ -29,6 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::adminz;
 use crate::friendz;
+use crate::hub_repo::HubRepo;
 use crate::userz;
 
 /// ALPN protocol identifier for remote hub administration.
@@ -95,6 +105,16 @@ struct Inner {
     adminz: adminz::Store,
     friendz: friendz::Store,
     userz: userz::Directory,
+    /// used to cancel a peer's already-accepted `iroh/automerge-repo/1`
+    /// connection immediately after a `Remove` request deletes their
+    /// `friendz` row (see `HubRepo::cancel_peer`'s doc comment for the full
+    /// reasoning on why this crosses from `friendz` into `hub_repo` here,
+    /// at the caller, rather than `friendz::Store` reaching into `HubRepo`
+    /// itself). this handler is constructed once per running hub process
+    /// (`hub::HubPeerService::start`), in the same process as the `HubRepo`
+    /// it holds, so it's a legitimate integration point for live
+    /// cancellation, unlike the CLI's `friend remove` (see `main.rs`).
+    hub_repo: HubRepo,
 }
 
 impl std::fmt::Debug for HubAdminHandler {
@@ -104,12 +124,18 @@ impl std::fmt::Debug for HubAdminHandler {
 }
 
 impl HubAdminHandler {
-    pub fn new(adminz: adminz::Store, friendz: friendz::Store, userz: userz::Directory) -> Self {
+    pub fn new(
+        adminz: adminz::Store,
+        friendz: friendz::Store,
+        userz: userz::Directory,
+        hub_repo: HubRepo,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 adminz,
                 friendz,
                 userz,
+                hub_repo,
             }),
         }
     }
@@ -256,9 +282,17 @@ async fn handle_request(
                 };
             }
             match handler.inner.friendz.delete(node_id).await {
-                Ok(()) => AdminResponse::Removed {
-                    node_id: node_id.to_string(),
-                },
+                Ok(()) => {
+                    // revoke, then cancel any already-accepted connection
+                    // for this peer, see `HubRepo::cancel_peer`'s doc
+                    // comment for why this two-step "caller does both"
+                    // pattern lives here rather than inside
+                    // `friendz::Store::delete` itself.
+                    handler.inner.hub_repo.cancel_peer(node_id).await;
+                    AdminResponse::Removed {
+                        node_id: node_id.to_string(),
+                    }
+                }
                 Err(e) => AdminResponse::Error {
                     message: format!("friendz delete failed: {e}"),
                 },
@@ -287,25 +321,37 @@ mod tests {
     use super::*;
     use crate::db;
 
+    /// the returned `TempDir` backs `HubRepo`'s sqlite file and must be kept
+    /// alive by the caller for as long as the returned handler/hub_repo are
+    /// used (dropping it deletes the backing file out from under the pool).
     async fn make_handler() -> (
         HubAdminHandler,
         adminz::Store,
         friendz::Store,
         userz::Directory,
+        HubRepo,
+        tempfile::TempDir,
     ) {
         let pool = db::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
         let friendz_store = friendz::Store::new(pool.clone());
         let userz_dir = userz::Directory::new(pool);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hub_repo = HubRepo::new("hub-node".to_string(), &tmp.path().join("hub-docs.db"))
+            .await
+            .expect("HubRepo::new should succeed");
         (
             HubAdminHandler::new(
                 adminz_store.clone(),
                 friendz_store.clone(),
                 userz_dir.clone(),
+                hub_repo.clone(),
             ),
             adminz_store,
             friendz_store,
             userz_dir,
+            hub_repo,
+            tmp,
         )
     }
 
@@ -330,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_admin_is_rejected_for_all_operations() {
-        let (handler, _adminz, _friendz, _userz) = make_handler().await;
+        let (handler, _adminz, _friendz, _userz, _hub_repo, _tmp) = make_handler().await;
         let stranger = "stranger-node";
 
         let allow = handle_request(
@@ -359,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_can_allow_list_and_remove() {
-        let (handler, adminz_store, _friendz, _userz) = make_handler().await;
+        let (handler, adminz_store, _friendz, _userz, _hub_repo, _tmp) = make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 
@@ -405,9 +451,67 @@ mod tests {
         }
     }
 
+    /// proves the cancellation wiring added alongside this handler's
+    /// `hub_repo` field: a `Remove` request doesn't just delete the
+    /// `friendz` row, it also cancels that peer's already-accepted
+    /// `iroh/automerge-repo/1` connection (driven here by a real
+    /// `HubRepo::handle_connection` loop over an in-memory
+    /// `tokio::io::duplex` pair, same approach as
+    /// `hub_repo::tests::cancel_peer_terminates_an_active_connection_promptly`
+    /// and `sync::tests::revoking_friendz_status_now_cancels_an_already_accepted_connection`,
+    /// since no unit test in this crate spins up a real iroh connection).
+    #[tokio::test]
+    async fn admin_remove_cancels_an_active_connection() {
+        let (handler, adminz_store, friendz_store, userz_dir, hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        let target_peer = "target-peer";
+        adminz_store.allow(admin_node).await.unwrap();
+        userz_dir.touch(target_peer).await.unwrap();
+        friendz_store
+            .upsert(target_peer, friendz::FriendStatus::Accepted, None)
+            .await
+            .unwrap();
+
+        let (client_side, server_side) = tokio::io::duplex(8192);
+        let repo_for_task = hub_repo.clone();
+        let conn_handle = tokio::spawn(async move {
+            repo_for_task
+                .handle_connection(target_peer.to_string(), server_side)
+                .await;
+        });
+
+        for _ in 0..100 {
+            if hub_repo.connected_peer_count().await == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(hub_repo.connected_peer_count().await, 1);
+
+        let remove = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::Remove {
+                node_id: target_peer.to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(remove, AdminResponse::Removed { .. }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), conn_handle)
+            .await
+            .expect("handle_connection should return promptly once cancelled")
+            .expect("handle_connection task should not panic");
+        assert_eq!(hub_repo.connected_peer_count().await, 0);
+
+        drop(client_side);
+    }
+
     #[tokio::test]
     async fn admin_allow_does_not_demote_an_already_accepted_friend() {
-        let (handler, adminz_store, friendz_store, userz_dir) = make_handler().await;
+        let (handler, adminz_store, friendz_store, userz_dir, _hub_repo, _tmp) =
+            make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 
@@ -439,7 +543,7 @@ mod tests {
     /// the wire response looks right.
     #[tokio::test]
     async fn non_admin_requests_have_no_side_effects_on_friendz_table() {
-        let (handler, _adminz, friendz_store, userz_dir) = make_handler().await;
+        let (handler, _adminz, friendz_store, userz_dir, _hub_repo, _tmp) = make_handler().await;
         let stranger = "stranger-node";
 
         let allow = handle_request(
@@ -474,7 +578,11 @@ mod tests {
         .await;
         assert!(matches!(remove, AdminResponse::NotAdmin));
         assert!(
-            friendz_store.get("existing-friend").await.unwrap().is_some(),
+            friendz_store
+                .get("existing-friend")
+                .await
+                .unwrap()
+                .is_some(),
             "a rejected Remove must not delete an existing friendz row"
         );
 
@@ -489,7 +597,8 @@ mod tests {
     /// variants), so it must never affect the caller's own admin rights.
     #[tokio::test]
     async fn admin_remove_never_touches_the_adminz_table() {
-        let (handler, adminz_store, friendz_store, userz_dir) = make_handler().await;
+        let (handler, adminz_store, friendz_store, userz_dir, _hub_repo, _tmp) =
+            make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
         userz_dir.touch(admin_node).await.unwrap();
@@ -523,7 +632,7 @@ mod tests {
     /// it's an intentional "delete is idempotent" convention, not a bug.
     #[tokio::test]
     async fn admin_remove_of_nonexistent_friend_reports_removed_not_error() {
-        let (handler, adminz_store, _friendz, _userz) = make_handler().await;
+        let (handler, adminz_store, _friendz, _userz, _hub_repo, _tmp) = make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 
@@ -543,7 +652,7 @@ mod tests {
     /// mutating request variants.
     #[tokio::test]
     async fn allow_and_remove_reject_whitespace_only_node_id() {
-        let (handler, adminz_store, _friendz, _userz) = make_handler().await;
+        let (handler, adminz_store, _friendz, _userz, _hub_repo, _tmp) = make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 

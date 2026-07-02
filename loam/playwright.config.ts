@@ -1,12 +1,43 @@
 import { defineConfig, devices } from "@playwright/test";
 
+// resource-intensive spec files: multi-page BroadcastChannel meshes (3-5
+// browser pages/contexts in a single test) or real-network tests that spawn
+// an actual reliquary hub child process and/or real iroh endpoints. running
+// several of these concurrently (either against each other or against the
+// rest of the suite) causes contention-driven flakiness — cpu/memory
+// pressure from many simultaneous browser contexts, iroh relay dial races,
+// hub process startup races — that doesn't reproduce when the same file is
+// run in isolation. keeping them in their own project with a hard worker
+// cap of 1 means at most one of these ever runs at a time, regardless of
+// how many workers the rest of the suite is using.
+const HEAVY_TEST_FILES = [
+  "multi-peer-mesh.spec.ts",
+  "p2p-sync.spec.ts",
+  "reliquary-hub.spec.ts",
+  "blob-sync.spec.ts",
+  "blob-acl.spec.ts",
+  "blob-acl-gate-prototype.spec.ts",
+  "friendz-hub.spec.ts",
+  "hub-admin.spec.ts",
+];
+
+const chromiumUse = {
+  ...devices["Desktop Chrome"],
+  viewport: { width: 1280, height: 800 },
+  // required for wasm + SharedArrayBuffer
+  launchOptions: {
+    args: ["--enable-features=SharedArrayBuffer"],
+  },
+};
+
 export default defineConfig({
   testDir: "./tests",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  // p2p tests open multiple browser contexts — keep workers=1 in CI to
-  // avoid saturating the iroh relay with too many concurrent connections.
+  // overall worker pool cap for the whole run. per-project `workers` below
+  // further restricts how much of this pool the heavy project may use at
+  // once — it doesn't add extra workers on top of this.
   workers: process.env.CI ? 1 : undefined,
   reporter: [["html", { outputFolder: "playwright-report" }], ["list"]],
   use: {
@@ -26,14 +57,17 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: {
-        ...devices["Desktop Chrome"],
-        viewport: { width: 1280, height: 800 },
-        // required for wasm + SharedArrayBuffer
-        launchOptions: {
-          args: ["--enable-features=SharedArrayBuffer"],
-        },
-      },
+      testIgnore: HEAVY_TEST_FILES,
+      use: chromiumUse,
+    },
+    {
+      name: "chromium-heavy",
+      testMatch: HEAVY_TEST_FILES,
+      // serialize all resource-intensive tests against each other — never
+      // more than one multi-page mesh / real-hub / real-iroh test running
+      // at the same time.
+      workers: 1,
+      use: chromiumUse,
     },
   ],
   webServer: {

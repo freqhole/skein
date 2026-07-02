@@ -197,10 +197,14 @@ impl HubPeerService {
         // remote hub administration: lets a privileged remote peer manage
         // this hub's friendz allow-list over the network (see
         // `protocol::hub_admin`), instead of requiring local CLI access.
+        // also hands over a `hub_repo` clone so a `Remove` request can
+        // cancel an already-accepted connection for the revoked peer, not
+        // just delete their `friendz` row.
         let hub_admin = crate::protocol::hub_admin::HubAdminHandler::new(
             adminz_store.clone(),
             friendz_store.clone(),
             userz.clone(),
+            hub_repo.clone(),
         );
 
         let router = iroh::protocol::Router::builder(endpoint.clone())
