@@ -38,14 +38,15 @@
 
 import { test, expect } from "./fixtures/p2p-page";
 import type { Page } from "@playwright/test";
+import { fromEvaluateArray, randomBlobBytes, toEvaluateArray } from "./helpers/blob-fixtures";
 
 /** import bytes into `page`'s own iroh-blobs store, returning the blake3 hex hash. */
-async function importBlob(page: Page, content: string): Promise<string> {
-  return page.evaluate(async (text: string) => {
+async function importBlob(page: Page, bytes: Uint8Array): Promise<string> {
+  return page.evaluate(async (byteArray: number[]) => {
     const bridge = (window as any).__skeinTest;
-    const bytes = new TextEncoder().encode(text);
+    const bytes = Uint8Array.from(byteArray);
     return bridge.p2p.importBlob(bytes) as Promise<string>;
-  }, content);
+  }, toEvaluateArray(bytes));
 }
 
 /** restrict a blob (already imported on `page`) to the given peer node ids. */
@@ -94,13 +95,13 @@ test("restricted blob: an allow-listed peer can still fetch it @p2p", async ({ p
   const owner = await p2pPage();
   const allowed = await p2pPage();
 
-  const marker = `blob-acl-gate-allowed ${Date.now()}`;
-  const blake3 = await importBlob(owner.page, marker);
+  const sourceBytes = randomBlobBytes();
+  const blake3 = await importBlob(owner.page, sourceBytes);
 
   await restrictBlobToPeers(owner.page, blake3, [allowed.nodeId]);
 
   const fetchedBytes = await fetchBlobWithRetry(allowed.page, owner.nodeId, blake3);
-  expect(new TextDecoder().decode(Uint8Array.from(fetchedBytes))).toBe(marker);
+  expect(fromEvaluateArray(fetchedBytes)).toEqual(sourceBytes);
 });
 
 test("restricted blob: a peer NOT on the allow-list is rejected @p2p", async ({ p2pPage }) => {
@@ -110,8 +111,8 @@ test("restricted blob: a peer NOT on the allow-list is rejected @p2p", async ({ 
   const allowed = await p2pPage();
   const stranger = await p2pPage();
 
-  const marker = `blob-acl-gate-denied ${Date.now()}`;
-  const blake3 = await importBlob(owner.page, marker);
+  const sourceBytes = randomBlobBytes();
+  const blake3 = await importBlob(owner.page, sourceBytes);
 
   // only `allowed` is on the allow-list for this hash — `stranger` is not.
   await restrictBlobToPeers(owner.page, blake3, [allowed.nodeId]);
@@ -120,7 +121,7 @@ test("restricted blob: a peer NOT on the allow-list is rejected @p2p", async ({ 
   // same owner, run first so a failure here is legible as "the gate broke
   // fetching entirely" rather than being confused with the denial below).
   const allowedBytes = await fetchBlobWithRetry(allowed.page, owner.nodeId, blake3);
-  expect(new TextDecoder().decode(Uint8Array.from(allowedBytes))).toBe(marker);
+  expect(fromEvaluateArray(allowedBytes)).toEqual(sourceBytes);
 
   // the stranger has the same information a real attacker would have (the
   // owner's node id + the blob's blake3 hash) but is not on the allow-list.
@@ -139,10 +140,10 @@ test("unrestricted blob: default behavior (anyone can fetch) is unchanged @p2p",
   const owner = await p2pPage();
   const stranger = await p2pPage();
 
-  const marker = `blob-acl-gate-unrestricted ${Date.now()}`;
-  const blake3 = await importBlob(owner.page, marker);
+  const sourceBytes = randomBlobBytes();
+  const blake3 = await importBlob(owner.page, sourceBytes);
   // deliberately never call restrictBlobToPeers for this hash.
 
   const bytes = await fetchBlobWithRetry(stranger.page, owner.nodeId, blake3);
-  expect(new TextDecoder().decode(Uint8Array.from(bytes))).toBe(marker);
+  expect(fromEvaluateArray(bytes)).toEqual(sourceBytes);
 });

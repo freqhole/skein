@@ -11,6 +11,23 @@ const AVATAR_SIZE = 28;
 const AVATAR_POINTER_SIZE = 8;
 
 /**
+ * resolve the effective cursor color for a peer: prefer their real profile
+ * accent color (once resolved via `colorResolver`) and fall back to the
+ * presence manager's palette-assigned color otherwise. exported as a pure
+ * function so the fallback behavior is unit-testable without pixi — mirrors
+ * how `share-dialog.ts`'s `splitFriendsForInvite()` extracts the one
+ * pure/testable piece out of an otherwise pixi-heavy file.
+ */
+export function resolveCursorColor(
+  peerId: string,
+  fallbackColor: number,
+  colorResolver: ((peerId: string) => number | null) | null
+): number {
+  const resolved = colorResolver?.(peerId) ?? null;
+  return resolved !== null ? resolved : fallbackColor;
+}
+
+/**
  * renders remote peer cursors on the canvas world container.
  *
  * each peer gets a small colored arrow (triangle) and a label showing
@@ -28,6 +45,17 @@ export class PresenceRenderer {
   private readonly cursors: Map<string, Container> = new Map();
   private nameResolver: ((peerId: string) => string | null) | null = null;
   private avatarResolver: ((peerId: string) => string | null) | null = null;
+  /** resolves a peer's real profile accent color, if known — see `resolveCursorColor()`. */
+  private colorResolver: ((peerId: string) => number | null) | null = null;
+
+  /**
+   * tracks the effective color each visible cursor was last drawn with, so
+   * `updatePeer` can detect when a peer's real profile color resolves (or
+   * changes) after their cursor already exists and rebuild it to match —
+   * same "look something up, update the visual once known" spirit as the
+   * avatar-appeared rebuild below.
+   */
+  private readonly resolvedColors: Map<string, number> = new Map();
 
   /**
    * tracks which resolved display name is already rendered by which peerId.
@@ -96,6 +124,19 @@ export class PresenceRenderer {
   }
 
   /**
+   * set a function that resolves peer IDs to their real profile accent
+   * color (see `resolveCursorColor()`). a peer's cursor keeps using the
+   * presence manager's palette-assigned fallback color until/unless this
+   * resolves a real color for them — matched lazily as presence changes
+   * arrive in `updatePeer` rather than forced here, since the resolver
+   * typically has nothing new to say for peers not yet friended/synced at
+   * the moment this setter is called.
+   */
+  setColorResolver(resolver: ((peerId: string) => number | null) | null): void {
+    this.colorResolver = resolver;
+  }
+
+  /**
    * create or update the cursor visual for a remote peer.
    * if the peer is the local user, their cursor position is null,
    * or they are offline, the visual is hidden.
@@ -151,7 +192,9 @@ export class PresenceRenderer {
         TAG,
         `creating cursor for peerId=${peerId.slice(0, 12)} name="${resolvedName ?? peerId.slice(0, 8)}" (total cursors: ${this.cursors.size + 1})`
       );
-      cursor = this.createCursorVisual(peerId, presence.color);
+      const effectiveColor = resolveCursorColor(peerId, presence.color, this.colorResolver);
+      cursor = this.createCursorVisual(peerId, effectiveColor);
+      this.resolvedColors.set(peerId, effectiveColor);
       this.cursors.set(peerId, cursor);
       this.root.addChild(cursor);
     }
@@ -170,7 +213,31 @@ export class PresenceRenderer {
         // avatar state changed — rebuild the cursor visual
         cursor.destroy({ children: true });
         this.cursors.delete(peerId);
-        const newCursor = this.createCursorVisual(peerId, presence.color);
+        const effectiveColor = resolveCursorColor(peerId, presence.color, this.colorResolver);
+        const newCursor = this.createCursorVisual(peerId, effectiveColor);
+        this.resolvedColors.set(peerId, effectiveColor);
+        this.cursors.set(peerId, newCursor);
+        this.root.addChild(newCursor);
+        newCursor.visible = true;
+        newCursor.x = presence.cursor!.x;
+        newCursor.y = presence.cursor!.y;
+        return;
+      }
+    }
+
+    // check if the peer's real profile accent color has resolved (or
+    // changed) since the cursor was last drawn — rebuild to pick it up.
+    // best-effort/non-blocking: `colorResolver` is a synchronous lookup
+    // against already-known local state (no network wait here), so this
+    // just re-checks on every presence update until/unless a real color
+    // becomes available, then keeps using it.
+    {
+      const effectiveColor = resolveCursorColor(peerId, presence.color, this.colorResolver);
+      if (this.resolvedColors.get(peerId) !== effectiveColor) {
+        cursor.destroy({ children: true });
+        this.cursors.delete(peerId);
+        const newCursor = this.createCursorVisual(peerId, effectiveColor);
+        this.resolvedColors.set(peerId, effectiveColor);
         this.cursors.set(peerId, newCursor);
         this.root.addChild(newCursor);
         newCursor.visible = true;
@@ -346,9 +413,11 @@ export class PresenceRenderer {
     }
     this.cursors.clear();
     this.nameToActivePeer.clear();
+    this.resolvedColors.clear();
 
     this.nameResolver = null;
     this.avatarResolver = null;
+    this.colorResolver = null;
     this.root.destroy({ children: true });
   }
 }

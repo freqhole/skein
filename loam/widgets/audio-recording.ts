@@ -12,6 +12,7 @@
 //
 // state machine:
 //   idle → requesting → recording → processing → ready ↔ playing
+//   ready → fetching → ready (remote peer: snatching the blob before playback)
 //   any error → error → (click) → requesting → ...
 //
 // storage:
@@ -20,7 +21,12 @@
 //   restore-from-doc playback uses getBlobData() which reads OPFS first, then
 //   falls back to the rust-side blob_get dispatch in tauri mode.
 //   waveformSamples are stored in the Automerge doc so collaborators can see
-//   the waveform without playing the audio.
+//   the waveform without playing the audio — but the audio bytes themselves
+//   never travel with the doc. on a peer that didn't make the recording,
+//   getBlobData() misses locally; resolveAudioBytes() (see below) falls
+//   back to snatching the blob from a canvas peer, same as file.ts's
+//   checkBlobLocality()/snatchBlob() flow, before handing back a playable
+//   object URL.
 //
 // device selection:
 //   selected deviceId persisted.
@@ -31,6 +37,14 @@
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { z } from "zod";
 import { getBlobData, storeBlobFromFile } from "../src/storage/skein-blob-store";
+import {
+  checkBlobLocality,
+  getLocalNodeId,
+  snatchBlob,
+  type BlobLocalityInfo,
+  type PeersMap,
+  type SnatchOptions,
+} from "../src/widgets/file-utils";
 import {
   isTransparent,
   type CompactInfo,
@@ -54,6 +68,11 @@ export const audioRecordingSchema = z.object({
   mime: z.string().default("audio/webm"),
   /** file size in bytes */
   size: z.number().default(0),
+  /** blake3 content hash (needed for verified P2P snatch on a remote peer) */
+  blake3: z.string().default(""),
+  /** node IDs that have snatched (or recorded) this blob — used to target
+   *  peer downloads when a remote peer needs to play it back. */
+  snatchedBy: z.array(z.string()).default([]),
   /** recording duration in seconds */
   duration: z.number().default(0),
   /** widget background color; -1 = transparent */
@@ -134,6 +153,96 @@ function mimeToExt(mime: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// blob resolution — shared by getPlaybackUrl() below and unit-tested directly.
+// ---------------------------------------------------------------------------
+
+/** minimal doc fields needed to resolve playable audio bytes */
+export interface AudioBlobRef {
+  blobId: string;
+  filename: string;
+  mime: string;
+  size: number;
+  blake3: string;
+}
+
+/** injectable dependencies — lets the resolution algorithm be unit-tested
+ *  without OPFS/IndexedDB/P2P plumbing. the widget wires in the real
+ *  implementations from skein-blob-store / file-utils. */
+export interface ResolveAudioBytesDeps {
+  getBlobData: (blobId: string) => Promise<ArrayBuffer | null>;
+  checkBlobLocality: (blobId: string, blake3?: string) => Promise<BlobLocalityInfo>;
+  snatchBlob: (
+    info: AudioBlobRef & { domain: string },
+    peers: PeersMap,
+    options?: SnatchOptions
+  ) => Promise<{ blobId: string; blake3?: string | null }>;
+  getLocalNodeId: () => Promise<string | null>;
+}
+
+export interface ResolvedAudioBytes {
+  buffer: ArrayBuffer;
+  /** the blob ID actually used to fetch the bytes (may differ from the doc's
+   *  blobId after a sha256-dedup rekey during snatch) */
+  blobId: string;
+  blake3: string;
+  /** set when a P2P snatch happened — the caller should record this node in
+   *  the doc's `snatchedBy` list so other peers can target it for downloads */
+  snatchedByNodeId: string | null;
+}
+
+/**
+ * resolve playable audio bytes for a recording, fetching from a canvas peer
+ * when the bytes aren't local (e.g. viewing another peer's recording — the
+ * automerge doc syncs fine, but the audio bytes never crossed the wire on
+ * their own). mirrors file.ts's "check locality, then snatch" flow.
+ *
+ * returns `null` when there's no blob, the bytes are genuinely local but
+ * unreadable, or no peer has them.
+ */
+export async function resolveAudioBytes(
+  ref: AudioBlobRef,
+  peers: PeersMap | undefined,
+  deps: ResolveAudioBytesDeps,
+  onProgress?: (fraction: number) => void,
+  isPeerOnline?: (nodeId: string) => boolean
+): Promise<ResolvedAudioBytes | null> {
+  if (!ref.blobId) return null;
+
+  // fast path — bytes already local (original recorder, or a peer that
+  // already snatched them earlier this session).
+  const local = await deps.getBlobData(ref.blobId);
+  if (local) {
+    return { buffer: local, blobId: ref.blobId, blake3: ref.blake3, snatchedByNodeId: null };
+  }
+
+  // confirm the blob is genuinely remote before paying for a P2P round-trip —
+  // a "local" locality result with a getBlobData() miss means something else
+  // is wrong (e.g. OPFS read failure), not a missing blob worth snatching.
+  const info = await deps.checkBlobLocality(ref.blobId, ref.blake3);
+  if (info.locality === "local") return null;
+
+  if (!peers || Object.keys(peers).length === 0) return null;
+
+  const result = await deps.snatchBlob(
+    { ...ref, domain: "audio" },
+    peers,
+    { onProgress, isPeerOnline }
+  );
+
+  const buffer = await deps.getBlobData(result.blobId);
+  if (!buffer) return null;
+
+  const localNodeId = await deps.getLocalNodeId();
+
+  return {
+    buffer,
+    blobId: result.blobId,
+    blake3: result.blake3 ?? ref.blake3,
+    snatchedByNodeId: localNodeId,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // widget
 // ---------------------------------------------------------------------------
 
@@ -143,8 +252,9 @@ type RecordState =
   | "recording" // recording in progress
   | "processing" // finalizing + storing blob
   | "ready" // has a recording; play button shown
+  | "fetching" // remote peer: downloading blob bytes before playback
   | "playing" // playing back the recording
-  | "error"; // getUserMedia or storage failure
+  | "error"; // getUserMedia, storage, or remote-fetch failure
 
 export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = {
   type: "audio-recording",
@@ -169,7 +279,9 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     blobId: state.blobId || undefined,
     mime: state.mime || undefined,
     filename: state.filename || undefined,
+    blake3: state.blake3 || undefined,
     size: state.size || undefined,
+    snatchedBy: state.snatchedBy?.length ? state.snatchedBy.map(String) : undefined,
   }),
 
   create(ctx: WidgetMountContext<typeof audioRecordingSchema>): WidgetController {
@@ -200,6 +312,10 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     let playbackUrl: string | null = null;
     let playbackElapsed = 0;
     let playRafId: number | null = null;
+    /** progress label shown in the "fetching" state while snatching a remote blob */
+    let fetchProgressText = "downloading…";
+    /** message shown after a failed remote-fetch attempt (cleared on next try) */
+    let fetchErrorMessage = "";
 
     // ── device selection state ───────────────────────────────────────────────
     // cachedDevices is populated by enumerateDevices() — labels are empty until
@@ -375,6 +491,13 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           btnGfx.fill({ color: COLOR_MUTED });
           break;
 
+        case "fetching":
+          btnGfx.circle(bx, by, BTN_R);
+          btnGfx.fill({ color: COLOR_MUTED });
+          btnGfx.circle(bx, by, BTN_R * 0.38);
+          btnGfx.stroke({ color: COLOR_PRIMARY, width: 2, alpha: 0.6 });
+          break;
+
         case "ready": {
           btnGfx.circle(bx, by, BTN_R);
           btnGfx.fill({ color: COLOR_PRIMARY });
@@ -483,9 +606,14 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           infoText.text = "";
           errorText.text = "";
           break;
+        case "fetching":
+          statusText.text = fetchProgressText;
+          infoText.text = "";
+          errorText.text = "";
+          break;
         case "ready":
           statusText.text = fmtDuration(state.duration);
-          infoText.text = fmtBytes(state.size);
+          infoText.text = fetchErrorMessage || fmtBytes(state.size);
           errorText.text = "";
           break;
         case "playing":
@@ -684,6 +812,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           d.filename = filename;
           d.mime = recMime;
           d.size = record.size;
+          d.blake3 = record.blake3;
           d.duration = durationSecs;
           // persist waveform — downsample to ≤200 points to keep doc size small
           const MAX_SAMPLES = 200;
@@ -709,29 +838,78 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     };
 
     // ── playback logic ───────────────────────────────────────────────────────
+    // resolves an object URL for the recorded audio, fetching the bytes from
+    // a canvas peer when they aren't local yet (see resolveAudioBytes above
+    // for the "check locality, then snatch" algorithm).
     const getPlaybackUrl = async (): Promise<string | null> => {
       if (playbackUrl) return playbackUrl;
 
-      const { blobId, mime } = ctx.doc.current;
+      const { blobId, filename, mime, size, blake3 } = ctx.doc.current;
       if (!blobId) return null;
 
+      const peers = ctx.canvasStore?.peers() as PeersMap | undefined;
+      let resolved: ResolvedAudioBytes | null = null;
       try {
-        const buffer = await getBlobData(blobId);
-        if (buffer) {
-          const blob = new Blob([buffer], { type: mime || "audio/webm" });
-          playbackUrl = URL.createObjectURL(blob);
-          return playbackUrl;
-        }
+        resolved = await resolveAudioBytes(
+          { blobId, filename, mime, size, blake3 },
+          peers,
+          { getBlobData, checkBlobLocality, snatchBlob, getLocalNodeId },
+          (fraction) => {
+            fetchProgressText =
+              fraction >= 0 ? `downloading… ${Math.round(fraction * 100)}%` : "downloading…";
+            if (recState === "fetching") updateTexts();
+          },
+          ctx.canvasStore ? (nodeId: string) => ctx.canvasStore!.isPeerOnline(nodeId) : undefined
+        );
       } catch (err) {
-        console.error("[audio-recording] getPlaybackUrl failed:", err);
+        console.error("[audio-recording] resolveAudioBytes failed:", err);
+        return null;
       }
-      return null;
+
+      if (!resolved) return null;
+
+      // a P2P snatch happened (not the fast local path) — show the
+      // "fetching" state while it ran, then sync the doc with the result.
+      if (resolved.snatchedByNodeId !== null) {
+        if (resolved.blobId !== blobId || resolved.blake3 !== blake3) {
+          ctx.doc.change((d) => {
+            d.blobId = resolved!.blobId;
+            d.blake3 = resolved!.blake3;
+          });
+        }
+        ctx.doc.change((d) => {
+          if (!d.snatchedBy) d.snatchedBy = [];
+          if (!d.snatchedBy.includes(resolved!.snatchedByNodeId!)) {
+            d.snatchedBy.push(resolved!.snatchedByNodeId!);
+          }
+        });
+      }
+
+      const blob = new Blob([resolved.buffer], { type: mime || "audio/webm" });
+      playbackUrl = URL.createObjectURL(blob);
+      return playbackUrl;
     };
 
     const startPlayback = async () => {
+      fetchErrorMessage = "";
+
+      // show a "downloading" state while resolving the bytes — usually
+      // resolves near-instantly from local storage, but on a remote peer's
+      // widget this covers a real P2P snatch instead of a hard error.
+      if (!playbackUrl) {
+        recState = "fetching";
+        fetchProgressText = "downloading…";
+        refresh();
+        ctx.setHeaderActions?.(makeHeaderActions());
+      }
+
       const url = await getPlaybackUrl();
       if (!url) {
         console.error("[audio-recording] no playback URL available");
+        recState = "ready";
+        fetchErrorMessage = "playback unavailable";
+        refresh();
+        ctx.setHeaderActions?.(makeHeaderActions());
         return;
       }
 
@@ -752,6 +930,10 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         await audioEl.play();
       } catch (err) {
         console.error("[audio-recording] play() failed:", err);
+        recState = "ready";
+        fetchErrorMessage = "playback unavailable";
+        refresh();
+        ctx.setHeaderActions?.(makeHeaderActions());
         return;
       }
 
@@ -785,12 +967,15 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       }
       capturedSamples = [];
       playbackElapsed = 0;
+      fetchErrorMessage = "";
       recState = "idle";
 
       ctx.doc.change((d) => {
         d.blobId = "";
         d.filename = "";
         d.size = 0;
+        d.blake3 = "";
+        d.snatchedBy = [];
         d.duration = 0;
         d.waveformSamples = [];
       });

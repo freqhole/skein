@@ -34,6 +34,7 @@ import {
 import { IrohNetworkAdapter, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
 import { AclFilteringNetworkAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
 import type { RoleResolver } from "../p2p/acl-filtering-network-adapter";
+import { createCanvasScopedSharePolicy } from "../p2p/canvas-scoped-share-policy";
 import { decodeShareString, encodeShareString } from "../p2p/share-string";
 import { resolveFriendDisplay, SqliteSocialDoc } from "../p2p/sqlite-social-doc";
 import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
@@ -178,6 +179,21 @@ class SkeinRouter {
       wrapNetworkAdapter: (iroh) => new AclFilteringNetworkAdapter(iroh, roleResolver),
     });
     repoBox.repo = harness.repo;
+
+    // scope automerge-repo's own sync eligibility to "does this specific
+    // document's .acl list this peer" (or, for a per-widget state doc, its
+    // owning canvas's .acl) — automerge-repo's default `shareConfig`
+    // announces/grants access to EVERY locally-known document to ANY
+    // connected peer, which meant a reliquary hub connected to accept ONE
+    // canvas invite was also proactively pushed narthex, every other
+    // canvas, and the private social/messagez docs. a real, confirmed
+    // confidentiality gap, 2026-07-03 ("is it that the hub peer is syncing
+    // ALL of a user's canvases? it should only sync stuff i share with
+    // it") — see canvas-scoped-share-policy.ts's module doc comment for
+    // the full reasoning, including why both `announce` (proactive push)
+    // and `access` (honoring an inbound request) need the same policy.
+    const sharePolicy = createCanvasScopedSharePolicy(harness.repo);
+    harness.repo.shareConfig = { announce: sharePolicy, access: sharePolicy };
 
     return new SkeinRouter(mountElement, harness);
   }
@@ -1328,6 +1344,27 @@ class SkeinRouter {
             for (const n of friend.nodeIds) {
               if (n.nodeId === peerId && n.avatarDataUrl) {
                 return n.avatarDataUrl;
+              }
+            }
+          }
+          return null;
+        });
+      }
+
+      // set up color resolver so presence cursors use a peer's own real
+      // profile accent color once it's known (learned via a profile-response
+      // message, same as avatarDataUrl above) — falls back to the presence
+      // manager's palette-assigned color until then (see
+      // presence-renderer.ts's resolveCursorColor()).
+      if (canvas.presenceRenderer) {
+        canvas.presenceRenderer.setColorResolver((peerId: string) => {
+          const state = this.socialDoc?.current;
+          if (!state?.friends) return null;
+          for (const friend of state.friends) {
+            if (!friend.nodeIds) continue;
+            for (const n of friend.nodeIds) {
+              if (n.nodeId === peerId && n.accentColor !== undefined) {
+                return n.accentColor;
               }
             }
           }

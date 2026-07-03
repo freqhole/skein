@@ -12,6 +12,14 @@ export const friendNodeIdSchema = z.object({
   username: z.string().default(""),
   bio: z.string().default(""),
   avatarDataUrl: z.string().default(""),
+  // this peer's own profile accent color (profileSchema.accentColor on
+  // their side), learned the same way as avatarDataUrl/username — via a
+  // profile-response message (see friends-protocol.ts's
+  // ProfileResponseMessage and friendz-wiring.ts's onProfileResponse).
+  // undefined until a profile response naming a color has arrived; canvas
+  // presence cursors fall back to the palette-assigned color until then
+  // (see presence-renderer.ts's resolveCursorColor()).
+  accentColor: z.number().optional(),
   // pointer to this peer's profile automerge doc (docs/hub-and-profile-plan.md
   // section 6) — learned either directly (profile-request/response) or
   // relayed via gossip digest from a mutual friend/hub (section 6's "hub

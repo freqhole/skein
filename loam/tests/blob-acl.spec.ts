@@ -55,7 +55,8 @@
 
 import { test, expect } from "./fixtures/p2p-page";
 import type { Page } from "@playwright/test";
-import { addPeer, joinCanvas, waitForPeerCount, waitForWidgetCount } from "./helpers/skein-bridge";
+import { addPeer, getWidgetCount, joinCanvas, waitForPeerCount, waitForWidgetCount } from "./helpers/skein-bridge";
+import { fromEvaluateArray, randomBlobBytes, toEvaluateArray } from "./helpers/blob-fixtures";
 
 /**
  * import bytes into `page`'s own iroh-blobs store and create a "file"
@@ -65,11 +66,11 @@ import { addPeer, joinCanvas, waitForPeerCount, waitForWidgetCount } from "./hel
  */
 async function importBlobAndCreateFileWidget(
   page: Page,
-  content: string
+  bytes: Uint8Array
 ): Promise<{ blake3: string; widgetDocId: string }> {
-  return page.evaluate(async (text: string) => {
+  return page.evaluate(async (byteArray: number[]) => {
     const bridge = (window as any).__skeinTest;
-    const bytes = new TextEncoder().encode(text);
+    const bytes = Uint8Array.from(byteArray);
     const blake3Hash: string = await bridge.p2p.importBlob(bytes);
 
     const repo = bridge.canvas.repo;
@@ -80,8 +81,8 @@ async function importBlobAndCreateFileWidget(
       doc.blobId = blake3Hash;
       doc.blake3 = blake3Hash;
       doc.domain = "file";
-      doc.filename = "blob-acl-test.txt";
-      doc.mime = "text/plain";
+      doc.filename = "blob-acl-test.bin";
+      doc.mime = "application/octet-stream";
       doc.size = bytes.byteLength;
       doc.thumbnailDataUrl = "";
     });
@@ -101,7 +102,7 @@ async function importBlobAndCreateFileWidget(
     });
 
     return { blake3: blake3Hash, widgetDocId: widgetHandle.documentId as string };
-  }, content);
+  }, toEvaluateArray(bytes));
 }
 
 /**
@@ -152,8 +153,8 @@ test("an invited canvas peer can fetch a blob referenced by a widget on that can
   const owner = await p2pPage();
   const member = await p2pPage();
 
-  const marker = `blob-acl-member ${Date.now()}`;
-  const { blake3 } = await importBlobAndCreateFileWidget(owner.page, marker);
+  const sourceBytes = randomBlobBytes();
+  const { blake3 } = await importBlobAndCreateFileWidget(owner.page, sourceBytes);
 
   // dial + join the canvas as an invited peer, then get explicitly recorded
   // in the owner's ACL — either "member" or "viewer" counts as "has access"
@@ -176,7 +177,61 @@ test("an invited canvas peer can fetch a blob referenced by a widget on that can
   // an invited peer must be able to fetch blobs referenced from a canvas
   // it has legitimate access to.
   const fetchedBytes = await fetchBlobWithRetry(member.page, owner.nodeId, blake3);
-  expect(new TextDecoder().decode(Uint8Array.from(fetchedBytes))).toBe(marker);
+  expect(fromEvaluateArray(fetchedBytes)).toEqual(sourceBytes);
+});
+
+// ---------------------------------------------------------------------------
+// widget doc sync for an ALREADY-connected peer (as opposed to a peer that
+// joins after the widget already exists, which the test above covers via
+// joinCanvas() batching up every existing widget at connect time). this is
+// the exact shape of a real user-reported bug, 2026-07-03: "user-a creates
+// a new audio recording on a canvas, and then as user-b i can see the new
+// widget... sometimes two different browser peers don't sync the [widget]
+// widget, sometimes it's only on one canvas" — root-caused to a race in
+// canvas-scoped-share-policy.ts's per-widget-doc reverse lookup: a widget
+// doc's docSynchronizer starts announcing/access-checking itself against
+// connected peers essentially the instant it's created, which can race
+// ahead of the *separate* canvas-doc sync message that tells a remote peer
+// about the new widget's docId in the first place (see CanvasStore's
+// constructor comment for the fix, `reevaluateDocumentShare()` on every
+// canvas doc change).
+// ---------------------------------------------------------------------------
+
+test("a widget added to a canvas AFTER a peer already joined still syncs to that peer @p2p", async ({
+  p2pPage,
+}) => {
+  test.setTimeout(180_000);
+
+  const owner = await p2pPage();
+  const member = await p2pPage();
+
+  await addPeer(member.page, owner.nodeId);
+  await waitForPeerCount(member.page, 1, 30_000);
+
+  await owner.page.evaluate((peerId: string) => {
+    const store = (window as any).__skeinTest.canvas.store;
+    store.addPeer(peerId);
+    store.setRole(peerId, "viewer");
+  }, member.nodeId);
+
+  const joinedDocId = await joinCanvas(member.page, owner.canvasDocId);
+  expect(joinedDocId).toBe(owner.canvasDocId);
+
+  // member is fully connected and has joined, but the owner hasn't created
+  // any widgets yet — confirms what follows is genuinely "widget added
+  // after the fact", not batched up as part of the join itself.
+  expect(await getWidgetCount(member.page)).toBe(0);
+
+  const sourceBytes = randomBlobBytes();
+  const { blake3 } = await importBlobAndCreateFileWidget(owner.page, sourceBytes);
+
+  // the already-connected member should see the new widget show up on its
+  // own, with no reconnect/rejoin — this is the part that used to be
+  // flaky/one-sided before the reevaluateDocumentShare() fix.
+  await waitForWidgetCount(member.page, 1, 15_000);
+
+  const fetchedBytes = await fetchBlobWithRetry(member.page, owner.nodeId, blake3);
+  expect(fromEvaluateArray(fetchedBytes)).toEqual(sourceBytes);
 });
 
 // ---------------------------------------------------------------------------
@@ -191,8 +246,7 @@ test("a peer with no canvas access cannot fetch a blob by node id + hash alone @
   const owner = await p2pPage();
   const stranger = await p2pPage();
 
-  const marker = `blob-acl-stranger ${Date.now()}`;
-  const { blake3 } = await importBlobAndCreateFileWidget(owner.page, marker);
+  const { blake3 } = await importBlobAndCreateFileWidget(owner.page, randomBlobBytes());
 
   // confirm the stranger genuinely has no footprint on the owner's canvas
   // doc at all — never invited, never joined, no ACL entry, no peers entry.

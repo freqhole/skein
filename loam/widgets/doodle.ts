@@ -98,6 +98,10 @@ export const doodleSchema = z.object({
   /** true once random pen/border colors have been written to the doc.
    *  ensures colors are chosen once per widget (not on every schema parse). */
   colorsSeeded: z.boolean().default(false),
+  /** when true, the canvas is read-only — pointer drawing is disabled until
+   *  unlocked again. persisted so the lock state survives reload and syncs
+   *  to other peers viewing the same widget. */
+  locked: z.boolean().default(false),
 });
 
 export type DoodleState = z.infer<typeof doodleSchema>;
@@ -219,6 +223,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
   },
   schema: doodleSchema,
   editableProps: [
+    { key: "locked", label: "locked", type: "boolean" as const, default: false },
     { key: "bgColor", label: "background", type: "color" as const, default: -1 },
     { key: "borderColor", label: "border", type: "color" as const, default: -1 },
     { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 1 },
@@ -277,6 +282,14 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     bgGfx.hitArea = new Rectangle(0, 0, cw, ch);
     bgGfx.cursor = "crosshair";
     container.addChild(bgGfx);
+
+    // ── locked cursor ────────────────────────────────────────────────────────
+    // when locked, swap the crosshair for a plain cursor so it reads as a
+    // read-only view rather than an active drawing surface.
+    const updateCursor = () => {
+      bgGfx.cursor = ctx.doc.current.locked ? "default" : "crosshair";
+    };
+    updateCursor();
 
     const drawBackground = () => {
       const { bgColor, borderColor, borderWidth } = ctx.doc.current;
@@ -479,6 +492,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     bgGfx.on("pointerdown", (e: any) => {
       if (drawing) return;
       if (ctx.canvasStore?.isLocalViewer()) return;
+      if (ctx.doc.current.locked) return;
       e.stopPropagation();
       drawing = true;
       activePointerId = e.pointerId;
@@ -629,7 +643,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     };
 
     const makeHeaderActions = (): HeaderAction[] => {
-      const { activeTool, brushShape, penOpacity, penWidth } = ctx.doc.current;
+      const { activeTool, brushShape, penOpacity, penWidth, locked } = ctx.doc.current;
       const shape = brushShape ?? "circle";
       const opacity = penOpacity ?? 100;
       const width = Math.max(1, penWidth ?? 3);
@@ -786,7 +800,58 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
           label: "↻",
           onClick: redo,
         },
+        {
+          id: "lock",
+          label: locked ? "unlock" : "lock",
+          active: locked,
+          marginLeft: 8,
+          // padlock icon — closed shackle when locked, swung open when unlocked.
+          renderIcon: (parent: Container, size: number, color: number) => {
+            const bodyW = Math.round(size * 0.56);
+            const bodyH = Math.round(size * 0.42);
+            const bodyX = Math.round((size - bodyW) / 2);
+            const bodyY = Math.round(size * 0.5);
+            const r = Math.max(2, Math.round(bodyW * 0.16));
+
+            const bodyGfx = new Graphics();
+            bodyGfx.roundRect(bodyX, bodyY, bodyW, bodyH, r);
+            bodyGfx.fill({ color, alpha: 0.92 });
+            // keyhole
+            const kx = size / 2;
+            const ky = bodyY + bodyH * 0.42;
+            bodyGfx.circle(kx, ky, Math.max(1, bodyW * 0.09));
+            bodyGfx.fill({ color: 0x000000, alpha: 0.35 });
+            parent.addChild(bodyGfx);
+
+            // shackle
+            const shackleGfx = new Graphics();
+            const shackleR = Math.round(bodyW * 0.34);
+            const shackleW = Math.max(2, Math.round(size * 0.09));
+            if (locked) {
+              // closed: centered arc sitting flush on top of the body
+              const cx = size / 2;
+              const cy = bodyY;
+              shackleGfx.arc(cx, cy, shackleR, Math.PI, 0, false);
+              shackleGfx.stroke({ width: shackleW, color, cap: "round" });
+            } else {
+              // open: swung up and to the side, only one leg meets the body
+              const cx = bodyX + bodyW * 0.32;
+              const cy = bodyY - shackleR * 0.15;
+              shackleGfx.arc(cx, cy, shackleR, Math.PI * 1.1, Math.PI * 0.15, false);
+              shackleGfx.stroke({ width: shackleW, color, cap: "round" });
+            }
+            parent.addChild(shackleGfx);
+          },
+          onClick: () => setLocked(!locked),
+        },
       ];
+    };
+
+    const setLocked = (next: boolean) => {
+      ctx.doc.change((d) => {
+        d.locked = next;
+      });
+      ctx.setHeaderActions?.(makeHeaderActions());
     };
 
     const setTool = (tool: string) => {
@@ -810,6 +875,17 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     const unsub = ctx.doc.on("change", (state) => {
       drawBackground();
       syncStrokes(state);
+      updateCursor();
+      if (state.locked && drawing) {
+        // locked mid-stroke (e.g. by a peer) — abort the in-progress stroke
+        // rather than let it commit after the fact.
+        drawing = false;
+        activePointerId = null;
+        activePoints = [];
+        activeStrokeId = "";
+        liveGfx.clear();
+        liveGfx.blendMode = "normal";
+      }
       if (!isDraggingOpacity && !isDraggingWidth) {
         ctx.setHeaderActions?.(makeHeaderActions());
       }

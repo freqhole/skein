@@ -147,6 +147,7 @@ export async function initFriendzWiring(
         username: p?.username ?? "anonymous",
         bio: p?.bio ?? "",
         avatarDataUrl: p?.avatarDataUrl ?? "",
+        ...(p?.accentColor !== undefined ? { accentColor: p.accentColor } : {}),
       };
       if (!profileStore) return base;
       const updatedAt = profileStore.updatedAt();
@@ -277,6 +278,7 @@ export async function initFriendzWiring(
             if (msg.username) n.username = msg.username;
             if (msg.bio !== undefined) n.bio = msg.bio;
             if (msg.avatarDataUrl !== undefined) n.avatarDataUrl = msg.avatarDataUrl;
+            if (msg.accentColor !== undefined) n.accentColor = msg.accentColor;
             n.lastSeenAt = new Date().toISOString();
             // profile-doc pointer (docs/hub-and-profile-plan.md section 6)
             // — only overwrite if strictly newer, or the current entry has

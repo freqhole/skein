@@ -1852,65 +1852,18 @@ export function createFriendsTab(ctx: TabContext): TabController {
     }
 
     // -----------------------------------------------------------------------
-    // friend's shared canvas bin — read-only, paginated (see canvas-bin.ts's
-    // module doc comment / docs/hub-and-profile-plan.md). best-effort only:
-    // shown once the friend's profile doc (already known via the gossip-
-    // relayed nodeIds[].profileDocId, see friendz-wiring.ts's
-    // mergeGossipDigestProfiles()) is reachable AND has published a
-    // canvasBinDocId — no error UI for the "not there yet" cases, matching
-    // this file's existing best-effort conventions elsewhere (bio, hub node
-    // id, etc).
-    // -----------------------------------------------------------------------
-    {
-      const mountY = dy;
-      // reserve the space synchronously regardless of whether the async
-      // lookup below actually finds a bin to mount — previously `dy` (and
-      // therefore the "remove friend" button positioned from it) never
-      // accounted for this section's height at all, so once the bin DID
-      // mount, it silently overlapped the button below (a real
-      // user-reported bug, 2026-07-02: "remove friend" button and the
-      // canvases bin on friends' profiles overlap).
-      dy += PROFILE_CANVAS_BIN_HEIGHT + 12;
-      const repo = ctx.canvasStore?.repo;
-      const friendProfileDocId = friend.nodeIds[0]?.profileDocId;
-      const requestFriendId = friend.id;
-      if (repo && friendProfileDocId) {
-        ProfileStore.open(repo, friendProfileDocId as DocumentId)
-          .then(async (friendProfileStore) => {
-            if (selectedFriendId !== requestFriendId || viewMode !== "detail") return;
-            const canvasBinDocId = friendProfileStore.canvasBinDocId();
-            if (!canvasBinDocId) return;
-            const friendCanvasBinStore = await CanvasBinStore.open(repo, canvasBinDocId as DocumentId);
-            if (selectedFriendId !== requestFriendId || viewMode !== "detail") return;
-            if (friendCanvasBinController) {
-              friendCanvasBinController.destroy();
-              friendCanvasBinController = null;
-            }
-            const controller = createProfileCanvasBinWidget({
-              canvasBinStore: friendCanvasBinStore,
-              profileStore: friendProfileStore,
-              width: contentW,
-              height: PROFILE_CANVAS_BIN_HEIGHT,
-              isReadOnly: true,
-              registerTestHooks: (hooks) => registerSocialBridge({ friendCanvasBin: hooks }),
-            });
-            friendCanvasBinController = controller;
-            controller.container.y = mountY;
-            detailInner.addChild(controller.container);
-          })
-          .catch(() => {
-            // friend's profile/canvas-bin doc not reachable yet — best
-            // effort, no error UI (matches this file's existing convention).
-          });
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // delete button — anchored to bottom of area
+    // delete button — anchored right after the friend's own fields, before
+    // the scrollable canvas-bin section below (a real user-reported
+    // ordering preference, 2026-07-03: "remove friend" used to come after
+    // the bin instead of before it).
     // -----------------------------------------------------------------------
 
     const deleteBtnY = dy;
     dy += DETAIL_BTN_HEIGHT + 12;
+    // baseline content height assuming the friend's canvas bin below turns
+    // out to be empty (or never loads) — grown in place once the async
+    // lookup below actually finds canvases to show, see that section's
+    // doc comment for why.
     detailContentHeight = dy;
     const deleteBtn = new Container();
     deleteBtn.eventMode = "static";
@@ -1980,6 +1933,63 @@ export function createFriendsTab(ctx: TabContext): TabController {
         });
       }
     });
+
+    // -----------------------------------------------------------------------
+    // friend's shared canvas bin — read-only, paginated (see canvas-bin.ts's
+    // module doc comment / docs/hub-and-profile-plan.md). best-effort only:
+    // shown once the friend's profile doc (already known via the gossip-
+    // relayed nodeIds[].profileDocId, see friendz-wiring.ts's
+    // mergeGossipDigestProfiles()) is reachable AND has published a
+    // canvasBinDocId — no error UI for the "not there yet" cases, matching
+    // this file's existing best-effort conventions elsewhere (bio, hub node
+    // id, etc). deliberately last (after "remove friend", a real
+    // user-reported ordering preference, 2026-07-03), and deliberately
+    // does NOT reserve scroll space up front — only once the async lookup
+    // confirms the friend actually has canvases to show does this grow
+    // `detailContentHeight`, so an empty/not-yet-loaded bin never makes an
+    // otherwise-short profile scrollable (a real user-reported request,
+    // 2026-07-03: "if there's no canvases to show, the container shouldn't
+    // scroll").
+    // -----------------------------------------------------------------------
+    {
+      const mountY = detailContentHeight;
+      const repo = ctx.canvasStore?.repo;
+      const friendProfileDocId = friend.nodeIds[0]?.profileDocId;
+      const requestFriendId = friend.id;
+      if (repo && friendProfileDocId) {
+        ProfileStore.open(repo, friendProfileDocId as DocumentId)
+          .then(async (friendProfileStore) => {
+            if (selectedFriendId !== requestFriendId || viewMode !== "detail") return;
+            const canvasBinDocId = friendProfileStore.canvasBinDocId();
+            if (!canvasBinDocId) return;
+            const friendCanvasBinStore = await CanvasBinStore.open(repo, canvasBinDocId as DocumentId);
+            if (selectedFriendId !== requestFriendId || viewMode !== "detail") return;
+            // nothing to show — leave detailContentHeight at its baseline
+            // (right after "remove friend") so the view doesn't scroll.
+            if (friendCanvasBinStore.nodes().length === 0) return;
+            if (friendCanvasBinController) {
+              friendCanvasBinController.destroy();
+              friendCanvasBinController = null;
+            }
+            const controller = createProfileCanvasBinWidget({
+              canvasBinStore: friendCanvasBinStore,
+              profileStore: friendProfileStore,
+              width: contentW,
+              height: PROFILE_CANVAS_BIN_HEIGHT,
+              isReadOnly: true,
+              registerTestHooks: (hooks) => registerSocialBridge({ friendCanvasBin: hooks }),
+            });
+            friendCanvasBinController = controller;
+            controller.container.y = mountY;
+            detailInner.addChild(controller.container);
+            detailContentHeight = mountY + PROFILE_CANVAS_BIN_HEIGHT + 12;
+          })
+          .catch(() => {
+            // friend's profile/canvas-bin doc not reachable yet — best
+            // effort, no error UI (matches this file's existing convention).
+          });
+      }
+    }
   };
 
   // ---------------------------------------------------------------------------
@@ -2197,8 +2207,8 @@ export function createFriendsTab(ctx: TabContext): TabController {
     addModeContainer.visible = true;
     addBtn.visible = false;
     layout(currentWidth, currentHeight);
-    // auto-focus the name field
-    nameField.handle.focus();
+    // auto-focus the node id field (first field in the view)
+    nodeIdField.handle.focus();
   });
 
   // ---------------------------------------------------------------------------
@@ -2299,11 +2309,13 @@ export function createFriendsTab(ctx: TabContext): TabController {
         detailMask.rect(0, 0, w, h).fill({ color: 0xffffff });
         detailContainer.hitArea = new Rectangle(0, 0, w, h);
         rebuildDetailView(selectedFriend, w);
-        // clamp scroll now that rebuildDetailView() has set the real
+        // clamp scroll now that rebuildDetailView() has set the baseline
         // content height (`detailContentHeight`) — the friend-canvas-bin
-        // section's height is reserved synchronously above regardless of
-        // whether it ends up mounting, so no further re-clamp is needed
-        // once its async lookup resolves.
+        // section only grows it further, asynchronously, if/when it turns
+        // out the friend actually has canvases to show (see that
+        // section's doc comment); `detailContentHeight` is read live by
+        // `clampDetailScroll()`/the wheel handler, so no re-clamp call is
+        // needed once that async lookup resolves.
         clampDetailScroll();
         break;
       }
@@ -2332,15 +2344,16 @@ export function createFriendsTab(ctx: TabContext): TabController {
 
         let addY = 0;
 
-        // name field — small internal padding for the input fields
+        // small internal padding for the input fields
         const fieldPad = PADDING_X;
         const fieldW = w - fieldPad * 2;
 
-        nameField.layoutAt(fieldPad, addY, fieldW);
+        // node id field — listed first, auto-focused when the view opens
+        nodeIdField.layoutAt(fieldPad, addY, fieldW);
         addY += LABEL_SIZE + 4 + FIELD_HEIGHT + FIELD_GAP;
 
-        // node id field
-        nodeIdField.layoutAt(fieldPad, addY, fieldW);
+        // alias field (optional)
+        nameField.layoutAt(fieldPad, addY, fieldW);
         addY += LABEL_SIZE + 4 + FIELD_HEIGHT + FIELD_GAP;
 
         // buttons — anchored to the bottom

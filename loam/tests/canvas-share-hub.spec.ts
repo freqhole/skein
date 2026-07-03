@@ -223,5 +223,4 @@ test.describe("share a canvas with a real reliquary hub @hub", () => {
     hub = await startReliquaryHub({ dataDir });
 
     await waitForCanvasPeer(page, hub.nodeId);
-  });
-});
+  });});

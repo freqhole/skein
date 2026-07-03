@@ -41,6 +41,27 @@ export class CanvasStore {
   private constructor(repo: Repo, handle: DocHandle<CanvasDocument>) {
     this.repo = repo;
     this.handle = handle;
+
+    // re-evaluate automerge-repo's own sync eligibility (`repo.shareConfig`,
+    // see canvas-scoped-share-policy.ts) every time this canvas doc changes
+    // — local or remote-synced. this closes a plausible race in the
+    // per-widget "no .acl of its own, inherit the owning canvas's" policy:
+    // a widget doc's docSynchronizer is set up (and first announce/access-
+    // checked) essentially the instant its doc is created, which could run
+    // *before* this canvas doc's own `.widgets[id].docId` link has
+    // propagated to a remote peer (they're two independent automerge docs
+    // with no ordering guarantee between their sync messages over a real,
+    // non-loopback network) — the very first check could then deny it, and
+    // nothing would ever re-ask once the owning link *did* arrive. cheap to
+    // call on every change (createCanvasScopedSharePolicy's own short-TTL
+    // per-peer/per-doc cache absorbs repeat calls), so this is included as
+    // a real hardening even though a dedicated e2e test for it
+    // (blob-acl.spec.ts's "widget added AFTER a peer already joined") did
+    // not reproduce a failure without it on fast loopback iroh connections
+    // — see /memories/session/canvas-scoped-share-policy-regression.md.
+    handle.on("change", () => {
+      void repo.synchronizer.reevaluateDocumentShare();
+    });
   }
 
   /**

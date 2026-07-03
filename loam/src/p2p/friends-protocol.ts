@@ -41,6 +41,11 @@ export interface ProfileResponseMessage {
   username: string;
   bio: string;
   avatarDataUrl: string;
+  /** the sender's own profile accent color, if they have one set.
+   *  omitted (not sent as a default) when the sender has no accent color
+   *  configured — matches the optional-field-omission convention already
+   *  used elsewhere in this file (e.g. `isHub`, `profileDocId`). */
+  accentColor?: number;
   /** pointer to the sender's profile automerge doc (docs/hub-and-profile-plan.md
    *  section 6), if they have one. omitted (not sent as "") when the
    *  sender has no profile doc yet — matches the optional-field-omission
@@ -432,6 +437,7 @@ export interface FriendzProtocolOptions {
     username: string;
     bio: string;
     avatarDataUrl: string;
+    accentColor?: number;
     profileDocId?: string;
     profileUpdatedAt?: string;
   };
@@ -474,6 +480,7 @@ export class FriendzProtocol {
     username: string;
     bio: string;
     avatarDataUrl: string;
+    accentColor?: number;
     profileDocId?: string;
     profileUpdatedAt?: string;
   };
@@ -806,6 +813,7 @@ export class FriendzProtocol {
       username: profile.username,
       bio: profile.bio,
       avatarDataUrl: profile.avatarDataUrl,
+      ...(profile.accentColor !== undefined ? { accentColor: profile.accentColor } : {}),
       ...(profile.profileDocId ? { profileDocId: profile.profileDocId } : {}),
       ...(profile.profileUpdatedAt ? { profileUpdatedAt: profile.profileUpdatedAt } : {}),
     };

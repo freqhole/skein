@@ -26,14 +26,15 @@
 
 import { test, expect } from "./fixtures/p2p-page";
 import type { Page } from "@playwright/test";
+import { fromEvaluateArray, randomBlobBytes, toEvaluateArray } from "./helpers/blob-fixtures";
 
 /** import bytes into `page`'s own iroh-blobs store, returning the blake3 hex hash. */
-async function importBlob(page: Page, content: string): Promise<string> {
-  return page.evaluate(async (text: string) => {
+async function importBlob(page: Page, bytes: Uint8Array): Promise<string> {
+  return page.evaluate(async (byteArray: number[]) => {
     const bridge = (window as any).__skeinTest;
-    const bytes = new TextEncoder().encode(text);
+    const bytes = Uint8Array.from(byteArray);
     return bridge.p2p.importBlob(bytes) as Promise<string>;
-  }, content);
+  }, toEvaluateArray(bytes));
 }
 
 /**
@@ -117,7 +118,7 @@ async function expectEventuallyAllowed(
   page: Page,
   peerNodeId: string,
   blake3Hash: string,
-  expectedContent: string,
+  expectedBytes: Uint8Array,
   attempts = 6,
   delayMs = 500
 ): Promise<void> {
@@ -125,7 +126,7 @@ async function expectEventuallyAllowed(
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       const bytes = await tryFetchBlob(page, peerNodeId, blake3Hash);
-      expect(new TextDecoder().decode(Uint8Array.from(bytes))).toBe(expectedContent);
+      expect(fromEvaluateArray(bytes)).toEqual(expectedBytes);
       return;
     } catch (err) {
       lastErr = err;
@@ -177,7 +178,7 @@ test("blob ACL mirrors canvas ACL: invite grants access, revoke removes it @p2p"
   // in real canvas creation — see standalone/boot.ts's createCanvasFromNarthex).
   await stampAdmin(owner.page, owner.nodeId);
 
-  const marker = `blob-acl-live-sync ${Date.now()}`;
+  const marker = randomBlobBytes();
   const blake3 = await importBlob(owner.page, marker);
   await addFileWidgetWithBlob(owner.page, blake3);
 
@@ -216,7 +217,7 @@ test("blob ACL mirrors canvas ACL: invite grants access, revoke removes it @p2p"
   // erase data a peer already legitimately received. the real, checkable
   // property is that revocation blocks the *next new* blob referenced by
   // this canvas — proven below with a second, previously-unseen hash.
-  const marker2 = `blob-acl-live-sync-after-revoke ${Date.now()}`;
+  const marker2 = randomBlobBytes();
   const blake3_2 = await importBlob(owner.page, marker2);
   await addFileWidgetWithBlob(owner.page, blake3_2);
   await expectEventuallyDenied(stranger.page, owner.nodeId, blake3_2);
@@ -232,7 +233,7 @@ test("blob ACL live sync: owner (always in .acl via stampAdmin) can always fetch
 
   await stampAdmin(owner.page, owner.nodeId);
 
-  const marker = `blob-acl-live-sync-owner ${Date.now()}`;
+  const marker = randomBlobBytes();
   const blake3 = await importBlob(owner.page, marker);
   await addFileWidgetWithBlob(owner.page, blake3);
 
