@@ -126,16 +126,24 @@ export interface ReliquaryHubHandle {
    * (e.g. a blob snatch) didn't happen.
    */
   getLog: () => string;
-  /** kill the child process and remove the temp data dir. */
-  stop: () => Promise<void>;
+  /** kill the child process and remove the temp data dir, unless
+   *  `preserveDataDir` is true (e.g. to immediately restart a fresh
+   *  process against the same data dir via `startReliquaryHub({ dataDir })`
+   *  — see `canvas-share-hub.spec.ts`'s restart-mid-flight coverage). */
+  stop: (options?: { preserveDataDir?: boolean }) => Promise<void>;
 }
 
 /**
- * spawn a `reliquary serve` process against a fresh temp data dir with an
- * ephemeral iroh port, and wait for it to be ready to accept connections.
+ * spawn a `reliquary serve` process against a fresh temp data dir (or an
+ * existing one, via `options.dataDir` — e.g. to restart a hub against the
+ * same identity/sqlite state after a previous handle's `stop({
+ * preserveDataDir: true })`, proving in-flight work resumes correctly
+ * across a restart) with an ephemeral iroh port, and wait for it to be
+ * ready to accept connections.
  */
 export async function startReliquaryHub(options?: {
   readyTimeoutMs?: number;
+  dataDir?: string;
 }): Promise<ReliquaryHubHandle> {
   if (!existsSync(RELIQUARY_BIN)) {
     throw new Error(
@@ -144,7 +152,7 @@ export async function startReliquaryHub(options?: {
     );
   }
 
-  const dataDir = await mkdtemp(join(tmpdir(), `reliquary-hub-${randomUUID()}-`));
+  const dataDir = options?.dataDir ?? (await mkdtemp(join(tmpdir(), `reliquary-hub-${randomUUID()}-`)));
   const readyTimeoutMs = options?.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
 
   const child = spawn(RELIQUARY_BIN, ["--data-dir", dataDir, "--port", "0", "serve"], {
@@ -227,11 +235,13 @@ export async function startReliquaryHub(options?: {
 
   let stopped = false;
 
-  const stop = async () => {
+  const stop = async (stopOptions?: { preserveDataDir?: boolean }) => {
     if (stopped) return;
     stopped = true;
     await killChild(child);
-    rmSync(dataDir, { recursive: true, force: true });
+    if (!stopOptions?.preserveDataDir) {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   };
 
   const friendAllow = async (peerNodeId: string): Promise<void> => {

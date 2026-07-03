@@ -11,6 +11,7 @@ import {
 } from "../p2p/friends-protocol";
 import { initBridge, setOutboundRequestHook } from "../p2p/friendz-bridge";
 import { getMiddenNode, getStoredIdentity } from "../p2p/identity";
+import { trashCanvasCard } from "../../widgets/narthex/trash-widget";
 import {
   FRIENDZ_ALPN,
   type IrohNetworkAdapter,
@@ -1415,6 +1416,16 @@ export interface AclChangeHandlersDeps {
  * directly (a real reported bug: a demoted peer kept seeing their old
  * "member" pill on the narthex indefinitely).
  *
+ * a "removed" role change also auto-trashes the card if the peer's
+ * previous role was "viewer" (see the auto-trash block below) — a real
+ * user-reported request, 2026-07-02: a viewer never had write access to
+ * lose, so there's nothing to gain from leaving them stuck looking at a
+ * permanent "revoked" overlay instead of just moving the card to the trash
+ * bin (still fully recoverable from there like any other soft-delete). a
+ * demoted member/admin is left alone — they might want to keep the card
+ * around to request access again, so only the "revoked" overlay applies
+ * to them.
+ *
  * exported as a standalone function (mirrors `wireFriendHandlers`/
  * `wireKnockHandlers`) so it can be exercised directly in tests without the
  * full narthex/social/messagez setup `initFriendzWiring()` requires.
@@ -1438,13 +1449,19 @@ export function wireAclChangeHandlers(deps: AclChangeHandlersDeps): void {
       const narthexDoc = narthexHandle?.doc();
       if (!narthexDoc?.widgets) return;
 
-      for (const [_cardId, card] of Object.entries(narthexDoc.widgets) as any[]) {
+      for (const [cardId, card] of Object.entries(narthexDoc.widgets) as any[]) {
         if (card?.type !== "canvas-card") continue;
         if ((card.props as any)?.canvasDocId !== msg.canvasDocId) continue;
         if (!card.docId) continue;
 
         const cardHandle = repo.handles[card.docId as any];
         if (!cardHandle) continue;
+
+        // capture the role we're about to overwrite — needed below to
+        // decide whether this removal should auto-trash the card (viewer
+        // role only, see wireAclChangeHandlers' doc comment).
+        const cardDocBefore = cardHandle.doc() as { role?: string } | undefined;
+        const wasViewer = cardDocBefore?.role === "viewer";
 
         cardHandle.change((draft: any) => {
           if (msg.newRole === "removed") {
@@ -1454,6 +1471,27 @@ export function wireAclChangeHandlers(deps: AclChangeHandlersDeps): void {
             draft.accessRevoked = false;
           }
         });
+
+        // a viewer-role peer removed from a canvas has nothing to lose by
+        // an immediate auto-trash (they never had write access to begin
+        // with, unlike a demoted member/admin who might want to keep the
+        // card around to request access again) — soft-delete + move to
+        // the trash bin right away rather than just showing the "revoked"
+        // overlay indefinitely (a real user-reported request, 2026-07-02:
+        // "if the peer is viewer role we can just trash it"). still
+        // fully recoverable from the trash bin like any other soft-delete.
+        if (msg.newRole === "removed" && wasViewer) {
+          void (async () => {
+            try {
+              const narthexStore = await CanvasStore.open(repo, narthexDocId as DocumentId);
+              const identity = await getStoredIdentity();
+              if (identity) narthexStore.setLocalNodeId(identity.node_id);
+              await trashCanvasCard(repo, narthexStore, cardId);
+            } catch (err) {
+              log.warn(TAG, "failed to auto-trash canvas card after viewer removal:", err);
+            }
+          })();
+        }
         break;
       }
     } catch (err) {

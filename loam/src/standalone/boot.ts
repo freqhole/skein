@@ -541,6 +541,14 @@ class SkeinRouter {
             const sw = window.visualViewport?.width ?? window.innerWidth;
             this.currentSocialOverlay?.toggle(sw);
           },
+          // dev/test-only: send a real friend request to a node id through
+          // the production app's actual FriendzProtocol instance, exactly
+          // as `friends-tab.ts`'s "add friend" flow does — no equivalent
+          // existed before (only test-harness-p2p.html's separate,
+          // in-memory-only FriendzProtocol bridge did), which made it
+          // impossible to drive a real "befriend a hub, then invite it to
+          // a canvas" flow against the actual production social doc.
+          sendFriendRequestTo: (nodeId: string) => sendFriendRequest(nodeId),
           // pickAvatar is registered by profile-tab.ts during socialWidget.create()
         };
         Object.defineProperty(social, "doc", {

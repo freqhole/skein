@@ -59,14 +59,18 @@ impl HubPeerService {
                     .await
                     .unwrap_or_default();
 
-            // tombstoned canvas — untrack from hub
+            // tombstoned canvas — untrack from hub. soft-delete (see
+            // `HubDocStorage::soft_remove_canvas_id`'s doc comment) rather
+            // than hard-delete, so the data survives for a maintenance
+            // window (`reliquary maintenance list`/`restore`/`purge`).
             if is_deleted {
                 tracing::info!(
                     doc_id = %doc_id_str,
-                    "canvas is tombstoned, untracking from hub"
+                    "canvas is tombstoned, untracking from hub (soft-delete)"
                 );
                 self.canvas_doc_ids.lock().await.remove(doc_id_str);
-                self.hub_repo.remove_canvas_id(doc_id_str).await;
+                self.hub_repo.soft_remove_canvas_id(doc_id_str).await;
+                self.hub_repo.evict_doc(doc_id_str).await;
                 // if there's an update entry (peer was a participant), still
                 // include it in the gossip digest so the peer learns of deletion.
                 // but don't add to shared_canvas_ids.
@@ -425,6 +429,14 @@ impl HubPeerService {
                         attempt,
                         "peer-write: SUCCESS — wrote hub peer into canvas doc peers map"
                     );
+                    // this mutation happened outside the normal request/
+                    // response sync cycle, so nothing would otherwise tell
+                    // an already-connected peer's `handle_connection` loop
+                    // to push it — see `notify_doc_changed`'s doc comment
+                    // for the bug this closes (a real one, 2026-07-02: the
+                    // hub wrote itself into `.peers` successfully but the
+                    // inviting peer never found out).
+                    hub_repo.notify_doc_changed(&doc_id_str);
                     return;
                 }
 
@@ -549,15 +561,21 @@ impl HubPeerService {
             deleted_by_username = %deleted_by_username,
             delete_mode = %delete_mode,
             deleted_at = %deleted_at,
-            "canvas deleted — untracking and relaying"
+            "canvas deleted — untracking (soft-delete) and relaying"
         );
 
-        // untrack the canvas
+        // untrack the canvas — soft-delete rather than hard-delete (see
+        // `HubDocStorage::soft_remove_canvas_id`'s doc comment), same
+        // reasoning as the tombstone-detection path above and the
+        // ACL-removed path in hub/messages.rs: the maintenance CLI is the
+        // one place that actually destroys data, not this passive
+        // notification handler.
         {
             let mut ids = self.canvas_doc_ids.lock().await;
             ids.remove(canvas_doc_id);
         }
-        self.hub_repo.remove_canvas_id(canvas_doc_id).await;
+        self.hub_repo.soft_remove_canvas_id(canvas_doc_id).await;
+        self.hub_repo.evict_doc(canvas_doc_id).await;
 
         // relay to other online friends (not the sender, not the deleter)
         let online_peers = self.friendz.get_online_peers().await;

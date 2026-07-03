@@ -491,20 +491,29 @@ impl HubPeerService {
                     "received ACL change notification"
                 );
 
-                // if the hub was removed from this canvas, stop tracking it
+                // if the hub was removed from this canvas, stop tracking it.
+                // soft-delete rather than hard-delete (see
+                // `HubDocStorage::soft_remove_canvas_id`'s doc comment) —
+                // the automerge doc + its persisted bytes survive so
+                // `reliquary maintenance restore` (or a later re-invite,
+                // which reactivates via `save_canvas_id`) can bring it back
+                // without re-syncing from scratch; a separate
+                // `reliquary maintenance purge` sweep is what actually
+                // deletes the data, once an admin confirms it's safe to.
                 if target_node_id == self.node_id_str && new_role == "removed" {
                     tracing::info!(
                         canvas_doc_id = %canvas_doc_id,
                         canvas_title = %canvas_title,
                         changed_by = %changed_by,
-                        "hub removed from canvas — untracking"
+                        "hub removed from canvas — soft-deleting (untracking, keeping data for maintenance)"
                     );
 
                     {
                         let mut ids = self.canvas_doc_ids.lock().await;
                         ids.remove(&canvas_doc_id);
                     }
-                    self.hub_repo.remove_canvas_id(&canvas_doc_id).await;
+                    self.hub_repo.soft_remove_canvas_id(&canvas_doc_id).await;
+                    self.hub_repo.evict_doc(&canvas_doc_id).await;
                 }
             }
             FriendzMessage::FriendReject {

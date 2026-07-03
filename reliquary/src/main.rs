@@ -40,6 +40,18 @@ enum Command {
     /// allow-list remotely, over the `iroh/skein-hub-admin/1` protocol)
     #[command(subcommand)]
     Admin(AdminCommand),
+
+    /// review and clean up canvases the hub was removed from (soft-deleted
+    /// — see `hub_repo::HubDocStorage`'s `removed_at` doc comment): list
+    /// what's in the trash, restore something removed by mistake, or
+    /// permanently purge a canvas's automerge doc + its own widget docs +
+    /// any blobs no longer referenced by any other canvas the hub still
+    /// holds. reads/writes the same `skein-docs.db` a running `reliquary
+    /// serve` process uses (same file-sharing caveat as `friend`/`admin`
+    /// above — a live process's in-memory state won't reflect a `restore`
+    /// until it restarts or the canvas is re-invited).
+    #[command(subcommand)]
+    Maintenance(MaintenanceCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -71,6 +83,35 @@ enum AdminCommand {
     Remove {
         /// the peer's iroh node id (hex public key)
         node_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MaintenanceCommand {
+    /// list soft-deleted canvases, most-recently-removed first
+    List {
+        /// max rows to show
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+        /// rows to skip (for paging through a long trash list)
+        #[arg(long, default_value_t = 0)]
+        offset: i64,
+    },
+    /// restore (undelete) a soft-deleted canvas
+    Restore {
+        /// the canvas's automerge document id
+        canvas_doc_id: String,
+    },
+    /// permanently purge a soft-deleted canvas: its automerge doc, its own
+    /// per-widget docs, and any blobs no longer referenced by any other
+    /// canvas the hub still holds. irreversible — asks for confirmation
+    /// unless `--yes` is passed.
+    Purge {
+        /// the canvas's automerge document id
+        canvas_doc_id: String,
+        /// skip the interactive confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -138,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => serve(data_dir, cli.port).await,
         Command::Friend(cmd) => friend(data_dir, cmd).await,
         Command::Admin(cmd) => admin(data_dir, cmd).await,
+        Command::Maintenance(cmd) => maintenance(data_dir, cmd).await,
     }
 }
 
@@ -304,6 +346,92 @@ async fn admin(data_dir: PathBuf, cmd: AdminCommand) -> anyhow::Result<()> {
             }
             store.remove(node_id).await?;
             println!("revoked admin rights from {node_id}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn maintenance(data_dir: PathBuf, cmd: MaintenanceCommand) -> anyhow::Result<()> {
+    // see the matching comment in `friend()` above — same reasoning: a
+    // `restore` here won't take live effect in an already-running
+    // `reliquary serve` process against this same data_dir until it
+    // restarts or the canvas is re-invited (see
+    // `hub_repo::HubDocStorage::restore_canvas_id`'s doc comment).
+    eprintln!("data_dir = {}", data_dir.display());
+
+    let docs_db_path = data_dir.join("skein-docs.db");
+    let storage = reliquary::hub_repo::HubDocStorage::new(&docs_db_path).await?;
+    let pool = db::open(&data_dir).await?;
+    let blobz_store = reliquary::blobz::Store::new(pool, &data_dir);
+
+    match cmd {
+        MaintenanceCommand::List { limit, offset } => {
+            let removed = reliquary::maintenance::list_removed(&storage, limit, offset).await;
+            if removed.is_empty() {
+                println!("(no soft-deleted canvases)");
+                return Ok(());
+            }
+            println!(
+                "{:<64}  {:<10}  removed_at",
+                "canvas_doc_id (title)", "added_at"
+            );
+            for c in removed {
+                let label = if c.title.is_empty() {
+                    c.canvas_doc_id.clone()
+                } else {
+                    format!("{} ({})", c.canvas_doc_id, c.title)
+                };
+                println!("{:<64}  {:<10}  {}", label, c.added_at, c.removed_at);
+            }
+        }
+        MaintenanceCommand::Restore { canvas_doc_id } => {
+            let canvas_doc_id = canvas_doc_id.trim();
+            if canvas_doc_id.is_empty() {
+                anyhow::bail!("canvas_doc_id cannot be empty");
+            }
+            if reliquary::maintenance::restore(&storage, canvas_doc_id).await {
+                println!("restored {canvas_doc_id}");
+            } else {
+                println!("{canvas_doc_id} was not soft-deleted — nothing to restore");
+            }
+        }
+        MaintenanceCommand::Purge { canvas_doc_id, yes } => {
+            let canvas_doc_id = canvas_doc_id.trim();
+            if canvas_doc_id.is_empty() {
+                anyhow::bail!("canvas_doc_id cannot be empty");
+            }
+            if !yes {
+                print!(
+                    "this will permanently delete canvas {canvas_doc_id} and any blobs it \
+                     alone references. this cannot be undone. type \"yes\" to continue: "
+                );
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if input.trim() != "yes" {
+                    println!("aborted — nothing was deleted");
+                    return Ok(());
+                }
+            }
+            match reliquary::maintenance::purge(&storage, &blobz_store, canvas_doc_id).await {
+                Ok(report) => {
+                    println!("purged canvas {canvas_doc_id}");
+                    println!(
+                        "  widget docs deleted: {}",
+                        report.widget_docs_deleted.len()
+                    );
+                    println!("  blobs deleted: {}", report.blobs_deleted.len());
+                    if !report.blobs_kept_still_referenced.is_empty() {
+                        println!(
+                            "  blobs kept (still referenced elsewhere): {}",
+                            report.blobs_kept_still_referenced.len()
+                        );
+                    }
+                }
+                Err(e) => anyhow::bail!("{e}"),
+            }
         }
     }
 

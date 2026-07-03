@@ -18,6 +18,7 @@ pub mod groupz;
 pub mod hub;
 pub mod hub_repo;
 pub mod identity;
+pub mod maintenance;
 pub mod protocol;
 pub mod service;
 pub mod settingz;

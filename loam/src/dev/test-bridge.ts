@@ -380,6 +380,18 @@ export interface SkeinTestBridgeSocial {
   ensureIdentity(): Promise<{ node_id: string }>;
   /** open / close the social overlay panel */
   toggleOverlay(): void;
+  /**
+   * send a real friend request to a node id through this page's actual
+   * production `FriendzProtocol` instance — exactly what `friends-tab.ts`'s
+   * "add friend" flow does. distinct from `test-harness-p2p.html`'s own
+   * `SkeinFriendzTestBridge` (`window.__skeinTest.friendz`), which uses a
+   * separate, in-memory-only `FriendzProtocol` instance with no narthex/
+   * social doc wiring at all — this one writes into the real social doc via
+   * `standalone/friendz-wiring.ts`'s handlers, so a friendship established
+   * this way is visible everywhere the production app itself reads
+   * `friendsState.friends` from (e.g. the share dialog's invite list).
+   */
+  sendFriendRequestTo?(nodeId: string): Promise<void>;
   /** trigger the avatar file picker (set by profile-tab on mount) */
   pickAvatar?(): Promise<void>;
   /** friends-tab test hooks (set by friends-tab.ts on mount) */

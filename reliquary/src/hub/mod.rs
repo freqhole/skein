@@ -294,6 +294,37 @@ impl HubPeerService {
             "hub peer service running"
         );
 
+        // resume any in-flight "write ourselves into this canvas's peers
+        // map" work that a previous run was interrupted mid-retry (e.g. the
+        // process was restarted while `schedule_write_self_to_canvas`'s
+        // background retry loop — spawned once, at invite-receipt time —
+        // was still waiting for the canvas doc to sync). that loop lives
+        // entirely in-memory; restarting the process kills it with no
+        // record left anywhere that it needs to resume, so a canvas the hub
+        // was invited to but hadn't yet finished writing itself into before
+        // the restart would otherwise NEVER complete that write — a real,
+        // confirmed bug, 2026-07-03 (found immediately after fixing the
+        // related "change never gets pushed" bug: restarting the hub to
+        // pick up that fix is exactly what surfaced this one, since the
+        // restart happened mid-retry). `schedule_write_self_to_canvas`
+        // itself is idempotent (see `write_self_to_canvas_doc`'s
+        // `already_in_peers` check — an already-completed canvas just gets
+        // its `lastSeenAt` stamped again, harmless), so it's safe to kick
+        // off for every persisted/tracked canvas id unconditionally rather
+        // than trying to first figure out which ones actually still need it.
+        {
+            let tracked: Vec<String> = self.canvas_doc_ids.lock().await.iter().cloned().collect();
+            if !tracked.is_empty() {
+                tracing::info!(
+                    count = tracked.len(),
+                    "resuming peer-write for all tracked canvases after startup"
+                );
+            }
+            for canvas_doc_id in tracked {
+                self.schedule_write_self_to_canvas(&canvas_doc_id);
+            }
+        }
+
         // change-driven blob snatcher: does one boot-time catch-up scan,
         // then only acts on doc-change notifications. replaces the prototype's
         // "scan everything every time anything changes" debounce loop.

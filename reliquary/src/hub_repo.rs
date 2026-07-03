@@ -208,6 +208,28 @@ impl HubDocStorage {
         .execute(&pool)
         .await?;
 
+        // `removed_at` was added after the table's initial release — check
+        // via `PRAGMA table_info` (rather than blindly running `ALTER TABLE
+        // ... ADD COLUMN` and swallowing a "duplicate column" error) so a
+        // genuinely unexpected migration failure still surfaces instead of
+        // being silently discarded. NULL means "actively tracked"; non-NULL
+        // means "the hub was removed from this canvas's ACL, but its data
+        // is only soft-deleted" — see `soft_remove_canvas_id()`/
+        // `restore_canvas_id()`/`purge_canvas_id()` below, and `reliquary
+        // maintenance` (main.rs) for the CLI that lists/restores/purges
+        // these. not macro-checkable: see `new()`'s doc comment.
+        let has_removed_at = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('hub_canvas_ids') WHERE name = 'removed_at'",
+        )
+        .fetch_one(&pool)
+        .await?
+            > 0;
+        if !has_removed_at {
+            sqlx::query("ALTER TABLE hub_canvas_ids ADD COLUMN removed_at TEXT")
+                .execute(&pool)
+                .await?;
+        }
+
         Ok(Self { pool })
     }
 
@@ -238,6 +260,18 @@ impl HubDocStorage {
         }
     }
 
+    /// permanently delete a document's raw bytes (used by the maintenance
+    /// purge path — see `purge_canvas_id()`). not macro-checkable: see `new()`.
+    pub async fn delete_doc(&self, doc_id: &str) {
+        if let Err(e) = sqlx::query("DELETE FROM hub_docs WHERE doc_id = ?")
+            .bind(doc_id)
+            .execute(&self.pool)
+            .await
+        {
+            tracing::warn!(doc_id, error = %e, "failed to delete doc");
+        }
+    }
+
     /// load all known document IDs (used on startup to reload persisted docs).
     ///
     /// not macro-checkable: see `new()`.
@@ -248,31 +282,72 @@ impl HubDocStorage {
             .unwrap_or_default()
     }
 
-    /// load all persisted canvas doc IDs.
+    /// load all persisted, **actively tracked** canvas doc IDs (excludes
+    /// soft-deleted ones — see the `removed_at` doc comment on `new()`).
+    /// used on startup to decide which canvases to resume gossip
+    /// participation for.
     ///
     /// not macro-checkable: see `new()`.
     pub async fn load_canvas_ids(&self) -> Vec<String> {
-        sqlx::query_scalar::<_, String>("SELECT canvas_doc_id FROM hub_canvas_ids")
-            .fetch_all(&self.pool)
-            .await
-            .unwrap_or_default()
+        sqlx::query_scalar::<_, String>(
+            "SELECT canvas_doc_id FROM hub_canvas_ids WHERE removed_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default()
     }
 
-    /// persist a canvas doc ID (idempotent — ignores duplicates).
+    /// persist a canvas doc ID as actively tracked (idempotent). if this
+    /// canvas id was previously soft-deleted (`removed_at` set — e.g. the
+    /// hub was removed from the canvas and is now being re-invited), this
+    /// also clears `removed_at`, reactivating the existing row rather than
+    /// leaving it stuck in the "removed" state forever — a real gap
+    /// otherwise: `handle_canvas_invite` (hub/canvas.rs) always calls this
+    /// unconditionally on every accept, new or repeat, with no separate
+    /// "was this previously removed" branch of its own.
     ///
     /// not macro-checkable: see `new()`.
     pub async fn save_canvas_id(&self, canvas_doc_id: &str) {
-        if let Err(e) =
-            sqlx::query("INSERT OR IGNORE INTO hub_canvas_ids (canvas_doc_id) VALUES (?)")
-                .bind(canvas_doc_id)
-                .execute(&self.pool)
-                .await
+        if let Err(e) = sqlx::query(
+            "INSERT INTO hub_canvas_ids (canvas_doc_id) VALUES (?) \
+             ON CONFLICT(canvas_doc_id) DO UPDATE SET removed_at = NULL",
+        )
+        .bind(canvas_doc_id)
+        .execute(&self.pool)
+        .await
         {
             tracing::warn!(canvas_doc_id, error = %e, "failed to persist canvas ID");
         }
     }
 
-    /// remove a canvas doc ID from persistence (e.g. when hub is removed from the canvas).
+    /// soft-delete a canvas doc ID — stamps `removed_at`, but keeps the row
+    /// (and the canvas's automerge doc in `hub_docs`) intact. used when the
+    /// hub is removed from a canvas's ACL (see `hub/messages.rs`'s
+    /// `AclChange` handler) instead of the old hard `DELETE`, so the data
+    /// survives for a maintenance window (`reliquary maintenance list` /
+    /// `restore` / `purge` — see main.rs) rather than vanishing immediately.
+    /// no-op (via `INSERT ... ON CONFLICT DO UPDATE`) if the row doesn't
+    /// exist yet, which shouldn't normally happen but keeps this safe to
+    /// call defensively.
+    ///
+    /// not macro-checkable: see `new()`.
+    pub async fn soft_remove_canvas_id(&self, canvas_doc_id: &str) {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO hub_canvas_ids (canvas_doc_id, removed_at) VALUES (?, datetime('now')) \
+             ON CONFLICT(canvas_doc_id) DO UPDATE SET removed_at = datetime('now')",
+        )
+        .bind(canvas_doc_id)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(canvas_doc_id, error = %e, "failed to soft-delete canvas ID");
+        }
+    }
+
+    /// remove a canvas doc ID from persistence (hard delete of the tracking
+    /// row only — does NOT touch `hub_docs`). kept for callers that
+    /// genuinely want the old hard-delete semantics; `soft_remove_canvas_id`
+    /// is what `hub/messages.rs`'s ACL-removed handler uses now.
     ///
     /// not macro-checkable: see `new()`.
     pub async fn remove_canvas_id(&self, canvas_doc_id: &str) {
@@ -284,6 +359,132 @@ impl HubDocStorage {
             tracing::warn!(canvas_doc_id, error = %e, "failed to remove canvas ID from storage");
         }
     }
+
+    /// all persisted canvas doc ids, active AND soft-deleted alike — used by
+    /// the maintenance purge sweep (`maintenance.rs`) to find every canvas
+    /// doc still known to the hub (even ones not yet purged) when checking
+    /// whether a blob is still referenced by something other than the
+    /// canvas being purged. `load_canvas_ids()` above deliberately excludes
+    /// soft-deleted ones (that method is about "what should the hub
+    /// actively gossip/sync"); this one is about "what data still exists".
+    ///
+    /// not macro-checkable: see `new()`.
+    pub async fn load_all_tracked_canvas_ids(&self) -> Vec<String> {
+        sqlx::query_scalar::<_, String>("SELECT canvas_doc_id FROM hub_canvas_ids")
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// number of soft-deleted (`removed_at IS NOT NULL`) canvas ids —
+    /// pairs with `load_removed_canvas_ids()` for CLI pagination.
+    ///
+    /// not macro-checkable: see `new()`.
+    pub async fn count_removed_canvas_ids(&self) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM hub_canvas_ids WHERE removed_at IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+    }
+
+    /// a page of soft-deleted canvas ids, most-recently-removed first —
+    /// used by `reliquary maintenance list` (main.rs) so an admin can page
+    /// through a potentially large trash list rather than dumping it all at
+    /// once.
+    ///
+    /// not macro-checkable: see `new()`.
+    pub async fn load_removed_canvas_ids(&self, limit: i64, offset: i64) -> Vec<RemovedCanvasRow> {
+        sqlx::query_as::<_, RemovedCanvasRow>(
+            "SELECT canvas_doc_id, added_at, removed_at FROM hub_canvas_ids \
+             WHERE removed_at IS NOT NULL \
+             ORDER BY removed_at DESC LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default()
+    }
+
+    /// restore (undelete) a soft-deleted canvas id — clears `removed_at` so
+    /// it's active again. note: like `reliquary friend remove`/`admin
+    /// remove`, this only updates the sqlite row; if a `reliquary serve`
+    /// process is currently running against the same data dir, its live
+    /// in-memory `canvas_doc_ids` set won't pick this up until it restarts
+    /// or the canvas is re-invited through the normal accept flow (which
+    /// calls `save_canvas_id`, itself reactivating). returns `true` if a
+    /// row was actually updated (i.e. it existed and was removed).
+    ///
+    /// not macro-checkable: see `new()`.
+    pub async fn restore_canvas_id(&self, canvas_doc_id: &str) -> bool {
+        match sqlx::query(
+            "UPDATE hub_canvas_ids SET removed_at = NULL \
+             WHERE canvas_doc_id = ? AND removed_at IS NOT NULL",
+        )
+        .bind(canvas_doc_id)
+        .execute(&self.pool)
+        .await
+        {
+            Ok(result) => result.rows_affected() > 0,
+            Err(e) => {
+                tracing::warn!(canvas_doc_id, error = %e, "failed to restore canvas ID");
+                false
+            }
+        }
+    }
+
+    /// permanently purge a soft-deleted canvas: deletes both the
+    /// `hub_canvas_ids` tracking row and the canvas's own automerge bytes
+    /// from `hub_docs`. deliberately does NOT purge the canvas's per-widget
+    /// docs or any blob files here — see `reliquary maintenance purge`
+    /// (main.rs) for the full sweep, which walks the canvas doc's widget
+    /// references first (so it can tell which blobs/widget docs are still
+    /// referenced by some OTHER still-active canvas before deleting
+    /// anything shared). refuses to purge a canvas id that isn't currently
+    /// soft-deleted (`removed_at IS NULL` or missing entirely) — purging an
+    /// actively-tracked canvas is never the right call from this path,
+    /// that's what removing the hub from the canvas's ACL is for. returns
+    /// `true` if the row was actually removed.
+    ///
+    /// not macro-checkable: see `new()`.
+    pub async fn purge_canvas_id(&self, canvas_doc_id: &str) -> bool {
+        let is_removed = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM hub_canvas_ids WHERE canvas_doc_id = ? AND removed_at IS NOT NULL",
+        )
+        .bind(canvas_doc_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0)
+            > 0;
+        if !is_removed {
+            return false;
+        }
+
+        self.delete_doc(canvas_doc_id).await;
+
+        match sqlx::query("DELETE FROM hub_canvas_ids WHERE canvas_doc_id = ?")
+            .bind(canvas_doc_id)
+            .execute(&self.pool)
+            .await
+        {
+            Ok(result) => result.rows_affected() > 0,
+            Err(e) => {
+                tracing::warn!(canvas_doc_id, error = %e, "failed to purge canvas ID");
+                false
+            }
+        }
+    }
+}
+
+/// a single soft-deleted canvas tracking row, as returned by
+/// `HubDocStorage::load_removed_canvas_ids()`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RemovedCanvasRow {
+    pub canvas_doc_id: String,
+    pub added_at: String,
+    pub removed_at: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -590,26 +791,97 @@ impl HubRepo {
 
         let hub_peer_id = self.peer_id.clone();
 
+        // listens for doc changes that happened outside this connection's
+        // own request/response cycle (another peer's sync message, or a
+        // local-only mutation like `write_self_to_canvas_doc`) so this peer
+        // gets pushed anything new for a doc it's already syncing with us —
+        // see `notify_doc_changed`'s doc comment for the bug this closes.
+        let mut doc_changes = self.doc_notify.subscribe();
+
         loop {
-            let next = tokio::select! {
+            enum LoopEvent {
+                Frame(Option<Result<bytes::BytesMut, std::io::Error>>),
+                DocChanged(String),
+            }
+
+            let event = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     tracing::info!(peer = %peer_id_str, "hub_repo: connection cancelled (access revoked)");
                     break;
                 }
-                next = framed.next() => next,
+                next = framed.next() => LoopEvent::Frame(next),
+                changed = doc_changes.recv() => {
+                    match changed {
+                        Ok(doc_id) => LoopEvent::DocChanged(doc_id),
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::debug!(
+                                peer = %peer_id_str,
+                                skipped,
+                                "hub_repo: doc-change notify lagged, some pushes may have been missed \
+                                 (the peer's next real sync round-trip will still reconcile)"
+                            );
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // sender side only lives as long as the HubRepo itself —
+                            // shouldn't happen while this connection is still up, but
+                            // isn't fatal to this connection either way.
+                            continue;
+                        }
+                    }
+                }
             };
 
-            let frame = match next {
-                Some(Ok(frame)) => frame,
-                Some(Err(e)) => {
-                    tracing::warn!(peer = %peer_id_str, error = %e, "hub_repo: frame read error");
-                    break;
+            let frame = match event {
+                LoopEvent::DocChanged(doc_id) => {
+                    if let Some(data) = self
+                        .generate_outbound_sync_message(&peer_id_str, &doc_id)
+                        .await
+                    {
+                        let response = SyncResponse {
+                            msg_type: "sync".to_string(),
+                            sender_id: hub_peer_id.clone(),
+                            target_id: peer_id_str.clone(),
+                            document_id: doc_id.clone(),
+                            data,
+                        };
+                        let mut buf = Vec::new();
+                        if let Err(e) = ciborium::into_writer(&response, &mut buf) {
+                            tracing::warn!(
+                                peer = %peer_id_str,
+                                error = %e,
+                                "hub_repo: failed to encode CBOR push message"
+                            );
+                            continue;
+                        }
+                        if let Err(e) = framed.send(bytes::Bytes::from(buf)).await {
+                            tracing::warn!(
+                                peer = %peer_id_str,
+                                error = %e,
+                                "hub_repo: failed to send proactive sync push"
+                            );
+                            break;
+                        }
+                        tracing::debug!(
+                            peer = %peer_id_str,
+                            doc_id = %doc_id,
+                            "hub_repo: pushed proactive sync message (doc changed outside request/response cycle)"
+                        );
+                    }
+                    continue;
                 }
-                None => {
-                    tracing::info!(peer = %peer_id_str, "hub_repo: stream closed");
-                    break;
-                }
+                LoopEvent::Frame(next) => match next {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(e)) => {
+                        tracing::warn!(peer = %peer_id_str, error = %e, "hub_repo: frame read error");
+                        break;
+                    }
+                    None => {
+                        tracing::info!(peer = %peer_id_str, "hub_repo: stream closed");
+                        break;
+                    }
+                },
             };
 
             // decode CBOR envelope
@@ -782,12 +1054,116 @@ impl HubRepo {
         self.storage.remove_canvas_id(canvas_doc_id).await;
     }
 
+    /// soft-delete a canvas doc ID (see `HubDocStorage::soft_remove_canvas_id`)
+    /// — used by `hub/messages.rs`'s ACL-removed handler instead of the
+    /// hard-delete `remove_canvas_id` above.
+    pub async fn soft_remove_canvas_id(&self, canvas_doc_id: &str) {
+        self.storage.soft_remove_canvas_id(canvas_doc_id).await;
+    }
+
+    /// evict a document from the in-memory `documents` map, without
+    /// touching its persisted `hub_docs` row — the doc is reloaded from
+    /// storage next time something calls `find()`/`wait_for_doc()` and it
+    /// isn't already resident (there's currently no lazy-reload path for a
+    /// evicted-but-still-persisted doc; this is meant to pair with a
+    /// soft-delete, where the canvas is expected to stay untracked rather
+    /// than looked up again soon). frees the doc's memory for a canvas the
+    /// hub was just removed from, closing the gap noted on `documents`'
+    /// own doc comment (previously nothing ever evicted from this map).
+    pub async fn evict_doc(&self, doc_id: &str) -> bool {
+        self.documents.write().await.remove(doc_id).is_some()
+    }
+
+    /// number of soft-deleted canvas ids (see `HubDocStorage::count_removed_canvas_ids`).
+    pub async fn count_removed_canvas_ids(&self) -> i64 {
+        self.storage.count_removed_canvas_ids().await
+    }
+
+    /// all persisted canvas doc ids, active and soft-deleted alike (see
+    /// `HubDocStorage::load_all_tracked_canvas_ids`).
+    pub async fn load_all_tracked_canvas_ids(&self) -> Vec<String> {
+        self.storage.load_all_tracked_canvas_ids().await
+    }
+
+    /// a page of soft-deleted canvas ids (see `HubDocStorage::load_removed_canvas_ids`).
+    pub async fn load_removed_canvas_ids(&self, limit: i64, offset: i64) -> Vec<RemovedCanvasRow> {
+        self.storage.load_removed_canvas_ids(limit, offset).await
+    }
+
+    /// restore (undelete) a soft-deleted canvas id (see `HubDocStorage::restore_canvas_id`).
+    pub async fn restore_canvas_id(&self, canvas_doc_id: &str) -> bool {
+        self.storage.restore_canvas_id(canvas_doc_id).await
+    }
+
+    /// permanently purge a soft-deleted canvas's tracking row + persisted
+    /// automerge bytes (see `HubDocStorage::purge_canvas_id`), and evict it
+    /// from the in-memory map too if a live process happens to still hold
+    /// it (normally it wouldn't, since it was untracked when soft-deleted,
+    /// but this keeps `purge` a true "this canvas is completely gone from
+    /// this process" operation regardless).
+    pub async fn purge_canvas_id(&self, canvas_doc_id: &str) -> bool {
+        let purged = self.storage.purge_canvas_id(canvas_doc_id).await;
+        if purged {
+            self.evict_doc(canvas_doc_id).await;
+        }
+        purged
+    }
+
     /// subscribe to document change notifications.
     ///
     /// fires whenever a document is created or updated via sync.
     /// the payload is the doc_id string.
     pub fn subscribe_doc_changes(&self) -> broadcast::Receiver<String> {
         self.doc_notify.subscribe()
+    }
+
+    /// broadcast that `doc_id` changed, for callers that mutate a doc
+    /// through a path other than `handle_sync_message` (which already fires
+    /// this itself on every successful incoming apply) — e.g.
+    /// `hub/canvas.rs`'s `write_self_to_canvas_doc`, which mutates a
+    /// [`DocHandle`] directly and has no `HubRepo` reference of its own to
+    /// call this through except via its caller. every connection's
+    /// `handle_connection` loop listens for this (see the `doc_notify`
+    /// branch there) and proactively pushes a fresh sync message to that
+    /// peer if it has anything new for them — without this, a change made
+    /// outside the request/response cycle (like the hub writing itself
+    /// into a canvas's `.peers` map) would sit in the hub's own local doc
+    /// forever, with no already-connected peer ever finding out about it. a
+    /// real, confirmed bug, 2026-07-02: this is why an invited hub wrote
+    /// itself into `.peers` successfully (per its own logs) but never
+    /// actually showed up in the inviting peer's share dialog — the write
+    /// happened, it just never got pushed anywhere.
+    pub fn notify_doc_changed(&self, doc_id: &str) {
+        let _ = self.doc_notify.send(doc_id.to_string());
+    }
+
+    /// generate an outbound sync message to push `doc_id`'s latest state to
+    /// `peer_id`, but ONLY if we already have a sync state for that
+    /// (peer, doc) pair — i.e. this peer has synced this doc with us
+    /// before (via an inbound sync/request message reaching
+    /// `handle_sync_message`, which always creates one). deliberately does
+    /// NOT create a new sync state (unlike `handle_sync_message`): a peer
+    /// who has never touched this doc shouldn't suddenly have it pushed at
+    /// them just because it changed. returns `None` if there's no existing
+    /// sync state, the doc doesn't exist, or automerge has nothing new to
+    /// send this peer (already caught up).
+    pub async fn generate_outbound_sync_message(
+        &self,
+        peer_id: &str,
+        doc_id: &str,
+    ) -> Option<Vec<u8>> {
+        let doc_arc = {
+            let docs = self.documents.read().await;
+            docs.get(doc_id)?.clone()
+        };
+        let doc = doc_arc.read().await;
+
+        let key = (peer_id.to_string(), doc_id.to_string());
+        let mut sync_states = self.sync_states.write().await;
+        let sync_state = sync_states.get_mut(&key)?;
+
+        doc.generate_sync_message(sync_state)
+            .map(|msg: automerge::sync::Message| msg.encode())
     }
 }
 

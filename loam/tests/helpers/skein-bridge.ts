@@ -408,6 +408,17 @@ export async function toggleSocialOverlay(page: Page): Promise<void> {
   });
 }
 
+/** send a real friend request to a node id through this page's actual
+ *  production FriendzProtocol instance \u2014 exactly what friends-tab.ts's
+ *  "add friend" flow does. distinct from the p2p-harness-only
+ *  `sendFriendRequest()` above (which needs test-harness-p2p.html). */
+export async function sendFriendRequestToBridge(page: Page, nodeId: string): Promise<void> {
+  await page.evaluate(
+    (id) => (window as any).__skeinTest.social.sendFriendRequestTo(id),
+    nodeId
+  );
+}
+
 /**
  * trigger the avatar file picker inside the social widget.
  * call page.waitForEvent("filechooser") BEFORE this.

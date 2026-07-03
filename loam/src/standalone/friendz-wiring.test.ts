@@ -3,12 +3,26 @@
 // (docs/hub-and-profile-plan.md section 3.3)
 // ---------------------------------------------------------------------------
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createTestRepo } from "../test-helpers/automerge-helpers";
 import { docHandleAsSocialDoc, wireAclChangeHandlers, wireFriendHandlers } from "./friendz-wiring";
 import { FriendzProtocol, type FriendzProtocolOptions } from "../p2p/friends-protocol";
 import type { MiddenStreamNode } from "../p2p/iroh-network-adapter";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
+import { CanvasStore } from "../canvas/canvas-store";
+import { TRASH_WIDGET_TYPE } from "../../widgets/narthex/trash-widget";
+
+// ---------------------------------------------------------------------------
+// mock: ../p2p/identity — wireAclChangeHandlers' viewer-auto-trash path
+// (see the new test below) calls getStoredIdentity() to stamp the local
+// node id before trashing a card; stubbed so the test doesn't depend on a
+// real IndexedDB-backed identity existing in this environment (mirrors
+// iroh-network-adapter.test.ts's identity mock).
+// ---------------------------------------------------------------------------
+
+vi.mock("../p2p/identity", () => ({
+  getStoredIdentity: vi.fn(async () => ({ node_id: "local-node-id" })),
+}));
 
 // ---------------------------------------------------------------------------
 // test helpers
@@ -376,5 +390,134 @@ describe("wireAclChangeHandlers — onAclChange", () => {
     // untouched — no card matches "some-other-canvas"
     expect(cardHandle.doc().role).toBe("member");
     expect(cardHandle.doc().accessRevoked).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // viewer-role auto-trash on removal
+  // -------------------------------------------------------------------------
+
+  /** seed a real narthex CanvasStore (with a trash widget + a canvas-card
+   *  widget pointing at a real target CanvasStore) — a fuller setup than
+   *  `seedNarthexWithCard()` above (which uses bare automerge docs), needed
+   *  here because the auto-trash path exercises the real `CanvasStore`/
+   *  `trashCanvasCard()` machinery end to end, not just the card doc's own
+   *  `role`/`accessRevoked` fields. */
+  async function seedRealNarthexWithTrashAndCard(role: string) {
+    const repo = createTestRepo();
+
+    const targetCanvas = CanvasStore.create(repo);
+
+    const cardHandle = repo.create<any>({
+      canvasDocId: targetCanvas.handle.documentId,
+      isRemote: true,
+      role,
+      accessRevoked: false,
+    });
+
+    const narthexStore = CanvasStore.create(repo);
+    const trashDocHandle = repo.create<any>({ items: [], cols: 3, rows: 1, slotScale: "m" });
+    narthexStore.addWidget({
+      id: "trash-1",
+      type: TRASH_WIDGET_TYPE,
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      zIndex: 0,
+      props: {},
+      collapsed: false,
+      docId: trashDocHandle.documentId,
+      parentId: null,
+    });
+    narthexStore.addWidget({
+      id: "widget-1",
+      type: "canvas-card",
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      zIndex: 0,
+      props: { canvasDocId: targetCanvas.handle.documentId },
+      collapsed: false,
+      docId: cardHandle.documentId,
+      parentId: null,
+    });
+
+    return { repo, narthexStore, cardHandle, targetCanvas, trashDocHandle };
+  }
+
+  /** poll until `predicate()` is true or `timeoutMs` elapses — the
+   *  auto-trash path is a best-effort async IIFE fired from inside the
+   *  synchronous `onAclChange` handler, so the test can't just await a
+   *  returned promise. */
+  async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+    const start = Date.now();
+    while (!predicate()) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error("waitFor: predicate never became true");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  it("auto-trashes the narthex card when a removed peer's last known role was 'viewer'", async () => {
+    const { repo, narthexStore, cardHandle, targetCanvas, trashDocHandle } =
+      await seedRealNarthexWithTrashAndCard("viewer");
+    const protocol = createTestProtocol();
+    wireAclChangeHandlers({ protocol, repo, narthexDocId: narthexStore.handle.documentId });
+
+    protocol.onAclChange!(
+      {
+        type: "acl-change",
+        canvasDocId: targetCanvas.handle.documentId,
+        canvasTitle: "shared canvas",
+        targetNodeId: "me",
+        newRole: "removed",
+        changedBy: BOB,
+        changedByUsername: "bob",
+      },
+      BOB
+    );
+
+    // synchronous part: accessRevoked flips immediately.
+    expect(cardHandle.doc().accessRevoked).toBe(true);
+
+    // async part: the card gets reparented under the trash widget, the
+    // trash widget's items list gains an entry for it, and the target
+    // canvas itself gets soft-deleted (tombstoned).
+    await waitFor(() => narthexStore.getWidget("widget-1")?.parentId === "trash-1");
+    expect(trashDocHandle.doc().items.some((i: any) => i.widgetId === "widget-1")).toBe(true);
+    await waitFor(() => targetCanvas.handle.doc()?.deleted === true);
+    expect(targetCanvas.handle.doc()?.deleteMode).toBe("soft");
+  });
+
+  it("does NOT auto-trash the narthex card when a removed peer's last known role was 'member'", async () => {
+    const { repo, narthexStore, cardHandle, targetCanvas, trashDocHandle } =
+      await seedRealNarthexWithTrashAndCard("member");
+    const protocol = createTestProtocol();
+    wireAclChangeHandlers({ protocol, repo, narthexDocId: narthexStore.handle.documentId });
+
+    protocol.onAclChange!(
+      {
+        type: "acl-change",
+        canvasDocId: targetCanvas.handle.documentId,
+        canvasTitle: "shared canvas",
+        targetNodeId: "me",
+        newRole: "removed",
+        changedBy: BOB,
+        changedByUsername: "bob",
+      },
+      BOB
+    );
+
+    expect(cardHandle.doc().accessRevoked).toBe(true);
+
+    // give any (incorrectly-fired) async auto-trash a chance to run before
+    // asserting its absence — a plain synchronous assertion right here
+    // wouldn't prove a bug is absent, only that it hasn't happened *yet*.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(narthexStore.getWidget("widget-1")?.parentId ?? null).toBeNull();
+    expect(trashDocHandle.doc().items).toEqual([]);
+    expect(targetCanvas.handle.doc()?.deleted).not.toBe(true);
   });
 });
