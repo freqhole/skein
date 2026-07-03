@@ -124,6 +124,20 @@ class SkeinRouter {
     // register adapter for module-level endpoint toggle (settings tab)
     registerEndpointAdapter(this.irohAdapter);
 
+    // scope automerge-repo's own sync eligibility — see
+    // canvas-scoped-share-policy.ts's module doc comment for the full
+    // rules. `isFriend` reads `this.socialDoc` live (a closure over the
+    // instance, not a snapshot) since it isn't populated until partway
+    // through `boot()`, well after this constructor runs — this mirrors
+    // the same "resolve lazily" shape `create()`'s `roleResolver`/`repoBox`
+    // already uses for the same reason.
+    const isFriend = (nodeId: string): boolean => {
+      const friends = this.socialDoc?.current.friends ?? [];
+      return friends.some((f) => f.nodeIds?.some((n) => n.nodeId === nodeId));
+    };
+    const sharePolicy = createCanvasScopedSharePolicy(this.repo, isFriend);
+    this.repo.shareConfig = { announce: sharePolicy, access: sharePolicy };
+
     // wrap the adapter's connection state API for the ConnectionStatus widget
     this.connectionStateSource = {
       getConnectionSummary: () => this.irohAdapter.getConnectionSummary(),
@@ -179,21 +193,6 @@ class SkeinRouter {
       wrapNetworkAdapter: (iroh) => new AclFilteringNetworkAdapter(iroh, roleResolver),
     });
     repoBox.repo = harness.repo;
-
-    // scope automerge-repo's own sync eligibility to "does this specific
-    // document's .acl list this peer" (or, for a per-widget state doc, its
-    // owning canvas's .acl) — automerge-repo's default `shareConfig`
-    // announces/grants access to EVERY locally-known document to ANY
-    // connected peer, which meant a reliquary hub connected to accept ONE
-    // canvas invite was also proactively pushed narthex, every other
-    // canvas, and the private social/messagez docs. a real, confirmed
-    // confidentiality gap, 2026-07-03 ("is it that the hub peer is syncing
-    // ALL of a user's canvases? it should only sync stuff i share with
-    // it") — see canvas-scoped-share-policy.ts's module doc comment for
-    // the full reasoning, including why both `announce` (proactive push)
-    // and `access` (honoring an inbound request) need the same policy.
-    const sharePolicy = createCanvasScopedSharePolicy(harness.repo);
-    harness.repo.shareConfig = { announce: sharePolicy, access: sharePolicy };
 
     return new SkeinRouter(mountElement, harness);
   }

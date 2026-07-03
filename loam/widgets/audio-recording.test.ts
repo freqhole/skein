@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import type { SnatchOptions } from "../src/widgets/file-utils";
 import {
   audioRecordingSchema,
   audioRecordingWidget,
+  fetchRingAngleForFraction,
   resolveAudioBytes,
   type AudioBlobRef,
   type ResolveAudioBytesDeps,
@@ -160,6 +162,38 @@ describe("resolveAudioBytes", () => {
     expect(getBlobData).toHaveBeenCalledTimes(2);
   });
 
+  it("forwards the raw progress fraction (including the -1 indeterminate sentinel) unchanged to onProgress", async () => {
+    const buffer = new ArrayBuffer(16);
+    const getBlobData = vi
+      .fn<ResolveAudioBytesDeps["getBlobData"]>()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(buffer);
+
+    let capturedOnProgress: ((fraction: number) => void) | undefined;
+    const snatchBlob = vi.fn(async (_ref, _peers, options?: SnatchOptions) => {
+      capturedOnProgress = options?.onProgress;
+      return { blobId: "blob-1", blake3: "blake3-1" };
+    });
+
+    const deps = makeDeps({
+      getBlobData,
+      checkBlobLocality: vi.fn(async () => ({ locality: "remote" as const })),
+      snatchBlob,
+    });
+
+    const onProgress = vi.fn();
+    await resolveAudioBytes(makeRef(), { peer1: { nodeId: "node-a" } }, deps, onProgress);
+
+    // simulate the P2P layer reporting an indeterminate fraction, then real progress
+    capturedOnProgress?.(-1);
+    capturedOnProgress?.(0.42);
+    capturedOnProgress?.(1);
+
+    expect(onProgress).toHaveBeenNthCalledWith(1, -1);
+    expect(onProgress).toHaveBeenNthCalledWith(2, 0.42);
+    expect(onProgress).toHaveBeenNthCalledWith(3, 1);
+  });
+
   it("keeps the re-keyed blobId/blake3 from snatchBlob (sha256 dedup may map to an existing blob)", async () => {
     const buffer = new ArrayBuffer(4);
     const getBlobData = vi
@@ -189,5 +223,27 @@ describe("resolveAudioBytes", () => {
 
     const result = await resolveAudioBytes(makeRef(), { peer1: { nodeId: "node-a" } }, deps);
     expect(result).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchRingAngleForFraction — the arc-sweep math behind the fetching-state
+// progress ring drawn around the play/pause button.
+// ---------------------------------------------------------------------------
+
+describe("fetchRingAngleForFraction", () => {
+  it("maps 0 to no sweep and 1 to a full circle", () => {
+    expect(fetchRingAngleForFraction(0)).toBe(0);
+    expect(fetchRingAngleForFraction(1)).toBe(Math.PI * 2);
+  });
+
+  it("maps a mid-progress fraction to a proportional sweep", () => {
+    expect(fetchRingAngleForFraction(0.5)).toBeCloseTo(Math.PI);
+    expect(fetchRingAngleForFraction(0.25)).toBeCloseTo(Math.PI / 2);
+  });
+
+  it("clamps out-of-range fractions instead of drawing a nonsensical arc", () => {
+    expect(fetchRingAngleForFraction(-1)).toBe(0);
+    expect(fetchRingAngleForFraction(1.5)).toBe(Math.PI * 2);
   });
 });

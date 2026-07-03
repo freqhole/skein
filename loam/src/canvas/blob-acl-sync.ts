@@ -12,14 +12,15 @@
  * hardcoded allow-list; this module is the real wiring from canvas ACL data
  * into that gate.
  *
- * a `file`-typed widget entry (see `widgets/file.ts`) is the only widget
- * kind that references a P2P-fetchable blob by blake3 hash — its own
- * per-widget automerge doc (not the canvas doc) carries the `blake3` field,
- * so this watches both:
- * - the canvas doc itself, for `.acl` changes and file widgets being
- *   added/removed
- * - each file widget's own doc, for the moment its `blake3` field actually
- *   gets set (upload/snatch completing) — a mutation `CanvasStore.onChange`
+ * any widget with a per-widget automerge doc carrying a non-empty `blake3`
+ * field references a P2P-fetchable blob (`widgets/file.ts` and
+ * `widgets/audio-recording.ts` today; any future widget type works
+ * automatically, no changes needed here) — that field lives on the
+ * widget's own doc, not the canvas doc, so this watches both:
+ * - the canvas doc itself, for `.acl` changes and widgets being added/
+ *   removed
+ * - each widget's own doc, for the moment its `blake3` field actually gets
+ *   set (upload/snatch completing) — a mutation `CanvasStore.onChange`
  *   never sees, since it lives in a separate automerge document
  *
  * `restrict_blob_to_peers` REPLACES the allow-list for a hash rather than
@@ -34,9 +35,6 @@ import type { CanvasStore } from "./canvas-store";
 import { log } from "../utils/log";
 
 const TAG = "canvas.blob-acl-sync";
-
-/** the only widget type that currently references a P2P blob by blake3 hash. */
-const FILE_WIDGET_TYPE = "file";
 
 /** coerce a raw automerge field value to a plain string, same as the
  *  `coerceStr` helper in `widgets/file-utils.ts` — automerge Text objects
@@ -121,12 +119,18 @@ export class CanvasBlobAclSync {
   private reconcileWidgetWatchers(): void {
     if (this.destroyed) return;
 
-    const currentFileDocIds = new Set<string>();
+    const currentWidgetDocIds = new Set<string>();
 
     for (const entry of this.store.allWidgets()) {
-      if (entry.type !== FILE_WIDGET_TYPE || !entry.docId) continue;
+      // any widget with a per-widget doc is a candidate — this isn't
+      // narrowed to a hardcoded set of widget types (previously just
+      // "file") since any widget type can reference a P2P-fetchable blob
+      // by blake3 hash (audio-recording does too now — see
+      // `widgets/audio-recording.ts`'s `blake3` schema field). `syncAll()`
+      // is what actually filters down to docs with a real blake3 value.
+      if (!entry.docId) continue;
       const docId = entry.docId;
-      currentFileDocIds.add(docId);
+      currentWidgetDocIds.add(docId);
       if (this.widgetUnsubs.has(docId) || this.pendingLookups.has(docId)) continue;
 
       this.pendingLookups.add(docId);
@@ -137,9 +141,7 @@ export class CanvasBlobAclSync {
           if (this.destroyed) return;
           // the widget may have been removed (or the doc replaced) while
           // this lookup was in flight — don't attach a stale subscription.
-          const stillPresent = this.store
-            .allWidgets()
-            .some((w) => w.docId === docId && w.type === FILE_WIDGET_TYPE);
+          const stillPresent = this.store.allWidgets().some((w) => w.docId === docId);
           if (!stillPresent) return;
 
           const listener = () => this.syncAll();
@@ -153,12 +155,12 @@ export class CanvasBlobAclSync {
         })
         .catch((err) => {
           this.pendingLookups.delete(docId);
-          log.warn(TAG, "failed to open file widget doc for blob-acl sync:", err);
+          log.warn(TAG, "failed to open widget doc for blob-acl sync:", err);
         });
     }
 
     for (const [docId, unsub] of this.widgetUnsubs) {
-      if (!currentFileDocIds.has(docId)) {
+      if (!currentWidgetDocIds.has(docId)) {
         unsub();
         this.widgetUnsubs.delete(docId);
       }
@@ -178,7 +180,7 @@ export class CanvasBlobAclSync {
     const hashes = new Set<string>();
 
     for (const entry of this.store.allWidgets()) {
-      if (entry.type !== FILE_WIDGET_TYPE || !entry.docId) continue;
+      if (!entry.docId) continue;
       const handle = this.repo.handles[entry.docId as DocumentId] as DocHandle<any> | undefined;
       if (!handle || !handle.isReady()) continue;
 
@@ -186,9 +188,6 @@ export class CanvasBlobAclSync {
       const blake3 = coerceStr(raw?.blake3);
       if (blake3) hashes.add(blake3);
     }
-
-    // eslint-disable-next-line no-console -- temp debug, removed before final commit
-    console.log("[blob-acl-sync DEBUG] syncAll " + JSON.stringify({ peerIds, hashes: [...hashes] }));
 
     if (hashes.size === 0) return;
 

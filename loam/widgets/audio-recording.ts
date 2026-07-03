@@ -152,6 +152,18 @@ function mimeToExt(mime: string): string {
   return "webm";
 }
 
+/**
+ * sweep angle (in radians) for a determinate fetch-progress ring, given a
+ * 0..1 fraction. clamps out-of-range input (defensive — snatchBlob's
+ * onProgress should already report values in range) so a stray fraction
+ * never draws a nonsensical arc. exported so the arc math can be unit
+ * tested without a real canvas/PixiJS renderer.
+ */
+export function fetchRingAngleForFraction(fraction: number): number {
+  const clamped = Math.max(0, Math.min(1, fraction));
+  return clamped * Math.PI * 2;
+}
+
 // ---------------------------------------------------------------------------
 // blob resolution — shared by getPlaybackUrl() below and unit-tested directly.
 // ---------------------------------------------------------------------------
@@ -314,8 +326,13 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     let playRafId: number | null = null;
     /** progress label shown in the "fetching" state while snatching a remote blob */
     let fetchProgressText = "downloading…";
+    /** progress fraction (0..1) backing the fetch ring; -1 = unknown/indeterminate */
+    let fetchProgressFraction = -1;
     /** message shown after a failed remote-fetch attempt (cleared on next try) */
     let fetchErrorMessage = "";
+    let fetchRafId: number | null = null;
+    /** current rotation offset (radians) for the indeterminate fetch-ring spinner */
+    let fetchAnimAngle = 0;
 
     // ── device selection state ───────────────────────────────────────────────
     // cachedDevices is populated by enumerateDevices() — labels are empty until
@@ -422,6 +439,12 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     const STAT_TOP = 12;
     const INFO_TOP = 28;
 
+    // ── fetch (remote-download) progress ring constants ────────────────────
+    const FETCH_RING_R = BTN_R + 4;
+    const FETCH_RING_WIDTH = 3;
+    const FETCH_RING_SWEEP = Math.PI / 2; // ~90° indeterminate arc while fraction is unknown
+    const FETCH_RING_SPEED = (Math.PI * 2) / 1200; // radians/ms — full spin every 1.2s
+
     // ── drawing helpers ──────────────────────────────────────────────────────
     const drawBg = () => {
       const { bgColor, borderColor, borderWidth } = ctx.doc.current;
@@ -491,12 +514,32 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           btnGfx.fill({ color: COLOR_MUTED });
           break;
 
-        case "fetching":
+        case "fetching": {
           btnGfx.circle(bx, by, BTN_R);
           btnGfx.fill({ color: COLOR_MUTED });
           btnGfx.circle(bx, by, BTN_R * 0.38);
           btnGfx.stroke({ color: COLOR_PRIMARY, width: 2, alpha: 0.6 });
+
+          // background track for the progress ring
+          btnGfx.circle(bx, by, FETCH_RING_R);
+          btnGfx.stroke({ color: COLOR_MUTED, width: FETCH_RING_WIDTH, alpha: 0.5 });
+
+          // active arc: determinate sweep from 12 o'clock when the fraction is
+          // known, otherwise a rotating indeterminate arc.
+          const top = -Math.PI / 2;
+          let arcStart: number;
+          let arcEnd: number;
+          if (fetchProgressFraction >= 0) {
+            arcStart = top;
+            arcEnd = top + fetchRingAngleForFraction(fetchProgressFraction);
+          } else {
+            arcStart = top + fetchAnimAngle;
+            arcEnd = arcStart + FETCH_RING_SWEEP;
+          }
+          btnGfx.arc(bx, by, FETCH_RING_R, arcStart, arcEnd);
+          btnGfx.stroke({ color: COLOR_PRIMARY, width: FETCH_RING_WIDTH });
           break;
+        }
 
         case "ready": {
           btnGfx.circle(bx, by, BTN_R);
@@ -700,6 +743,27 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       }
     };
 
+    // ── fetch (remote-download) progress ring animation ──────────────────────
+    const startFetchAnim = () => {
+      let lastTime = performance.now();
+      const tick = (now: number) => {
+        if (recState !== "fetching") return;
+        fetchRafId = requestAnimationFrame(tick);
+        const dt = now - lastTime;
+        lastTime = now;
+        fetchAnimAngle = (fetchAnimAngle + dt * FETCH_RING_SPEED) % (Math.PI * 2);
+        drawBtn();
+      };
+      fetchRafId = requestAnimationFrame(tick);
+    };
+
+    const stopFetchAnim = () => {
+      if (fetchRafId !== null) {
+        cancelAnimationFrame(fetchRafId);
+        fetchRafId = null;
+      }
+    };
+
     // ── playback animation ───────────────────────────────────────────────────
     const startPlayAnim = () => {
       const dur = Math.max(0.001, ctx.doc.current.duration);
@@ -855,6 +919,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           peers,
           { getBlobData, checkBlobLocality, snatchBlob, getLocalNodeId },
           (fraction) => {
+            fetchProgressFraction = fraction;
             fetchProgressText =
               fraction >= 0 ? `downloading… ${Math.round(fraction * 100)}%` : "downloading…";
             if (recState === "fetching") updateTexts();
@@ -899,6 +964,8 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       if (!playbackUrl) {
         recState = "fetching";
         fetchProgressText = "downloading…";
+        fetchProgressFraction = -1;
+        startFetchAnim();
         refresh();
         ctx.setHeaderActions?.(makeHeaderActions());
       }
@@ -906,6 +973,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       const url = await getPlaybackUrl();
       if (!url) {
         console.error("[audio-recording] no playback URL available");
+        stopFetchAnim();
         recState = "ready";
         fetchErrorMessage = "playback unavailable";
         refresh();
@@ -930,6 +998,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         await audioEl.play();
       } catch (err) {
         console.error("[audio-recording] play() failed:", err);
+        stopFetchAnim();
         recState = "ready";
         fetchErrorMessage = "playback unavailable";
         refresh();
@@ -939,6 +1008,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
 
       recState = "playing";
       playbackElapsed = audioEl.currentTime;
+      stopFetchAnim();
       startPlayAnim();
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
@@ -1082,6 +1152,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       destroy() {
         stopWaveAnim();
         stopPlayAnim();
+        stopFetchAnim();
         mediaRecorder?.stop();
         mediaStream?.getTracks().forEach((t) => t.stop());
         void audioCtx?.close();

@@ -458,9 +458,25 @@ export class WidgetManager {
         // new widget with no existing document — create one and persist the
         // docId back into the canvas document so other peers can sync it.
         // merge entry.props into schema defaults so callers can seed initial
-        // state (e.g., canvasDocId for narthex canvas-card widgets).
+        // state (e.g., canvasDocId for narthex canvas-card widgets — note
+        // this is a DIFFERENT field than the `ownerCanvasId` stamped
+        // below: canvas-card's own `canvasDocId` is real widget data (the
+        // canvas a narthex card *links to*), whereas `ownerCanvasId`
+        // records the canvas this widget doc *physically lives on* — see
+        // canvas-scoped-share-policy.ts's module doc comment for why they
+        // can't share a name).
         const defaults = factory.schema.parse(entry.props ?? {});
-        widgetDocHandle = this.repo.create(defaults);
+        // stamp the owning canvas's own doc id directly into the raw
+        // automerge content (bypassing the schema, which strips anything
+        // it doesn't declare — no widget type needs to know this field
+        // exists). this is what canvas-scoped-share-policy.ts's `access`/
+        // `announce` policy uses to resolve "which canvas's `.acl` governs
+        // this widget doc" without any reverse-lookup guessing.
+        const initialContent = {
+          ...(defaults as Record<string, unknown>),
+          ownerCanvasId: this.store.handle.documentId,
+        };
+        widgetDocHandle = this.repo.create(initialContent);
         this.store.setDocId(entry.id, widgetDocHandle.documentId);
       }
 

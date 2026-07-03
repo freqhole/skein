@@ -204,7 +204,7 @@ impl HubPeerService {
             fs_store,
             Some(crate::blob_acl::build_gated_blobs_events(blob_acl_gate)),
         );
-        let blob_proxy = BlobProxyHandler::new(fs_store, blobz.clone());
+        let blob_proxy = BlobProxyHandler::new(fs_store, blobz.clone(), friendz_store.clone());
 
         // remote hub administration: lets a privileged remote peer manage
         // this hub's friendz allow-list over the network (see

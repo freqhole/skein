@@ -208,7 +208,7 @@ impl Service {
             store,
             Some(crate::blob_acl::build_gated_blobs_events(blob_acl_gate)),
         );
-        let blob_proxy = BlobProxyHandler::new(store, blobz.clone());
+        let blob_proxy = BlobProxyHandler::new(store, blobz.clone(), friendz_store.clone());
 
         // router
         let router = Router::builder(endpoint.clone())

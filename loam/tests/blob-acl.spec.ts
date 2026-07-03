@@ -106,6 +106,61 @@ async function importBlobAndCreateFileWidget(
 }
 
 /**
+ * same as `importBlobAndCreateFileWidget` above, but creates an
+ * **audio-recording**-typed widget instead of a "file" one — proves
+ * `CanvasBlobAclSync`'s generalization beyond the hardcoded `"file"` widget
+ * type (see `src/canvas/blob-acl-sync.ts`'s doc comment and
+ * `docs/widget-blob-acl-plan.md` section 3.4): any widget with a per-widget
+ * doc carrying a non-empty `blake3` field gets the same ACL-gated
+ * treatment, with no changes needed to blob-acl-sync.ts itself. field
+ * names/shape mirror `widgets/audio-recording.ts`'s real `audioRecordingSchema`
+ * exactly (only the fields relevant to blob identity/ACL are set — the rest
+ * default fine, same as the file-widget helper above not bothering with
+ * `file.ts`'s own full schema either).
+ */
+async function importBlobAndCreateAudioRecordingWidget(
+  page: Page,
+  bytes: Uint8Array
+): Promise<{ blake3: string; widgetDocId: string }> {
+  return page.evaluate(async (byteArray: number[]) => {
+    const bridge = (window as any).__skeinTest;
+    const bytes = Uint8Array.from(byteArray);
+    const blake3Hash: string = await bridge.p2p.importBlob(bytes);
+
+    const repo = bridge.canvas.repo;
+    const store = bridge.canvas.store;
+
+    const widgetHandle = repo.create();
+    widgetHandle.change((doc: any) => {
+      doc.blobId = blake3Hash;
+      doc.filename = "blob-acl-test.webm";
+      doc.mime = "audio/webm";
+      doc.size = bytes.byteLength;
+      doc.blake3 = blake3Hash;
+      doc.snatchedBy = [];
+      doc.duration = 1.5;
+      doc.waveformSamples = [];
+    });
+
+    store.addWidget({
+      id: crypto.randomUUID(),
+      type: "audio-recording",
+      x: 0,
+      y: 0,
+      width: 200,
+      height: 100,
+      zIndex: 1,
+      props: {},
+      collapsed: false,
+      docId: widgetHandle.documentId,
+      parentId: null,
+    });
+
+    return { blake3: blake3Hash, widgetDocId: widgetHandle.documentId as string };
+  }, toEvaluateArray(bytes));
+}
+
+/**
  * fetch a blob directly from `peerNodeId` by hash, retrying a handful of
  * times. a cold first dial between two iroh endpoints can occasionally hit
  * the same relay-discovery lag documented on `IrohNetworkAdapter.openBiWithRetry()`
@@ -272,5 +327,64 @@ test("a peer with no canvas access cannot fetch a blob by node id + hash alone @
   // owner's `CanvasBlobAclSync` restricts `blake3` to just its own `.acl`
   // (itself, since it's the admin) the moment the file widget above is
   // added, and the stranger was never added to it.
+  await expect(fetchBlobWithRetry(stranger.page, owner.nodeId, blake3)).rejects.toThrow();
+});
+
+// ---------------------------------------------------------------------------
+// same two scenarios (invited can fetch / stranger cannot), but for an
+// audio-recording widget instead of a file widget — proves
+// `CanvasBlobAclSync`'s generalization beyond the hardcoded `"file"` widget
+// type actually covers `widgets/audio-recording.ts`'s `blake3` field the
+// same way, with no changes needed to blob-acl-sync.ts itself (see
+// docs/widget-blob-acl-plan.md section 3.4).
+// ---------------------------------------------------------------------------
+
+test("an invited canvas peer can fetch a blob referenced by an audio-recording widget on that canvas @p2p", async ({
+  p2pPage,
+}) => {
+  test.setTimeout(180_000);
+
+  const owner = await p2pPage();
+  const member = await p2pPage();
+
+  const sourceBytes = randomBlobBytes();
+  const { blake3 } = await importBlobAndCreateAudioRecordingWidget(owner.page, sourceBytes);
+
+  await addPeer(member.page, owner.nodeId);
+  await waitForPeerCount(member.page, 1, 30_000);
+
+  await owner.page.evaluate((peerId: string) => {
+    const store = (window as any).__skeinTest.canvas.store;
+    store.addPeer(peerId);
+    store.setRole(peerId, "viewer");
+  }, member.nodeId);
+
+  const joinedDocId = await joinCanvas(member.page, owner.canvasDocId);
+  expect(joinedDocId).toBe(owner.canvasDocId);
+  await waitForWidgetCount(member.page, 1, 15_000);
+
+  const fetchedBytes = await fetchBlobWithRetry(member.page, owner.nodeId, blake3);
+  expect(fromEvaluateArray(fetchedBytes)).toEqual(sourceBytes);
+});
+
+test("a peer with no canvas access cannot fetch a blob referenced by an audio-recording widget @p2p", async ({
+  p2pPage,
+}) => {
+  test.setTimeout(180_000);
+
+  const owner = await p2pPage();
+  const stranger = await p2pPage();
+
+  const { blake3 } = await importBlobAndCreateAudioRecordingWidget(owner.page, randomBlobBytes());
+
+  const strangerFootprint = await owner.page.evaluate((peerId: string) => {
+    const doc = (window as any).__skeinTest.canvas.store.doc();
+    return {
+      inPeers: !!doc.peers?.[peerId],
+      inAcl: !!doc.acl?.[peerId],
+    };
+  }, stranger.nodeId);
+  expect(strangerFootprint).toEqual({ inPeers: false, inAcl: false });
+
   await expect(fetchBlobWithRetry(stranger.page, owner.nodeId, blake3)).rejects.toThrow();
 });
