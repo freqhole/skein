@@ -6,3 +6,7 @@
 
 # local sqlx compile-time-check dev db (see .cargo/config.toml)
 /reliquary/dev-data/
+# `make hub-dev`'s own, separate data dir (see Makefile) — deliberately not
+# the same dir as reliquary/dev-data, so a hub and `make tauri-dev` can run
+# at the same time without sharing an iroh identity/sqlite files.
+/reliquary/hub-dev-data/

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SnatchOptions } from "../src/widgets/file-utils";
 import {
+  addSnatcher,
   audioRecordingSchema,
   audioRecordingWidget,
   fetchRingAngleForFraction,
@@ -47,6 +48,41 @@ describe("audioRecordingWidget metadata", () => {
     );
     expect(info.blake3).toBe("deadbeef");
     expect(info.snatchedBy).toEqual(["node-a"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// addSnatcher — the dedup helper `finishRecording` (recorder self-registers
+// immediately) and the post-snatch doc.change (a peer that just downloaded
+// the blob) both use. this is the actual invariant a regression could break:
+// no duplicate node ids, and the recorder must be added at record time (not
+// just after some other peer snatches it later).
+// ---------------------------------------------------------------------------
+
+describe("addSnatcher", () => {
+  it("adds a node id to an empty/undefined list", () => {
+    expect(addSnatcher(undefined, "node-a")).toEqual(["node-a"]);
+    expect(addSnatcher([], "node-a")).toEqual(["node-a"]);
+  });
+
+  it("does not add the same node id twice (regression guard for duplicate snatchedBy entries)", () => {
+    expect(addSnatcher(["node-a"], "node-a")).toEqual(["node-a"]);
+  });
+
+  it("appends a distinct node id, preserving existing entries", () => {
+    expect(addSnatcher(["node-a"], "node-b")).toEqual(["node-a", "node-b"]);
+  });
+
+  it("is a no-op for a null/empty node id", () => {
+    expect(addSnatcher(["node-a"], null)).toEqual(["node-a"]);
+    expect(addSnatcher(undefined, null)).toEqual([]);
+  });
+
+  it("does not mutate the input array", () => {
+    const original = ["node-a"];
+    const result = addSnatcher(original, "node-b");
+    expect(original).toEqual(["node-a"]);
+    expect(result).toEqual(["node-a", "node-b"]);
   });
 });
 

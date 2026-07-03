@@ -14,6 +14,13 @@
  * transfer, then ingest it into the local grimoire (creating a media_blobz
  * entry, domain entity, and thumbnail job).
  *
+ * snatch to disk (browser only): same download, but written straight to a
+ * user-chosen disk location via the File System Access API instead of
+ * being persisted into OPFS/IndexedDB — useful for large files the user
+ * doesn't want a second copy of sitting in browser storage. not needed in
+ * Tauri mode, which already writes blob storage to the user's real
+ * filesystem.
+ *
  * save to disk: export a locally-stored blob to a user-chosen filesystem
  * path via the native save dialog.
  */
@@ -40,6 +47,7 @@ import {
 import {
   base64Decode,
   generateThumbnailDataUrl as generateThumbnailDataUrlWorker,
+  hashBlake3,
 } from "../workers/blob-worker-client";
 
 const TAG = "file-utils";
@@ -400,6 +408,28 @@ export async function checkBlobLocality(
 // ---------------------------------------------------------------------------
 
 /**
+ * in-flight snatch dedup: keyed by blake3 (falls back to blobId when no
+ * blake3 is known yet). without this, two widgets referencing the same
+ * content (e.g. the same file dropped into two separate file widgets, or
+ * a file widget and an audio-recording widget that happen to hash-collide)
+ * each independently probing + downloading the same blob at nearly the same
+ * time would double the P2P network traffic for no benefit — storeBlob()
+ * is idempotent for identical content, so the redundant work was always
+ * wasted, never actually harmful/corrupting.
+ *
+ * caveat (documented, not solved here): only the FIRST caller's
+ * onProgress/onPeerAttempt/isPeerOnline options are honored — a second,
+ * joining caller's progress callbacks never fire (it only gets the final
+ * resolved/rejected result). similarly, if the FIRST caller's `signal`
+ * aborts, every joiner's shared promise rejects too, even if the joiner
+ * never asked to abort. both are acceptable for the common case (the
+ * whole point is that joiners get the exact same result as the original
+ * request), but worth knowing if per-caller cancellation semantics are
+ * ever needed here.
+ */
+const inFlightSnatches = new Map<string, Promise<FileUploadResult>>();
+
+/**
  * snatch a blob from a canvas peer: download the full file via iroh-blobs
  * verified transfer, then ingest it into the local grimoire to create a
  * media_blobz entry, domain entity, and thumbnail job.
@@ -409,8 +439,50 @@ export async function checkBlobLocality(
  *
  * in browser mode, uses the midden node's fetch methods and stores
  * in OPFS + IndexedDB. in Tauri mode, uses IPC commands.
+ *
+ * deduplicates concurrent calls for the same content (see inFlightSnatches
+ * above) — a second call for a blake3/blobId already being snatched joins
+ * the same in-flight promise instead of starting a redundant P2P transfer.
  */
 export async function snatchBlob(
+  info: SnatchBlobInfo,
+  peers: PeersMap,
+  options?: SnatchOptions
+): Promise<FileUploadResult> {
+  const dedupKey = coerceStr(info.blake3) || coerceStr(info.blobId);
+  const existing = dedupKey ? inFlightSnatches.get(dedupKey) : undefined;
+  if (existing) {
+    log.debug(TAG, `snatch already in flight for ${dedupKey.slice(0, 16)}..., joining it`);
+    return existing;
+  }
+
+  const promise = snatchBlobUncached(info, peers, options);
+  if (dedupKey) {
+    inFlightSnatches.set(dedupKey, promise);
+    // `.finally()` returns a NEW promise distinct from `promise` — if
+    // `promise` rejects, this derived promise rejects too (same reason),
+    // even though `promise` itself is already properly awaited/caught by
+    // whoever called snatchBlob(). without the trailing `.catch(() => {})`
+    // below, a failed snatch (offline peer, blob not found, aborted, etc.)
+    // fires a real unhandled-promise-rejection event — confirmed via a
+    // standalone repro and covered by a regression test — regardless of
+    // the caller correctly handling the snatch failure. the empty catch is
+    // safe because the actual error is never swallowed: it still reaches
+    // every caller via the returned `promise`/`existing` above.
+    void promise
+      .finally(() => {
+        // only delete if we're still the tracked promise for this key — a
+        // later snatch of the same content may have already replaced us.
+        if (inFlightSnatches.get(dedupKey) === promise) {
+          inFlightSnatches.delete(dedupKey);
+        }
+      })
+      .catch(() => {});
+  }
+  return promise;
+}
+
+async function snatchBlobUncached(
   info: SnatchBlobInfo,
   peers: PeersMap,
   options?: SnatchOptions
@@ -659,26 +731,42 @@ function sortPeersByConnectivity(
 // ---------------------------------------------------------------------------
 
 /**
- * download and ingest a blob from a single browser peer via midden WASM.
+ * download a blob's raw bytes from a single browser peer via midden WASM.
+ * shared by snatchFromBrowserPeer (persists the result into OPFS + IndexedDB)
+ * and snatchBlobToDisk (writes the result straight to a user-chosen disk
+ * location, skipping OPFS/IndexedDB entirely).
+ *
+ * NOTE: this always returns the complete, fully-buffered payload — none of
+ * midden's download methods (download_verified_with_ensure_progress /
+ * download_verified_by_id_progress) expose an incremental chunk callback,
+ * only a progress *fraction* callback. so there is no way to stream bytes
+ * to disk as they arrive over the network; the whole payload is buffered
+ * in memory first, exactly like a normal snatch.
  */
-async function snatchFromBrowserPeer(
+async function downloadBlobBytesFromPeer(
   info: SnatchBlobInfo,
   peerAddr: string,
   options?: SnatchOptions
-): Promise<FileUploadResult> {
+): Promise<{ bytes: Uint8Array; blake3: string | null; mime: string }> {
   const node = await getMiddenNode();
 
   log.debug(
     TAG,
-    `browser snatch: blob ${info.blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
+    `downloading blob ${info.blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
   );
 
   let bytes: Uint8Array | undefined;
   let blake3Hash = info.blake3;
+  let mime = info.mime;
 
   const nodeAny = node as any;
   const onProgress = options?.onProgress;
   let downloaded = false;
+  // true only when strategy 3 (the unverified proxy_request JSON fallback)
+  // is what actually produced `bytes` — used below to decide whether an
+  // explicit blake3 check is needed (strategies 1/2 are already
+  // cryptographically verified by iroh-blobs itself).
+  let downloadedViaUnverifiedFallback = false;
   const progressFn = onProgress
     ? (fraction: number) => {
         onProgress(fraction);
@@ -799,11 +887,12 @@ async function snatchFromBrowserPeer(
             // payloads (snatched blobs are routinely megabytes).
             bytes = await base64Decode(b64);
             // mime may have been refined by the responder
-            if (typeof parsed.data?.mime === "string" && !info.mime) {
-              info = { ...info, mime: parsed.data.mime };
+            if (typeof parsed.data?.mime === "string" && !mime) {
+              mime = parsed.data.mime;
             }
             progressFn(1);
             downloaded = true;
+            downloadedViaUnverifiedFallback = true;
           } else {
             log.debug(TAG, "proxy_request not successful:", parsed?.message);
           }
@@ -818,30 +907,70 @@ async function snatchFromBrowserPeer(
     throw new Error("iroh-blobs download failed — no fallback available");
   }
 
-  // refuse to store empty payloads. a 0-byte file would hash to the
-  // well-known empty-bytes blake3 / sha256 (e3b0c442... / af1349b9...),
-  // poisoning OPFS / IDB with a record that points at nothing — the
-  // `<video>` element later returns ERR_REQUEST_RANGE_NOT_SATISFIABLE
-  // because there's no byte 0 to range-fetch. fail loudly instead so the
-  // upstream snatcher can retry / show an error.
+  // refuse empty payloads. a 0-byte file would hash to the well-known
+  // empty-bytes blake3 / sha256 (e3b0c442... / af1349b9...), which would
+  // poison a persisted record (OPFS/IDB) or a saved disk file with
+  // something that points at nothing — fail loudly instead so the caller
+  // can retry / show an error.
   if (bytes.length === 0) {
-    throw new Error(
-      "snatch returned 0 bytes — refusing to store empty payload (would mask future fetches)"
-    );
+    throw new Error("snatch returned 0 bytes — refusing empty payload");
   }
 
-  log.debug(TAG, `browser snatch: downloaded ${formatFileSize(bytes.length)}, storing in OPFS...`);
+  // strategies 1/2 get real cryptographic verification for free — iroh-blobs'
+  // own verified-transfer machinery checks each chunk against the requested
+  // hash's BAO tree during the download itself, so a mismatching response
+  // never makes it back as `bytes` in the first place. the skein/1
+  // proxy_request fallback (strategy 3, used when the peer is a tauri app
+  // whose rust backend doesn't accept the iroh-blobs ALPN) has no such
+  // guarantee: it's a plain base64 JSON response with zero transfer-level
+  // integrity checking. verify explicitly here so a corrupted or malicious
+  // response is rejected instead of being silently accepted and persisted
+  // under the wrong hash.
+  if (downloadedViaUnverifiedFallback && info.blake3) {
+    const actualHash = await hashBlake3(bytes);
+    if (actualHash && actualHash !== info.blake3) {
+      throw new Error(
+        `snatch hash mismatch: expected blake3 ${info.blake3.slice(0, 16)}... but downloaded bytes hash to ${actualHash.slice(0, 16)}... (proxy_request fallback path is not cryptographically verified in transit)`
+      );
+    }
+  }
+
+  log.debug(TAG, `downloaded ${formatFileSize(bytes.length)} from ${peerAddr.slice(0, 16)}...`);
+
+  return { bytes, blake3: blake3Hash || null, mime };
+}
+
+/**
+ * download and ingest a blob from a single browser peer via midden WASM.
+ * persists the result into OPFS + IndexedDB via storeBlob.
+ */
+async function snatchFromBrowserPeer(
+  info: SnatchBlobInfo,
+  peerAddr: string,
+  options?: SnatchOptions
+): Promise<FileUploadResult> {
+  const { bytes, blake3: blake3Hash, mime } = await downloadBlobBytesFromPeer(
+    info,
+    peerAddr,
+    options
+  );
+
+  if (mime && mime !== info.mime) {
+    info = { ...info, mime };
+  }
 
   if (options?.signal?.aborted) {
     throw new DOMException("snatch cancelled", "AbortError");
   }
+
+  log.debug(TAG, `browser snatch: storing ${formatFileSize(bytes.length)} in OPFS...`);
 
   // store in OPFS + IDB
   const sha256 = await computeSha256(bytes.buffer as ArrayBuffer);
   await storeBlob(sha256, bytes.buffer as ArrayBuffer, {
     blob_id: sha256,
     sha256: sha256,
-    blake3: blake3Hash,
+    blake3: blake3Hash ?? "",
     filename: info.filename,
     mime: info.mime,
     size: info.size || bytes.length,
@@ -878,8 +1007,137 @@ async function snatchFromBrowserPeer(
 }
 
 // ---------------------------------------------------------------------------
+// snatch straight to disk (browser only — skips OPFS/IndexedDB entirely)
+// ---------------------------------------------------------------------------
+
+/** result from a disk-only snatch — no local blob record is created. */
+export interface SnatchToDiskResult {
+  /** number of bytes written to disk */
+  size: number;
+  /** mime type, refined by the responding peer when available */
+  mime: string;
+  /** blake3 hash of the downloaded content, when known */
+  blake3: string | null;
+}
+
+/**
+ * check whether "download straight to disk" is available in the current
+ * runtime. this is deliberately browser-only: tauri mode already writes
+ * blob storage straight to the user's real filesystem (there's no OPFS
+ * concept to skip there), and the reliquary hub peer has no UI at all.
+ * requires the File System Access API (`window.showSaveFilePicker`) —
+ * unsupported in Safari and some older browsers as of this writing.
+ */
+export function canSnatchToDisk(): boolean {
+  if (isTauriMode()) return false;
+  return typeof (globalThis as { showSaveFilePicker?: unknown }).showSaveFilePicker === "function";
+}
+
+/**
+ * download a blob straight from a canvas peer to a user-chosen disk
+ * location, without ever writing it into OPFS/IndexedDB.
+ *
+ * IMPORTANT — this is NOT chunk-streamed over the network: midden's
+ * download methods only ever hand back one complete Uint8Array once the
+ * whole transfer has finished (see downloadBlobBytesFromPeer's doc
+ * comment), so the full payload is buffered in memory exactly like a
+ * normal snatch. the value this provides over a normal snatch is entirely
+ * on the persistence side — once downloaded, the bytes are written once to
+ * the caller-provided writable stream and the OPFS/IndexedDB persistence
+ * step (storeBlob) is skipped entirely, so a large file never consumes
+ * browser storage quota.
+ *
+ * peer probing/retry mirrors snatchBlob: if a peer's download fails, the
+ * next peer is tried. once bytes are successfully downloaded, a failure
+ * writing them to disk is NOT retried against another peer (retrying would
+ * risk writing to the stream twice) — it's surfaced directly to the caller.
+ *
+ * browser-only; throws in tauri mode.
+ */
+export async function snatchBlobToDisk(
+  info: SnatchBlobInfo,
+  peers: PeersMap,
+  writable: FileSystemWritableFileStream,
+  options?: SnatchOptions
+): Promise<SnatchToDiskResult> {
+  if (isTauriMode()) {
+    throw new Error("snatchBlobToDisk is browser-only — tauri already writes blobs to disk");
+  }
+
+  const allPeerAddrs = await getPeerNodeIds(peers);
+
+  // defensive: coerce blob info strings — automerge may store them as Text objects
+  info = {
+    ...info,
+    blobId: coerceStr(info.blobId),
+    filename: coerceStr(info.filename),
+    mime: coerceStr(info.mime),
+    blake3: coerceStr(info.blake3),
+    domain: coerceStr(info.domain),
+  };
+
+  if (allPeerAddrs.length === 0) {
+    throw new Error("no peers available for snatch");
+  }
+
+  let remaining = [...allPeerAddrs];
+  let lastError: unknown;
+
+  while (remaining.length > 0) {
+    if (options?.signal?.aborted) {
+      throw new DOMException("snatch cancelled", "AbortError");
+    }
+
+    const bestPeer = await probePeersForBlob(info, remaining, options);
+    if (!bestPeer) {
+      throw new Error("no peer has the blob (all probes failed)");
+    }
+
+    const peerIndex = allPeerAddrs.indexOf(bestPeer);
+    const isOnline = options?.isPeerOnline?.(bestPeer) ?? false;
+    options?.onPeerAttempt?.(peerIndex, allPeerAddrs.length, isOnline);
+
+    let bytes: Uint8Array;
+    let blake3: string | null;
+    let mime: string;
+    try {
+      const downloaded = await downloadBlobBytesFromPeer(info, bestPeer, options);
+      bytes = downloaded.bytes;
+      blake3 = downloaded.blake3;
+      mime = downloaded.mime;
+    } catch (err) {
+      lastError = err;
+      log.debug(TAG, `snatch-to-disk from probed peer ${bestPeer.slice(0, 16)}... failed:`, err);
+      remaining = remaining.filter((p) => p !== bestPeer);
+      continue;
+    }
+
+    if (options?.signal?.aborted) {
+      throw new DOMException("snatch cancelled", "AbortError");
+    }
+
+    // write phase — a failure here is a real disk-write error, not a peer
+    // problem, so it isn't retried against another peer. `.slice()` copies
+    // into a fresh, exactly-sized ArrayBuffer (not the wasm-bindgen
+    // Uint8Array's own possibly-oversized/shared backing buffer).
+    await writable.write(bytes.slice());
+    await writable.close();
+
+    log.debug(
+      TAG,
+      `snatch-to-disk complete: ${formatFileSize(bytes.length)} written to disk (OPFS/IndexedDB skipped)`
+    );
+
+    return { size: bytes.length, mime: mime || info.mime, blake3 };
+  }
+
+  throw lastError ?? new Error("snatch failed: all peers exhausted");
+}
+
+// ---------------------------------------------------------------------------
 // batch snatch
 // ---------------------------------------------------------------------------
+
 
 /** options for batch snatch operations */
 export interface BatchSnatchOptions {

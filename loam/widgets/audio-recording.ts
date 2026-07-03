@@ -203,6 +203,19 @@ export interface ResolvedAudioBytes {
 }
 
 /**
+ * add a node id to a `snatchedBy` list, deduped. used both right after a
+ * fresh recording is stored (the recorder always has the blob locally, so
+ * it must be recorded as a snatcher immediately — otherwise a hub or peer
+ * has no one to target for a snatch until some OTHER peer happens to fetch
+ * it first) and after a P2P snatch (the snatching peer now has it too).
+ */
+export function addSnatcher(snatchedBy: string[] | undefined, nodeId: string | null): string[] {
+  const list = snatchedBy ? [...snatchedBy] : [];
+  if (nodeId && !list.includes(nodeId)) list.push(nodeId);
+  return list;
+}
+
+/**
  * resolve playable audio bytes for a recording, fetching from a canvas peer
  * when the bytes aren't local (e.g. viewing another peer's recording — the
  * automerge doc syncs fine, but the audio bytes never crossed the wire on
@@ -299,6 +312,12 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
   create(ctx: WidgetMountContext<typeof audioRecordingSchema>): WidgetController {
     let cw = ctx.width;
     let ch = ctx.height;
+
+    // set when the widget is destroyed; async handlers (chiefly
+    // getPlaybackUrl's P2P snatch resolution, which has no real
+    // cancellation — see destroy() below) check this to bail out instead
+    // of writing to a torn-down doc/pixi tree.
+    let destroyed = false;
 
     // ── transient recording state ────────────────────────────────────────────
     let recState: RecordState = ctx.doc.current.blobId ? "ready" : "idle";
@@ -870,6 +889,11 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       try {
         const file = new File([recordedBlob], filename, { type: recMime });
         const record = await storeBlobFromFile(file, "audio");
+        // the recorder has the blob locally the instant it's stored — record
+        // that now, not just after some other peer later snatches it. without
+        // this, a hub or peer trying to snatch a freshly-recorded blob has no
+        // `snatchedBy` entry to target until someone else fetches it first.
+        const localNodeId = await getLocalNodeId();
 
         ctx.doc.change((d) => {
           d.blobId = record.blob_id;
@@ -878,6 +902,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           d.size = record.size;
           d.blake3 = record.blake3;
           d.duration = durationSecs;
+          d.snatchedBy = addSnatcher(d.snatchedBy, localNodeId);
           // persist waveform — downsample to ≤200 points to keep doc size small
           const MAX_SAMPLES = 200;
           if (capturedSamples.length > MAX_SAMPLES) {
@@ -931,6 +956,13 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         return null;
       }
 
+      // the widget may have been deleted while resolveAudioBytes (in
+      // particular its P2P snatch path) was in flight. there's no cancellation
+      // threaded into the underlying download here (no AbortController is
+      // even created for this call), so bail out before writing to ctx.doc
+      // or touching anything pixi-side that destroy() already tore down.
+      if (destroyed) return null;
+
       if (!resolved) return null;
 
       // a P2P snatch happened (not the fast local path) — show the
@@ -943,10 +975,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           });
         }
         ctx.doc.change((d) => {
-          if (!d.snatchedBy) d.snatchedBy = [];
-          if (!d.snatchedBy.includes(resolved!.snatchedByNodeId!)) {
-            d.snatchedBy.push(resolved!.snatchedByNodeId!);
-          }
+          d.snatchedBy = addSnatcher(d.snatchedBy, resolved!.snatchedByNodeId);
         });
       }
 
@@ -971,6 +1000,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       }
 
       const url = await getPlaybackUrl();
+      if (destroyed) return;
       if (!url) {
         console.error("[audio-recording] no playback URL available");
         stopFetchAnim();
@@ -1150,6 +1180,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         },
       ],
       destroy() {
+        destroyed = true;
         stopWaveAnim();
         stopPlayAnim();
         stopFetchAnim();

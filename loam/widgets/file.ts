@@ -4,6 +4,7 @@ import { log } from "../src/utils/log";
 import { getMediaPlaybackUrl } from "../src/media";
 import { isTauriMode } from "../src/p2p/tauri-transport";
 import {
+  canSnatchToDisk,
   checkBlobLocality,
   formatFileSize,
   getDocumentPages,
@@ -14,6 +15,7 @@ import {
   revealBlobInFinder,
   saveBlobToDisk,
   snatchBlob,
+  snatchBlobToDisk,
   uploadFile,
   type PeersMap,
   type PickedFile,
@@ -27,6 +29,21 @@ import type {
   WidgetFactory,
   WidgetMountContext,
 } from "../src/widgets/widget-types";
+
+// `showSaveFilePicker` is the File System Access API's save-dialog entry
+// point (Chromium/Edge; not in standard lib.dom.d.ts, unlike the OPFS-only
+// FileSystemFileHandle/FileSystemWritableFileStream types this file already
+// relies on transitively). declared here, ambient, so the disk-snatch flow
+// below can call it without an `any` cast at every call site. availability
+// is checked at runtime via file-utils.ts's canSnatchToDisk().
+declare global {
+  interface Window {
+    showSaveFilePicker?(options?: {
+      suggestedName?: string;
+      types?: { description?: string; accept: Record<string, string[]> }[];
+    }): Promise<FileSystemFileHandle>;
+  }
+}
 
 export const fileSchema = z.object({
   /** media blob ID from grimoire */
@@ -53,7 +70,14 @@ export type FileState = z.infer<typeof fileSchema>;
 type LoadState = "empty" | "loading" | "loaded" | "error";
 
 /** tracks whether the blob is local, remote, or just snatched this session */
-type ActionState = "checking" | "local" | "remote" | "snatched" | "saving" | "snatching";
+type ActionState =
+  | "checking"
+  | "local"
+  | "remote"
+  | "snatched"
+  | "saving"
+  | "snatching"
+  | "disk-snatching";
 
 const INFO_BAR_HEIGHT = 48;
 const ACTION_BAR_HEIGHT = 28;
@@ -220,6 +244,14 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     let snatchCancelled = false;
     let snatchProgressText = "";
     let snatchHovered = false;
+    // disk-snatch: mirrors the snatchAbort/snatchCancelled/snatchProgressText/
+    // snatchHovered quartet above, for the "download straight to disk" flow.
+    let diskSnatchAbort: AbortController | null = null;
+    let diskSnatchCancelled = false;
+    let diskSnatchProgressText = "";
+    let diskSnatchHovered = false;
+    // browser capability check — computed once, doesn't change at runtime.
+    const diskSnatchSupported = canSnatchToDisk();
     let lastRequestedBlobId = "";
     let loadedAssetKey = "";
     let activeOverlay: MediaOverlayHandle | null = null;
@@ -433,6 +465,35 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       }
     });
 
+    // snatch-to-disk button — an alternative to "snatch" for a remote blob:
+    // downloads straight to a user-chosen disk location instead of the
+    // canvas peer store, skipping OPFS/IndexedDB entirely. browser-only
+    // (tauri already writes blob storage to the user's real filesystem) and
+    // only shown when the File System Access API is available.
+    const diskSnatchBtn = createPillButton("→ disk", 0x5a4527, () => {
+      if (actionState === "disk-snatching") {
+        cancelDiskSnatch();
+      } else {
+        handleSnatchToDisk();
+      }
+    });
+    actionContainer.addChild(diskSnatchBtn.container);
+
+    diskSnatchBtn.container.on("pointerover", () => {
+      if (actionState === "disk-snatching") {
+        diskSnatchHovered = true;
+        diskSnatchBtn.setLabel("cancel");
+        diskSnatchBtn.setColor(0x5a2727);
+      }
+    });
+    diskSnatchBtn.container.on("pointerout", () => {
+      if (actionState === "disk-snatching") {
+        diskSnatchHovered = false;
+        diskSnatchBtn.setLabel(diskSnatchProgressText || "downloading...");
+        diskSnatchBtn.setColor(0x555555);
+      }
+    });
+
     // save to disk button — shown after snatch (blob is local but not "on disk")
     const saveBtn = createPillButton(
       isTauriMode() ? "reveal" : "save",
@@ -473,7 +534,12 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       if (actionState === "remote") return true;
       if (actionState === "snatched") return true;
       if (actionState === "local" && !uploadedLocally) return true;
-      if (actionState === "saving" || actionState === "snatching") return true;
+      if (
+        actionState === "saving" ||
+        actionState === "snatching" ||
+        actionState === "disk-snatching"
+      )
+        return true;
       // no action buttons when the user uploaded locally
       if (actionState === "local" && uploadedLocally) {
         return false;
@@ -498,6 +564,19 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       } else {
         snatchBtn.setLabel("snatch");
         snatchBtn.setColor(0x2d5a27);
+      }
+
+      // snatch-to-disk: visible when remote or actively downloading to disk,
+      // and only when the browser actually supports it.
+      diskSnatchBtn.setVisible(
+        diskSnatchSupported && (actionState === "remote" || actionState === "disk-snatching")
+      );
+      if (actionState === "disk-snatching") {
+        // label is managed by the progress callback in handleSnatchToDisk
+        diskSnatchBtn.setColor(0x555555);
+      } else {
+        diskSnatchBtn.setLabel("→ disk");
+        diskSnatchBtn.setColor(0x5a4527);
       }
 
       // save: visible when snatched or local (but not uploaded locally), or saving
@@ -564,7 +643,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         const actionY = h - ACTION_BAR_HEIGHT + 2;
         let xCursor = 8;
 
-        const buttons = [snatchBtn, saveBtn];
+        const buttons = [snatchBtn, diskSnatchBtn, saveBtn];
         for (const btn of buttons) {
           if (btn.container.visible) {
             btn.container.x = xCursor;
@@ -1406,6 +1485,19 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           return;
         }
 
+        // the widget may have been deleted while the snatch was in flight.
+        // aborting snatchAbort (in destroy()) does NOT actually cancel the
+        // underlying WASM/iroh-blobs download call — the abort signal is
+        // only polled between attempts, never threaded into the in-flight
+        // transfer itself — so this promise can still resolve well after
+        // destroy() already tore down the pixi container and unsubscribed
+        // from doc changes. bail out before touching ctx.doc (writing to an
+        // orphaned widget doc) or any destroyed pixi object.
+        if (destroyed) {
+          log.debug("file-widget", "snatch result discarded (widget destroyed)");
+          return;
+        }
+
         // update the doc if the blob ID changed (SHA256 dedup might map to existing)
         // suppress the doc-change subscription so it doesn't overwrite
         // "snatched" with a re-check that resolves to "local"
@@ -1452,6 +1544,8 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             const thumbDataUrl = await getThumbnailDataUrl(result.blobId, {
               size: 200,
             });
+            // re-check: the widget can be destroyed during this await too.
+            if (destroyed) return;
             if (thumbDataUrl && ctx.doc.current.blobId === result.blobId) {
               ctx.doc.change((draft) => {
                 draft.thumbnailDataUrl = thumbDataUrl;
@@ -1467,11 +1561,15 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           }
         } catch {
           // thumbnail generation failed — try loading from local/cache
-          loadThumbnail(result.blobId);
+          if (!destroyed) loadThumbnail(result.blobId);
         }
       } catch (err) {
         if (snatchCancelled) {
           log.debug("file-widget", "snatch aborted (cancelled)");
+          return;
+        }
+        if (destroyed) {
+          log.debug("file-widget", "snatch failed after widget destroyed:", err);
           return;
         }
         log.error("file-widget", "snatch failed:", err);
@@ -1479,6 +1577,184 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         syncActionButtons();
       } finally {
         snatchAbort = null;
+      }
+    }
+
+    // -- snatch-to-disk handler ------------------------------------------------
+    // browser-only alternative to handleSnatch: downloads the same blob but
+    // writes it straight to a user-chosen disk location instead of OPFS/
+    // IndexedDB. see snatchBlobToDisk's doc comment in file-utils.ts for why
+    // this can't be true network-chunk streaming (midden's download methods
+    // only ever hand back one complete buffer at the end).
+
+    function cancelDiskSnatch() {
+      if (actionState !== "disk-snatching") return;
+      diskSnatchCancelled = true;
+      if (diskSnatchAbort) {
+        diskSnatchAbort.abort();
+        diskSnatchAbort = null;
+      }
+      diskSnatchHovered = false;
+      diskSnatchProgressText = "";
+      actionState = "remote";
+      diskSnatchBtn.setLabel("→ disk");
+      diskSnatchBtn.setColor(0x5a4527);
+      syncActionButtons();
+      positionInfoBar(currentWidth, currentHeight);
+      log.debug("file-widget", "snatch-to-disk cancelled by user");
+    }
+
+    async function handleSnatchToDisk() {
+      if (actionState !== "remote") return;
+      if (!diskSnatchSupported) return;
+
+      const state = ctx.doc.current;
+      const allPeers = ctx.canvasStore?.peers();
+      if (!allPeers || Object.keys(allPeers).length === 0) {
+        log.warn("file-widget", "no peers available for snatch-to-disk");
+        return;
+      }
+
+      // prefer peers listed in snatchedBy, same as handleSnatch
+      const snatchedBy = (state.snatchedBy ?? []).map(String);
+      let peers: typeof allPeers;
+      if (snatchedBy.length > 0) {
+        const filtered: typeof allPeers = {};
+        for (const [key, value] of Object.entries(allPeers)) {
+          if (snatchedBy.includes(String(value.nodeId))) {
+            filtered[key] = value;
+          }
+        }
+        peers = Object.keys(filtered).length > 0 ? filtered : allPeers;
+      } else {
+        peers = allPeers;
+      }
+
+      // ask where to save it BEFORE starting the download — if the user
+      // cancels the native picker, nothing else happens.
+      let handle: FileSystemFileHandle;
+      try {
+        // non-null: gated by diskSnatchSupported (canSnatchToDisk()) above,
+        // which already confirmed this method exists at runtime.
+        handle = await window.showSaveFilePicker!({
+          suggestedName: state.filename || "file",
+        });
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return; // user cancelled
+        log.error("file-widget", "showSaveFilePicker failed:", err);
+        return;
+      }
+
+      let writable: FileSystemWritableFileStream;
+      try {
+        writable = await handle.createWritable();
+      } catch (err) {
+        log.error("file-widget", "createWritable failed:", err);
+        return;
+      }
+
+      diskSnatchCancelled = false;
+      diskSnatchAbort = new AbortController();
+
+      actionState = "disk-snatching";
+      diskSnatchBtn.setLabel("downloading...");
+      diskSnatchBtn.setColor(0x555555);
+      syncActionButtons();
+
+      diskSnatchProgressText = "probing...";
+      if (!diskSnatchHovered) {
+        diskSnatchBtn.setLabel(diskSnatchProgressText);
+      }
+
+      try {
+        await snatchBlobToDisk(
+          {
+            blobId: String(state.blobId || ""),
+            filename: String(state.filename || ""),
+            mime: String(state.mime || ""),
+            size: state.size,
+            blake3: String(state.blake3 || ""),
+            domain: String(state.domain || ""),
+          },
+          peers as PeersMap,
+          writable,
+          {
+            onProgress: (fraction) => {
+              if (diskSnatchCancelled) return;
+              if (fraction >= 0) {
+                const pct = Math.round(fraction * 100);
+                diskSnatchProgressText = `${pct}%`;
+                if (!diskSnatchHovered) {
+                  diskSnatchBtn.setLabel(diskSnatchProgressText);
+                }
+              } else {
+                diskSnatchProgressText = "downloading...";
+                if (!diskSnatchHovered) {
+                  diskSnatchBtn.setLabel(diskSnatchProgressText);
+                }
+              }
+            },
+            signal: diskSnatchAbort?.signal,
+            isPeerOnline: ctx.canvasStore
+              ? (nodeId: string) => ctx.canvasStore!.isPeerOnline(nodeId)
+              : undefined,
+            onPeerAttempt: (peerIndex, peerCount, online) => {
+              if (diskSnatchCancelled) return;
+              const label =
+                peerCount > 1
+                  ? `peer ${peerIndex + 1}/${peerCount}${online ? "" : " (offline)"}`
+                  : "downloading...";
+              diskSnatchProgressText = label;
+              if (!diskSnatchHovered) {
+                diskSnatchBtn.setLabel(diskSnatchProgressText);
+              }
+            },
+          }
+        );
+
+        if (diskSnatchCancelled) {
+          log.debug("file-widget", "snatch-to-disk result discarded (cancelled)");
+          return;
+        }
+
+        // same destroy-race as handleSnatch: aborting diskSnatchAbort does
+        // NOT cancel the in-flight WASM download, so this can still resolve
+        // after destroy() already tore down the pixi container.
+        if (destroyed) {
+          log.debug("file-widget", "snatch-to-disk result discarded (widget destroyed)");
+          return;
+        }
+
+        // deliberately leave actionState as "remote" — we skipped
+        // OPFS/IndexedDB persistence on purpose, so the blob genuinely
+        // isn't local from this widget's point of view.
+        log.debug(
+          "file-widget",
+          "snatch-to-disk complete — blob remains remote (OPFS/IndexedDB skipped)"
+        );
+        actionState = "remote";
+        syncActionButtons();
+        positionInfoBar(currentWidth, currentHeight);
+      } catch (err) {
+        if (diskSnatchCancelled) {
+          // best-effort: discard the partially-opened file handle
+          try {
+            await writable.abort();
+          } catch {
+            // nothing more we can do here
+          }
+          log.debug("file-widget", "snatch-to-disk aborted (cancelled)");
+          return;
+        }
+        if (destroyed) {
+          log.debug("file-widget", "snatch-to-disk failed after widget destroyed:", err);
+          return;
+        }
+        log.error("file-widget", "snatch-to-disk failed:", err);
+        actionState = "remote";
+        syncActionButtons();
+      } finally {
+        diskSnatchAbort = null;
       }
     }
 
@@ -1738,6 +2014,10 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         if (snatchAbort) {
           snatchAbort.abort();
           snatchAbort = null;
+        }
+        if (diskSnatchAbort) {
+          diskSnatchAbort.abort();
+          diskSnatchAbort = null;
         }
         if (activeOverlay && !activeOverlay.closed) {
           activeOverlay.close();

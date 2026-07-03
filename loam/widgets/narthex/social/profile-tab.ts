@@ -22,6 +22,7 @@ import {
   COLOR_DOT_GAP,
   COLOR_DOT_RADIUS,
   COLOR_PALETTE,
+  COLOR_RING_INSET,
   FIELD_GAP,
   FIELD_HEIGHT,
   FONT,
@@ -1028,7 +1029,7 @@ export function createProfileTab(ctx: TabContext): TabController {
     colorLabel.x = 0;
     colorLabel.y = y;
     y += LABEL_SIZE + 6;
-    layoutColorDots(0, y);
+    layoutColorDots(COLOR_RING_INSET, y);
 
     // node id
     y += COLOR_DOT_RADIUS * 2 + FIELD_GAP;

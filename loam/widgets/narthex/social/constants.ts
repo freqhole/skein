@@ -94,6 +94,11 @@ export const AVATAR_EXPORT_SIZE = 100;
 // color picker dots
 export const COLOR_DOT_RADIUS = 7;
 export const COLOR_DOT_GAP = 4;
+/** left inset for the color-dot row so the selection ring (drawn at
+ *  `COLOR_DOT_RADIUS + 3`, 2px stroke) doesn't overhang past the row's
+ *  own x=0 and get clipped by the profile tab's scroll mask (a real
+ *  user-reported bug, 2026-07-03: ring cut off on the left side). */
+export const COLOR_RING_INSET = 4;
 
 // profile tab — "my canvases" list
 export const PROFILE_CANVAS_ROW_HEIGHT = 40;

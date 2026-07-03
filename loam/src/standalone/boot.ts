@@ -10,7 +10,9 @@ import { initCanvas, type SkeinCanvas } from "../canvas/init";
 import { ensureMyProfileDoc, type ProfileStore } from "../canvas/profile-doc";
 import { showShareDialog, type FriendInfo, type ShareDialogOptions } from "../canvas/share-dialog";
 import { registerSocialBridge } from "../dev/test-bridge-registry";
+import { buildP2PBridge } from "../dev/test-bridge";
 import type { SkeinTestBridgeSocial, ShareTestHooks } from "../dev/test-bridge";
+import { sharedBlobAclRegistry } from "../canvas/blob-acl-registry";
 import { preloadFonts } from "../fonts/font-loader";
 import { handleSkeinStream } from "../p2p/skein-handler";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
@@ -123,6 +125,19 @@ class SkeinRouter {
 
     // register adapter for module-level endpoint toggle (settings tab)
     registerEndpointAdapter(this.irohAdapter);
+
+    // dev/test-only: expose the real production IrohNetworkAdapter's p2p
+    // bridge (importBlob/fetchBlob/restrictBlobToPeers/etc — see
+    // dev/test-bridge.ts's buildP2PBridge) on window.__skeinTest.p2p. this
+    // is the same bridge test-harness-p2p.html already exposes, wired here
+    // so e2e tests can drive real blob import/fetch against the actual
+    // production app + router (needed for cross-canvas blob-ACL coverage,
+    // where the test must navigate between two real canvases via the real
+    // SkeinRouter, not the lighter-weight p2p test harness).
+    if (import.meta.env.DEV) {
+      const bridge: Record<string, unknown> = ((window as any).__skeinTest ??= {});
+      bridge.p2p = buildP2PBridge(this.irohAdapter);
+    }
 
     // scope automerge-repo's own sync eligibility — see
     // canvas-scoped-share-policy.ts's module doc comment for the full
@@ -618,6 +633,14 @@ class SkeinRouter {
 
           // delete the canvas document itself
           repo.delete(canvasDocId as DocumentId);
+
+          // a purged canvas is no longer an active sharing context — stop
+          // vouching for its peers in the cross-canvas blob-ACL union (see
+          // blob-acl-registry.ts). this canvas may not even be the one
+          // currently open/mounted, so CanvasBlobAclSync itself has no
+          // chance to observe this deletion live — clear it directly here.
+          sharedBlobAclRegistry.clearCanvas(canvasDocId);
+
           log.debug(
             TAG,
             "cleaned up canvas and widget docs for:",

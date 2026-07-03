@@ -25,13 +25,22 @@
  *
  * `restrict_blob_to_peers` REPLACES the allow-list for a hash rather than
  * adding to it (confirmed in `midden/src/lib.rs` — `HashMap::insert`
- * overwrites any existing entry), so recomputing and resending the full
- * current allow-list on every change is what makes revocation actually
- * work: a peer removed from `.acl` is simply absent from the next call.
+ * overwrites any existing entry). only one canvas is ever open/mounted at
+ * a time in this app (see `standalone/boot.ts`'s `SkeinRouter` — one
+ * `CanvasBlobAclSync` per open canvas, created in `initCanvas()`, destroyed
+ * in `destroyCurrent()`), so simply "recompute and resend this canvas's
+ * full current allow-list" would silently revoke access for peers a
+ * *different*, currently-closed canvas legitimately still shares the same
+ * blob with — whichever canvas synced last would win. `blob-acl-registry.ts`
+ * fixes this: every sync reports this canvas's own hash->peers contribution
+ * into a shared, session-scoped registry and pushes the UNION across every
+ * canvas contribution currently known, not just this one. see that file's
+ * doc comment for the full design + accepted limitations.
  */
 
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import type { CanvasStore } from "./canvas-store";
+import { sharedBlobAclRegistry, type BlobAclRegistry } from "./blob-acl-registry";
 import { log } from "../utils/log";
 
 const TAG = "canvas.blob-acl-sync";
@@ -48,15 +57,25 @@ function coerceStr(v: unknown): string {
 
 /**
  * watches a canvas's `.acl` and its file widgets, keeping each referenced
- * blob's iroh-blobs allow-list in sync via `restrictBlobToPeers`.
+ * blob's iroh-blobs allow-list in sync via `restrictBlobToPeers` — computed
+ * as the union of this canvas's own contribution and every other canvas's
+ * last-known contribution recorded in the shared registry (see
+ * `blob-acl-registry.ts`).
  *
  * call `start()` once (after the canvas's widgets have begun mounting) and
- * `destroy()` when the canvas is torn down.
+ * `destroy()` when the canvas is torn down. `destroy()` deliberately does
+ * NOT clear this canvas's registry contribution — see `blob-acl-registry.ts`'s
+ * doc comment for why that's required for the union to work across
+ * navigations, not a leak.
  */
 export class CanvasBlobAclSync {
   private readonly store: CanvasStore;
   private readonly repo: Repo;
   private readonly restrictBlobToPeers: (blake3Hash: string, peerNodeIds: string[]) => Promise<void>;
+  private readonly registry: BlobAclRegistry;
+  /** this canvas's own document id — the key this instance's contributions
+   *  are recorded under in the shared registry. */
+  private readonly canvasId: string;
 
   /** docId -> unsubscribe, for each file widget's own doc we're watching. */
   private readonly widgetUnsubs = new Map<string, () => void>();
@@ -68,11 +87,14 @@ export class CanvasBlobAclSync {
   constructor(
     store: CanvasStore,
     repo: Repo,
-    restrictBlobToPeers: (blake3Hash: string, peerNodeIds: string[]) => Promise<void>
+    restrictBlobToPeers: (blake3Hash: string, peerNodeIds: string[]) => Promise<void>,
+    registry: BlobAclRegistry = sharedBlobAclRegistry
   ) {
     this.store = store;
     this.repo = repo;
     this.restrictBlobToPeers = restrictBlobToPeers;
+    this.registry = registry;
+    this.canvasId = store.handle.documentId;
   }
 
   /**
@@ -90,7 +112,13 @@ export class CanvasBlobAclSync {
     });
   }
 
-  /** stop watching and release all subscriptions. */
+  /**
+   * stop watching and release all subscriptions. deliberately does NOT
+   * clear this canvas's contribution from the shared registry — a closed
+   * canvas must keep contributing its last-known peer set to the union so
+   * navigating to a different canvas doesn't silently revoke access this
+   * canvas still legitimately grants. see `blob-acl-registry.ts`.
+   */
   destroy(): void {
     this.destroyed = true;
     this.canvasUnsub?.();
@@ -98,6 +126,31 @@ export class CanvasBlobAclSync {
     for (const unsub of this.widgetUnsubs.values()) unsub();
     this.widgetUnsubs.clear();
     this.pendingLookups.clear();
+  }
+
+  /**
+   * whether this canvas should currently be contributing peers to the
+   * shared registry at all. false (contribute nothing) when:
+   * - the canvas is tombstoned (soft- or hard-deleted) — no longer an
+   *   active sharing context, see `blob-acl-registry.ts`'s doc comment.
+   * - the local peer's own `.acl` entry has been removed while OTHER
+   *   entries still exist — i.e. this device was itself removed from the
+   *   canvas's participant list, and has no basis left to keep vouching
+   *   for who else the canvas authorizes. distinguished from "this canvas
+   *   simply has no ACL data at all" (an empty `.acl`, e.g. a legacy
+   *   pre-ACL canvas or a test fixture that never called `stampAdmin()`/
+   *   `setRole()`) — that case still contributes normally, matching the
+   *   pre-existing behavior of `allowedPeerIds()` computing an empty list
+   *   from an empty `.acl` regardless of this check.
+   */
+  private isStillParticipating(): boolean {
+    if (this.store.isDeleted) return false;
+    const acl = this.store.doc().acl ?? {};
+    const localNodeId = this.store.localNodeId;
+    if (!localNodeId) return true; // identity not resolved yet — can't tell, default to contributing
+    const aclEntries = Object.keys(acl);
+    if (aclEntries.length === 0) return true; // no ACL data at all — not a removal
+    return aclEntries.includes(localNodeId);
   }
 
   /**
@@ -168,33 +221,41 @@ export class CanvasBlobAclSync {
   }
 
   /**
-   * recompute the allow-list and every referenced blob hash, then push the
-   * full allow-list to each hash. reads widget docs from `repo.handles`
+   * recompute this canvas's own hash->peers contribution and report it
+   * into the shared registry, then push the UNION across every canvas
+   * contribution currently known (not just this one) for every hash
+   * affected by this update. reads widget docs from `repo.handles`
    * (already-cached handles only — `reconcileWidgetWatchers` is what
    * actually opens them) so this never triggers a network fetch itself.
    */
   private syncAll(): void {
     if (this.destroyed) return;
 
-    const peerIds = this.allowedPeerIds();
-    const hashes = new Set<string>();
+    const contributing = this.isStillParticipating();
+    const peerIds = contributing ? this.allowedPeerIds() : [];
+    const contribution = new Map<string, string[]>();
 
-    for (const entry of this.store.allWidgets()) {
-      if (!entry.docId) continue;
-      const handle = this.repo.handles[entry.docId as DocumentId] as DocHandle<any> | undefined;
-      if (!handle || !handle.isReady()) continue;
+    if (contributing) {
+      for (const entry of this.store.allWidgets()) {
+        if (!entry.docId) continue;
+        const handle = this.repo.handles[entry.docId as DocumentId] as DocHandle<any> | undefined;
+        if (!handle || !handle.isReady()) continue;
 
-      const raw = handle.doc() as { blake3?: unknown } | undefined;
-      const blake3 = coerceStr(raw?.blake3);
-      if (blake3) hashes.add(blake3);
+        const raw = handle.doc() as { blake3?: unknown } | undefined;
+        const blake3 = coerceStr(raw?.blake3);
+        if (blake3) contribution.set(blake3, peerIds);
+      }
     }
 
-    if (hashes.size === 0) return;
+    const affectedHashes = this.registry.setCanvasContribution(this.canvasId, contribution);
+    if (affectedHashes.size === 0) return;
 
-    for (const hash of hashes) {
-      this.restrictBlobToPeers(hash, peerIds).catch((err) => {
+    for (const hash of affectedHashes) {
+      const union = this.registry.unionForHash(hash);
+      this.restrictBlobToPeers(hash, union).catch((err) => {
         log.warn(TAG, "restrict_blob_to_peers failed for hash", hash.slice(0, 16), err);
       });
     }
   }
 }
+
