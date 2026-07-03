@@ -68,6 +68,7 @@ export function deterministicBytes(sizeBytes: number, seed = 0xc0ffee): Uint8Arr
  *  byte-for-byte disk write independent of any PRNG's own patterns). */
 export function randomBlobBytes(sizeBytes: number = DEFAULT_RANDOM_BLOB_SIZE): Uint8Array {
   return new Uint8Array(nodeRandomBytes(sizeBytes));
+}
 
 /** load the real sample PNG fixture (`tests/fixtures/freqhole.png`, a
  *  512x512 RGBA image, ~3.5KB) — for proving an actual file format
