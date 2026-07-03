@@ -3,7 +3,10 @@
 // ---------------------------------------------------------------------------
 
 import { Assets, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
+import type { DocumentId } from "@automerge/automerge-repo";
 import { log } from "../../../src/utils/log";
+import { CanvasBinStore } from "../../../src/canvas/canvas-bin-doc";
+import { ProfileStore } from "../../../src/canvas/profile-doc";
 import {
   getHubAdminTransport,
   isOnline as bridgeIsOnline,
@@ -14,6 +17,11 @@ import {
 import { createHubAdminClient } from "../../../src/p2p/hub-admin-client";
 import { registerSocialBridge } from "../../../src/dev/test-bridge-registry";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
+import {
+  createProfileCanvasBinWidget,
+  PROFILE_CANVAS_BIN_HEIGHT,
+  type ProfileCanvasBinController,
+} from "./canvas-bin";
 import {
   ACCENT,
   BG,
@@ -119,6 +127,11 @@ export function createFriendsTab(ctx: TabContext): TabController {
   // hub-profile-panel state (docs/hub-and-profile-plan.md section 5/8 step 7)
   let hubProfileHandle: HubProfilePanelHandle | null = null;
   let hubProfileHubNodeId: string | null = null;
+
+  // a friend's read-only canvas-bin section in the detail view (see
+  // rebuildDetailView() below) — best-effort, mounted asynchronously once
+  // the friend's profile+bin docs are reachable.
+  let friendCanvasBinController: ProfileCanvasBinController | null = null;
 
   // scroll state for the list view
   let scrollY = 0;
@@ -986,13 +999,55 @@ export function createFriendsTab(ctx: TabContext): TabController {
   };
 
   // ---------------------------------------------------------------------------
-  // detail view
+  // detail view (scrollable, masked — same pattern the friend-list area
+  // above uses. added when the friend-canvas-bin section could push total
+  // detail content past the social panel's own fixed bounds with nothing
+  // to clip/scroll it — a real user-reported bug, 2026-07-02).
   // ---------------------------------------------------------------------------
 
   const detailContainer = new Container();
   detailContainer.eventMode = "static";
   detailContainer.visible = false;
   container.addChild(detailContainer);
+
+  const detailMask = new Graphics();
+  detailContainer.addChild(detailMask);
+
+  let detailScrollY = 0;
+  let detailAreaHeight = 0;
+  // total content height, tracked manually as `rebuildDetailView()` lays
+  // things out (never read via `detailInner.height`) — `detailInner` has a
+  // `.mask` set, and asking Pixi v8 for `.height`/`.getBounds()` on a
+  // masked object makes it walk the mask's matrix relative to a shared
+  // root to compute "effective" bounds, which both logs a "Mask bounds,
+  // renderable is not inside the root container" warning AND can break
+  // rendering outright (a real, serious user-reported bug, 2026-07-02: the
+  // whole profile view went blank from the identical mistake in
+  // profile-tab.ts). `bin/bin-renderer.ts`'s `totalContentHeight` field is
+  // the established safe alternative this mirrors.
+  let detailContentHeight = 0;
+
+  const clampDetailScroll = () => {
+    const maxScroll = Math.max(0, detailContentHeight - detailAreaHeight);
+    detailScrollY = Math.max(0, Math.min(detailScrollY, maxScroll));
+    detailInner.y = -detailScrollY;
+  };
+
+  detailContainer.on("wheel", (e: WheelEvent) => {
+    const canScroll = detailContentHeight > detailAreaHeight;
+    if (!canScroll) return; // let the event pass through to the canvas viewport
+
+    e.stopPropagation();
+    // claim the native event so the viewport doesn't also pan
+    if ((e as any).nativeEvent) (e as any).nativeEvent._skeinWidgetScroll = true;
+    detailScrollY += e.deltaY > 0 ? SCROLL_SPEED : -SCROLL_SPEED;
+    clampDetailScroll();
+  });
+
+  const detailInner = new Container();
+  detailInner.eventMode = "static";
+  detailContainer.addChild(detailInner);
+  detailInner.mask = detailMask;
 
   // ---------------------------------------------------------------------------
   // hub-profile-panel view — mounted for a friend-detail view where
@@ -1069,7 +1124,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
     hubProfileHandle.layout(w, panelHeight);
   }
 
-  const rebuildDetailView = (friend: FriendEntry, contentW: number, areaHeight: number) => {
+  const rebuildDetailView = (friend: FriendEntry, contentW: number) => {
     // clean up any existing input handles before destroying children
     if (aliasInputHandle) {
       aliasInputHandle.destroy();
@@ -1079,10 +1134,20 @@ export function createFriendsTab(ctx: TabContext): TabController {
       groupInputHandle.destroy();
       groupInputHandle = null;
     }
+    if (friendCanvasBinController) {
+      const c = friendCanvasBinController.container;
+      friendCanvasBinController.destroy();
+      if (c.parent) c.parent.removeChild(c);
+      friendCanvasBinController = null;
+      registerSocialBridge({ friendCanvasBin: undefined });
+    }
     detailNodeIdTextRef = null;
+    // fresh friend/detail view — don't carry over a scroll offset from
+    // whichever friend (or lack thereof) was viewed previously.
+    detailScrollY = 0;
 
-    while (detailContainer.children.length > 0) {
-      detailContainer.removeChildAt(0).destroy({ children: true });
+    while (detailInner.children.length > 0) {
+      detailInner.removeChildAt(0).destroy({ children: true });
     }
 
     let dy = 0;
@@ -1108,7 +1173,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
       scrollY = 0;
       layout(currentWidth, currentHeight);
     });
-    detailContainer.addChild(backBtn);
+    detailInner.addChild(backBtn);
     dy += backText.height + 12;
 
     // avatar — large centered circle
@@ -1123,7 +1188,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
     avatarCircle.eventMode = "none";
     avatarCircle.circle(avatarCx, avatarCy, DETAIL_AVATAR_SIZE / 2);
     avatarCircle.fill({ color: avatarColor });
-    detailContainer.addChild(avatarCircle);
+    detailInner.addChild(avatarCircle);
 
     const initial = displayName.charAt(0).toUpperCase() || "?";
     const avatarInitial = new Text({
@@ -1141,7 +1206,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
     avatarInitial.anchor.set(0.5);
     avatarInitial.x = avatarCx;
     avatarInitial.y = avatarCy;
-    detailContainer.addChild(avatarInitial);
+    detailInner.addChild(avatarInitial);
 
     if (avatarUrl) {
       // helper to overlay the avatar sprite once we have a texture
@@ -1157,9 +1222,9 @@ export function createFriendsTab(ctx: TabContext): TabController {
         const spriteMask = new Graphics();
         spriteMask.circle(avatarCx, avatarCy, DETAIL_AVATAR_SIZE / 2);
         spriteMask.fill({ color: 0xffffff });
-        detailContainer.addChild(spriteMask);
+        detailInner.addChild(spriteMask);
         avatarSprite.mask = spriteMask;
-        detailContainer.addChild(avatarSprite);
+        detailInner.addChild(avatarSprite);
 
         avatarCircle.visible = false;
         avatarInitial.visible = false;
@@ -1185,33 +1250,25 @@ export function createFriendsTab(ctx: TabContext): TabController {
       }
     }
 
-    dy += DETAIL_AVATAR_SIZE + 10;
-
-    // online status dot + text
+    // online/offline presence dot — overlaid on the avatar's bottom-right
+    // corner (a small ring-bordered dot, standard presence-indicator
+    // convention) rather than its own separate label+dot line, to free up
+    // vertical space for the friend-canvas-bin section below (a real
+    // user-reported request, 2026-07-02).
     const isOnline = friend.nodeIds.some((n) => bridgeIsOnline(n.nodeId));
     const statusDot = new Graphics();
     statusDot.eventMode = "none";
     const statusColor = isOnline ? ONLINE_COLOR : OFFLINE_COLOR;
-    const statusLabel = isOnline ? "online" : "offline";
-    const statusText = new Text({
-      text: statusLabel,
-      style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
-      resolution: RESOLUTION,
-    });
-    statusText.eventMode = "none";
-    const statusTotalW = ONLINE_DOT_SIZE + 4 + statusText.width;
-    const statusStartX = (contentW - statusTotalW) / 2;
-    statusDot.circle(
-      statusStartX + ONLINE_DOT_SIZE / 2,
-      dy + statusText.height / 2,
-      ONLINE_DOT_SIZE / 2
-    );
-    statusDot.fill({ color: statusColor });
-    detailContainer.addChild(statusDot);
-    statusText.x = statusStartX + ONLINE_DOT_SIZE + 4;
-    statusText.y = dy;
-    detailContainer.addChild(statusText);
-    dy += statusText.height + 8;
+    const dotR = ONLINE_DOT_SIZE / 2 + 1;
+    const dotCx = avatarCx + DETAIL_AVATAR_SIZE / 2 - dotR;
+    const dotCy = avatarCy + DETAIL_AVATAR_SIZE / 2 - dotR;
+    // ring border matches the panel background, so the dot reads as
+    // "cut into" the avatar rather than floating on top of it.
+    statusDot.circle(dotCx, dotCy, dotR + 1.5).fill({ color: BG });
+    statusDot.circle(dotCx, dotCy, dotR).fill({ color: statusColor });
+    detailInner.addChild(statusDot);
+
+    dy += DETAIL_AVATAR_SIZE + 10;
 
     // display name — centered
     const nameText = new Text({
@@ -1227,7 +1284,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
     nameText.eventMode = "none";
     nameText.x = Math.max(0, (contentW - nameText.width) / 2);
     nameText.y = dy;
-    detailContainer.addChild(nameText);
+    detailInner.addChild(nameText);
     dy += DETAIL_NAME_SIZE + 6;
 
     // -----------------------------------------------------------------------
@@ -1243,7 +1300,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
       manageHubBtn.cursor = "pointer";
       manageHubBtn.hitArea = new Rectangle(0, 0, contentW, DETAIL_BTN_HEIGHT);
       manageHubBtn.y = dy;
-      detailContainer.addChild(manageHubBtn);
+      detailInner.addChild(manageHubBtn);
 
       const manageHubBg = new Graphics();
       manageHubBg.eventMode = "none";
@@ -1284,7 +1341,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
         });
         hubNodeIdLabel.eventMode = "none";
         hubNodeIdLabel.y = dy;
-        detailContainer.addChild(hubNodeIdLabel);
+        detailInner.addChild(hubNodeIdLabel);
         dy += LABEL_SIZE + 4;
 
         const hubNodeIdText = new Text({
@@ -1294,10 +1351,38 @@ export function createFriendsTab(ctx: TabContext): TabController {
         });
         hubNodeIdText.eventMode = "none";
         hubNodeIdText.y = dy;
-        detailContainer.addChild(hubNodeIdText);
+        detailInner.addChild(hubNodeIdText);
         detailNodeIdTextRef = hubNodeIdText;
         dy += hubNodeIdText.height + 8;
       }
+    }
+
+    // -----------------------------------------------------------------------
+    // bio (if any nodeId has one) — shown before alias (a real user-
+    // reported layout preference, 2026-07-02: alias editing used to come
+    // first).
+    // -----------------------------------------------------------------------
+
+    const bio = friend.nodeIds.find((n) => n.bio)?.bio;
+    if (bio) {
+      const bioText = new Text({
+        text: truncate(bio, 80),
+        style: {
+          fontFamily: FONT,
+          fontSize: DETAIL_BIO_SIZE,
+          fill: MUTED_TEXT,
+          wordWrap: true,
+          wordWrapWidth: contentW,
+        },
+        resolution: RESOLUTION,
+      });
+      bioText.eventMode = "none";
+      bioText.x = Math.max(0, (contentW - bioText.width) / 2);
+      bioText.y = dy;
+      detailInner.addChild(bioText);
+      dy += bioText.height + 10;
+    } else {
+      dy += 4;
     }
 
     // -----------------------------------------------------------------------
@@ -1312,7 +1397,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
     aliasLabel.eventMode = "none";
     aliasLabel.x = 0;
     aliasLabel.y = dy;
-    detailContainer.addChild(aliasLabel);
+    detailInner.addChild(aliasLabel);
     dy += LABEL_SIZE + 4;
 
     if (editingAlias) {
@@ -1326,7 +1411,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
       });
       aliasInputHandle.input.x = 0;
       aliasInputHandle.input.y = dy;
-      detailContainer.addChild(aliasInputHandle.input);
+      detailInner.addChild(aliasInputHandle.input);
       dy += FIELD_HEIGHT + 6;
 
       // save button
@@ -1364,7 +1449,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
           if (idx !== -1) draft.friends[idx].alias = newValue;
         });
       });
-      detailContainer.addChild(aliasSaveBtn);
+      detailInner.addChild(aliasSaveBtn);
 
       // cancel button
       const aliasCancelBtn = new Container();
@@ -1397,7 +1482,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
         editingAlias = false;
         layout(currentWidth, currentHeight);
       });
-      detailContainer.addChild(aliasCancelBtn);
+      detailInner.addChild(aliasCancelBtn);
 
       dy += saveH + 8;
     } else {
@@ -1405,7 +1490,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
       const aliasRow = new Container();
       aliasRow.eventMode = "static";
       aliasRow.y = dy;
-      detailContainer.addChild(aliasRow);
+      detailInner.addChild(aliasRow);
 
       const aliasValue = friend.alias || "none";
       const aliasValueText = new Text({
@@ -1456,38 +1541,12 @@ export function createFriendsTab(ctx: TabContext): TabController {
       dy += editH + 8;
     }
 
-    // -----------------------------------------------------------------------
-    // bio (if any nodeId has one)
-    // -----------------------------------------------------------------------
-
-    const bio = friend.nodeIds.find((n) => n.bio)?.bio;
-    if (bio) {
-      const bioText = new Text({
-        text: truncate(bio, 80),
-        style: {
-          fontFamily: FONT,
-          fontSize: DETAIL_BIO_SIZE,
-          fill: MUTED_TEXT,
-          wordWrap: true,
-          wordWrapWidth: contentW,
-        },
-        resolution: RESOLUTION,
-      });
-      bioText.eventMode = "none";
-      bioText.x = Math.max(0, (contentW - bioText.width) / 2);
-      bioText.y = dy;
-      detailContainer.addChild(bioText);
-      dy += bioText.height + 10;
-    } else {
-      dy += 4;
-    }
-
     // separator
     const sep = new Graphics();
     sep.moveTo(0, dy);
     sep.lineTo(contentW, dy);
     sep.stroke({ color: BORDER, width: 1, alpha: 0.5 });
-    detailContainer.addChild(sep);
+    detailInner.addChild(sep);
     dy += 10;
 
     // -----------------------------------------------------------------------
@@ -1497,22 +1556,23 @@ export function createFriendsTab(ctx: TabContext): TabController {
     for (const nodeEntry of friend.nodeIds) {
       if (!nodeEntry.nodeId) continue;
 
+      // "node id" label + abbreviated value + copy button all on one row
+      // (previously the label had its own line above — merged to free up
+      // vertical space for the friend-canvas-bin section below, a real
+      // user-reported request, 2026-07-02).
+      const nodeIdRow = new Container();
+      nodeIdRow.eventMode = "static";
+      nodeIdRow.y = dy;
+      detailInner.addChild(nodeIdRow);
+
       const nodeIdLabel = new Text({
         text: "node id",
         style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
         resolution: RESOLUTION,
       });
       nodeIdLabel.eventMode = "none";
-      nodeIdLabel.x = 0;
-      nodeIdLabel.y = dy;
-      detailContainer.addChild(nodeIdLabel);
-      dy += LABEL_SIZE + 4;
-
-      // abbreviated node ID + copy button in a row
-      const nodeIdRow = new Container();
-      nodeIdRow.eventMode = "static";
-      nodeIdRow.y = dy;
-      detailContainer.addChild(nodeIdRow);
+      nodeIdLabel.y = 2;
+      nodeIdRow.addChild(nodeIdLabel);
 
       const abbreviated = nodeEntry.nodeId.slice(0, 8) + "\u2026" + nodeEntry.nodeId.slice(-8);
       const nodeIdText = new Text({
@@ -1525,6 +1585,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
         resolution: RESOLUTION,
       });
       nodeIdText.eventMode = "none";
+      nodeIdText.x = nodeIdLabel.width + 8;
       nodeIdText.y = 2;
       nodeIdRow.addChild(nodeIdText);
 
@@ -1532,7 +1593,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
       const copyBtn = new Container();
       copyBtn.eventMode = "static";
       copyBtn.cursor = "pointer";
-      copyBtn.x = nodeIdText.width + 8;
+      copyBtn.x = nodeIdText.x + nodeIdText.width + 8;
 
       const copyBtnBg = new Graphics();
       copyBtnBg.eventMode = "none";
@@ -1562,7 +1623,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
           () => {
             copyLabel.text = "copied!";
             setTimeout(() => {
-              if (detailContainer.destroyed) return;
+              if (detailInner.destroyed) return;
               copyLabel.text = "copy";
             }, COPY_FEEDBACK_MS);
           },
@@ -1585,7 +1646,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
       });
       groupLabel.eventMode = "none";
       groupLabel.y = dy;
-      detailContainer.addChild(groupLabel);
+      detailInner.addChild(groupLabel);
       dy += LABEL_SIZE + 6;
 
       // collect all known groups
@@ -1663,7 +1724,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
           }
         });
 
-        detailContainer.addChild(pill);
+        detailInner.addChild(pill);
         px += pillW + OPTION_PILL_GAP;
       }
 
@@ -1680,7 +1741,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
         });
         groupInputHandle.input.x = 0;
         groupInputHandle.input.y = dy;
-        detailContainer.addChild(groupInputHandle.input);
+        detailInner.addChild(groupInputHandle.input);
         dy += FIELD_HEIGHT + 6;
 
         // confirm button
@@ -1725,7 +1786,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
             });
           }
         });
-        detailContainer.addChild(newGroupConfirmBtn);
+        detailInner.addChild(newGroupConfirmBtn);
 
         // cancel button
         const newGroupCancelBtn = new Container();
@@ -1758,7 +1819,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
           editingNewGroup = false;
           layout(currentWidth, currentHeight);
         });
-        detailContainer.addChild(newGroupCancelBtn);
+        detailInner.addChild(newGroupCancelBtn);
 
         dy += ngH + 8;
       }
@@ -1776,7 +1837,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
       });
       addedLabel.eventMode = "none";
       addedLabel.y = dy;
-      detailContainer.addChild(addedLabel);
+      detailInner.addChild(addedLabel);
       dy += LABEL_SIZE + 4;
 
       const addedText = new Text({
@@ -1786,21 +1847,77 @@ export function createFriendsTab(ctx: TabContext): TabController {
       });
       addedText.eventMode = "none";
       addedText.y = dy;
-      detailContainer.addChild(addedText);
+      detailInner.addChild(addedText);
       dy += addedText.height + 10;
+    }
+
+    // -----------------------------------------------------------------------
+    // friend's shared canvas bin — read-only, paginated (see canvas-bin.ts's
+    // module doc comment / docs/hub-and-profile-plan.md). best-effort only:
+    // shown once the friend's profile doc (already known via the gossip-
+    // relayed nodeIds[].profileDocId, see friendz-wiring.ts's
+    // mergeGossipDigestProfiles()) is reachable AND has published a
+    // canvasBinDocId — no error UI for the "not there yet" cases, matching
+    // this file's existing best-effort conventions elsewhere (bio, hub node
+    // id, etc).
+    // -----------------------------------------------------------------------
+    {
+      const mountY = dy;
+      // reserve the space synchronously regardless of whether the async
+      // lookup below actually finds a bin to mount — previously `dy` (and
+      // therefore the "remove friend" button positioned from it) never
+      // accounted for this section's height at all, so once the bin DID
+      // mount, it silently overlapped the button below (a real
+      // user-reported bug, 2026-07-02: "remove friend" button and the
+      // canvases bin on friends' profiles overlap).
+      dy += PROFILE_CANVAS_BIN_HEIGHT + 12;
+      const repo = ctx.canvasStore?.repo;
+      const friendProfileDocId = friend.nodeIds[0]?.profileDocId;
+      const requestFriendId = friend.id;
+      if (repo && friendProfileDocId) {
+        ProfileStore.open(repo, friendProfileDocId as DocumentId)
+          .then(async (friendProfileStore) => {
+            if (selectedFriendId !== requestFriendId || viewMode !== "detail") return;
+            const canvasBinDocId = friendProfileStore.canvasBinDocId();
+            if (!canvasBinDocId) return;
+            const friendCanvasBinStore = await CanvasBinStore.open(repo, canvasBinDocId as DocumentId);
+            if (selectedFriendId !== requestFriendId || viewMode !== "detail") return;
+            if (friendCanvasBinController) {
+              friendCanvasBinController.destroy();
+              friendCanvasBinController = null;
+            }
+            const controller = createProfileCanvasBinWidget({
+              canvasBinStore: friendCanvasBinStore,
+              profileStore: friendProfileStore,
+              width: contentW,
+              height: PROFILE_CANVAS_BIN_HEIGHT,
+              isReadOnly: true,
+              registerTestHooks: (hooks) => registerSocialBridge({ friendCanvasBin: hooks }),
+            });
+            friendCanvasBinController = controller;
+            controller.container.y = mountY;
+            detailInner.addChild(controller.container);
+          })
+          .catch(() => {
+            // friend's profile/canvas-bin doc not reachable yet — best
+            // effort, no error UI (matches this file's existing convention).
+          });
+      }
     }
 
     // -----------------------------------------------------------------------
     // delete button — anchored to bottom of area
     // -----------------------------------------------------------------------
 
-    const deleteBtnY = areaHeight - DETAIL_BTN_HEIGHT;
+    const deleteBtnY = dy;
+    dy += DETAIL_BTN_HEIGHT + 12;
+    detailContentHeight = dy;
     const deleteBtn = new Container();
     deleteBtn.eventMode = "static";
     deleteBtn.cursor = "pointer";
     deleteBtn.hitArea = new Rectangle(0, 0, contentW, DETAIL_BTN_HEIGHT);
     deleteBtn.y = deleteBtnY;
-    detailContainer.addChild(deleteBtn);
+    detailInner.addChild(deleteBtn);
 
     const deleteBg = new Graphics();
     deleteBg.eventMode = "none";
@@ -1836,7 +1953,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
         deleteBg.fill({ color: REJECT_COLOR });
         // auto-reset after 3 seconds
         deleteConfirmTimer = setTimeout(() => {
-          if (detailContainer.destroyed) return;
+          if (detailInner.destroyed) return;
           deleteConfirmPending = false;
           deleteText.text = "remove friend";
           deleteText.style.fill = REJECT_COLOR;
@@ -2177,7 +2294,17 @@ export function createFriendsTab(ctx: TabContext): TabController {
         detailContainer.visible = true;
         detailContainer.x = 0;
         detailContainer.y = 0;
-        rebuildDetailView(selectedFriend, w, h);
+        detailAreaHeight = h;
+        detailMask.clear();
+        detailMask.rect(0, 0, w, h).fill({ color: 0xffffff });
+        detailContainer.hitArea = new Rectangle(0, 0, w, h);
+        rebuildDetailView(selectedFriend, w);
+        // clamp scroll now that rebuildDetailView() has set the real
+        // content height (`detailContentHeight`) — the friend-canvas-bin
+        // section's height is reserved synchronously above regardless of
+        // whether it ends up mounting, so no further re-clamp is needed
+        // once its async lookup resolves.
+        clampDetailScroll();
         break;
       }
 

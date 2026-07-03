@@ -478,6 +478,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
 
     bgGfx.on("pointerdown", (e: any) => {
       if (drawing) return;
+      if (ctx.canvasStore?.isLocalViewer()) return;
       e.stopPropagation();
       drawing = true;
       activePointerId = e.pointerId;

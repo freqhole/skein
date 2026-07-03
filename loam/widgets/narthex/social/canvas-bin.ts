@@ -37,14 +37,12 @@
 // own instruction not to invent a new access-denied UI.
 // ---------------------------------------------------------------------------
 
-import { Container, Graphics, Rectangle, Text } from "pixi.js";
+import { Assets, Container, Graphics, Rectangle, Sprite, Text, type Texture } from "pixi.js";
 import type { CanvasBinNode } from "../../../src/canvas/canvas-bin-doc";
 import { CanvasBinStore, type CanvasBinMode } from "../../../src/canvas/canvas-bin-doc";
 import type { ProfileStore } from "../../../src/canvas/profile-doc";
 import {
-  autoFitCols,
-  computeRows,
-  resolveScale,
+  computePageSize,
   slotRect,
   type SlotSizeOptions,
 } from "../../bin/bin-layout";
@@ -56,7 +54,6 @@ import {
   FONT,
   MUTED_TEXT,
   RESOLUTION,
-  SCROLL_SPEED,
   TEXT_COLOR,
 } from "./constants";
 import { truncate } from "./helpers";
@@ -72,8 +69,11 @@ export const PROFILE_CANVAS_BIN_WIDGET_TYPE = "profile-canvas-bin";
 
 const HEADER_HEIGHT = 24;
 const VIEWPORT_HEIGHT = 220;
+const PAGER_HEIGHT = 20;
 const BIN_PADDING = 6;
-const CARD_LABEL_SIZE = 9;
+const CARD_LABEL_SIZE = 12;
+const CARD_DESCRIPTION_SIZE = 10;
+const CARD_LABEL_LINE_GAP = 4;
 const HOLD_MS = 220;
 const DRAG_THRESHOLD = 6;
 const GHOST_ALPHA = 0.7;
@@ -88,12 +88,84 @@ export interface ProfileCanvasBinContext {
   profileStore: ProfileStore;
   width: number;
   height: number;
+  /** render in read-only mode: no drag-to-move, no "+ folder" button — only
+   *  navigate-into-folder and open-canvas stay active. used for viewing a
+   *  FRIEND's bin (friends-tab.ts's friend-detail view, and the
+   *  `friend-canvas-bin` narthex widget) — the owner's own embed
+   *  (profile-tab.ts) omits this (defaults to `false`, fully editable). */
+  isReadOnly?: boolean;
+  /**
+   * override how this instance's test hooks get exposed. defaults to
+   * `registerSocialBridge({ canvasBin: hooks })` — the owner's own
+   * profile-tab embed, which is a permanent per-session singleton. any
+   * OTHER concurrent mount of this widget (a friend's read-only bin in
+   * friends-tab.ts, or an instance of the `friend-canvas-bin` narthex
+   * widget) must supply its own registration target here, or it would
+   * silently clobber the owner's own hooks under the same
+   * `window.__skeinTest.social.canvasBin` key.
+   */
+  registerTestHooks?: (hooks: ProfileCanvasBinTestHooks) => void;
 }
 
 export interface ProfileCanvasBinController {
   container: Container;
-  layout(width: number): void;
+  layout(width: number, height?: number): void;
   destroy(): void;
+}
+
+/**
+ * test hooks for this widget — see `ProfileCanvasBinContext.registerTestHooks`
+ * above for how/where an instance's hooks get exposed on
+ * `window.__skeinTest`. `getVisibleNodes()` reads the folder currently being
+ * viewed (root or a sub-folder) directly off `CanvasBinStore` — proves the
+ * tree, not just pixi render state (and is NOT paginated — pagination only
+ * affects which of these are actually drawn on the current page, see
+ * `getCurrentPage()`/`getTotalPages()`). `enterFolder`/`goBack`/`addFolder`/
+ * `moveNode`/`activateNode` call the widget's real internal handlers
+ * directly, same precedent as `FriendsTabTestHooks` (no infra in this repo
+ * for simulated pixi pointer drags).
+ */
+export interface ProfileCanvasBinTestHooks {
+  /** child nodes of the currently-viewed folder (or root). */
+  getVisibleNodes(): CanvasBinNode[];
+  /** the currently-viewed folder's id, or null at root. */
+  getCurrentFolderId(): string | null;
+  /** enter a folder (as if its card were tapped) or navigate to a canvas
+   *  (as if a canvas card were tapped) — dispatches on the node's kind. */
+  enterFolder(nodeId: string): void;
+  /** return to the parent folder, as if the "‹ back" button were tapped. */
+  goBack(): void;
+  /** create a new folder under the currently-viewed folder. returns the new
+   *  folder's id, or "" if it couldn't be created (also "" in read-only
+   *  mode — see `isReadOnly()`). */
+  addFolder(title: string): string;
+  /** move a node (folder or canvas reference) to a new parent folder id, or
+   *  to root when null — as if it had been dragged and dropped there.
+   *  returns whether the move succeeded (always `false` in read-only mode —
+   *  see `isReadOnly()`; see `CanvasBinStore.moveNode()` for the other
+   *  cases it refuses). */
+  moveNode(nodeId: string, newParentId: string | null): boolean;
+  /** whether this instance is rendering in read-only mode (no drag/add-
+   *  folder wiring — see `ProfileCanvasBinContext.isReadOnly`). */
+  isReadOnly(): boolean;
+  /** the current page (0-based) within the currently-viewed folder. */
+  getCurrentPage(): number;
+  /** total page count for the currently-viewed folder (at least 1). */
+  getTotalPages(): number;
+  /** advance to the next page, as if the "next" button were tapped.
+   *  no-op if already on the last page. */
+  nextPage(): void;
+  /** go back to the previous page, as if the "prev" button were tapped.
+   *  no-op if already on the first page. */
+  prevPage(): void;
+  /** activate a node by id exactly as a real tap would (enter folder /
+   *  navigate to canvas), regardless of which folder is currently visible. */
+  activateNode(nodeId: string): void;
+  /** node ids on the current page whose preview-image `Sprite` has actually
+   *  finished loading and attached (not just that the entry has a
+   *  `previewUrl` set) — lets a test (or live debugging) prove an image
+   *  genuinely rendered. */
+  getLoadedPreviewNodeIds(): string[];
 }
 
 /** find the next available "new folder"/"new folder 2"/... name among
@@ -109,13 +181,36 @@ function nextFolderName(siblings: CanvasBinNode[]): string {
 }
 
 export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): ProfileCanvasBinController {
-  const { canvasBinStore, profileStore } = ctx;
+  const { canvasBinStore, profileStore, isReadOnly = false } = ctx;
 
   const container = new Container();
   container.eventMode = "static";
   container.label = "profile-canvas-bin";
 
   let currentWidth = ctx.width;
+  let viewportHeight = ctx.height > 0 ? ctx.height : VIEWPORT_HEIGHT;
+
+  // real prev/next pagination (not scroll — see module doc comment and
+  // ProfileCanvasBinContext's doc comment). reset to 0 whenever the
+  // currently-viewed folder changes; clamped into range on every render()
+  // in case the item count shrinks (e.g. a canvas removed elsewhere).
+  let page = 0;
+  let lastTotalPages = 1;
+
+  // bumped on every render() — guards the async preview-thumbnail loads
+  // below (see the per-card loop) against adding a Sprite to a card
+  // container that a LATER render() has already destroyed (render() fully
+  // tears down and rebuilds listInner's children every call).
+  let renderGeneration = 0;
+
+  // node ids (not canvasDocIds — folders never have previews) whose
+  // preview-image Sprite has actually finished loading and attached, as of
+  // the current render generation. reset at the start of every render(),
+  // populated by loadEndcapPreview() on success — exposed via
+  // `getLoadedPreviewNodeIds()` below so tests (and live debugging) can
+  // prove an image genuinely rendered, not just that `entry.previewUrl`
+  // was non-empty.
+  let loadedPreviewNodeIds = new Set<string>();
 
   // path of folder ids from root down to the currently-viewed folder, with
   // titles cached for the breadcrumb (avoids a re-lookup if a folder gets
@@ -149,8 +244,9 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
   container.addChild(backBtn);
 
   const addFolderBtn = new Container();
-  addFolderBtn.eventMode = "static";
+  addFolderBtn.eventMode = isReadOnly ? "none" : "static";
   addFolderBtn.cursor = "pointer";
+  addFolderBtn.visible = !isReadOnly;
   const addFolderLabel = new Text({
     text: "+ folder",
     style: { fontFamily: FONT, fontSize: 10, fill: ACCENT },
@@ -163,17 +259,19 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
   backBtn.on("pointertap", (e) => {
     e.stopPropagation();
     path = path.slice(0, -1);
+    page = 0;
     render();
   });
 
   addFolderBtn.on("pointertap", (e) => {
     e.stopPropagation();
+    if (isReadOnly) return;
     const siblings = canvasBinStore.getChildren(currentParentId());
     canvasBinStore.addFolder(nextFolderName(siblings), currentParentId());
     render();
   });
 
-  // -- scrollable content area -----------------------------------------------
+  // -- content area (paginated — real prev/next, not scroll) -----------------
 
   const listContainer = new Container();
   listContainer.eventMode = "static";
@@ -196,23 +294,69 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
   emptyText.visible = false;
   container.addChild(emptyText);
 
-  let scrollY = 0;
   let listAreaHeight = 0;
-  let totalListHeight = 0;
 
-  const clampScroll = () => {
-    const maxScroll = Math.max(0, totalListHeight - listAreaHeight);
-    scrollY = Math.max(0, Math.min(scrollY, maxScroll));
-  };
+  // -- pager: "‹ prev" / "page X of Y" / "next ›" ------------------------------
+  // real page navigation (an explicit, deliberate design choice — see module
+  // doc comment) rather than scrolling a taller list. shared by owner and
+  // read-only modes alike; only shown when there's more than one page.
 
-  listContainer.on("wheel", (e: WheelEvent) => {
-    const canScroll = totalListHeight > listAreaHeight;
-    if (!canScroll) return;
+  const pagerContainer = new Container();
+  pagerContainer.eventMode = "static";
+  pagerContainer.visible = false;
+  container.addChild(pagerContainer);
+
+  const prevPageBtn = new Container();
+  prevPageBtn.eventMode = "static";
+  prevPageBtn.cursor = "pointer";
+  const prevPageLabel = new Text({
+    text: "‹ prev",
+    style: { fontFamily: FONT, fontSize: 9, fill: ACCENT },
+    resolution: RESOLUTION,
+  });
+  prevPageLabel.eventMode = "none";
+  prevPageBtn.addChild(prevPageLabel);
+  pagerContainer.addChild(prevPageBtn);
+
+  const pageIndicator = new Text({
+    text: "page 1 of 1",
+    style: { fontFamily: FONT, fontSize: 9, fill: MUTED_TEXT },
+    resolution: RESOLUTION,
+  });
+  pageIndicator.eventMode = "none";
+  pagerContainer.addChild(pageIndicator);
+
+  const nextPageBtn = new Container();
+  nextPageBtn.eventMode = "static";
+  nextPageBtn.cursor = "pointer";
+  const nextPageLabel = new Text({
+    text: "next ›",
+    style: { fontFamily: FONT, fontSize: 9, fill: ACCENT },
+    resolution: RESOLUTION,
+  });
+  nextPageLabel.eventMode = "none";
+  nextPageBtn.addChild(nextPageLabel);
+  pagerContainer.addChild(nextPageBtn);
+
+  function goToPrevPage() {
+    if (page <= 0) return;
+    page -= 1;
+    render();
+  }
+
+  function goToNextPage() {
+    if (page >= lastTotalPages - 1) return;
+    page += 1;
+    render();
+  }
+
+  prevPageBtn.on("pointertap", (e) => {
     e.stopPropagation();
-    if ((e as any).nativeEvent) (e as any).nativeEvent._skeinWidgetScroll = true;
-    scrollY += e.deltaY > 0 ? SCROLL_SPEED : -SCROLL_SPEED;
-    clampScroll();
-    listInner.y = -scrollY;
+    goToPrevPage();
+  });
+  nextPageBtn.on("pointertap", (e) => {
+    e.stopPropagation();
+    goToNextPage();
   });
 
   // -- drag-to-move state ----------------------------------------------------
@@ -220,6 +364,9 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
   // dragged onto another folder card (or the back button, to move up one
   // level) to file it there. mirrors friends-tab.ts's own hold+threshold
   // drag-vs-tap distinction, simplified (no groups/multi-drop-zone bar).
+  // read-only mode skips this entirely — cards are wired for a plain tap
+  // instead (see the card-creation loop in render()).
+
 
   interface DragState {
     nodeId: string;
@@ -354,6 +501,7 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
     if (!node) return;
     if (node.kind === "folder") {
       path = [...path, { id: node.id, title: node.title }];
+      page = 0;
       render();
     } else {
       // click-to-navigate — see module doc comment for why this mirrors
@@ -365,6 +513,23 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
 
   // -- rendering ---------------------------------------------------------------
 
+  /**
+   * draw a full-width drawer row: a square "endcap" (folder glyph or color
+   * swatch, matching the row's own height, flush left — same visual idiom
+   * `widgets/bin/bin-card-builders.ts`'s `buildDrawerCard()` uses for its
+   * own drawer rows) plus the row's background/border. the title label
+   * itself is a separate `Text` positioned to the right of the endcap by
+   * the caller (`render()`), not drawn here.
+   */
+  /**
+   * draw a full-width drawer row: a square "endcap" (folder glyph or color
+   * swatch, matching the row's own height, flush left — same visual idiom
+   * `widgets/bin/bin-card-builders.ts`'s `buildDrawerCard()` uses for its
+   * own drawer rows) plus the row's background/border. the title/
+   * description labels and the endcap's preview-image sprite (when the
+   * entry has one) are added separately by the caller (`render()`), not
+   * drawn here.
+   */
   function drawCard(
     g: Graphics,
     w: number,
@@ -374,33 +539,107 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
     isDropHover: boolean
   ) {
     g.clear();
+    const rowColor = isFolder ? BG : (color ?? MUTED_TEXT);
+    g.roundRect(0, 0, w, h, 4).fill({ color: rowColor, alpha: isFolder ? 1 : 0.18 }).stroke({
+      width: isDropHover ? 2 : 1,
+      color: isDropHover ? ACCENT : isFolder ? BORDER : 0x000000,
+      alpha: isDropHover ? 1 : isFolder ? 0.8 : 0.25,
+    });
+
+    // square endcap, flush left, matching row height — the caller may
+    // layer a preview-image Sprite on top of this once loaded (canvas
+    // entries only; folders always just show the glyph).
+    const endcap = h;
     if (isFolder) {
-      g.roundRect(0, 0, w, h, 4).fill({ color: BG }).stroke({
-        width: isDropHover ? 2 : 1,
-        color: isDropHover ? ACCENT : BORDER,
-        alpha: isDropHover ? 1 : 0.8,
+      // simple folder glyph — a small tab + body, centered in the endcap
+      const gw = endcap * 0.5;
+      const gx = (endcap - gw) / 2;
+      g.roundRect(gx, endcap * 0.28, gw, 3, 1).fill({ color: MUTED_TEXT, alpha: 0.7 });
+      g.roundRect(gx, endcap * 0.42, gw, endcap * 0.32, 2).stroke({
+        color: MUTED_TEXT,
+        width: 1,
+        alpha: 0.6,
       });
-      // simple folder glyph — a small tab + body
-      g.roundRect(4, 4, w * 0.4, 5, 1).fill({ color: MUTED_TEXT, alpha: 0.6 });
-      g.roundRect(4, 9, w - 8, h - 20, 2).stroke({ color: MUTED_TEXT, width: 1, alpha: 0.5 });
     } else {
-      g.roundRect(0, 0, w, h, 4).fill({ color: color ?? MUTED_TEXT }).stroke({
-        width: isDropHover ? 2 : 1,
-        color: isDropHover ? ACCENT : 0x000000,
-        alpha: isDropHover ? 1 : 0.25,
-      });
+      // color swatch fill for the endcap — the base look, and the fallback
+      // shown while (or if) a preview image fails to load.
+      g.roundRect(1, 1, endcap - 2, h - 2, 3).fill({ color: color ?? MUTED_TEXT, alpha: 0.9 });
     }
   }
 
+  /**
+   * best-effort: load a canvas entry's preview image into the endcap area
+   * of an already-drawn row, replacing the plain color swatch once it's
+   * ready. guarded by `myGeneration` so a load that resolves after a LATER
+   * render() has already torn this card down (render() fully rebuilds
+   * listInner's children every call) never touches a destroyed container.
+   *
+   * NOTE: never call `Assets.unload()` for `dataUrl` — profile canvas
+   * previews are `data:` URLs, which can be shared with other live
+   * consumers of the same texture (a narthex canvas-card showing the same
+   * canvas, the canvas-wizard's own preview field, etc). unloading it out
+   * from under them crashes the renderer mid-frame — same class of bug
+   * already root-caused and fixed the same way in
+   * canvas-card.ts/file.ts/property-tray.ts/canvas-wizard.ts this session.
+   */
+  function loadEndcapPreview(
+    nodeId: string,
+    cardContainer: Container,
+    dataUrl: string,
+    endcap: number,
+    rowHeight: number,
+    myGeneration: number
+  ): void {
+    Assets.load<Texture>(dataUrl)
+      .then((texture) => {
+        if (myGeneration !== renderGeneration || cardContainer.destroyed) return;
+
+        const sprite = new Sprite(texture);
+        sprite.eventMode = "none";
+        const scale = Math.max(endcap / texture.width, rowHeight / texture.height);
+        sprite.width = texture.width * scale;
+        sprite.height = texture.height * scale;
+        sprite.x = (endcap - sprite.width) / 2;
+        sprite.y = (rowHeight - sprite.height) / 2;
+
+        const mask = new Graphics();
+        mask.roundRect(1, 1, endcap - 2, rowHeight - 2, 3).fill({ color: 0xffffff });
+        cardContainer.addChild(mask);
+        sprite.mask = mask;
+        cardContainer.addChild(sprite);
+        loadedPreviewNodeIds.add(nodeId);
+      })
+      .catch(() => {
+        // silently keep the color-swatch fallback already drawn.
+      });
+  }
+
   function render() {
+    renderGeneration++;
+    const myGeneration = renderGeneration;
+
     // reconcile the tree against the live profile before every render so a
     // canvas added/removed elsewhere (e.g. profile-tab.ts's own list, or a
     // remote device sync) always shows up / disappears here too.
     canvasBinStore.reconcileWithProfile(profileStore.canvases());
 
     const nodes = canvasBinStore.getChildren(currentParentId());
-    const mode = canvasBinStore.mode() as CanvasBinMode;
-    const scaleOptions: SlotSizeOptions = { scale: resolveScale(canvasBinStore.slotScale()) };
+    // always render as a vertical drawer (full-width rows), paginated —
+    // not a user-toggleable mode like the general bin/ widget's own
+    // grid/shelf/crate/drawer picker. `slotRect`/`computePageSize`
+    // (bin-layout.ts) already handle "drawer" generically (1 column,
+    // full content width per row), so this needs no other rendering
+    // changes — just fixing which mode this specific widget always uses.
+    // `CanvasBinStore.mode()`/`setMode()` still exist (canvas-bin-doc.ts)
+    // for potential future use, but nothing in this widget reads/exposes
+    // them anymore.
+    const mode: CanvasBinMode = "drawer";
+    // fixed, larger-than-default row scale (not `canvasBinStore.slotScale()`
+    // — that setting has no UI for this widget either, same reasoning as
+    // hardcoding `mode` above) so a row has room for a legible title AND
+    // description line plus a preview-image endcap, rather than the
+    // general bin/ widget's compact single-line drawer rows.
+    const scaleOptions: SlotSizeOptions = { scale: 2.0 };
 
     backBtn.visible = path.length > 0;
     headerLabel.text = path.length > 0 ? path[path.length - 1].title : "canvas bin";
@@ -409,16 +648,33 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
       listInner.removeChildAt(0).destroy({ children: true });
     }
     cardBoundsByNodeId = new Map();
+    loadedPreviewNodeIds = new Set();
 
     emptyText.visible = nodes.length === 0;
 
     const contentWidth = currentWidth - BIN_PADDING * 2;
-    const cols = autoFitCols(mode, contentWidth, scaleOptions);
-    const rows = computeRows(nodes.length, cols);
+    const listTop = backBtn.visible ? HEADER_HEIGHT + 4 : HEADER_HEIGHT - 6;
+    listAreaHeight = Math.max(0, viewportHeight - listTop - PAGER_HEIGHT);
+
+    const pageSize = computePageSize(mode, contentWidth, listAreaHeight, scaleOptions);
+    const cols = pageSize.cols;
+    const itemsPerPage = Math.max(1, pageSize.itemsPerPage);
+    lastTotalPages = Math.max(1, Math.ceil(nodes.length / itemsPerPage));
+    page = Math.min(Math.max(0, page), lastTotalPages - 1);
+
+    pagerContainer.visible = lastTotalPages > 1;
+    pageIndicator.text = `page ${page + 1} of ${lastTotalPages}`;
+    prevPageBtn.eventMode = page > 0 ? "static" : "none";
+    prevPageBtn.alpha = page > 0 ? 1 : 0.4;
+    nextPageBtn.eventMode = page < lastTotalPages - 1 ? "static" : "none";
+    nextPageBtn.alpha = page < lastTotalPages - 1 ? 1 : 0.4;
+
+    const pageStart = page * itemsPerPage;
+    const pageNodes = nodes.slice(pageStart, pageStart + itemsPerPage);
     const canvasEntries = profileStore.canvases();
 
-    for (let i = 0; i < nodes.length; i++) {
-      const node = nodes[i];
+    for (let i = 0; i < pageNodes.length; i++) {
+      const node = pageNodes[i];
       const rect = slotRect(mode, { col: i % cols, row: Math.floor(i / cols) }, contentWidth, scaleOptions);
 
       const cardContainer = new Container();
@@ -438,27 +694,65 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
       const isDropHover = dragState?.isDragging === true && hoveredDropFolderId === node.id;
       drawCard(g, rect.width, rect.height, isFolder, entry?.color, isDropHover);
 
-      const labelText = isFolder ? node.title : entry?.title ?? "untitled canvas";
-      const maxChars = Math.max(4, Math.floor(rect.width / 6));
-      const label = new Text({
-        text: truncate(labelText, maxChars),
+      const endcap = rect.height;
+      if (!isFolder && entry?.previewUrl) {
+        loadEndcapPreview(node.id, cardContainer, entry.previewUrl, endcap, rect.height, myGeneration);
+      }
+
+      // title + (optional) description sit to the right of the square
+      // endcap. title is vertically centered when there's no description;
+      // otherwise both lines are stacked and centered as a pair.
+      const titleText = isFolder ? node.title : entry?.title ?? "untitled canvas";
+      const descriptionText = !isFolder ? entry?.description?.trim() : undefined;
+      const labelX = endcap + 6;
+      const labelMaxWidth = Math.max(10, rect.width - labelX - 4);
+      const titleMaxChars = Math.max(4, Math.floor(labelMaxWidth / 7.5));
+      const descriptionMaxChars = Math.max(4, Math.floor(labelMaxWidth / 6.5));
+
+      const title = new Text({
+        text: truncate(titleText, titleMaxChars),
         style: {
           fontFamily: FONT,
           fontSize: CARD_LABEL_SIZE,
           fill: isFolder ? TEXT_COLOR : 0xffffff,
-          wordWrap: true,
-          wordWrapWidth: rect.width - 6,
         },
         resolution: RESOLUTION,
       });
-      label.x = 3;
-      label.y = rect.height - label.height - 3;
-      cardContainer.addChild(label);
+      title.x = labelX;
 
-      cardContainer.on("pointerdown", (e) => {
-        e.stopPropagation();
-        startDrag(node.id, e);
-      });
+      if (descriptionText) {
+        const description = new Text({
+          text: truncate(descriptionText, descriptionMaxChars),
+          style: {
+            fontFamily: FONT,
+            fontSize: CARD_DESCRIPTION_SIZE,
+            fill: MUTED_TEXT,
+          },
+          resolution: RESOLUTION,
+        });
+        description.x = labelX;
+        const pairHeight = title.height + CARD_LABEL_LINE_GAP + description.height;
+        title.y = (rect.height - pairHeight) / 2;
+        description.y = title.y + title.height + CARD_LABEL_LINE_GAP;
+        cardContainer.addChild(description);
+      } else {
+        title.y = (rect.height - title.height) / 2;
+      }
+      cardContainer.addChild(title);
+
+      if (isReadOnly) {
+        // no drag-to-move in read-only mode — a plain tap navigates
+        // straight through (see module doc comment on click-to-navigate).
+        cardContainer.on("pointertap", (e) => {
+          e.stopPropagation();
+          activateNode(node.id);
+        });
+      } else {
+        cardContainer.on("pointerdown", (e) => {
+          e.stopPropagation();
+          startDrag(node.id, e);
+        });
+      }
 
       cardBoundsByNodeId.set(node.id, {
         x: rect.x,
@@ -469,26 +763,7 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
       });
     }
 
-    totalListHeight = mode === "drawer" ? rows * (rect_height_for_drawer()) : contentDimsHeight(mode, rows, cols, contentWidth, scaleOptions);
     layoutHeader();
-  }
-
-  function rect_height_for_drawer(): number {
-    return slotRect("drawer", { col: 0, row: 0 }, currentWidth - BIN_PADDING * 2, {
-      scale: resolveScale(canvasBinStore.slotScale()),
-    }).height;
-  }
-
-  function contentDimsHeight(
-    mode: CanvasBinMode,
-    rows: number,
-    _cols: number,
-    contentWidth: number,
-    options: SlotSizeOptions
-  ): number {
-    if (rows === 0) return 0;
-    const last = slotRect(mode, { col: 0, row: rows - 1 }, contentWidth, options);
-    return last.y + last.height;
   }
 
   function layoutHeader() {
@@ -506,10 +781,7 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
     const listTop = backBtn.visible ? HEADER_HEIGHT + 4 : HEADER_HEIGHT - 6;
     listContainer.x = BIN_PADDING;
     listContainer.y = listTop;
-
-    listAreaHeight = Math.max(0, VIEWPORT_HEIGHT - listTop);
-    clampScroll();
-    listInner.y = -scrollY;
+    listInner.y = 0;
 
     listMask.clear();
     listMask.rect(listContainer.x, listContainer.y, currentWidth - BIN_PADDING * 2, listAreaHeight).fill({
@@ -518,6 +790,21 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
 
     emptyText.x = BIN_PADDING;
     emptyText.y = listTop + 4;
+
+    // pager row, anchored to the bottom of the widget's viewport — only
+    // visible when there's more than one page (set in render()).
+    const pagerY = viewportHeight - PAGER_HEIGHT + 4;
+
+    prevPageBtn.x = 0;
+    prevPageBtn.y = pagerY;
+    prevPageBtn.hitArea = new Rectangle(-4, -4, prevPageLabel.width + 8, prevPageLabel.height + 8);
+
+    pageIndicator.x = (currentWidth - pageIndicator.width) / 2;
+    pageIndicator.y = pagerY;
+
+    nextPageBtn.x = currentWidth - nextPageLabel.width;
+    nextPageBtn.y = pagerY;
+    nextPageBtn.hitArea = new Rectangle(-4, -4, nextPageLabel.width + 8, nextPageLabel.height + 8);
   }
 
   // -- profile/tree change subscriptions ---------------------------------------
@@ -526,39 +813,49 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
   const binUnsub = canvasBinStore.onChange(() => render());
 
   // -- test hooks ---------------------------------------------------------------
-  // see src/dev/test-bridge.ts's ProfileCanvasBinTestHooks — mirrors the
+  // see ProfileCanvasBinTestHooks above / ProfileCanvasBinContext.registerTestHooks
+  // for how this gets exposed for different concurrent mounts — mirrors the
   // established "call the widget's real internal handlers directly, since
   // this repo has no infra for simulated pixi pointer drags" precedent
   // (profile-tab.ts's pickAvatar, friends-tab.ts's FriendsTabTestHooks).
-  registerSocialBridge({
-    canvasBin: {
-      getVisibleNodes: () => canvasBinStore.getChildren(currentParentId()),
-      getCurrentFolderId: () => currentParentId(),
-      enterFolder: (folderId: string) => activateNode(folderId),
-      goBack: () => {
-        path = path.slice(0, -1);
-        render();
-      },
-      addFolder: (title: string) => {
-        const id = canvasBinStore.addFolder(title, currentParentId());
-        render();
-        return id;
-      },
-      moveNode: (nodeId: string, newParentId: string | null) => {
-        const moved = canvasBinStore.moveNode(nodeId, newParentId);
-        render();
-        return moved;
-      },
-      activateNode: (nodeId: string) => activateNode(nodeId),
+  const registerHooks = ctx.registerTestHooks ?? ((hooks) => registerSocialBridge({ canvasBin: hooks }));
+  registerHooks({
+    getVisibleNodes: () => canvasBinStore.getChildren(currentParentId()),
+    getCurrentFolderId: () => currentParentId(),
+    enterFolder: (folderId: string) => activateNode(folderId),
+    goBack: () => {
+      path = path.slice(0, -1);
+      page = 0;
+      render();
     },
+    addFolder: (title: string) => {
+      if (isReadOnly) return "";
+      const id = canvasBinStore.addFolder(title, currentParentId());
+      render();
+      return id;
+    },
+    moveNode: (nodeId: string, newParentId: string | null) => {
+      if (isReadOnly) return false;
+      const moved = canvasBinStore.moveNode(nodeId, newParentId);
+      render();
+      return moved;
+    },
+    isReadOnly: () => isReadOnly,
+    getCurrentPage: () => page,
+    getTotalPages: () => lastTotalPages,
+    nextPage: () => goToNextPage(),
+    prevPage: () => goToPrevPage(),
+    activateNode: (nodeId: string) => activateNode(nodeId),
+    getLoadedPreviewNodeIds: () => [...loadedPreviewNodeIds],
   });
 
   render();
 
   return {
     container,
-    layout(width: number) {
+    layout(width: number, height?: number) {
       currentWidth = width;
+      if (height !== undefined && height > 0) viewportHeight = height;
       render();
     },
     destroy() {
@@ -571,3 +868,4 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
 }
 
 export { VIEWPORT_HEIGHT as PROFILE_CANVAS_BIN_HEIGHT };
+

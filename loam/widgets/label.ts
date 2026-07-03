@@ -250,6 +250,7 @@ export const labelWidget: WidgetFactory<typeof labelSchema> = {
 
     const startEditing = () => {
       if (editing) return;
+      if (ctx.canvasStore?.isLocalViewer()) return;
       editing = true;
       drawBg(currentWidth, currentHeight, true);
       textDisplay.visible = false;

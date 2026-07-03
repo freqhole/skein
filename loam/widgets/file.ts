@@ -1165,6 +1165,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     const handleUpload = async () => {
       if (loadState !== "empty") return;
+      if (ctx.canvasStore?.isLocalViewer()) return;
 
       try {
         const picked = await pickFiles();

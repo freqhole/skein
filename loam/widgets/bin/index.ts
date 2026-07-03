@@ -143,11 +143,14 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       const count = state.items.length;
       const actions: HeaderAction[] = [];
 
-      actions.push({
-        id: "add",
-        label: "+ add",
-        onClick: handleAddFiles,
-      });
+      // viewers can't add files to a bin — don't even wire the button.
+      if (!ctx.canvasStore?.isLocalViewer()) {
+        actions.push({
+          id: "add",
+          label: "+ add",
+          onClick: handleAddFiles,
+        });
+      }
 
       actions.push({
         id: "snatch",
@@ -267,6 +270,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
     async function handleAddFiles() {
       if (!store || !repo) return;
+      if (store.isLocalViewer()) return;
 
       const picked = await pickFiles();
       if (!picked || picked.length === 0) return;

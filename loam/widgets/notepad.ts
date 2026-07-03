@@ -150,6 +150,7 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
 
     const startEditing = () => {
       if (editing) return;
+      if (ctx.canvasStore?.isLocalViewer()) return;
       editing = true;
       drawBg(currentWidth, currentHeight, true);
       textDisplay.visible = false;

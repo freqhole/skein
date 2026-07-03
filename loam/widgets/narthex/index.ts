@@ -5,6 +5,7 @@ import { markdownWidget } from "../markdown";
 
 import { canvasCardWidget } from "./canvas-card";
 import { canvasWizardWidget } from "./canvas-wizard";
+import { friendCanvasBinWidget } from "./friend-canvas-bin";
 import { joinCanvasWidget } from "./join-canvas";
 import { messagezWidget } from "./messagez-widget";
 import { socialWidget } from "./social/social-widget";
@@ -28,6 +29,7 @@ export function createNarthexRegistry(): WidgetRegistry {
   registry.register(canvasCardWidget);
   registry.register(canvasWizardWidget);
   registry.register(joinCanvasWidget);
+  registry.register(friendCanvasBinWidget);
   registry.register(socialWidget);
   registry.register(messagezWidget);
   registry.register(labelWidget);

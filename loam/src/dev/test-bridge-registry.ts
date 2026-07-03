@@ -52,3 +52,30 @@ export function registerSocialBridge(partial: Partial<SkeinTestBridgeSocial>): v
   Object.defineProperties(social, descriptors);
   bridge.social = social;
 }
+
+/**
+ * register test hooks for one instance of a real, palette-placeable
+ * `WidgetFactory` widget, keyed by its widget id — for widgets that don't
+ * go through the social overlay's single hand-mounted-tab pattern (which
+ * uses `registerSocialBridge()` above) and where more than one instance can
+ * exist at once (e.g. several `friend-canvas-bin` widgets pinned to
+ * different friends on the same narthex).
+ *
+ * no-op outside DEV builds, same guard as `registerSocialBridge()`.
+ */
+export function registerWidgetBridge(widgetId: string, hooks: unknown): void {
+  if (!import.meta.env.DEV) return;
+  const bridge: Record<string, unknown> = ((window as any).__skeinTest ??= {});
+  const widgets = (bridge.widgets as Record<string, unknown>) ?? {};
+  widgets[widgetId] = hooks;
+  bridge.widgets = widgets;
+}
+
+/** remove a widget's test hooks (call on widget destroy) so stale hooks
+ *  pointing at a torn-down widget instance can't be mistaken for a live one. */
+export function unregisterWidgetBridge(widgetId: string): void {
+  if (!import.meta.env.DEV) return;
+  const bridge = (window as any).__skeinTest as Record<string, unknown> | undefined;
+  const widgets = bridge?.widgets as Record<string, unknown> | undefined;
+  if (widgets) delete widgets[widgetId];
+}

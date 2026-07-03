@@ -327,6 +327,7 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
 
     const startEditing = () => {
       if (editing) return;
+      if (ctx.canvasStore?.isLocalViewer()) return;
       editing = true;
       drawBg(currentWidth, currentHeight, true);
 

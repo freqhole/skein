@@ -11,9 +11,9 @@ describe("createNarthexRegistry", () => {
     expect(registry.has("join-canvas")).toBe(true);
   });
 
-  it("has exactly 9 widget types", () => {
+  it("has exactly 10 widget types", () => {
     const registry = createNarthexRegistry();
-    expect(registry.types().length).toBe(9);
+    expect(registry.types().length).toBe(10);
   });
 
   it("canvas-card is hidden", () => {
@@ -63,10 +63,20 @@ describe("createNarthexRegistry", () => {
     expect(registry.get("messagez")!.metadata.hidden).toBe(true);
   });
 
+  it("registers friend-canvas-bin", () => {
+    const registry = createNarthexRegistry();
+    expect(registry.has("friend-canvas-bin")).toBe(true);
+  });
+
+  it("friend-canvas-bin is not hidden (placeable via the add-widget palette)", () => {
+    const registry = createNarthexRegistry();
+    expect(registry.get("friend-canvas-bin")!.metadata.hidden).toBeFalsy();
+  });
+
   it("non-hidden widgets for palette", () => {
     const registry = createNarthexRegistry();
     const visible = registry.all().filter((f) => !f.metadata.hidden);
-    expect(visible.length).toBe(6);
+    expect(visible.length).toBe(7);
     const types = visible.map((f) => f.type);
     expect(types).toContain("canvas-wizard");
     expect(types).toContain("label");
@@ -74,6 +84,7 @@ describe("createNarthexRegistry", () => {
     expect(types).toContain("bin");
     expect(types).toContain("markdown");
     expect(types).toContain("trash");
+    expect(types).toContain("friend-canvas-bin");
     // social + messagez are hidden — they live in the toolbar as icon buttons
     expect(types).not.toContain("social");
     expect(types).not.toContain("messagez");

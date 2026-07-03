@@ -14,11 +14,6 @@ import {
 import { pickImageAsDataUrl } from "../../../src/widgets/image-utils";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
 import {
-  createProfileCanvasBinWidget,
-  PROFILE_CANVAS_BIN_HEIGHT,
-  type ProfileCanvasBinController,
-} from "./canvas-bin";
-import {
   ACCENT,
   AVATAR_EXPORT_SIZE,
   AVATAR_RADIUS,
@@ -37,6 +32,7 @@ import {
   PROFILE_CANVAS_SWATCH_SIZE,
   RESOLUTION,
   ROW_ALT_BG,
+  SCROLL_SPEED,
   TEXT_COLOR,
   TEXT_SIZE,
 } from "./constants";
@@ -100,8 +96,54 @@ function createField(
 // ---------------------------------------------------------------------------
 
 export function createProfileTab(ctx: TabContext): TabController {
+  const profileInner = new Container();
+  profileInner.eventMode = "static";
+
+  // outer scrollable/masked viewport (same pattern friends-tab.ts's list
+  // and detail views use) — profile content (avatar, fields, "my
+  // canvases" list) can easily exceed the social panel's fixed height,
+  // and nothing above this tab provides any scroll/clip of its own (see
+  // social-widget.ts, which just calls `tab.layout(w, h)` and trusts the
+  // tab to fit or scroll itself) — a real user-reported bug, 2026-07-02.
   const container = new Container();
   container.eventMode = "static";
+
+  const scrollMask = new Graphics();
+  container.addChild(scrollMask);
+
+  container.addChild(profileInner);
+  profileInner.mask = scrollMask;
+
+  let scrollY = 0;
+  let scrollAreaHeight = 0;
+  // total content height, tracked manually (never read via
+  // `profileInner.height`) — `profileInner` has a `.mask` set, and asking
+  // Pixi v8 for `.height`/`.getBounds()` on a masked object makes it walk
+  // the mask's matrix relative to a shared root to compute "effective"
+  // bounds, which both logs a "Mask bounds, renderable is not inside the
+  // root container" warning AND can break rendering outright (a real,
+  // serious user-reported bug, 2026-07-02: the whole profile view went
+  // blank). `bin/bin-renderer.ts`'s `totalContentHeight` field is the
+  // established safe alternative this mirrors — layout() already computes
+  // the accumulated `y` as it lays out fields, so that value is stored
+  // here instead of re-derived from the (masked) display object itself.
+  let contentHeight = 0;
+
+  const clampScroll = () => {
+    const maxScroll = Math.max(0, contentHeight - scrollAreaHeight);
+    scrollY = Math.max(0, Math.min(scrollY, maxScroll));
+    profileInner.y = -scrollY;
+  };
+
+  container.on("wheel", (e: WheelEvent) => {
+    const canScroll = contentHeight > scrollAreaHeight;
+    if (!canScroll) return; // let the event pass through to the canvas viewport
+
+    e.stopPropagation();
+    if ((e as any).nativeEvent) (e as any).nativeEvent._skeinWidgetScroll = true;
+    scrollY += e.deltaY > 0 ? SCROLL_SPEED : -SCROLL_SPEED;
+    clampScroll();
+  });
 
   let currentWidth = 0;
   let currentHeight = 0;
@@ -113,7 +155,7 @@ export function createProfileTab(ctx: TabContext): TabController {
   const avatarContainer = new Container();
   avatarContainer.eventMode = "static";
   avatarContainer.cursor = "pointer";
-  container.addChild(avatarContainer);
+  profileInner.addChild(avatarContainer);
 
   // placeholder circle (shown when no avatar image is set)
   const avatarPlaceholder = new Graphics();
@@ -149,7 +191,7 @@ export function createProfileTab(ctx: TabContext): TabController {
   });
   avatarHint.eventMode = "none";
   avatarHint.visible = false;
-  container.addChild(avatarHint);
+  profileInner.addChild(avatarHint);
 
   avatarContainer.on("pointerover", () => {
     avatarHint.visible = true;
@@ -275,8 +317,8 @@ export function createProfileTab(ctx: TabContext): TabController {
   // text fields
   // -------------------------------------------------------------------------
 
-  const usernameField = createField(ctx, container, "username", "username", "your name...", 200);
-  const bioField = createField(ctx, container, "bio", "bio", "about you...", 200);
+  const usernameField = createField(ctx, profileInner, "username", "username", "your name...", 200);
+  const bioField = createField(ctx, profileInner, "bio", "bio", "about you...", 200);
   const fields: FieldEntry[] = [usernameField, bioField];
 
   // wire up avatar click (defined after fields so we can blur them)
@@ -296,11 +338,11 @@ export function createProfileTab(ctx: TabContext): TabController {
     resolution: RESOLUTION,
   });
   colorLabel.eventMode = "none";
-  container.addChild(colorLabel);
+  profileInner.addChild(colorLabel);
 
   const colorContainer = new Container();
   colorContainer.eventMode = "static";
-  container.addChild(colorContainer);
+  profileInner.addChild(colorContainer);
 
   const colorDots: Graphics[] = [];
   const colorRing = new Graphics();
@@ -364,7 +406,7 @@ export function createProfileTab(ctx: TabContext): TabController {
     resolution: RESOLUTION,
   });
   nodeIdLabel.eventMode = "none";
-  container.addChild(nodeIdLabel);
+  profileInner.addChild(nodeIdLabel);
 
   const nodeIdText = new Text({
     text: "",
@@ -372,7 +414,7 @@ export function createProfileTab(ctx: TabContext): TabController {
     resolution: RESOLUTION,
   });
   nodeIdText.eventMode = "none";
-  container.addChild(nodeIdText);
+  profileInner.addChild(nodeIdText);
 
   // copy button
   const copyBtn = new Container();
@@ -387,7 +429,7 @@ export function createProfileTab(ctx: TabContext): TabController {
   });
   copyLabel.eventMode = "none";
   copyBtn.addChild(copyLabel);
-  container.addChild(copyBtn);
+  profileInner.addChild(copyBtn);
 
   copyBtn.on("pointertap", (e) => {
     e.stopPropagation();
@@ -410,7 +452,7 @@ export function createProfileTab(ctx: TabContext): TabController {
   const identitySetupContainer = new Container();
   identitySetupContainer.eventMode = "static";
   identitySetupContainer.visible = false;
-  container.addChild(identitySetupContainer);
+  profileInner.addChild(identitySetupContainer);
 
   const setupDescText = new Text({
     text: "generate an identity to connect with friends, share canvases, and use social features.",
@@ -643,7 +685,7 @@ export function createProfileTab(ctx: TabContext): TabController {
     resolution: RESOLUTION,
   });
   canvasSectionLabel.eventMode = "none";
-  container.addChild(canvasSectionLabel);
+  profileInner.addChild(canvasSectionLabel);
 
   const addCanvasBtn = new Container();
   addCanvasBtn.eventMode = "static";
@@ -657,11 +699,11 @@ export function createProfileTab(ctx: TabContext): TabController {
   });
   addCanvasBtnText.eventMode = "none";
   addCanvasBtn.addChild(addCanvasBtnText);
-  container.addChild(addCanvasBtn);
+  profileInner.addChild(addCanvasBtn);
 
   const canvasListContainer = new Container();
   canvasListContainer.eventMode = "static";
-  container.addChild(canvasListContainer);
+  profileInner.addChild(canvasListContainer);
 
   const canvasEmptyText = new Text({
     text: "no canvases on your profile yet",
@@ -670,12 +712,68 @@ export function createProfileTab(ctx: TabContext): TabController {
   });
   canvasEmptyText.eventMode = "none";
   canvasEmptyText.visible = false;
-  container.addChild(canvasEmptyText);
+  profileInner.addChild(canvasEmptyText);
 
   /** titles as actually rendered in the list (post-truncation) — exposed to
    *  tests via the profileTab bridge hook so a UI assertion proves the
    *  render actually reflects the doc, not just that the doc changed. */
   let lastRenderedCanvasTitles: string[] = [];
+
+  // bumped every rebuildCanvasList() call — guards the async preview-image
+  // loads below (loadCanvasRowPreview()) against attaching a Sprite to a
+  // row container a LATER rebuild has already destroyed (rebuildCanvasList()
+  // fully tears down and recreates every row each call). same pattern as
+  // canvas-bin.ts's `renderGeneration`.
+  let canvasListRenderGeneration = 0;
+
+  // canvasDocIds whose preview-image Sprite has actually finished loading
+  // and attached, as of the current rebuild generation — exposed via
+  // `getLoadedPreviewCanvasIds()` so a test (or live debugging) can prove
+  // an image genuinely rendered, not just that `entry.previewUrl` was
+  // non-empty (mirrors canvas-bin.ts's `getLoadedPreviewNodeIds()`).
+  let loadedPreviewCanvasIds = new Set<string>();
+
+  /**
+   * best-effort: load a canvas entry's preview image into the row's swatch
+   * area, replacing the plain color swatch once ready. guarded by
+   * `myGeneration` so a load that resolves after a LATER rebuild has
+   * already torn this row down never touches a destroyed container.
+   *
+   * NOTE: never call `Assets.unload()` for `dataUrl` — same reasoning as
+   * canvas-bin.ts's `loadEndcapPreview()` (data: URLs can be shared with
+   * other live consumers of the same texture).
+   */
+  function loadCanvasRowPreview(
+    canvasDocId: string,
+    row: Container,
+    dataUrl: string,
+    size: number,
+    myGeneration: number
+  ): void {
+    Assets.load<Texture>(dataUrl)
+      .then((texture) => {
+        if (myGeneration !== canvasListRenderGeneration || row.destroyed) return;
+
+        const sprite = new Sprite(texture);
+        sprite.eventMode = "none";
+        const scale = Math.max(size / texture.width, size / texture.height);
+        sprite.width = texture.width * scale;
+        sprite.height = texture.height * scale;
+        const swatchY = (PROFILE_CANVAS_ROW_HEIGHT - size) / 2;
+        sprite.x = (size - sprite.width) / 2;
+        sprite.y = swatchY + (size - sprite.height) / 2;
+
+        const mask = new Graphics();
+        mask.roundRect(0, swatchY, size, size, 3).fill({ color: 0xffffff });
+        row.addChild(mask);
+        sprite.mask = mask;
+        row.addChild(sprite);
+        loadedPreviewCanvasIds.add(canvasDocId);
+      })
+      .catch(() => {
+        // silently keep the color-swatch fallback already drawn.
+      });
+  }
 
   /** true if the "add current canvas" button should be shown: needs both a
    *  canvas + profile store, must NOT be the narthex meta-canvas (a private
@@ -709,6 +807,14 @@ export function createProfileTab(ctx: TabContext): TabController {
       title: doc.title || "untitled canvas",
       description: doc.description || undefined,
       color: doc.color || undefined,
+      // carry over a preview image if one was already set on the canvas
+      // itself (canvas-info.ts's manual "pick image" -> setPreviewUrl()) —
+      // this was previously silently dropped here, so a canvas WITH a real
+      // preview image still showed no image anywhere it was curated onto a
+      // profile (a real user-reported bug, 2026-07-02). there's no
+      // automatic screenshot-capture anywhere in this app — previewUrl is
+      // only ever populated by that manual canvas-info.ts flow today.
+      previewUrl: doc.previewUrl || undefined,
     });
     layout(currentWidth, currentHeight);
   };
@@ -731,6 +837,10 @@ export function createProfileTab(ctx: TabContext): TabController {
     while (canvasListContainer.children.length > 0) {
       canvasListContainer.removeChildAt(0).destroy({ children: true });
     }
+
+    canvasListRenderGeneration++;
+    const myGeneration = canvasListRenderGeneration;
+    loadedPreviewCanvasIds = new Set();
 
     const entries = ctx.profileStore?.canvases() ?? [];
     canvasEmptyText.visible = entries.length === 0;
@@ -759,6 +869,16 @@ export function createProfileTab(ctx: TabContext): TabController {
       swatch.roundRect(0, swatchY, PROFILE_CANVAS_SWATCH_SIZE, PROFILE_CANVAS_SWATCH_SIZE, 3);
       swatch.fill({ color: entry.color ?? MUTED_TEXT });
       row.addChild(swatch);
+
+      if (entry.previewUrl) {
+        loadCanvasRowPreview(
+          entry.canvasDocId,
+          row,
+          entry.previewUrl,
+          PROFILE_CANVAS_SWATCH_SIZE,
+          myGeneration
+        );
+      }
 
       const titleText = truncate(entry.title || "untitled canvas", 28);
       lastRenderedCanvasTitles.push(titleText);
@@ -815,37 +935,32 @@ export function createProfileTab(ctx: TabContext): TabController {
       addCurrentCanvas: addCurrentCanvasToProfile,
       removeCanvas: removeCanvasFromProfile,
       getRenderedCanvasTitles: () => [...lastRenderedCanvasTitles],
+      getLoadedPreviewCanvasIds: () => [...loadedPreviewCanvasIds],
     },
   });
 
   // -------------------------------------------------------------------------
-  // canvas bin — real narthex display widget for the profile's curated
-  // canvases, shown at the bottom of the profile view (docs/hub-and-profile-
-  // plan.md section 10.2). distinct from the "my canvases" list above: that
-  // list is the *management* affordance (add current / remove); this widget
-  // is the *display* surface, with recursive folders for organizing many
-  // canvases. mounted directly (not via the widget registry/palette — see
-  // canvas-bin.ts's module doc comment for why), once the local peer's own
-  // `CanvasBinStore` doc has resolved (async, so it may not be ready on the
-  // very first layout() call).
+  // canvas bin — the recursive-folder *display* surface for the profile's
+  // curated canvases (docs/hub-and-profile-plan.md section 10.2) is NOT
+  // shown here on the owner's own profile view — the "my canvases" list
+  // above already covers add/remove management, so showing both here was
+  // duplicate UI (a real user-reported issue, 2026-07-02). the underlying
+  // `CanvasBinStore` doc still gets created/stamped below regardless,
+  // since that's what makes a FRIEND able to discover and view this
+  // profile's bin (friends-tab.ts's read-only detail view, and the
+  // `friend-canvas-bin` narthex widget) — only the local rendering of it
+  // was removed.
   // -------------------------------------------------------------------------
-
-  let canvasBinController: ProfileCanvasBinController | null = null;
-  const canvasBinContainer = new Container();
-  container.addChild(canvasBinContainer);
 
   if (ctx.profileStore) {
     const profileStore = ctx.profileStore;
     ensureMyCanvasBinDoc(profileStore.repo)
       .then((canvasBinStore) => {
-        canvasBinController = createProfileCanvasBinWidget({
-          canvasBinStore,
-          profileStore,
-          width: currentWidth || 200,
-          height: PROFILE_CANVAS_BIN_HEIGHT,
-        });
-        canvasBinContainer.addChild(canvasBinController.container);
-        layout(currentWidth, currentHeight);
+        // stamp the canvas-bin doc id onto the profile doc so a friend
+        // syncing this profile doc (already reachable via the gossip-relayed
+        // profileDocId on their friend entry) can find it too — see
+        // profile-doc.ts's `canvasBinDocId` schema field doc comment.
+        profileStore.setCanvasBinDocId(canvasBinStore.handle.documentId);
       })
       .catch((err) => {
         console.warn("[skein:social:profile] failed to load canvas-bin doc:", err);
@@ -1056,7 +1171,6 @@ export function createProfileTab(ctx: TabContext): TabController {
     addCanvasBtn.visible = false;
     canvasListContainer.visible = !!nid;
     canvasEmptyText.visible = false;
-    canvasBinContainer.visible = !!nid;
 
     if (nid) {
       y += FIELD_GAP + 4;
@@ -1087,16 +1201,26 @@ export function createProfileTab(ctx: TabContext): TabController {
       if (canvasEmptyText.visible) {
         y += canvasEmptyText.height + FIELD_GAP;
       }
-
-      // -- canvas bin (display widget, section 10.2) -------------------------
-
-      canvasBinContainer.x = 0;
-      canvasBinContainer.y = y;
-      if (canvasBinController) {
-        canvasBinController.layout(w);
-        y += PROFILE_CANVAS_BIN_HEIGHT + FIELD_GAP;
-      }
     }
+
+    // size the scroll mask/viewport to the space this tab was given, then
+    // clamp — `y`'s final accumulated value IS the real content height (see
+    // `contentHeight`'s doc comment above for why this isn't read back off
+    // `profileInner` itself).
+    contentHeight = y;
+    scrollAreaHeight = h;
+    scrollMask.clear();
+    scrollMask.rect(0, 0, w, h);
+    scrollMask.fill({ color: 0xffffff });
+    // explicit hit area so wheel events fire anywhere in the visible
+    // region, not just over child content — without this, gaps between
+    // fields/rows don't register wheel events at all (see
+    // bin/bin-renderer.ts's setupDrawerScroll() for the reference pattern
+    // this mirrors; a real bug found live, 2026-07-02: scrolling silently
+    // failed because gaps between profile fields have no hit-testable
+    // content of their own).
+    container.hitArea = new Rectangle(0, 0, w, h);
+    clampScroll();
   };
 
   // -------------------------------------------------------------------------
@@ -1161,6 +1285,13 @@ export function createProfileTab(ctx: TabContext): TabController {
   // -------------------------------------------------------------------------
 
   return {
+    // the outer masked/scrollable wrapper, NOT `profileInner` — `profileInner`
+    // is the inner content layer whose `.mask` points at `scrollMask`, a
+    // sibling that only exists inside `container`. mounting `profileInner`
+    // directly (as this previously did) parents it somewhere that never
+    // includes `container`/`scrollMask` at all, so its mask is permanently
+    // disconnected from the render tree — pixi then renders nothing for it.
+    // a real, serious bug, 2026-07-02: this blanked the entire profile view.
     container,
 
     layout(width: number, height: number) {
@@ -1173,7 +1304,6 @@ export function createProfileTab(ctx: TabContext): TabController {
       docUnsub();
       if (identityUnsub) identityUnsub();
       if (profileStoreUnsub) profileStoreUnsub();
-      canvasBinController?.destroy();
       if (avatarSprite) {
         avatarContainer.removeChild(avatarSprite);
         avatarSprite.mask = null;

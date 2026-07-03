@@ -18,7 +18,7 @@ import {
 import type { SocialDoc } from "../../widgets/narthex/social/types";
 import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { HubProfilePanelState } from "../../widgets/narthex/social/hub-profile-panel";
-import type { CanvasBinNode } from "../canvas/canvas-bin-doc";
+import type { ProfileCanvasBinTestHooks } from "../../widgets/narthex/social/canvas-bin";
 import type { ProfileCanvasEntry, ProfileStore } from "../canvas/profile-doc";
 import type { FriendInfo } from "../canvas/share-dialog";
 import { storeBlob, classifyDomain } from "../storage/skein-blob-store";
@@ -303,43 +303,12 @@ export interface ProfileTabTestHooks {
   /** titles currently rendered in the "my canvases" list — proves the UI
    *  actually reflects the doc, not just that the doc was mutated. */
   getRenderedCanvasTitles(): string[];
-}
-
-/**
- * test hooks for the profile canvas-bin widget (see
- * docs/hub-and-profile-plan.md section 10.2,
- * `widgets/narthex/social/canvas-bin.ts`). registered via
- * `registerSocialBridge({ canvasBin: ... })` from the widget itself on
- * mount, same pattern as `profileTab`/`friendsTab`.
- *
- * `getVisibleNodes()` reads the folder currently being viewed (root or a
- * sub-folder) directly off `CanvasBinStore` — proves the tree, not just
- * pixi render state. `enterFolder`/`goBack`/`addFolder`/`moveNode`/
- * `activateNode` call the widget's real internal handlers directly, same
- * precedent as `FriendsTabTestHooks` (no infra in this repo for simulated
- * pixi pointer drags).
- */
-export interface ProfileCanvasBinTestHooks {
-  /** child nodes of the currently-viewed folder (or root). */
-  getVisibleNodes(): CanvasBinNode[];
-  /** the currently-viewed folder's id, or null at root. */
-  getCurrentFolderId(): string | null;
-  /** enter a folder (as if its card were tapped) or navigate to a canvas
-   *  (as if a canvas card were tapped) — dispatches on the node's kind. */
-  enterFolder(nodeId: string): void;
-  /** return to the parent folder, as if the "‹ back" button were tapped. */
-  goBack(): void;
-  /** create a new folder under the currently-viewed folder. returns the new
-   *  folder's id, or "" if it couldn't be created. */
-  addFolder(title: string): string;
-  /** move a node (folder or canvas reference) to a new parent folder id, or
-   *  to root when null — as if it had been dragged and dropped there.
-   *  returns whether the move succeeded (see `CanvasBinStore.moveNode()`
-   *  for the cases it refuses). */
-  moveNode(nodeId: string, newParentId: string | null): boolean;
-  /** activate a node by id exactly as a real tap would (enter folder /
-   *  navigate to canvas), regardless of which folder is currently visible. */
-  activateNode(nodeId: string): void;
+  /** canvasDocIds in the "my canvases" list whose preview-image `Sprite`
+   *  has actually finished loading and attached (not just that the entry
+   *  has a `previewUrl` set) — lets a test (or live debugging) prove an
+   *  image genuinely rendered, mirrors canvas-bin.ts's
+   *  `ProfileCanvasBinTestHooks.getLoadedPreviewNodeIds()`. */
+  getLoadedPreviewCanvasIds(): string[];
 }
 
 /**
@@ -419,6 +388,11 @@ export interface SkeinTestBridgeSocial {
   profileTab?: ProfileTabTestHooks;
   /** profile canvas-bin widget test hooks (set by canvas-bin.ts on mount) */
   canvasBin?: ProfileCanvasBinTestHooks;
+  /** a friend's read-only canvas-bin test hooks, mounted inside the
+   *  friend-detail view once their profile+bin docs are reachable (set by
+   *  friends-tab.ts). absent/undefined whenever no friend-bin section is
+   *  currently mounted (no selected friend, no resolvable docs yet, etc). */
+  friendCanvasBin?: ProfileCanvasBinTestHooks;
 }
 
 /**
@@ -468,6 +442,47 @@ export interface SkeinTestBridge {
    * null/absent otherwise.
    */
   share?: ShareTestHooks | null;
+  /**
+   * generic per-widget-instance test hooks, keyed by widget id — for real
+   * `WidgetFactory`-registered widgets placed via the palette (unlike the
+   * social overlay's hand-mounted tabs, which use `registerSocialBridge()`
+   * under a single well-known key). see `registerWidgetBridge()`/
+   * `unregisterWidgetBridge()` in test-bridge-registry.ts. populated in DEV
+   * builds only.
+   */
+  widgets?: Record<string, unknown>;
+}
+
+/**
+ * test hooks for the "friend canvas bin" narthex widget (a real,
+ * palette-placeable `WidgetFactory` — see
+ * widgets/narthex/friend-canvas-bin.ts). registered per widget instance via
+ * `registerWidgetBridge(widgetId, hooks)` under
+ * `window.__skeinTest.widgets[widgetId]`, since (unlike the social overlay's
+ * singleton tabs) more than one instance of this widget can exist on the
+ * narthex at once.
+ */
+export interface FriendCanvasBinTestHooks {
+  /** the currently-configured friend selection, or null if the widget is
+   *  still in its unconfigured "pick a friend" state. */
+  getSelection(): { nodeId: string; profileDocId: string; displayName: string } | null;
+  /** select a friend as if their row in the picker had been tapped —
+   *  same precedent as other widgets' "drive the real internal handler
+   *  directly" test hooks (no infra for simulated pixi pointer taps). */
+  selectFriend(nodeId: string, profileDocId: string, displayName: string): void;
+  /** clear the current selection, returning to the "pick a friend" state,
+   *  as if the "change friend" link had been tapped. */
+  clearSelection(): void;
+  /** the picker's current candidate list (best-effort read of the local
+   *  peer's own friend list — see friend-directory.ts). */
+  getPickerCandidates(): Array<{ nodeId: string; profileDocId: string; displayName: string }>;
+  /** high-level resolution status, for asserting the "friend has no
+   *  canvas-bin doc yet" / "doc unreachable" best-effort cases without an
+   *  error UI. */
+  getStatus(): "unconfigured" | "resolving" | "no-canvas-bin" | "ready";
+  /** the mounted read-only bin's own test hooks, once `getStatus()` is
+   *  `"ready"` — null otherwise. */
+  getBinHooks(): ProfileCanvasBinTestHooks | null;
 }
 
 // ---------------------------------------------------------------------------

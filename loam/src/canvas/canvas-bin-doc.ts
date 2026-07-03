@@ -345,9 +345,27 @@ export class CanvasBinStore {
    * inside nested folders). folders themselves are never touched by this —
    * only the leaf canvas references. call this whenever the profile doc
    * changes (e.g. on `ProfileStore.onChange()`).
+   *
+   * IMPORTANT: only calls `handle.change()` when the tree actually needs a
+   * mutation. `canvas-bin.ts`'s `render()` calls this on *every* render
+   * (including ones triggered by `canvasBinStore.onChange()` itself), so an
+   * unconditional `handle.change()` here — even one whose callback happens
+   * not to mutate anything — risks a self-triggered "change" event on every
+   * render, which bumps `render()`'s `renderGeneration` guard and can
+   * starve an in-flight `Assets.load()` preview-image fetch before it ever
+   * resolves (a real bug suspected live, 2026-07-03: preview images
+   * consistently failing to appear). computing the no-op case up front and
+   * skipping the write entirely closes that off regardless of automerge's
+   * own no-op-change behavior.
    */
   reconcileWithProfile(entries: ProfileCanvasEntry[]): void {
     const validIds = new Set(entries.map((e) => e.canvasDocId));
+    const currentDoc = this.doc();
+    const present = collectCanvasDocIds(currentDoc.nodes);
+    const hasStaleNode = [...present].some((id) => !validIds.has(id));
+    const hasMissingEntry = entries.some((e) => !present.has(e.canvasDocId));
+    if (!hasStaleNode && !hasMissingEntry) return;
+
     this.handle.change((doc) => {
       pruneCanvasNodesNotIn(doc.nodes, validIds);
       const present = collectCanvasDocIds(doc.nodes);

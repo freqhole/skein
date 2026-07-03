@@ -323,6 +323,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
         g.eventMode = "static";
         g.cursor = "pointer";
         g.on("pointertap", () => {
+          if (canvasStore.isLocalViewer()) return;
           canvasStore.setColor(color);
         });
 
@@ -360,6 +361,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
     });
 
     setImageText.on("pointertap", async () => {
+      if (canvasStore.isLocalViewer()) return;
       const url = await pickImageAsDataUrl({ maxWidth: 320, maxHeight: 200 });
       if (url) {
         canvasStore.setPreviewUrl(url);
@@ -475,6 +477,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
     deleteBtn.addChild(deleteBtnText);
 
     deleteBtn.on("pointertap", () => {
+      if (canvasStore.isLocalViewer()) return;
       if (canvasStore.isDeleted) return;
       const confirmed = window.confirm("delete this canvas? it will be moved to the trash.");
       if (!confirmed) return;
@@ -563,6 +566,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
 
     const startTitleEdit = () => {
       if (titleOverlay) return;
+      if (canvasStore.isLocalViewer()) return;
       titleText.visible = false;
 
       const m = canvasStore.metadata();
@@ -610,6 +614,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
 
     const startDescEdit = () => {
       if (descOverlay) return;
+      if (canvasStore.isLocalViewer()) return;
       descText.visible = false;
 
       const m = canvasStore.metadata();

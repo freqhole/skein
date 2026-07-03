@@ -85,6 +85,36 @@ export function computeRows(itemCount: number, cols: number): number {
 }
 
 /**
+ * page sizing for real prev/next pagination (as opposed to bin's own
+ * scroll-based viewport) — see widgets/narthex/social/canvas-bin.ts, which
+ * uses this to slice a folder's children into fixed-size pages that always
+ * fit within a given viewport height, rather than scrolling a taller list.
+ * schema-agnostic and pure, same spirit as `autoFitCols`/`computeRows`.
+ */
+export interface PageSize {
+  /** columns per row, same value `autoFitCols` would return. */
+  cols: number;
+  /** how many rows fit within `viewportHeight` (at least 1). */
+  rowsPerPage: number;
+  /** `cols * rowsPerPage` — how many items fit on one page. */
+  itemsPerPage: number;
+}
+
+export function computePageSize(
+  mode: BinMode,
+  contentWidth: number,
+  viewportHeight: number,
+  options?: SlotSizeOptions
+): PageSize {
+  const cols = autoFitCols(mode, contentWidth, options);
+  const size = slotSize(mode, options);
+  const gap = slotGap(mode);
+  const rowHeight = size.height + gap;
+  const rowsPerPage = rowHeight > 0 ? Math.max(1, Math.floor((viewportHeight + gap) / rowHeight)) : 1;
+  return { cols, rowsPerPage, itemsPerPage: cols * rowsPerPage };
+}
+
+/**
  * compute the minimum grid dimensions needed to fit all items at their
  * current slot positions. ensures no item overflows the grid.
  * also respects minCols (from autoFitCols) so the grid is at least

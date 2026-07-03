@@ -908,6 +908,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
     const handleUpload = async () => {
       const state = ctx.doc.current;
       if (state.pageBlobIds.length > 0 || state.blobId) return;
+      if (ctx.canvasStore?.isLocalViewer()) return;
 
       try {
         const picked = await pickPdfFile();

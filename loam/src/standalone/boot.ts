@@ -67,7 +67,12 @@ import { log } from "../utils/log";
 // indexeddb key for the well-known narthex document id
 const NARTHEX_DOC_KEY = "skein-narthex-doc-id";
 const MESSAGEZ_DOC_KEY = "skein-messagez-doc-id";
-const SOCIAL_DOC_KEY = "skein-social-doc-id"; // browser mode only
+/** meta-db key for the standalone (browser-mode) social doc id — exported so
+ *  other modules that need best-effort, read-only access to the local
+ *  peer's own friend list (e.g. src/canvas/friend-directory.ts's friend
+ *  picker for the "friend canvas bin" narthex widget) can look it up
+ *  without duplicating the key string or depending on this whole class. */
+export const SOCIAL_DOC_KEY = "skein-social-doc-id"; // browser mode only
 const TAG = "skein.boot";
 
 // ---------------------------------------------------------------------------
@@ -1745,6 +1750,17 @@ class SkeinRouter {
     // set color on the canvas document (source of truth for metadata)
     if (detail?.color) {
       newStore.setColor(detail.color);
+    }
+
+    // set the preview image captured in the create-canvas wizard, if any —
+    // this was previously only ever applied to the narthex card's own
+    // cosmetic prop copy below, never to the real canvas doc's own
+    // `previewUrl` field, so a canvas created with an image picked during
+    // the wizard still showed no image anywhere that reads the canvas
+    // doc's own previewUrl directly (e.g. profile-tab.ts's "add current
+    // canvas to profile" — a real user-reported bug, 2026-07-02).
+    if (detail?.previewUrl) {
+      newStore.setPreviewUrl(detail.previewUrl);
     }
 
     // seed a canvas-info widget so every new canvas has one by default.

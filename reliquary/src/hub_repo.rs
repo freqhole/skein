@@ -427,11 +427,56 @@ impl HubRepo {
         doc
     }
 
+    /// read a peer's effective canvas role from `.acl[peer_id].role` on an
+    /// automerge document.
+    ///
+    /// mirrors `loam/src/p2p/acl-filtering-network-adapter.ts`'s
+    /// `createRepoRoleResolver()` exactly, so the two enforcement points
+    /// stay in sync: any entry that's missing, malformed, or not the
+    /// literal string `"viewer"` is treated as `"member"` (full read/write)
+    /// — including a doc with no `.acl` field at all (pre-ACL canvases, or
+    /// non-canvas docs like narthex/social/messagez, which have no acl
+    /// field and must keep working exactly as before this gate existed).
+    /// deliberately does NOT special-case `"admin"` or any other value —
+    /// only `"viewer"` ever changes behavior, same as the JS resolver.
+    fn peer_canvas_role(doc: &automerge::Automerge, peer_id: &str) -> String {
+        use automerge::ReadDoc;
+
+        let acl_obj = match doc.get(automerge::ROOT, "acl") {
+            Ok(Some((automerge::Value::Object(automerge::ObjType::Map), obj))) => obj,
+            _ => return "member".to_string(),
+        };
+        let entry_obj = match doc.get(&acl_obj, peer_id) {
+            Ok(Some((automerge::Value::Object(automerge::ObjType::Map), obj))) => obj,
+            _ => return "member".to_string(),
+        };
+        match doc.get(&entry_obj, "role") {
+            Ok(Some((v, _))) => v
+                .to_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "member".to_string()),
+            _ => "member".to_string(),
+        }
+    }
+
     /// handle an incoming sync/request message from a peer.
     ///
     /// applies the incoming automerge sync message, generates a response if the
     /// local document has changes to send back, and persists the document
     /// asynchronously.
+    ///
+    /// enforces per-canvas viewer read-only access centrally, at the hub's
+    /// one and only point of applying inbound changes to its own canonical
+    /// copy of a doc: a "viewer" peer's incoming changes are stripped
+    /// before `receive_sync_message` ever sees them (heads/have/need are
+    /// left untouched so the viewer's own reads keep syncing normally) —
+    /// same rule `AclFilteringNetworkAdapter` enforces browser-side, see
+    /// `peer_canvas_role`'s doc comment. enforcing it here too (not just in
+    /// every browser peer) closes a real gap: without this, a viewer's
+    /// forbidden edit that reached the hub would get merged into the hub's
+    /// own canonical doc and then legitimately re-relayed onward to every
+    /// other connected peer as the hub's own change, laundering straight
+    /// past each browser's separate, sender-identity-based filter.
     ///
     /// returns the encoded response sync message bytes, or `None` if there is
     /// nothing to send back.
@@ -452,7 +497,7 @@ impl HubRepo {
             .or_insert_with(automerge::sync::State::new);
 
         // decode the incoming automerge sync message
-        let incoming = match automerge::sync::Message::decode(sync_message_bytes) {
+        let mut incoming = match automerge::sync::Message::decode(sync_message_bytes) {
             Ok(msg) => msg,
             Err(e) => {
                 tracing::warn!(
@@ -464,6 +509,15 @@ impl HubRepo {
                 return None;
             }
         };
+
+        if !incoming.changes.is_empty() && Self::peer_canvas_role(&doc, peer_id) == "viewer" {
+            tracing::info!(
+                peer_id,
+                doc_id,
+                "hub: stripping changes from viewer-role peer before applying sync message"
+            );
+            incoming.changes = automerge::sync::ChunkList::empty();
+        }
 
         // apply the message to our document
         if let Err(e) = doc.receive_sync_message(sync_state, incoming) {
@@ -762,7 +816,6 @@ mod tests {
         assert!(!hub_repo.cancel_peer("never-connected").await);
         assert_eq!(hub_repo.connected_peer_count().await, 0);
     }
-
     /// this is the core regression test for the fix described on
     /// `HubRepo::cancel_peer`'s doc comment: a peer with an active
     /// connection (an in-flight `handle_connection` loop, here driven by an
@@ -823,5 +876,239 @@ mod tests {
         );
 
         drop(client_side);
+    }
+
+    // -----------------------------------------------------------------
+    // per-canvas viewer-role enforcement (peer_canvas_role /
+    // handle_sync_message)
+    // -----------------------------------------------------------------
+
+    /// build an automerge doc with the shape `read_str`/`peer_canvas_role`
+    /// expect: `version`/`widgets`/`title` (so it counts as "synced" for
+    /// other helpers elsewhere in this crate that check for that), plus an
+    /// `.acl` map with one entry per `(peer_id, role)` pair given.
+    fn build_seed_doc(title: &str, acl_entries: &[(&str, &str)]) -> automerge::Automerge {
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            tx.put(automerge::ROOT, "version", 1_i64)?;
+            tx.put_object(automerge::ROOT, "widgets", automerge::ObjType::Map)?;
+            tx.put(automerge::ROOT, "title", title)?;
+
+            if !acl_entries.is_empty() {
+                let acl = tx.put_object(automerge::ROOT, "acl", automerge::ObjType::Map)?;
+                for (peer_id, role) in acl_entries {
+                    let entry = tx.put_object(&acl, *peer_id, automerge::ObjType::Map)?;
+                    tx.put(&entry, "role", *role)?;
+                }
+            }
+            Ok(())
+        })
+        .expect("seed doc transact should succeed");
+        doc
+    }
+
+    #[test]
+    fn peer_canvas_role_reads_the_recorded_role() {
+        let doc = build_seed_doc("t", &[("viewer-peer", "viewer"), ("member-peer", "member")]);
+        assert_eq!(HubRepo::peer_canvas_role(&doc, "viewer-peer"), "viewer");
+        assert_eq!(HubRepo::peer_canvas_role(&doc, "member-peer"), "member");
+    }
+
+    #[test]
+    fn peer_canvas_role_defaults_to_member_when_acl_or_entry_is_missing() {
+        // no `.acl` map at all — e.g. a pre-ACL canvas, or a non-canvas doc
+        // (narthex/social/messagez) that has no acl field.
+        let doc_no_acl = build_seed_doc("t", &[]);
+        assert_eq!(HubRepo::peer_canvas_role(&doc_no_acl, "anyone"), "member");
+
+        // `.acl` exists, but this peer has no entry in it.
+        let doc_with_acl = build_seed_doc("t", &[("someone-else", "viewer")]);
+        assert_eq!(
+            HubRepo::peer_canvas_role(&doc_with_acl, "stranger"),
+            "member"
+        );
+    }
+
+    /// drive a real 3-message automerge sync handshake between an
+    /// independent peer-side doc/state and `hub_repo.handle_sync_message`,
+    /// returning the peer's final synced doc (so callers can also assert
+    /// on it if useful) after the exchange settles. panics if the exchange
+    /// doesn't settle within a small fixed number of rounds.
+    async fn sync_peer_with_hub(
+        hub_repo: &HubRepo,
+        peer_id: &str,
+        doc_id: &str,
+        peer_doc: &mut automerge::Automerge,
+    ) {
+        use automerge::sync::SyncDoc;
+
+        let mut peer_state = automerge::sync::State::new();
+        for _ in 0..5 {
+            let Some(msg) = peer_doc.generate_sync_message(&mut peer_state) else {
+                break;
+            };
+            let Some(resp_bytes) = hub_repo
+                .handle_sync_message(peer_id, doc_id, &msg.encode())
+                .await
+            else {
+                continue;
+            };
+            let resp = automerge::sync::Message::decode(&resp_bytes).expect("decode hub response");
+            peer_doc
+                .receive_sync_message(&mut peer_state, resp)
+                .expect("peer should apply hub's response");
+        }
+    }
+
+    #[tokio::test]
+    async fn viewer_role_peers_changes_are_stripped_before_reaching_the_hubs_canonical_doc() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+
+        let seed_doc = build_seed_doc("original title", &[("viewer-peer", "viewer")]);
+        let seed_bytes = seed_doc.save();
+
+        let storage = HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+        storage.save_doc("canvas-1", &seed_bytes).await;
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new (reload) should succeed");
+
+        // "viewer-peer"'s own local replica, forked from the same initial
+        // state, with a forbidden edit applied only on their side.
+        let mut peer_doc = automerge::Automerge::load(&seed_bytes).expect("load peer doc");
+        peer_doc
+            .transact::<_, _, automerge::AutomergeError>(|tx| {
+                use automerge::transaction::Transactable;
+                tx.put(automerge::ROOT, "title", "HACKED BY VIEWER")?;
+                Ok(())
+            })
+            .expect("peer transact should succeed");
+
+        sync_peer_with_hub(&hub_repo, "viewer-peer", "canvas-1", &mut peer_doc).await;
+
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+        let hub_title = tokio::task::spawn_blocking(move || {
+            use automerge::ReadDoc;
+            handle.with_document(|doc| {
+                doc.get(automerge::ROOT, "title")
+                    .ok()
+                    .flatten()
+                    .and_then(|(v, _)| v.to_str().map(|s| s.to_string()))
+            })
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+
+        assert_eq!(
+            hub_title,
+            Some("original title".to_string()),
+            "a viewer-role peer's change must never be applied to the hub's canonical doc"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_role_peers_changes_are_applied_normally() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+
+        let seed_doc = build_seed_doc("original title", &[("member-peer", "member")]);
+        let seed_bytes = seed_doc.save();
+
+        let storage = HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+        storage.save_doc("canvas-1", &seed_bytes).await;
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new (reload) should succeed");
+
+        let mut peer_doc = automerge::Automerge::load(&seed_bytes).expect("load peer doc");
+        peer_doc
+            .transact::<_, _, automerge::AutomergeError>(|tx| {
+                use automerge::transaction::Transactable;
+                tx.put(automerge::ROOT, "title", "edited by member")?;
+                Ok(())
+            })
+            .expect("peer transact should succeed");
+
+        sync_peer_with_hub(&hub_repo, "member-peer", "canvas-1", &mut peer_doc).await;
+
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+        let hub_title = tokio::task::spawn_blocking(move || {
+            use automerge::ReadDoc;
+            handle.with_document(|doc| {
+                doc.get(automerge::ROOT, "title")
+                    .ok()
+                    .flatten()
+                    .and_then(|(v, _)| v.to_str().map(|s| s.to_string()))
+            })
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+
+        assert_eq!(
+            hub_title,
+            Some("edited by member".to_string()),
+            "a member-role peer's change must be applied normally — this gate must not be overly restrictive"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_doc_with_no_acl_at_all_still_applies_changes_normally() {
+        // e.g. narthex/social/messagez docs, or a pre-ACL canvas — must
+        // behave exactly as before this gate existed (fully read/write for
+        // everyone) since `peer_canvas_role` defaults to "member" here.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+
+        let seed_doc = build_seed_doc("original title", &[]);
+        let seed_bytes = seed_doc.save();
+
+        let storage = HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+        storage.save_doc("doc-1", &seed_bytes).await;
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new (reload) should succeed");
+
+        let mut peer_doc = automerge::Automerge::load(&seed_bytes).expect("load peer doc");
+        peer_doc
+            .transact::<_, _, automerge::AutomergeError>(|tx| {
+                use automerge::transaction::Transactable;
+                tx.put(automerge::ROOT, "title", "edited, no acl at all")?;
+                Ok(())
+            })
+            .expect("peer transact should succeed");
+
+        sync_peer_with_hub(&hub_repo, "anyone", "doc-1", &mut peer_doc).await;
+
+        let handle = hub_repo.find("doc-1").await.expect("doc should be found");
+        let hub_title = tokio::task::spawn_blocking(move || {
+            use automerge::ReadDoc;
+            handle.with_document(|doc| {
+                doc.get(automerge::ROOT, "title")
+                    .ok()
+                    .flatten()
+                    .and_then(|(v, _)| v.to_str().map(|s| s.to_string()))
+            })
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+
+        assert_eq!(hub_title, Some("edited, no acl at all".to_string()));
     }
 }

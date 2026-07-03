@@ -7,6 +7,34 @@ import type { Page } from "@playwright/test";
 // import these helpers and never touch the window object themselves.
 // ---------------------------------------------------------------------------
 
+/**
+ * start collecting console warnings/errors matching pixi's own internal
+ * "mask bounds" renderer diagnostic ("Mask bounds, renderable is not
+ * inside the root container") — this is a `console.warn` call, not a
+ * thrown exception, so a `page.on("pageerror", ...)` listener (see
+ * texture-lifecycle.test.ts) never sees it; a passing test can still be
+ * masking a broken/blank render (a real bug that got past every e2e test
+ * in this repo, 2026-07-02 — see profile-tab.ts's/friends-tab.ts's
+ * `.height`-on-a-masked-container mistake). deliberately narrower than
+ * "any PixiJS warning" — this app also emits other, unrelated, benign
+ * PixiJS warnings (e.g. "HTMLTextSystem: Failed to clean texture") that
+ * aren't evidence of this specific bug class. call this right after
+ * `page.goto()`, then assert the returned array is empty after exercising
+ * the flow under test.
+ */
+export function collectPixiWarnings(page: Page): string[] {
+  const messages: string[] = [];
+  page.on("console", (msg) => {
+    const type = msg.type();
+    if (type !== "warning" && type !== "error") return;
+    const text = msg.text();
+    if (text.includes("Mask bounds")) {
+      messages.push(text);
+    }
+  });
+  return messages;
+}
+
 // --- canvas state ---
 
 /** number of live widgets on the canvas */
@@ -445,61 +473,11 @@ export async function getRenderedProfileCanvasTitles(page: Page): Promise<string
   );
 }
 
-// --- profile canvas-bin widget (window.__skeinTest.social.canvasBin) ---
-// see docs/hub-and-profile-plan.md section 10.2, widgets/narthex/social/canvas-bin.ts.
-
-export interface CanvasBinNodeSummary {
-  kind: "folder" | "canvas";
-  id: string;
-  title?: string;
-  canvasDocId?: string;
-}
-
-/** child nodes of the canvas-bin widget's currently-viewed folder (or root). */
-export async function getCanvasBinVisibleNodes(page: Page): Promise<CanvasBinNodeSummary[]> {
+/** canvasDocIds in the profile tab's "my canvases" list whose preview-image
+ *  Sprite has actually finished loading and attached. */
+export async function getLoadedPreviewCanvasIds(page: Page): Promise<string[]> {
   return page.evaluate(
-    () => (window as any).__skeinTest?.social?.canvasBin?.getVisibleNodes?.() ?? []
-  );
-}
-
-/** the canvas-bin widget's currently-viewed folder id, or null at root. */
-export async function getCanvasBinCurrentFolderId(page: Page): Promise<string | null> {
-  return page.evaluate(
-    () => (window as any).__skeinTest?.social?.canvasBin?.getCurrentFolderId?.() ?? null
-  );
-}
-
-/** enter a folder or navigate to a canvas, as if its card were tapped. */
-export async function activateCanvasBinNode(page: Page, nodeId: string): Promise<void> {
-  await page.evaluate(
-    (id) => (window as any).__skeinTest?.social?.canvasBin?.activateNode?.(id),
-    nodeId
-  );
-}
-
-/** return to the parent folder, as if the "‹ back" button were tapped. */
-export async function canvasBinGoBack(page: Page): Promise<void> {
-  await page.evaluate(() => (window as any).__skeinTest?.social?.canvasBin?.goBack?.());
-}
-
-/** create a new folder under the currently-viewed folder. returns its new id. */
-export async function addCanvasBinFolder(page: Page, title: string): Promise<string> {
-  return page.evaluate(
-    (t) => (window as any).__skeinTest?.social?.canvasBin?.addFolder?.(t) ?? "",
-    title
-  );
-}
-
-/** move a node to a new parent folder id (or root when null), as if dragged and dropped. */
-export async function moveCanvasBinNode(
-  page: Page,
-  nodeId: string,
-  newParentId: string | null
-): Promise<boolean> {
-  return page.evaluate(
-    ({ nodeId, newParentId }) =>
-      (window as any).__skeinTest?.social?.canvasBin?.moveNode?.(nodeId, newParentId) ?? false,
-    { nodeId, newParentId }
+    () => (window as any).__skeinTest?.social?.profileTab?.getLoadedPreviewCanvasIds?.() ?? []
   );
 }
 

@@ -11,7 +11,9 @@ import { expect, test } from "@playwright/test";
 import {
   addCurrentCanvasToProfile,
   canAddCurrentCanvasToProfile,
+  collectPixiWarnings,
   ensureIdentityBridge,
+  getLoadedPreviewCanvasIds,
   getProfileCanvasEntries,
   getRenderedProfileCanvasTitles,
   removeCanvasFromProfile,
@@ -63,9 +65,25 @@ test.describe("profile tab — my canvases", () => {
   test.describe.configure({ mode: "serial" });
   test.setTimeout(120_000);
 
+  const pixiWarningsByPage = new WeakMap<import("@playwright/test").Page, string[]>();
+
   test.beforeEach(async ({ page }) => {
+    pixiWarningsByPage.set(page, collectPixiWarnings(page));
     await page.goto("/");
     await waitForNarthex(page);
+  });
+
+  // a masked/scrollable container's `.height` (or `.getBounds()`) must
+  // never be read directly in this app — pixi logs "PixiJS Warning: Mask
+  // bounds, renderable is not inside the root container" when it is, and
+  // (per a real bug found live, 2026-07-02, in profile-tab.ts's "my
+  // canvases" scroll wrapper) rendering can silently break at the same
+  // time, with no thrown exception for a `pageerror` listener to catch.
+  // collecting here (rather than per-test) covers every test in this file
+  // automatically.
+  test.afterEach(async ({ page }, testInfo) => {
+    if (testInfo.status !== "passed") return;
+    expect(pixiWarningsByPage.get(page) ?? []).toEqual([]);
   });
 
   test("add-current-canvas is hidden while on the narthex meta-canvas, shown on a real canvas", async ({
@@ -236,5 +254,45 @@ test.describe("profile tab — my canvases", () => {
     expect(entries.map((e) => e.canvasDocId)).toContain(docId);
     const persisted = entries.find((e) => e.canvasDocId === docId);
     expect(persisted?.title).toBe("persisted canvas");
+  });
+
+  test("a canvas entry with a previewUrl actually loads and attaches its preview image in the flat list", async ({
+    page,
+  }) => {
+    // 1x1 transparent PNG — same fixture used elsewhere in this repo for
+    // "does a data: URL preview actually render" coverage.
+    const previewUrl =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    const docId = await createCanvasAndWaitForNavigation(page, {
+      title: "img canvas",
+      color: 0x10b981,
+    });
+
+    // set the previewUrl directly on the canvas doc (mirrors canvas-info.ts's
+    // manual "pick image" flow / the create-wizard's own previewUrl seeding —
+    // this test only cares about the profile list actually rendering it).
+    await page.evaluate(() => {
+      const skein = (window as any).__skein;
+      skein.store.setPreviewUrl(
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+      );
+    });
+
+    // the "my canvases" section (and everything rendered by
+    // rebuildCanvasList(), including image loading) is gated behind an
+    // identity existing — see the "renders every entry" test's comment.
+    await ensureIdentityBridge(page);
+    await toggleSocialOverlay(page);
+    await page.waitForTimeout(300);
+    await addCurrentCanvasToProfile(page);
+
+    const entries = await getProfileCanvasEntries(page);
+    const entry = entries.find((e) => e.canvasDocId === docId) as { previewUrl?: string } | undefined;
+    expect(entry?.previewUrl).toBe(previewUrl);
+
+    await expect
+      .poll(async () => getLoadedPreviewCanvasIds(page), { timeout: 10_000 })
+      .toContain(docId);
   });
 });

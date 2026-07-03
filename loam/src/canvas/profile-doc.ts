@@ -60,6 +60,18 @@ export const profileDocumentSchema = z.object({
   /** curated, user-chosen list — see `ProfileCanvasEntry` above. */
   canvases: z.array(profileCanvasEntrySchema),
   /**
+   * the local peer's own canvas-bin doc id (canvas-bin-doc.ts's
+   * `CanvasBinStore`) — a separate automerge doc holding the recursive
+   * folder tree that organizes this profile's curated canvases for
+   * display (see docs/hub-and-profile-plan.md section 10.2). riding this
+   * along on the profile doc (rather than inventing a new gossip/wire
+   * field) means a friend who already syncs this profile doc for free
+   * also learns where to find the owner's canvas-bin doc, once they open
+   * it — see `ProfileStore.setCanvasBinDocId()`/`canvasBinDocId()` below.
+   * "" / absent means the local peer hasn't created one yet.
+   */
+  canvasBinDocId: z.string().optional(),
+  /**
    * ISO timestamp of the last content mutation (username/bio/avatar/
    * canvases — NOT `.acl` changes, which aren't "profile content").
    * stamped by every mutating `ProfileStore` method. used for gossip
@@ -283,6 +295,30 @@ export class ProfileStore {
         doc.canvases.splice(index, 1);
         doc.updatedAt = new Date().toISOString();
       }
+    });
+  }
+
+  // -- canvas-bin doc pointer ------------------------------------------------
+
+  /** the local peer's own canvas-bin doc id, if `setCanvasBinDocId()` has
+   *  ever been called on this doc — see the schema field's doc comment for
+   *  why this rides along on the profile doc. `undefined` means unset. */
+  canvasBinDocId(): string | undefined {
+    return this.doc().canvasBinDocId;
+  }
+
+  /**
+   * stamp this profile's canvas-bin doc id. no-op (doesn't bump
+   * `updatedAt`) if already set to the same value — this is called every
+   * time `ensureMyCanvasBinDoc()` resolves (which returns the same doc id
+   * on every call after the first), so guarding against a redundant write
+   * avoids bumping staleness metadata for no real content change.
+   */
+  setCanvasBinDocId(docId: string): void {
+    if (this.doc().canvasBinDocId === docId) return;
+    this.handle.change((doc) => {
+      doc.canvasBinDocId = docId;
+      doc.updatedAt = new Date().toISOString();
     });
   }
 

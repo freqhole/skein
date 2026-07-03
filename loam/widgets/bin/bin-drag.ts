@@ -178,6 +178,10 @@ export function createBinDragHandler(ctx: BinDragContext): CardInteractionCallba
 
   return {
     onCardPointerDown(widgetId: string, e: PointerEvent): void {
+      // viewers can't drag cards out of or rearrange a bin — mirrors the
+      // frame-level isReadOnly() gate widget-frame.ts uses for ordinary drags.
+      if (ctx.store.isLocalViewer()) return;
+
       // clean up any in-progress drag (shouldn't normally happen)
       if (dragCandidate || dragging) {
         cleanup();

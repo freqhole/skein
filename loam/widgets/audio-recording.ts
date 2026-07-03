@@ -804,9 +804,11 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       switch (recState) {
         case "idle":
         case "error":
+          if (ctx.canvasStore?.isLocalViewer()) return;
           void startRecording();
           break;
         case "recording":
+          if (ctx.canvasStore?.isLocalViewer()) return;
           stopRecording();
           break;
         case "ready":

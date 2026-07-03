@@ -118,6 +118,7 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
     // click placeholder to upload an image
     const handlePlaceholderClick = async () => {
       if (loadState !== "empty") return;
+      if (ctx.canvasStore?.isLocalViewer()) return;
       const dataUrl = await pickImageAsDataUrl({
         maxWidth: 800,
         maxHeight: 800,
