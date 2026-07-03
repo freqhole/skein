@@ -190,14 +190,13 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
  * unavailable. reuses the existing repo/iroh endpoint from
  * `initSkeinP2PForTest`; destroys and replaces the current canvas.
  *
- * even after `repo.peers` shows the peer connection, `repo.find()` on a
- * docId this repo has never seen before can still race: automerge-repo's
- * sync-message plumbing for a *brand new* document request needs a moment
- * to actually reach the other peer and get a response, and `repo.find()`
- * rejects with "Document ... is unavailable" if that round-trip doesn't
- * land in time. retry a few times with a short delay — this is a test-only
- * concern (real usage has much more time between connecting and opening a
- * shared doc, e.g. a human clicking an invite link).
+ * no retry loop here: `CanvasStore.open()` (used internally by
+ * `initCanvas()`) already waits out a transient "unavailable" verdict via
+ * automerge-repo's own event-driven `whenReady()` recovery — see its doc
+ * comment in canvas-store.ts. a manual retry loop used to live here,
+ * silently working around the exact same failure mode as a real,
+ * user-reported production crash (2026-07-03) — which is exactly why e2e
+ * coverage never caught it before now.
  */
 async function joinCanvasForTest(docId: string): Promise<{ canvasDocId: string }> {
   if (!sharedRepo || !sharedMountElement) {
@@ -207,32 +206,15 @@ async function joinCanvasForTest(docId: string): Promise<{ canvasDocId: string }
   const bridge = (window as any).__skeinTest;
   bridge.canvas.destroy();
 
-  const maxAttempts = 5;
-  const delayMs = 1000;
-  let canvas: Awaited<ReturnType<typeof initCanvas>> | null = null;
-  let lastErr: unknown;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      canvas = await initCanvas({
-        mountElement: sharedMountElement,
-        canvasDocId: docId,
-        registry: createTestRegistry(),
-        repo: sharedRepo,
-        restrictBlobToPeers: sharedIrohAdapter
-          ? (blake3Hash, peerNodeIds) => sharedIrohAdapter!.restrictBlobToPeers(blake3Hash, peerNodeIds)
-          : undefined,
-      });
-      break;
-    } catch (err) {
-      lastErr = err;
-      if (attempt < maxAttempts) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-      }
-    }
-  }
-  if (!canvas) {
-    throw lastErr;
-  }
+  const canvas = await initCanvas({
+    mountElement: sharedMountElement,
+    canvasDocId: docId,
+    registry: createTestRegistry(),
+    repo: sharedRepo,
+    restrictBlobToPeers: sharedIrohAdapter
+      ? (blake3Hash, peerNodeIds) => sharedIrohAdapter!.restrictBlobToPeers(blake3Hash, peerNodeIds)
+      : undefined,
+  });
 
   bridge.canvas = canvas;
   (window as any).__skein = canvas;

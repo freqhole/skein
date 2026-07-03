@@ -74,9 +74,34 @@ export class CanvasStore {
 
   /**
    * open an existing canvas document by ID.
+   *
+   * doesn't let a transient "unavailable" verdict be the final word. a
+   * peer opening a canvas newly shared with them can legitimately hit
+   * "unavailable" on the very first attempt — the sharing peer's own
+   * `access`/`announce` decision for a brand-new invite can race a hair
+   * behind the invite message itself (see
+   * `canvas-scoped-share-policy.ts`'s module doc comment for the full
+   * story) — and automerge-repo's default `repo.find()` treats that as
+   * terminal, throwing immediately and uncaught (a real, user-reported
+   * production crash, 2026-07-03: "Document ... is unavailable" took the
+   * whole app down). automerge-repo's own `DocHandle` state machine
+   * already models the real recovery path event-drivenly: an
+   * "unavailable" handle still transitions to "ready" the moment real
+   * content actually arrives (`DOC_READY`, fired by the handle's own
+   * change-detection) — `whenReady()` below is what actually waits on
+   * that, backed by the library's own internal timeout, not a
+   * hand-rolled setTimeout/poll loop here.
    */
   static async open(repo: Repo, docId: DocumentId): Promise<CanvasStore> {
-    const handle = await repo.find<CanvasDocument>(docId);
+    const handle = await repo.find<CanvasDocument>(docId, {
+      allowableStates: ["ready", "unavailable"],
+    });
+    if (!handle.isReady()) {
+      // throws (via the library's own internal timeout) if the doc
+      // genuinely never arrives — that's a real failure the caller should
+      // handle, not swallow.
+      await handle.whenReady(["ready"]);
+    }
     return new CanvasStore(repo, handle);
   }
 

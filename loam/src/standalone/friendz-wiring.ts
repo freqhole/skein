@@ -250,7 +250,7 @@ export async function initFriendzWiring(
   // logic — including the sticky hub-flag merge — is directly unit-testable
   // without the rest of initFriendzWiring's heavier setup (identity, midden,
   // narthex doc lookups, etc).
-  wireFriendHandlers({ protocol, sDoc });
+  wireFriendHandlers({ protocol, sDoc, profileStore });
 
   // incoming friend reject -> update outbound request status
   protocol.onFriendReject = (_msg, fromNodeId) => {
@@ -1505,13 +1505,20 @@ export function wireAclChangeHandlers(deps: AclChangeHandlersDeps): void {
 export interface FriendHandlersDeps {
   protocol: FriendzProtocol;
   sDoc: SocialDoc;
+  /**
+   * granted viewer access on our own profile doc whenever a friendship is
+   * confirmed from this side (either by receiving an accept, or by
+   * auto-accepting a reciprocal request) — optional so existing unit tests
+   * that don't care about profile-doc sync can omit it.
+   */
+  profileStore?: ProfileStore;
 }
 
 /**
  * wire the `friend-request`/`friend-accept` message handlers onto `protocol`.
  */
 export function wireFriendHandlers(deps: FriendHandlersDeps): void {
-  const { protocol, sDoc } = deps;
+  const { protocol, sDoc, profileStore } = deps;
 
   // incoming friend request -> write to social doc.
   // edge cases handled here:
@@ -1606,6 +1613,15 @@ export function wireFriendHandlers(deps: FriendHandlersDeps): void {
           });
         });
       }
+      // friendship is now mutually confirmed on this side too (we just sent
+      // our own accept back) — grant them access to our profile doc. this
+      // is the ONLY place `grantViewerRole` gets called for this direction
+      // of friend-establishment; without it, a profile doc's `.acl` never
+      // gains an entry and (under canvas-scoped-share-policy.ts's rule 1,
+      // which profile docs share) can never sync to anyone, ever — a real
+      // regression confirmed 2026-07-03 ("can't get 'manage hub' after
+      // adding as friend": that panel needs the hub's own profile doc).
+      profileStore?.grantViewerRole(fromNodeId);
     }
   };
 
@@ -1680,6 +1696,13 @@ export function wireFriendHandlers(deps: FriendHandlersDeps): void {
     // request the accepted peer's profile so bio/avatar arrive immediately
     // (without this, profile data only populates on next init / page reload)
     protocol.requestProfile(fromNodeId).catch(() => {});
+
+    // friendship is now mutually confirmed on this side (we just received
+    // their accept) — grant them access to our profile doc. see the other
+    // call site (onFriendRequest's reciprocal branch) for why this call
+    // matters at all: without it, no peer's profile doc `.acl` ever gains
+    // an entry, so it can never sync to anyone.
+    profileStore?.grantViewerRole(fromNodeId);
   };
 }
 

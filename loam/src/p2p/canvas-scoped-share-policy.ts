@@ -11,29 +11,52 @@
 // with it").
 //
 // this module scopes `announce` (do we proactively push a doc to a peer)
-// and `access` (do we honor a peer's own request for a doc) using two
-// layered rules, from most to least precise:
+// and `access` (do we honor a peer's own request/accept an inbound push for
+// a doc) using layered rules, from most to least precise. **both** are
+// evaluated the same way here — `announce` alone would leave the door open
+// for a peer to just ask for an unshared doc directly.
 //
-// 1. a doc with its own `.acl` field (a canvas doc) — sync eligibility is
-//    exactly "does `.acl` list this peer" (any role). this is the same
-//    per-document ACL model `CanvasStore`/`createRepoRoleResolver()`
-//    (acl-filtering-network-adapter.ts) already use, just enforced at the
-//    network-boundary sync-eligibility layer instead of (or rather, in
-//    addition to) the CRDT-content-filtering layer that adapter covers. a
-//    doc with an `.acl` field that doesn't list the peer (including an
-//    EMPTY `.acl`, e.g. narthex, which is a real canvas doc that never gets
-//    `stampAdmin()`'d — see `narthex-seed.ts`) is denied, full stop, no
-//    fallback.
+// CRITICAL DESIGN CONSTRAINT, discovered the hard way (2026-07-03: a peer
+// opening a canvas newly shared with them got an uncaught "Document ...
+// is unavailable" crash): `access`/`announce` get evaluated on BOTH the
+// data-holding side (who has real content, real `.acl`, and can safely
+// make a content-based decision) AND the first-time-receiving side (who by
+// definition has NO content yet for a doc they've never seen before —
+// that's exactly what's being negotiated). a rule that requires reading
+// `.acl` off the doc's own content is fine for the former and IMPOSSIBLE
+// for the latter — the doc can only become ready by accepting the very
+// message this policy is being asked whether to accept. this is why every
+// rule below explicitly separates "doc is ready, make the real content-
+// based decision" from "doc isn't ready yet, don't wait for it (no
+// setTimeout/polling — automerge-repo re-invokes this policy on every
+// subsequent reconnect and inbound message, and `CanvasStore`'s own
+// `reevaluateDocumentShare()` call on every change re-triggers it too, so
+// the decision self-corrects, purely event-driven, the moment real content
+// arrives) — fall back to a friend-gate floor instead of denying outright."
+// that floor is safe: it only ever applies transiently, on whichever
+// device DOESN'T yet hold the real data — the device that DOES hold it
+// always evaluates the real, content-based rule (its own handle is always
+// ready), so a friend fishing for a canvas they were never actually
+// invited to still gets correctly denied there.
 //
-// 2. a doc with NO `.acl` of its own but an `ownerCanvasId` field (a
-//    per-widget state doc — file, audio-recording, etc; see
+// the rules:
+//
+// 1. a doc with its own `.acl` field once ready (a canvas doc) — sync
+//    eligibility is exactly "does `.acl` list this peer" (any role). this
+//    is the same per-document ACL model `CanvasStore`/
+//    `createRepoRoleResolver()` (acl-filtering-network-adapter.ts) already
+//    use, just enforced at the network-boundary sync-eligibility layer
+//    too. an EMPTY `.acl` (e.g. narthex, which is a real canvas doc that
+//    never gets `stampAdmin()`'d — see `narthex-seed.ts`) denies everyone,
+//    correctly, once ready — no special-casing needed.
+//
+// 2. a doc with NO `.acl` of its own but an `ownerCanvasId` field once
+//    ready (a per-widget state doc — file, audio-recording, etc; see
 //    `widget-manager.ts`'s `mountWidget()`, which stamps this at creation
 //    time) — sync eligibility defers to THAT canvas's own `.acl`, if the
-//    canvas doc is locally known and ready. if it isn't (yet), fall back to
-//    rule 3 (friend-gate) rather than denying outright — the canvas doc
-//    becoming available later re-triggers this via `CanvasStore`'s own
-//    `reevaluateDocumentShare()` call on every change, narrowing access
-//    down to the real ACL once it's resolvable.
+//    canvas doc is ALSO locally known and ready. if the owning canvas
+//    itself isn't resolvable yet either, friend-gate floor (same
+//    self-correcting reasoning as above).
 //
 //    `ownerCanvasId` is an infrastructure-only field, unrelated to any
 //    widget's own application data — several widget schemas already have
@@ -47,27 +70,29 @@
 //    anything it doesn't declare) and is never read by widget code — only
 //    this policy reads it, straight off `handle.doc()`.
 //
-//    this deliberately replaces an EARLIER, more "precise"-looking design
-//    that instead reverse-scanned every other locally-known doc looking for
-//    one whose `widgets[*].docId` referenced this doc, to guess its owning
-//    canvas. that had a real, confirmed race: a widget doc's own sync-
-//    eligibility check runs essentially the instant `repo.create()` is
-//    called, which could run before the *separate* canvas-doc sync message
-//    (carrying the new widget's docId link) ever reached a remote peer —
-//    two independent automerge docs, no ordering guarantee between their
-//    sync messages — silently and permanently denying a widget that should
-//    have been allowed (2026-07-03: reported as "widgets not syncing
-//    between peers, sometimes showing a crashed UI state"). direct
-//    ownership (`ownerCanvasId`, stamped once at creation, always part of
-//    the doc's own synced content) needs no such guessing.
+//    this rule deliberately replaces an EARLIER, more "precise"-looking
+//    design that instead reverse-scanned every other locally-known doc
+//    looking for one whose `widgets[*].docId` referenced this doc, to
+//    guess its owning canvas — a real, confirmed race (a widget doc's own
+//    sync-eligibility check could run before the *separate* canvas-doc
+//    sync message carrying the new widget's docId link ever reached a
+//    remote peer), fixed by direct, always-available ownership instead of
+//    guessing.
 //
-// 3. anything else (no `.acl`, no `ownerCanvasId` — social/messagez docs,
-//    or a widget doc created before `ownerCanvasId` existed) — denied by
-//    default. these were never meant to leave the local device via
-//    automerge-repo sync at all (friend requests/messages go over a
-//    dedicated protocol instead, see `friends-protocol.ts`), so there's no
-//    friend-gate fallback for this bucket specifically — only rule 2's
-//    "resolving a real widget's owning canvas" gets that allowance.
+// 3. a doc that IS ready, and has neither `.acl` nor `ownerCanvasId` —
+//    social/messagez/narthex-shaped docs. denied, no fallback: these were
+//    never meant to leave the local device via automerge-repo sync at all
+//    (friend requests/messages go over a dedicated protocol instead, see
+//    `friends-protocol.ts`).
+//
+// 4. a doc that is NOT YET ready (registered locally — automerge-repo
+//    always registers a handle before any sync traffic for it can flow —
+//    but no content has arrived yet) — friend-gate floor, full stop. we
+//    genuinely cannot know yet which of rules 1-3 will end up applying, so
+//    we don't try to guess further than "is this at least a friend" (the
+//    minimum bar for anything reaching this policy at all). self-corrects
+//    to the real rule the moment the doc actually becomes ready (see the
+//    "critical design constraint" note above).
 // ---------------------------------------------------------------------------
 
 import type { DocumentId, PeerId, Repo } from "@automerge/automerge-repo";
@@ -104,13 +129,9 @@ function peerIsInAcl(doc: AclBearingDoc, peerId: string): boolean {
   return typeof doc.acl?.[peerId]?.role === "string";
 }
 
-const CACHE_TTL_MS = 1000;
-
 /**
  * build a `Repo.shareConfig`-compatible policy. intended to be assigned to
- * BOTH `announce` and `access` (see this module's doc comment for why both
- * matter — `announce` alone leaves the door open for a peer to just ask
- * for an unshared doc directly).
+ * BOTH `announce` and `access`.
  *
  * `isFriend` is a lazily-read callback (not a snapshot) so it can be wired
  * up via the same "box" pattern `boot.ts` already uses for `roleResolver` —
@@ -120,57 +141,43 @@ const CACHE_TTL_MS = 1000;
  * `documentId` is optional per automerge-repo's own `SharePolicy` type
  * (called with `undefined` in some internal paths) — treated as deny.
  *
- * results are memoized per `(peerId, documentId)` for a short window —
- * automerge-repo calls `announce`/`access` for EVERY locally-known doc
- * synchronizer on every peer (re)connect, and again on every inbound sync
- * message for a doc, both calling `announce` AND `access` together on
- * every call, so a single peer reconnect against a canvas with a handful
- * of widgets means dozens of evaluations in a tight burst — cutting that
- * redundant work is a reasonable, low-risk win on its own.
+ * deliberately synchronous in spirit (wrapped in `Promise.resolve()` only
+ * because the `SharePolicy` type requires a `Promise<boolean>`) — no
+ * `await`, no polling, no timeout anywhere in this function. see the
+ * module doc comment's "critical design constraint" section for why: a
+ * not-yet-ready doc gets an immediate, honest "friend-gate floor" answer
+ * rather than waiting around for it to maybe become ready, trusting
+ * automerge-repo's own re-invocation (on every reconnect/inbound message)
+ * plus `CanvasStore`'s `reevaluateDocumentShare()` hook to naturally
+ * re-ask once real content — and therefore a real answer — is available.
  */
 export function createCanvasScopedSharePolicy(
   repo: Repo,
   isFriend: (peerId: string) => boolean
 ): (peerId: PeerId, documentId?: DocumentId) => Promise<boolean> {
-  const cache = new Map<string, { result: boolean; expiresAt: number }>();
-
-  return async (peerId, documentId) => {
-    if (!documentId) return false;
-
-    const cacheKey = `${peerId}:${documentId}`;
-    const cached = cache.get(cacheKey);
-    const now = Date.now();
-    if (cached && cached.expiresAt > now) {
-      return cached.result;
-    }
-
-    const result = await evaluate(repo, peerId, documentId, isFriend);
-    cache.set(cacheKey, { result, expiresAt: now + CACHE_TTL_MS });
-    return result;
-  };
+  return async (peerId, documentId) => evaluate(repo, peerId, documentId, isFriend);
 }
 
-async function evaluate(
+function evaluate(
   repo: Repo,
   peerId: PeerId,
-  documentId: DocumentId,
+  documentId: DocumentId | undefined,
   isFriend: (peerId: string) => boolean
-): Promise<boolean> {
+): boolean {
+  if (!documentId) return false;
+
   const handle = repo.handles[documentId];
   if (!handle) return false;
 
-  // best-effort: give an already-in-flight load a moment to resolve so a
-  // doc that's *about* to be ready isn't denied purely on timing. not
-  // awaited indefinitely — `shareConfig` callbacks run on a hot sync
-  // path, so a doc that never becomes ready should fall through to
-  // "deny", not hang the caller.
+  // rule 4 — not ready yet: friend-gate floor, no waiting. see this
+  // module's doc comment for why this is both necessary (the alternative
+  // is an impossible-to-satisfy content check) and safe (this branch only
+  // ever applies transiently, on whichever device doesn't yet hold the
+  // real data — the data-holding device's handle is always ready, so it
+  // always gets the real, content-based answer below instead).
   if (!handle.isReady()) {
-    await Promise.race([
-      handle.whenReady().catch(() => {}),
-      new Promise((resolve) => setTimeout(resolve, 200)),
-    ]);
+    return isFriend(peerId);
   }
-  if (!handle.isReady()) return false;
 
   const doc = handle.doc();
   if (!doc) return false;
@@ -195,6 +202,6 @@ async function evaluate(
     return isFriend(peerId);
   }
 
-  // rule 3 — no .acl, no ownerCanvasId. deny by default.
+  // rule 3 — ready, no .acl, no ownerCanvasId. deny by default.
   return false;
 }

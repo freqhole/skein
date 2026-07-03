@@ -369,7 +369,9 @@ class SkeinRouter {
 
     // listen for hash changes (browser back/forward, programmatic navigation)
     window.addEventListener("hashchange", () => {
-      this.onHashChange();
+      this.onHashChange().catch((err) => {
+        log.error(TAG, "onHashChange failed:", err);
+      });
     });
 
     // listen for the custom create-canvas event dispatched from the canvas wizard
@@ -579,6 +581,8 @@ class SkeinRouter {
           // impossible to drive a real "befriend a hub, then invite it to
           // a canvas" flow against the actual production social doc.
           sendFriendRequestTo: (nodeId: string) => sendFriendRequest(nodeId),
+          getMessagezInvites: () =>
+            ((this.messagezDocHandle?.doc() as any)?.invites ?? []) as Array<Record<string, unknown>>,
           // pickAvatar is registered by profile-tab.ts during socialWidget.create()
         };
         Object.defineProperty(social, "doc", {
@@ -758,6 +762,17 @@ class SkeinRouter {
   private async navigateToCanvas(docId: string): Promise<void> {
     if (this.navigating) return;
     this.navigating = true;
+
+    // a genuine failure to open the requested canvas (e.g. it's truly
+    // unreachable/never arrives — see CanvasStore.open()'s doc comment for
+    // the recoverable cases this no longer treats as terminal) must not
+    // propagate as an uncaught rejection: `destroyCurrent()` below already
+    // tore down whatever was previously mounted by the time `initCanvas()`
+    // could throw, so an uncaught failure here left the app with *nothing*
+    // mounted at all — a real, user-reported crash ("everything turns
+    // black"), 2026-07-03. caught below and recovered by falling back to
+    // the narthex, same as clicking the home button would.
+    let failure: unknown = null;
 
     try {
       // stamp lastVisitedAt before tearing down so own edits aren't flagged
@@ -1432,8 +1447,15 @@ class SkeinRouter {
       this.registerAndReconnectPeers(canvas).catch((err) => {
         log.warn(TAG, "peer registration/reconnection failed:", err);
       });
+    } catch (err) {
+      failure = err;
     } finally {
       this.navigating = false;
+    }
+
+    if (failure) {
+      log.error(TAG, "failed to open canvas, falling back to narthex:", docId, failure);
+      await this.navigateToNarthex();
     }
   }
 

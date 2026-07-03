@@ -392,6 +392,14 @@ export interface SkeinTestBridgeSocial {
    * `friendsState.friends` from (e.g. the share dialog's invite list).
    */
   sendFriendRequestTo?(nodeId: string): Promise<void>;
+  /**
+   * read-only snapshot of this peer's own messagez `invites` inbox (the
+   * doc `onCanvasInvite` writes into, see `friendz-wiring.ts`) — lets a
+   * test wait for a real, network-delivered canvas invite to arrive before
+   * driving the accept flow, instead of assuming delivery already
+   * happened.
+   */
+  getMessagezInvites?(): Array<Record<string, unknown>>;
   /** trigger the avatar file picker (set by profile-tab on mount) */
   pickAvatar?(): Promise<void>;
   /** friends-tab test hooks (set by friends-tab.ts on mount) */

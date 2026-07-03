@@ -150,5 +150,73 @@ describe("createCanvasScopedSharePolicy", () => {
     const policy = createCanvasScopedSharePolicy(repo, onlyFriend(PEER));
     expect(await policy(PEER, widgetHandle.documentId)).toBe(false);
   });
+
+  // -------------------------------------------------------------------------
+  // rule 4 — the exact scenario behind a real, user-reported production
+  // crash (2026-07-03): a peer opening a canvas newly shared with them hit
+  // an uncaught "Document ... is unavailable" error. root cause: the
+  // previous design waited up to 200ms for a not-yet-ready handle then
+  // DENIED it — but denying a doc's `access` check makes automerge-repo
+  // emit an explicit "doc-unavailable" message back to the requester,
+  // permanently marking THEIR handle unavailable for that request. a
+  // peer receiving a doc for the very first time can *never* have a ready
+  // handle for it yet (that's exactly what's being negotiated) — so the
+  // old design would reliably deny the very first sync attempt for any
+  // brand-new shared canvas. these tests prove the fix: a not-yet-ready
+  // handle gets an immediate friend-gate answer, no waiting, no denial.
+  // -------------------------------------------------------------------------
+
+  it("a canvas doc that isn't ready yet (first-time receive) gets a friend-gate floor, not a deny", async () => {
+    // two independent, disconnected repos — `otherRepo`'s doc id is
+    // structurally valid but `repo` has no network adapter at all, so it
+    // can never actually fetch content for it — the handle settles into
+    // "unavailable" almost immediately, same as `isReady()` would report
+    // during the real (recoverable) "still waiting on a peer" window this
+    // test is standing in for. `allowableStates` here just keeps
+    // `repo.find()` itself from throwing, so the test can inspect the
+    // handle — it does NOT affect what the *policy* does with it (rule 4
+    // in canvas-scoped-share-policy.ts treats any not-ready sub-state,
+    // "loading"/"requesting"/"unavailable" alike, as "friend-gate floor").
+    const otherRepo = createTestRepo();
+    const otherHandle = otherRepo.create<{ acl: Record<string, { role: string }> }>({
+      acl: { [PEER]: { role: "member" } },
+    });
+    await otherHandle.whenReady();
+
+    const repo = createTestRepo();
+    const notYetReadyHandle = await repo.find(otherHandle.documentId, {
+      allowableStates: ["ready", "unavailable", "requesting", "loading"],
+    });
+    expect(notYetReadyHandle.isReady()).toBe(false);
+
+    const friendPolicy = createCanvasScopedSharePolicy(repo, onlyFriend(PEER));
+    expect(await friendPolicy(PEER, otherHandle.documentId)).toBe(true);
+    expect(await friendPolicy(STRANGER, otherHandle.documentId)).toBe(false);
+
+    const noFriendPolicy = createCanvasScopedSharePolicy(repo, noFriends);
+    expect(await noFriendPolicy(PEER, otherHandle.documentId)).toBe(false);
+  });
+
+  it("does not wait/poll for readiness — resolves synchronously-in-spirit for a not-yet-ready doc", async () => {
+    const otherRepo = createTestRepo();
+    const otherHandle = otherRepo.create<{ acl: Record<string, { role: string }> }>({
+      acl: { [PEER]: { role: "member" } },
+    });
+    await otherHandle.whenReady();
+
+    const repo = createTestRepo();
+    await repo.find(otherHandle.documentId, {
+      allowableStates: ["ready", "unavailable", "requesting", "loading"],
+    });
+
+    const policy = createCanvasScopedSharePolicy(repo, onlyFriend(PEER));
+    const start = Date.now();
+    await policy(PEER, otherHandle.documentId);
+    // generous upper bound — this is a regression guard against
+    // reintroducing a setTimeout/poll-based wait, not a tight perf
+    // assertion. the old design's wait was 200ms; this should be a couple
+    // of orders of magnitude faster.
+    expect(Date.now() - start).toBeLessThan(50);
+  });
 });
 

@@ -419,6 +419,47 @@ export async function sendFriendRequestToBridge(page: Page, nodeId: string): Pro
   );
 }
 
+/** this page's own messagez `invites` inbox \u2014 real, network-delivered
+ *  canvas invites written by `onCanvasInvite` (friendz-wiring.ts). */
+export async function getMessagezInvites(
+  page: Page
+): Promise<Array<{ id: string; canvasDocId: string; fromNodeId: string; status: string }>> {
+  return page.evaluate(
+    () => (window as any).__skeinTest.social.getMessagezInvites() as Array<{
+      id: string;
+      canvasDocId: string;
+      fromNodeId: string;
+      status: string;
+    }>
+  );
+}
+
+/** dispatch the same `skein:accept-canvas-invite` custom event the real
+ *  inbox widget's accept button fires, and wait for
+ *  `skein:accept-canvas-invite-done` (boot.ts's `acceptCanvasInvite()`
+ *  dispatches it once the handler fully completes). */
+export async function acceptCanvasInviteViaEvent(
+  page: Page,
+  invite: {
+    canvasDocId: string;
+    fromNodeId: string;
+    canvasTitle: string;
+    canvasDescription: string;
+    canvasColor: number;
+    canvasPreviewUrl: string;
+    fromUsername: string;
+    relayedBy?: string;
+    role?: string;
+  }
+): Promise<void> {
+  await page.evaluate((detail) => {
+    return new Promise<void>((resolve) => {
+      window.addEventListener("skein:accept-canvas-invite-done", () => resolve(), { once: true });
+      window.dispatchEvent(new CustomEvent("skein:accept-canvas-invite", { detail }));
+    });
+  }, invite);
+}
+
 /**
  * trigger the avatar file picker inside the social widget.
  * call page.waitForEvent("filechooser") BEFORE this.
