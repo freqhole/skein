@@ -213,6 +213,69 @@ export class Blake3Hasher {
 if (Symbol.dispose) Blake3Hasher.prototype[Symbol.dispose] = Blake3Hasher.prototype.free;
 
 /**
+ * cooperative cancellation for in-flight downloads (pause/cancel from JS).
+ * the download loops select on `cancelled()` between progress events —
+ * cancellation takes effect at the next event boundary, and the partial
+ * data stays in the (persistent) store, so a later download of the same
+ * hash resumes from the persisted bitfield (only missing ranges transfer).
+ */
+export class CancelToken {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(CancelToken.prototype);
+        obj.__wbg_ptr = ptr;
+        CancelTokenFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        CancelTokenFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_canceltoken_free(ptr, 0);
+    }
+    /**
+     * request cancellation. idempotent.
+     */
+    cancel() {
+        if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+        _assertNum(this.__wbg_ptr);
+        wasm.canceltoken_cancel(this.__wbg_ptr);
+    }
+    /**
+     * return a new CancelToken sharing the same cancellation state.
+     * needed because passing a wasm class by value consumes the JS handle —
+     * callers keep the original and pass a clone into download calls.
+     * @returns {CancelToken}
+     */
+    clone_token() {
+        if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+        _assertNum(this.__wbg_ptr);
+        const ret = wasm.canceltoken_clone_token(this.__wbg_ptr);
+        return CancelToken.__wrap(ret);
+    }
+    /**
+     * @returns {boolean}
+     */
+    is_cancelled() {
+        if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+        _assertNum(this.__wbg_ptr);
+        const ret = wasm.canceltoken_is_cancelled(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    constructor() {
+        const ret = wasm.canceltoken_new();
+        this.__wbg_ptr = ret >>> 0;
+        CancelTokenFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+}
+if (Symbol.dispose) CancelToken.prototype[Symbol.dispose] = CancelToken.prototype.free;
+
+/**
  * result from fetching the server hello image from a peer
  */
 export class HelloImageResult {
@@ -693,6 +756,10 @@ export class MiddenNode {
      *
      * callback signature: `on_chunk(chunk: Uint8Array, offset: number) -> void`
      * progress callback: `on_progress(fraction: number) -> void`
+     * `cancel`: optional cooperative cancellation (pause). on cancellation
+     * the error message is "download cancelled", the partial data stays in
+     * the store, and the hash is auto-protected from gc so a later retry
+     * resumes from the persisted bitfield (call unprotect_blob to discard).
      *
      * returns total bytes streamed.
      * @param {string} peer_addr
@@ -700,37 +767,57 @@ export class MiddenNode {
      * @param {number} total_size
      * @param {Function} on_chunk
      * @param {Function} on_progress
+     * @param {CancelToken | null} [cancel]
      * @returns {Promise<number>}
      */
-    download_verified_streaming(peer_addr, blake3_hash, total_size, on_chunk, on_progress) {
+    download_verified_streaming(peer_addr, blake3_hash, total_size, on_chunk, on_progress, cancel) {
         if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
         _assertNum(this.__wbg_ptr);
         const ptr0 = passStringToWasm0(peer_addr, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(blake3_hash, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.middennode_download_verified_streaming(this.__wbg_ptr, ptr0, len0, ptr1, len1, total_size, on_chunk, on_progress);
+        let ptr2 = 0;
+        if (!isLikeNone(cancel)) {
+            _assertClass(cancel, CancelToken);
+            if (cancel.__wbg_ptr === 0) {
+                throw new Error('Attempt to use a moved value');
+            }
+            ptr2 = cancel.__destroy_into_raw();
+        }
+        const ret = wasm.middennode_download_verified_streaming(this.__wbg_ptr, ptr0, len0, ptr1, len1, total_size, on_chunk, on_progress, ptr2);
         return ret;
     }
     /**
      * streaming download with auto ensure+retry. first attempts the
      * streaming download; if the verified download fails (blob not in
-     * peer's store), calls ensure_blob to load it, then retries.
+     * peer's store), calls ensure_blob to load it, then retries. a
+     * deliberate cancellation is NOT retried — it propagates immediately
+     * with the "download cancelled" message.
      * @param {string} peer_addr
      * @param {string} blake3_hash
      * @param {number} total_size
      * @param {Function} on_chunk
      * @param {Function} on_progress
+     * @param {CancelToken | null} [cancel]
      * @returns {Promise<number>}
      */
-    download_verified_streaming_with_ensure(peer_addr, blake3_hash, total_size, on_chunk, on_progress) {
+    download_verified_streaming_with_ensure(peer_addr, blake3_hash, total_size, on_chunk, on_progress, cancel) {
         if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
         _assertNum(this.__wbg_ptr);
         const ptr0 = passStringToWasm0(peer_addr, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(blake3_hash, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.middennode_download_verified_streaming_with_ensure(this.__wbg_ptr, ptr0, len0, ptr1, len1, total_size, on_chunk, on_progress);
+        let ptr2 = 0;
+        if (!isLikeNone(cancel)) {
+            _assertClass(cancel, CancelToken);
+            if (cancel.__wbg_ptr === 0) {
+                throw new Error('Attempt to use a moved value');
+            }
+            ptr2 = cancel.__destroy_into_raw();
+        }
+        const ret = wasm.middennode_download_verified_streaming_with_ensure(this.__wbg_ptr, ptr0, len0, ptr1, len1, total_size, on_chunk, on_progress, ptr2);
         return ret;
     }
     /**
@@ -971,6 +1058,22 @@ export class MiddenNode {
         return ret;
     }
     /**
+     * pin a hash so gc won't sweep it (e.g. a paused partial download).
+     * idempotent. pair with unprotect_blob when the partial is resumed to
+     * completion or discarded.
+     * @param {string} blake3_hash
+     */
+    protect_blob(blake3_hash) {
+        if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+        _assertNum(this.__wbg_ptr);
+        const ptr0 = passStringToWasm0(blake3_hash, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.middennode_protect_blob(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
      * send an API request to a peer
      * peer_addr can be plain node_id or full endpoint JSON with relay/IP hints
      * @param {string} peer_addr
@@ -1054,6 +1157,20 @@ export class MiddenNode {
         _assertNum(this.__wbg_ptr);
         const ret = wasm.middennode_start_import(this.__wbg_ptr);
         return ImportSession.__wrap(ret);
+    }
+    /**
+     * remove a gc pin added by protect_blob (or by a cancelled download).
+     * @param {string} blake3_hash
+     */
+    unprotect_blob(blake3_hash) {
+        if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+        _assertNum(this.__wbg_ptr);
+        const ptr0 = passStringToWasm0(blake3_hash, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.middennode_unprotect_blob(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
     }
 }
 if (Symbol.dispose) MiddenNode.prototype[Symbol.dispose] = MiddenNode.prototype.free;
@@ -2009,6 +2126,9 @@ const BiStreamFinalization = (typeof FinalizationRegistry === 'undefined')
 const Blake3HasherFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_blake3hasher_free(ptr >>> 0, 1));
+const CancelTokenFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_canceltoken_free(ptr >>> 0, 1));
 const HelloImageResultFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_helloimageresult_free(ptr >>> 0, 1));
@@ -2039,6 +2159,12 @@ function addToExternrefTable0(obj) {
 function _assertBoolean(n) {
     if (typeof(n) !== 'boolean') {
         throw new Error(`expected a boolean argument, found ${typeof(n)}`);
+    }
+}
+
+function _assertClass(instance, klass) {
+    if (!(instance instanceof klass)) {
+        throw new Error(`expected instance of ${klass.name}`);
     }
 }
 

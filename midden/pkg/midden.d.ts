@@ -104,6 +104,30 @@ export class Blake3Hasher {
 }
 
 /**
+ * cooperative cancellation for in-flight downloads (pause/cancel from JS).
+ * the download loops select on `cancelled()` between progress events —
+ * cancellation takes effect at the next event boundary, and the partial
+ * data stays in the (persistent) store, so a later download of the same
+ * hash resumes from the persisted bitfield (only missing ranges transfer).
+ */
+export class CancelToken {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * request cancellation. idempotent.
+     */
+    cancel(): void;
+    /**
+     * return a new CancelToken sharing the same cancellation state.
+     * needed because passing a wasm class by value consumes the JS handle —
+     * callers keep the original and pass a clone into download calls.
+     */
+    clone_token(): CancelToken;
+    is_cancelled(): boolean;
+    constructor();
+}
+
+/**
  * result from fetching the server hello image from a peer
  */
 export class HelloImageResult {
@@ -282,16 +306,22 @@ export class MiddenNode {
      *
      * callback signature: `on_chunk(chunk: Uint8Array, offset: number) -> void`
      * progress callback: `on_progress(fraction: number) -> void`
+     * `cancel`: optional cooperative cancellation (pause). on cancellation
+     * the error message is "download cancelled", the partial data stays in
+     * the store, and the hash is auto-protected from gc so a later retry
+     * resumes from the persisted bitfield (call unprotect_blob to discard).
      *
      * returns total bytes streamed.
      */
-    download_verified_streaming(peer_addr: string, blake3_hash: string, total_size: number, on_chunk: Function, on_progress: Function): Promise<number>;
+    download_verified_streaming(peer_addr: string, blake3_hash: string, total_size: number, on_chunk: Function, on_progress: Function, cancel?: CancelToken | null): Promise<number>;
     /**
      * streaming download with auto ensure+retry. first attempts the
      * streaming download; if the verified download fails (blob not in
-     * peer's store), calls ensure_blob to load it, then retries.
+     * peer's store), calls ensure_blob to load it, then retries. a
+     * deliberate cancellation is NOT retried — it propagates immediately
+     * with the "download cancelled" message.
      */
-    download_verified_streaming_with_ensure(peer_addr: string, blake3_hash: string, total_size: number, on_chunk: Function, on_progress: Function): Promise<number>;
+    download_verified_streaming_with_ensure(peer_addr: string, blake3_hash: string, total_size: number, on_chunk: Function, on_progress: Function, cancel?: CancelToken | null): Promise<number>;
     /**
      * download a blob using iroh-blobs with automatic ensure + retry
      *
@@ -395,6 +425,12 @@ export class MiddenNode {
      */
     open_bi(peer_addr: string, alpn: string): Promise<BiStream>;
     /**
+     * pin a hash so gc won't sweep it (e.g. a paused partial download).
+     * idempotent. pair with unprotect_blob when the partial is resumed to
+     * completion or discarded.
+     */
+    protect_blob(blake3_hash: string): void;
+    /**
      * send an API request to a peer
      * peer_addr can be plain node_id or full endpoint JSON with relay/IP hints
      */
@@ -428,6 +464,10 @@ export class MiddenNode {
      * the wasm boundary. see ImportSession for the push/finish protocol.
      */
     start_import(): ImportSession;
+    /**
+     * remove a gc pin added by protect_blob (or by a cancelled download).
+     */
+    unprotect_blob(blake3_hash: string): void;
 }
 
 /**

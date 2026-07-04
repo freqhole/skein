@@ -1416,7 +1416,7 @@ async fn export_bao<F: BlobFile>(
 async fn export_ranges<F: BlobFile>(
     entry: Option<Entry<F>>,
     cmd: ExportRangesRequest,
-    mut tx: irpc::channel::mpsc::Sender<ExportRangesItem>,
+    tx: irpc::channel::mpsc::Sender<ExportRangesItem>,
 ) {
     let Some(entry) = entry else {
         let err = io::Error::new(io::ErrorKind::NotFound, "hash not found");

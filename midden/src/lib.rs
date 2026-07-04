@@ -9,6 +9,9 @@
 
 use bao_tree::ChunkRanges;
 use indexmap::IndexMap;
+// the opfs store backs the wasm build; on native it is only exercised by
+// the unit tests (via the in-memory storage shim)
+#[cfg(any(target_arch = "wasm32", test))]
 mod opfs_store;
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -612,6 +615,7 @@ fn make_gc_config(protected_hashes: Arc<Mutex<HashSet<Hash>>>) -> GcConfig {
 /// pinned until release_blob). needed for the opfs store, whose
 /// GLOBAL-scope temp tags are untracked (iroh-blobs' TagDrop is
 /// crate-private) — without this, gc would sweep pinned imports.
+#[cfg(any(target_arch = "wasm32", test))]
 fn make_protect_cb(
     protected_hashes: Arc<Mutex<HashSet<Hash>>>,
     active_tags: Arc<Mutex<IndexMap<Hash, TempTag>>>,
@@ -651,6 +655,67 @@ impl Drop for ProtectGuard {
         }
     }
 }
+
+/// cooperative cancellation for in-flight downloads (pause/cancel from JS).
+/// the download loops select on `cancelled()` between progress events —
+/// cancellation takes effect at the next event boundary, and the partial
+/// data stays in the (persistent) store, so a later download of the same
+/// hash resumes from the persisted bitfield (only missing ranges transfer).
+#[wasm_bindgen]
+pub struct CancelToken {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+#[wasm_bindgen]
+impl CancelToken {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> CancelToken {
+        CancelToken {
+            flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// request cancellation. idempotent.
+    pub fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// return a new CancelToken sharing the same cancellation state.
+    /// needed because passing a wasm class by value consumes the JS handle —
+    /// callers keep the original and pass a clone into download calls.
+    pub fn clone_token(&self) -> CancelToken {
+        CancelToken {
+            flag: self.flag.clone(),
+            notify: self.notify.clone(),
+        }
+    }
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelToken {
+    /// resolves when cancel() is called (or immediately if already cancelled)
+    async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// error message used for cancelled downloads — JS matches on this to
+/// distinguish a deliberate pause from a genuine failure.
+const DOWNLOAD_CANCELLED_MSG: &str = "download cancelled";
 
 /// browser P2P node for the skein canvas ecosystem.
 ///
@@ -1435,6 +1500,10 @@ impl MiddenNode {
     ///
     /// callback signature: `on_chunk(chunk: Uint8Array, offset: number) -> void`
     /// progress callback: `on_progress(fraction: number) -> void`
+    /// `cancel`: optional cooperative cancellation (pause). on cancellation
+    /// the error message is "download cancelled", the partial data stays in
+    /// the store, and the hash is auto-protected from gc so a later retry
+    /// resumes from the persisted bitfield (call unprotect_blob to discard).
     ///
     /// returns total bytes streamed.
     pub async fn download_verified_streaming(
@@ -1444,6 +1513,7 @@ impl MiddenNode {
         total_size: f64,
         on_chunk: &JsFunction,
         on_progress: &JsFunction,
+        cancel: Option<CancelToken>,
     ) -> Result<f64, JsError> {
         use iroh_blobs::api::downloader::DownloadProgressItem;
         use n0_future::StreamExt;
@@ -1469,7 +1539,15 @@ impl MiddenNode {
         // error, or panic).
         let _guard = ProtectGuard::new(self.protected_hashes.clone(), hash);
 
-        // step 1: download into MemStore (verified)
+        // on cancellation: keep the partial protected past the guard's drop
+        // so gc can't sweep it before the user resumes
+        let cancel_cleanup = |protected: &Arc<Mutex<HashSet<Hash>>>| {
+            if let Ok(mut set) = protected.lock() {
+                set.insert(hash);
+            }
+        };
+
+        // step 1: download into the store (verified)
         let hash_and_format = HashAndFormat::raw(hash);
         let progress = self.blobs_downloader.download(hash_and_format, [addr.id]);
         let mut stream = progress
@@ -1483,7 +1561,22 @@ impl MiddenNode {
         let mut event_count: u64 = 0;
         let mut last_log_bytes: u64 = 0;
 
-        while let Some(event) = stream.next().await {
+        loop {
+            // cooperative cancellation between progress events. dropping
+            // `stream` stops the downloader task at its next send.
+            let event = if let Some(token) = &cancel {
+                tokio::select! {
+                    event = stream.next() => event,
+                    _ = token.cancelled() => {
+                        debug!("download_verified_streaming: cancelled for {} after {} bytes", short, last_dl_bytes);
+                        cancel_cleanup(&self.protected_hashes);
+                        return Err(JsError::new(DOWNLOAD_CANCELLED_MSG));
+                    }
+                }
+            } else {
+                stream.next().await
+            };
+            let Some(event) = event else { break };
             event_count += 1;
             match &event {
                 DownloadProgressItem::Progress(bytes) => {
@@ -1575,6 +1668,17 @@ impl MiddenNode {
         let mut chunks_sent: u64 = 0;
 
         loop {
+            // pause can land during the read-out phase too
+            if let Some(token) = &cancel {
+                if token.is_cancelled() {
+                    debug!(
+                        "download_verified_streaming: cancelled during read for {} after {} bytes",
+                        short, total_read
+                    );
+                    cancel_cleanup(&self.protected_hashes);
+                    return Err(JsError::new(DOWNLOAD_CANCELLED_MSG));
+                }
+            }
             let n = match reader.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
@@ -1622,7 +1726,9 @@ impl MiddenNode {
 
     /// streaming download with auto ensure+retry. first attempts the
     /// streaming download; if the verified download fails (blob not in
-    /// peer's store), calls ensure_blob to load it, then retries.
+    /// peer's store), calls ensure_blob to load it, then retries. a
+    /// deliberate cancellation is NOT retried — it propagates immediately
+    /// with the "download cancelled" message.
     pub async fn download_verified_streaming_with_ensure(
         &self,
         peer_addr: &str,
@@ -1630,16 +1736,30 @@ impl MiddenNode {
         total_size: f64,
         on_chunk: &JsFunction,
         on_progress: &JsFunction,
+        cancel: Option<CancelToken>,
     ) -> Result<f64, JsError> {
+        let cancel_ref = cancel.as_ref();
         match self
-            .download_verified_streaming(peer_addr, blake3_hash, total_size, on_chunk, on_progress)
+            .download_verified_streaming(
+                peer_addr,
+                blake3_hash,
+                total_size,
+                on_chunk,
+                on_progress,
+                cancel_ref.map(|t| t.clone_token()),
+            )
             .await
         {
             Ok(n) => return Ok(n),
             Err(e) => {
-                // first attempt failed (often: blob not yet in peer's store).
-                // log the cause then retry via ensure_blob so that genuine
-                // failures (bad hash, transport error) aren't silently masked.
+                // deliberate pause/cancel: do NOT fall into ensure+retry
+                if cancel_ref.map(|t| t.is_cancelled()).unwrap_or(false) {
+                    return Err(e);
+                }
+                // first attempt failed (often: blob not yet in peer's
+                // store). log the cause then retry via ensure_blob so that
+                // genuine failures (bad hash, transport error) aren't
+                // silently masked.
                 warn!(
                     "download_verified_streaming_with_ensure: first attempt failed for {}, calling ensure_blob: {:?}",
                     &blake3_hash[..16.min(blake3_hash.len())],
@@ -1657,8 +1777,39 @@ impl MiddenNode {
             )));
         }
 
-        self.download_verified_streaming(peer_addr, blake3_hash, total_size, on_chunk, on_progress)
-            .await
+        self.download_verified_streaming(
+            peer_addr,
+            blake3_hash,
+            total_size,
+            on_chunk,
+            on_progress,
+            cancel_ref.map(|t| t.clone_token()),
+        )
+        .await
+    }
+
+    /// pin a hash so gc won't sweep it (e.g. a paused partial download).
+    /// idempotent. pair with unprotect_blob when the partial is resumed to
+    /// completion or discarded.
+    pub fn protect_blob(&self, blake3_hash: &str) -> Result<(), JsError> {
+        let hash: Hash = blake3_hash
+            .parse()
+            .map_err(|e| JsError::new(&format!("invalid blake3 hash: {}", e)))?;
+        if let Ok(mut set) = self.protected_hashes.lock() {
+            set.insert(hash);
+        }
+        Ok(())
+    }
+
+    /// remove a gc pin added by protect_blob (or by a cancelled download).
+    pub fn unprotect_blob(&self, blake3_hash: &str) -> Result<(), JsError> {
+        let hash: Hash = blake3_hash
+            .parse()
+            .map_err(|e| JsError::new(&format!("invalid blake3 hash: {}", e)))?;
+        if let Ok(mut set) = self.protected_hashes.lock() {
+            set.remove(&hash);
+        }
+        Ok(())
     }
 
     /// compute blake3 hash for a blob on demand

@@ -51,6 +51,7 @@ pub trait BlobDir {
 // native impl (cargo test)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod native {
     use std::{
         cell::RefCell,
