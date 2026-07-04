@@ -42,8 +42,10 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   // overall worker pool cap for the whole run. per-project `workers` below
   // further restricts how much of this pool the heavy project may use at
-  // once — it doesn't add extra workers on top of this.
-  workers: process.env.CI ? 1 : undefined,
+  // once — it doesn't add extra workers on top of this. locally, unlimited
+  // workers (one per core) causes contention flakes in app-boot-heavy specs
+  // (midden wasm + iroh init under cpu pressure) — cap at 4.
+  workers: process.env.CI ? 1 : 4,
   reporter: [["html", { outputFolder: "playwright-report" }], ["list"]],
   use: {
     baseURL: "http://localhost:5897",

@@ -38,16 +38,16 @@ vi.mock("../p2p/identity", () => ({
 const mockGetBlobRecord = vi.fn<(blobId: string) => Promise<any>>();
 const mockStoreBlob = vi.fn<(...args: any[]) => Promise<void>>();
 const mockComputeSha256 = vi.fn<(data: ArrayBuffer) => Promise<string>>();
+const mockResolveBlob = vi.fn<(blobId: string, blake3?: string) => Promise<any>>();
+const mockHasBlobBytes = vi.fn<(blobId: string) => Promise<boolean>>();
 vi.mock("../storage/skein-blob-store", () => ({
-  hasBlob: vi.fn(),
+  hasBlobBytes: (...args: any[]) => mockHasBlobBytes(...args),
   getBlobRecord: (...args: any[]) => mockGetBlobRecord(...args),
-  getBlobRecordBySha256: vi.fn(),
-  getBlobRecordByBlake3: vi.fn(),
   getBlobObjectURL: vi.fn(),
   storeBlob: (...args: any[]) => mockStoreBlob(...args),
   computeSha256: (...args: any[]) => mockComputeSha256(...args),
   storeBlobFromFile: vi.fn(),
-  resolveBlob: vi.fn(),
+  resolveBlob: (...args: any[]) => mockResolveBlob(...args),
   getBlobData: vi.fn(),
   classifyDomain: (mime: string) => {
     if (mime.startsWith("image/")) return "photo";
@@ -120,6 +120,50 @@ describe("file-utils — tauri-mode branches", () => {
       const result = await checkBlobLocality("blake3hash-3");
 
       expect(result).toEqual({ locality: "unknown" });
+    });
+
+    it("browser: local when a record resolves AND its OPFS bytes exist", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      mockResolveBlob.mockResolvedValue({
+        blob_id: "blake3-abc",
+        blake3: "blake3-abc",
+        mime: "video/mp4",
+        filename: "movie.mp4",
+        size: 1234,
+      });
+      mockHasBlobBytes.mockResolvedValue(true);
+
+      const result = await checkBlobLocality("blake3-abc");
+
+      expect(result.locality).toBe("local");
+      expect(result.metadata?.blake3).toBe("blake3-abc");
+      expect(mockHasBlobBytes).toHaveBeenCalledWith("blake3-abc");
+    });
+
+    it("browser: a stranded record (bytes missing from OPFS) counts as remote so re-snatch can repair it", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      mockResolveBlob.mockResolvedValue({
+        blob_id: "blake3-stranded",
+        blake3: "blake3-stranded",
+        mime: "video/mp4",
+        filename: "movie.mp4",
+        size: 1234,
+      });
+      mockHasBlobBytes.mockResolvedValue(false);
+
+      const result = await checkBlobLocality("blake3-stranded");
+
+      expect(result).toEqual({ locality: "remote" });
+    });
+
+    it("browser: remote when no record resolves at all", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      mockResolveBlob.mockResolvedValue(null);
+
+      const result = await checkBlobLocality("unknown-id");
+
+      expect(result).toEqual({ locality: "remote" });
+      expect(mockHasBlobBytes).not.toHaveBeenCalled();
     });
   });
 
@@ -463,6 +507,195 @@ describe("file-utils — tauri-mode branches", () => {
       expect(downloadFn).toHaveBeenCalledTimes(1);
       expect(writable.close).not.toHaveBeenCalled();
       expect(mockStoreBlob).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("snatchBlobToDisk — chunk-streamed path (download_verified_streaming_with_ensure)", () => {
+    const blobInfo = {
+      blobId: "doc-blob-id",
+      filename: "movie.mp4",
+      mime: "video/mp4",
+      size: 8,
+      blake3: "deadbeef",
+      domain: "video",
+    };
+
+    function makeWritable() {
+      return {
+        write: vi.fn(async () => {}),
+        close: vi.fn(async () => {}),
+        truncate: vi.fn(async () => {}),
+      };
+    }
+
+    it("streams chunks to the writable at explicit offsets and never buffers the payload", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      const chunk1 = new Uint8Array([1, 2, 3, 4]);
+      const chunk2 = new Uint8Array([5, 6, 7, 8]);
+      const buffered = vi.fn();
+      mockGetMiddenNode.mockResolvedValue({
+        ensure_blob: vi.fn(async () => true),
+        download_verified_with_ensure_progress: buffered,
+        download_verified_streaming_with_ensure: vi.fn(
+          async (
+            _peerAddr: string,
+            _blake3: string,
+            _size: number,
+            onChunk: (chunk: Uint8Array, offset: number) => void,
+            onProgress: (fraction: number) => void
+          ) => {
+            onChunk(chunk1, 0);
+            onChunk(chunk2, 4);
+            onProgress(1);
+            return 8;
+          }
+        ),
+      });
+
+      const writable = makeWritable();
+
+      const result = await snatchBlobToDisk(
+        blobInfo,
+        { peer1: { nodeId: "remote-node-id" } },
+        writable as unknown as FileSystemWritableFileStream
+      );
+
+      expect(result).toEqual({ size: 8, mime: "video/mp4", blake3: "deadbeef" });
+      expect(writable.write).toHaveBeenCalledTimes(2);
+      expect(writable.write).toHaveBeenNthCalledWith(1, {
+        type: "write",
+        position: 0,
+        data: chunk1,
+      });
+      expect(writable.write).toHaveBeenNthCalledWith(2, {
+        type: "write",
+        position: 4,
+        data: chunk2,
+      });
+      expect(writable.close).toHaveBeenCalledTimes(1);
+      // the buffered download method must not be touched on the streamed path
+      expect(buffered).not.toHaveBeenCalled();
+      expect(mockStoreBlob).not.toHaveBeenCalled();
+    });
+
+    it("truncates partial data and retries the next peer after a mid-stream failure", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      const goodChunk = new Uint8Array([7, 7, 7, 7, 7, 7, 7, 7]);
+      let attempt = 0;
+      const streamFn = vi.fn(
+        async (
+          _peerAddr: string,
+          _blake3: string,
+          _size: number,
+          onChunk: (chunk: Uint8Array, offset: number) => void
+        ) => {
+          attempt += 1;
+          if (attempt === 1) {
+            // first peer dies mid-transfer after delivering a partial chunk
+            onChunk(goodChunk.slice(0, 4), 0);
+            throw new Error("connection lost");
+          }
+          onChunk(goodChunk, 0);
+          return 8;
+        }
+      );
+      mockGetMiddenNode.mockResolvedValue({
+        ensure_blob: vi.fn(async () => true),
+        download_verified_streaming_with_ensure: streamFn,
+      });
+
+      const writable = makeWritable();
+
+      const result = await snatchBlobToDisk(
+        blobInfo,
+        {
+          peer1: { nodeId: "remote-node-id-1" },
+          peer2: { nodeId: "remote-node-id-2" },
+        },
+        writable as unknown as FileSystemWritableFileStream
+      );
+
+      expect(result.size).toBe(8);
+      expect(streamFn).toHaveBeenCalledTimes(2);
+      // partial data from the failed attempt was wiped before the retry
+      expect(writable.truncate).toHaveBeenCalledWith(0);
+      expect(writable.close).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects a 0-byte streamed payload", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      mockGetMiddenNode.mockResolvedValue({
+        ensure_blob: vi.fn(async () => true),
+        download_verified_streaming_with_ensure: vi.fn(async () => 0),
+      });
+
+      const writable = makeWritable();
+
+      await expect(
+        snatchBlobToDisk(
+          blobInfo,
+          { peer1: { nodeId: "remote-node-id" } },
+          writable as unknown as FileSystemWritableFileStream
+        )
+      ).rejects.toThrow("0 bytes");
+
+      expect(writable.close).not.toHaveBeenCalled();
+    });
+
+    it("surfaces a chunk write failure instead of silently completing", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      mockGetMiddenNode.mockResolvedValue({
+        ensure_blob: vi.fn(async () => true),
+        download_verified_streaming_with_ensure: vi.fn(
+          async (
+            _peerAddr: string,
+            _blake3: string,
+            _size: number,
+            onChunk: (chunk: Uint8Array, offset: number) => void
+          ) => {
+            onChunk(new Uint8Array([1]), 0);
+            return 1;
+          }
+        ),
+      });
+
+      const writable = makeWritable();
+      writable.write.mockRejectedValue(new Error("disk full"));
+
+      await expect(
+        snatchBlobToDisk(
+          blobInfo,
+          { peer1: { nodeId: "remote-node-id" } },
+          writable as unknown as FileSystemWritableFileStream
+        )
+      ).rejects.toThrow("disk full");
+
+      expect(writable.close).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the buffered path when the doc has no blake3 hash", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      const payload = new Uint8Array([1, 2, 3]);
+      const streamFn = vi.fn();
+      mockGetMiddenNode.mockResolvedValue({
+        ensure_blob: vi.fn(async () => true),
+        download_verified_streaming_with_ensure: streamFn,
+        // strategy 2 path: blake3 unknown, so the buffered by-id download runs
+        download_verified_by_id_progress: vi.fn(async () => [payload, "computed-hash"]),
+      });
+
+      const writable = makeWritable();
+
+      const result = await snatchBlobToDisk(
+        { ...blobInfo, blake3: "" },
+        { peer1: { nodeId: "remote-node-id" } },
+        writable as unknown as FileSystemWritableFileStream
+      );
+
+      expect(streamFn).not.toHaveBeenCalled();
+      expect(result.size).toBe(3);
+      expect(writable.write).toHaveBeenCalledTimes(1);
+      expect(writable.close).toHaveBeenCalledTimes(1);
     });
   });
 });
@@ -990,7 +1223,11 @@ describe("downloadBlobBytesFromPeer — proxy_request fallback hash verification
       { peer1: { nodeId: "remote-node-id" } }
     );
 
-    expect(result.blobId).toBe("sha256-of-payload");
+    // blake3 is the canonical blob id now — the record is keyed by the
+    // (verified) content hash, not the legacy sha256.
+    expect(result.blobId).toBe("expected-hash-of-real-content");
+    expect(result.sha256).toBe("sha256-of-payload");
     expect(mockStoreBlob).toHaveBeenCalledTimes(1);
+    expect(mockStoreBlob.mock.calls[0][0]).toBe("expected-hash-of-real-content");
   });
 });

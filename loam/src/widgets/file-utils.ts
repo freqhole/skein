@@ -33,10 +33,8 @@ import { listen } from "@tauri-apps/api/event";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
-  hasBlob,
+  hasBlobBytes,
   getBlobRecord,
-  getBlobRecordBySha256,
-  getBlobRecordByBlake3,
   getBlobObjectURL,
   storeBlob,
   computeSha256,
@@ -320,66 +318,36 @@ export async function checkBlobLocality(
 
   if (!isTauriMode()) {
     try {
-      const exists = await hasBlob(blobId);
-      if (!exists) {
-        // blobId might be a server-assigned UUID that doesn't match our IDB primary key.
-        // fall back to sha256 index lookup — the browser originally stored the blob
-        // under its sha256 hash, but a Tauri peer's snatch may have overwritten the
-        // automerge doc's blobId with the server UUID.
-        const sha256Record = await getBlobRecordBySha256(blobId);
-        if (sha256Record) {
-          const result: BlobLocalityInfo = {
-            locality: "local",
-            metadata: {
-              id: sha256Record.blob_id,
-              mime: sha256Record.mime || undefined,
-              filename: sha256Record.filename || undefined,
-              size: sha256Record.size || undefined,
-              blake3: sha256Record.blake3 || undefined,
-            },
-          };
-          localityCache.set(blobId, result);
-          return result;
-        }
-        // fallback: try blake3 index — the blobId might be a server UUID that
-        // doesn't match our sha256-based primary key, but the content hash is
-        // the same regardless of which peer assigned the ID.
-        if (blake3) {
-          const blake3Record = await getBlobRecordByBlake3(blake3);
-          if (blake3Record) {
-            const result: BlobLocalityInfo = {
-              locality: "local",
-              metadata: {
-                id: blake3Record.blob_id,
-                mime: blake3Record.mime || undefined,
-                filename: blake3Record.filename || undefined,
-                size: blake3Record.size || undefined,
-                blake3: blake3Record.blake3 || undefined,
-              },
-            };
-            localityCache.set(blobId, result);
-            return result;
-          }
-        }
-
+      // resolveBlob tries primary key → blake3(blobId) → sha256 →
+      // blake3(param), covering both id generations (blake3 canonical,
+      // sha256 legacy) and tauri-overwritten doc ids.
+      const record = await resolveBlob(blobId, blake3);
+      if (!record) {
         return { locality: "remote" };
       }
-      const record = await getBlobRecord(blobId);
-      if (record) {
-        const result: BlobLocalityInfo = {
-          locality: "local",
-          metadata: {
-            id: record.blob_id,
-            mime: record.mime || undefined,
-            filename: record.filename || undefined,
-            size: record.size || undefined,
-            blake3: record.blake3 || undefined,
-          },
-        };
-        localityCache.set(blobId, result);
-        return result;
+      // a record alone is not enough — the bytes must actually be present
+      // in OPFS. a stranded record (e.g. an old snatch whose best-effort
+      // OPFS write silently failed) previously claimed "local" forever
+      // while playback found nothing and no re-snatch was offered. treat
+      // it as remote so the snatch path can repair it.
+      const bytesPresent = await hasBlobBytes(record.blob_id);
+      if (!bytesPresent) {
+        log.warn(
+          TAG,
+          `blob record ${record.blob_id.slice(0, 16)}... exists but OPFS bytes are missing — treating as remote (re-snatch will repair)`
+        );
+        return { locality: "remote" };
       }
-      const result: BlobLocalityInfo = { locality: "local" };
+      const result: BlobLocalityInfo = {
+        locality: "local",
+        metadata: {
+          id: record.blob_id,
+          mime: record.mime || undefined,
+          filename: record.filename || undefined,
+          size: record.size || undefined,
+          blake3: record.blake3 || undefined,
+        },
+      };
       localityCache.set(blobId, result);
       return result;
     } catch (err) {
@@ -751,15 +719,12 @@ function sortPeersByConnectivity(
 /**
  * download a blob's raw bytes from a single browser peer via midden WASM.
  * shared by snatchFromBrowserPeer (persists the result into OPFS + IndexedDB)
- * and snatchBlobToDisk (writes the result straight to a user-chosen disk
- * location, skipping OPFS/IndexedDB entirely).
+ * and snatchBlobToDisk's buffered fallback (writes the result straight to a
+ * user-chosen disk location, skipping OPFS/IndexedDB entirely).
  *
- * NOTE: this always returns the complete, fully-buffered payload — none of
- * midden's download methods (download_verified_with_ensure_progress /
- * download_verified_by_id_progress) expose an incremental chunk callback,
- * only a progress *fraction* callback. so there is no way to stream bytes
- * to disk as they arrive over the network; the whole payload is buffered
- * in memory first, exactly like a normal snatch.
+ * NOTE: this always returns the complete, fully-buffered payload. for the
+ * chunk-streamed variant (bounded memory, used by snatch-to-disk when the
+ * blake3 hash is known), see downloadBlobToWritableFromPeer below.
  */
 async function downloadBlobBytesFromPeer(
   info: SnatchBlobInfo,
@@ -996,12 +961,17 @@ async function snatchFromBrowserPeer(
 
   log.debug(TAG, `browser snatch: storing ${formatFileSize(bytes.length)} in OPFS...`);
 
-  // store in OPFS + IDB
+  // store in OPFS + IDB under the blake3 hash — the canonical blob id
+  // (matches iroh-blobs and tauri's rust store). strategies 1/2 hand back
+  // the verified blake3; the unverified fallback may not, so compute it
+  // then. sha256 is still computed as legacy metadata so old doc
+  // references keep resolving via the sha256 index.
+  const blake3Id = blake3Hash || (await hashBlake3(bytes));
   const sha256 = await computeSha256(bytes.buffer as ArrayBuffer);
-  await storeBlob(sha256, bytes.buffer as ArrayBuffer, {
-    blob_id: sha256,
+  await storeBlob(blake3Id, bytes.buffer as ArrayBuffer, {
+    blob_id: blake3Id,
     sha256: sha256,
-    blake3: blake3Hash ?? "",
+    blake3: blake3Id,
     filename: info.filename,
     mime: info.mime,
     size: info.size || bytes.length,
@@ -1018,19 +988,19 @@ async function snatchFromBrowserPeer(
   thumbnailCache.delete(key50);
 
   localityCache.set(info.blobId, { locality: "local" });
-  localityCache.set(sha256, { locality: "local" });
+  localityCache.set(blake3Id, { locality: "local" });
 
   log.debug(
     TAG,
-    `browser snatch complete: blob ${sha256.slice(0, 8)}... (doc blobId=${info.blobId.slice(0, 8)}...)`
+    `browser snatch complete: blob ${blake3Id.slice(0, 8)}... (doc blobId=${info.blobId.slice(0, 8)}...)`
   );
 
   return {
-    blobId: sha256,
+    blobId: blake3Id,
     domain: info.domain,
     jobId: null,
     sha256: sha256,
-    blake3: blake3Hash || null,
+    blake3: blake3Id,
     size: info.size || bytes.length,
     mime: info.mime,
     existing: false,
@@ -1065,23 +1035,90 @@ export function canSnatchToDisk(): boolean {
 }
 
 /**
+ * chunk-streamed download from one peer straight into a writable stream.
+ * wraps midden's `download_verified_streaming_with_ensure`: each verified
+ * 256KB chunk arrives via a synchronous wasm callback and is queued onto a
+ * sequential write chain (the File System Access API requires ordered,
+ * awaited writes; the wasm side doesn't await the callback). the chain is
+ * drained before returning, and any write failure is rethrown.
+ *
+ * returns the total number of bytes streamed. does NOT close the writable —
+ * the caller decides (close on success, truncate+retry on failure).
+ */
+async function downloadBlobToWritableFromPeer(
+  node: any,
+  info: SnatchBlobInfo,
+  peerAddr: string,
+  writable: FileSystemWritableFileStream,
+  options?: SnatchOptions
+): Promise<number> {
+  log.debug(
+    TAG,
+    `streaming blob ${info.blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}... to disk`
+  );
+
+  // sequential write chain — on_chunk is called synchronously from wasm and
+  // must not await, so writes are chained and drained afterwards.
+  let writeChain: Promise<void> = Promise.resolve();
+  let writeError: unknown = null;
+
+  // wasm-bindgen delivers each chunk as a fresh, plain-ArrayBuffer-backed
+  // Uint8Array (never a SharedArrayBuffer view), so the narrower type is safe
+  const onChunk = (chunk: Uint8Array<ArrayBuffer>, offset: number) => {
+    if (writeError) return; // stop queueing after the first failure
+    writeChain = writeChain.then(async () => {
+      if (writeError) return;
+      try {
+        await writable.write({ type: "write", position: offset, data: chunk });
+      } catch (err) {
+        writeError = err;
+      }
+    });
+  };
+
+  const onProgress = options?.onProgress
+    ? (fraction: number) => options.onProgress!(fraction)
+    : () => {};
+
+  // same generous timeout as strategy 1: the responding peer may need to
+  // import the blob into its store (BAO tree computation) on first request.
+  const total = (await withPeerTimeout(
+    node.download_verified_streaming_with_ensure(
+      peerAddr,
+      info.blake3,
+      info.size || 0,
+      onChunk,
+      onProgress
+    ) as Promise<number>,
+    10 * 60_000
+  )) as number;
+
+  // drain any writes still in flight, then surface the first write error
+  await writeChain;
+  if (writeError) throw writeError;
+
+  return total;
+}
+
+
+/**
  * download a blob straight from a canvas peer to a user-chosen disk
  * location, without ever writing it into OPFS/IndexedDB.
  *
- * IMPORTANT — this is NOT chunk-streamed over the network: midden's
- * download methods only ever hand back one complete Uint8Array once the
- * whole transfer has finished (see downloadBlobBytesFromPeer's doc
- * comment), so the full payload is buffered in memory exactly like a
- * normal snatch. the value this provides over a normal snatch is entirely
- * on the persistence side — once downloaded, the bytes are written once to
- * the caller-provided writable stream and the OPFS/IndexedDB persistence
- * step (storeBlob) is skipped entirely, so a large file never consumes
- * browser storage quota.
+ * when the blake3 hash is known and midden exposes
+ * `download_verified_streaming_with_ensure`, the transfer is chunk-streamed:
+ * each verified 256KB chunk is written to the caller's writable at its
+ * explicit offset as it is read out of the wasm store, so JS never holds
+ * the whole payload. (the network side still buffers inside midden's
+ * MemStore until the opfs store lands — this eliminates the wasm->JS and
+ * JS-side full copies.) otherwise it falls back to the fully-buffered
+ * download + single write.
  *
  * peer probing/retry mirrors snatchBlob: if a peer's download fails, the
- * next peer is tried. once bytes are successfully downloaded, a failure
- * writing them to disk is NOT retried against another peer (retrying would
- * risk writing to the stream twice) — it's surfaced directly to the caller.
+ * next peer is tried. on a mid-stream failure the writable is truncated
+ * back to zero before retrying, so a retry never appends onto partial
+ * data. once bytes are fully written, a failure closing the stream is NOT
+ * retried against another peer — it's surfaced directly to the caller.
  *
  * browser-only; throws in tauri mode.
  */
@@ -1114,6 +1151,10 @@ export async function snatchBlobToDisk(
   let remaining = [...allPeerAddrs];
   let lastError: unknown;
 
+  const node = (await getMiddenNode()) as any;
+  const canStream =
+    !!info.blake3 && typeof node.download_verified_streaming_with_ensure === "function";
+
   while (remaining.length > 0) {
     if (options?.signal?.aborted) {
       throw new DOMException("snatch cancelled", "AbortError");
@@ -1128,6 +1169,35 @@ export async function snatchBlobToDisk(
     const isOnline = options?.isPeerOnline?.(bestPeer) ?? false;
     options?.onPeerAttempt?.(peerIndex, allPeerAddrs.length, isOnline);
 
+    // chunk-streamed path: verified chunks land on disk as they are read
+    // out of the wasm store — no full payload in JS memory, ever.
+    if (canStream) {
+      try {
+        const size = await downloadBlobToWritableFromPeer(node, info, bestPeer, writable, options);
+        if (size === 0) {
+          throw new Error("snatch returned 0 bytes — refusing empty payload");
+        }
+        await writable.close();
+        log.debug(
+          TAG,
+          `snatch-to-disk complete (streamed): ${formatFileSize(size)} written to disk (OPFS/IndexedDB skipped)`
+        );
+        return { size, mime: info.mime, blake3: info.blake3 || null };
+      } catch (err) {
+        lastError = err;
+        log.warn(
+          TAG,
+          `streamed snatch-to-disk from peer ${bestPeer.slice(0, 16)}... failed:`,
+          err
+        );
+        // wipe any partially-written chunks so the next peer starts clean
+        await writable.truncate(0);
+        remaining = remaining.filter((p) => p !== bestPeer);
+        continue;
+      }
+    }
+
+    // buffered fallback (no blake3 in doc, or midden without the streaming api)
     let bytes: Uint8Array;
     let blake3: string | null;
     let mime: string;

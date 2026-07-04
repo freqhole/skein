@@ -17,14 +17,17 @@ test("blob worker initialises and hashes + writes to OPFS", async ({ canvasPage 
   expect(processed.blake3).not.toBe("");
   expect(processed.sha256).not.toBe("");
   expect(processed.size).toBe(28);
+  // blake3 is the canonical blob id (sha256 is legacy metadata)
+  expect(processed.blob_id).toBe(processed.blake3);
 
   // confirm the bytes actually landed in OPFS via the worker's own read path
+  // (files are keyed by the canonical blake3 id)
   const opfsBytesLength = await page.evaluate(async (blobId: string) => {
     const helpers = (window as any).__skeinHelpers;
     const worker = await helpers.getBlobWorker();
     const buf = await worker.readBlobFromOpfs(blobId);
     return buf ? buf.byteLength : null;
-  }, processed.sha256);
+  }, processed.blake3);
 
   expect(opfsBytesLength).toBe(28);
 });

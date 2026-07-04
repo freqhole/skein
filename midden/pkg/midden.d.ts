@@ -208,6 +208,34 @@ export class MiddenNode {
      */
     download_verified_by_id_progress(peer_addr: string, blob_id: string, total_size: number, on_progress: Function): Promise<Array<any>>;
     /**
+     * download a verified blob and stream chunks to JS via callback
+     * (ported from tomb's midden).
+     *
+     * this is the preferred path for large blobs. instead of materializing
+     * the full blob in wasm linear memory (which fails around 32MB+ due to
+     * allocator pressure on a single contiguous Bytes), this:
+     *
+     * 1. downloads the blob into MemStore using the verified iroh-blobs path
+     * 2. opens a streaming reader and pulls chunks
+     * 3. delivers each chunk to the JS callback as a Uint8Array
+     *
+     * JS can write each chunk straight to a writable stream (disk) or
+     * accumulate into a Blob, releasing chunks as it goes. wasm peak memory
+     * stays bounded by chunk_size + the MemStore copy.
+     *
+     * callback signature: `on_chunk(chunk: Uint8Array, offset: number) -> void`
+     * progress callback: `on_progress(fraction: number) -> void`
+     *
+     * returns total bytes streamed.
+     */
+    download_verified_streaming(peer_addr: string, blake3_hash: string, total_size: number, on_chunk: Function, on_progress: Function): Promise<number>;
+    /**
+     * streaming download with auto ensure+retry. first attempts the
+     * streaming download; if the verified download fails (blob not in
+     * peer's store), calls ensure_blob to load it, then retries.
+     */
+    download_verified_streaming_with_ensure(peer_addr: string, blake3_hash: string, total_size: number, on_chunk: Function, on_progress: Function): Promise<number>;
+    /**
      * download a blob using iroh-blobs with automatic ensure + retry
      *
      * tries download_verified first. if blob not in peer's FsStore,
@@ -277,7 +305,7 @@ export class MiddenNode {
      * import raw bytes into the iroh-blobs store, returning the blake3 hash.
      * this makes the blob available for verified download by peers.
      * the blob stays in the store as long as its TempTag is held in active_tags.
-     * call release_blob() to allow GC, or it will be evicted when the map exceeds 3 entries.
+     * call release_blob() to allow GC.
      */
     import_blob(data: Uint8Array): Promise<string>;
     /**

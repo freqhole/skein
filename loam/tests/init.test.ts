@@ -152,7 +152,11 @@ test("registry contains the expected widget types", async ({ canvasPage }) => {
   expect(types).toContain("peedeeeff");
   expect(types).toContain("bin");
   expect(types).toContain("canvas-info");
-  expect(types).toHaveLength(10);
+  expect(types).toContain("link");
+  expect(types).toContain("canvas-card");
+  expect(types).toContain("canvas-wizard");
+  expect(types).toContain("canvas-link-picker");
+  expect(types).toHaveLength(14);
 });
 
 test("canvas persists widgets across sessions via IndexedDB", async ({ browser }) => {

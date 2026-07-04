@@ -155,8 +155,8 @@ async function readBlobFromOpfs(blobId: string): Promise<ArrayBuffer | null> {
 // ---- combo: full upload pipeline ------------------------------------------
 
 export interface ProcessedBlob {
-  blob_id: string; // sha256 hex (skein's content-address for the blob db)
-  sha256: string;
+  blob_id: string; // blake3 hex — the canonical content-address for the blob db
+  sha256: string; // legacy hash, kept so old records/doc references still resolve
   blake3: string;
   size: number;
   mime: string;
@@ -167,6 +167,10 @@ export interface ProcessedBlob {
  * one-shot: hash bytes (sha256 + blake3), write to OPFS, return metadata.
  * lets callers avoid three round-trips across the worker boundary for an
  * upload. `data` should be transferred.
+ *
+ * blake3 is the canonical blob id (matches iroh-blobs / tauri's rust
+ * store); sha256 is still computed so legacy sha256-keyed records and old
+ * doc references keep resolving via the sha256 index.
  */
 async function processBlobBytes(
   data: ArrayBuffer,
@@ -177,9 +181,9 @@ async function processBlobBytes(
   // copy of the bytes, so we can't transfer-and-reuse — do them in parallel
   // and let the runtime overlap them.
   const [sha256, blake3] = await Promise.all([hashSha256(data), hashBlake3(new Uint8Array(data))]);
-  await writeBlobToOpfs(sha256, data);
+  await writeBlobToOpfs(blake3, data);
   return {
-    blob_id: sha256,
+    blob_id: blake3,
     sha256,
     blake3,
     size: data.byteLength,

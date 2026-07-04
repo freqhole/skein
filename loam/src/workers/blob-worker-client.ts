@@ -195,7 +195,7 @@ export async function processBlobBytes(
     fallbackHashBlake3(new Uint8Array(buffer)),
   ]);
   return {
-    blob_id: sha256,
+    blob_id: blake3,
     sha256,
     blake3,
     size: buffer.byteLength,

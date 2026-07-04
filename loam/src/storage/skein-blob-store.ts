@@ -177,18 +177,16 @@ export function classifyDomain(mime: string): string {
 /**
  * try to write bytes to OPFS via the blob worker (uses
  * `FileSystemSyncAccessHandle` for max throughput when available, falling
- * back to the async writable-stream API). silently no-ops when OPFS or
- * Worker isn't available.
- *
- * NOTE: transfers ownership of `data` to the worker — callers must not
- * use the buffer after this returns. when the buffer is still needed on
- * the main thread, slice it first.
+ * back to the async writable-stream API). returns false when OPFS or
+ * Worker isn't available or the write fails.
  */
-async function tryWriteOpfs(blobId: string, data: ArrayBuffer): Promise<void> {
+async function tryWriteOpfs(blobId: string, data: ArrayBuffer): Promise<boolean> {
   try {
     await writeBlobToOpfs(blobId, data);
+    return true;
   } catch (err) {
     log.warn(TAG, "tryWriteOpfs failed for", blobId.slice(0, 16), err);
+    return false;
   }
 }
 
@@ -203,11 +201,19 @@ export async function storeBlob(
   data: ArrayBuffer,
   meta: Omit<SkeinBlobRecord, "created_at">
 ): Promise<void> {
-  // write bytes to OPFS — best-effort. webkit (tauri's webview) does not
-  // expose `createWritable()` on the main thread; in that case the bytes
-  // are expected to live in the rust-side blob store and `getBlobData()`
-  // will fall back to a `blob_get` dispatch.
-  await tryWriteOpfs(blobId, data);
+  // write bytes to OPFS. on webkit (tauri's webview) `createWritable()` is
+  // missing on the main thread — there the bytes live in the rust-side
+  // blob store and `getBlobData()` falls back to a `blob_get` dispatch, so
+  // a failed write stays best-effort. in plain browser mode there is no
+  // such fallback: a record without bytes would claim the blob is local
+  // forever while playback finds nothing (the stranded-video failure
+  // mode) — fail loudly instead so the caller can retry/surface it.
+  const wrote = await tryWriteOpfs(blobId, data);
+  if (!wrote && !isTauriMode()) {
+    throw new Error(
+      `OPFS write failed for blob ${blobId.slice(0, 16)}... — not persisting record`
+    );
+  }
 
   // write metadata record to IndexedDB
   const record: SkeinBlobRecord = {
@@ -246,7 +252,9 @@ export async function storeBlobFromFile(file: File, domain?: string): Promise<Sk
   // hashing AND the OPFS write happen off the main thread in a single
   // round-trip. transfers ownership of `buffer` \u2014 do not use it after.
   const processed = await processBlobBytes(buffer, file.name, mime);
-  const blobId = processed.sha256;
+  // blake3 is the canonical blob id (matches iroh-blobs / tauri's rust
+  // store); sha256 is legacy metadata kept for old records/doc references.
+  const blobId = processed.blake3;
 
   // dedup \u2014 return existing record if already stored. (the worker has
   // already written the bytes to OPFS, but that's a no-op overwrite of an
@@ -534,11 +542,14 @@ export async function deleteBaoData(blake3Hash: string): Promise<void> {
 
 /**
  * resolve a blobId to a SkeinBlobRecord using multiple lookup strategies.
- * tries: primary key → sha256 index → blake3 index (if provided).
+ * tries: primary key → blake3 index (blobId itself) → sha256 index →
+ * blake3 index (separately-known hash).
  *
- * this handles the case where the automerge doc's blobId was overwritten
- * by a Tauri peer with a server-assigned UUID that doesn't match the
- * browser's sha256-based primary key.
+ * handles both id generations — blake3 is the canonical id now, while
+ * sha256-keyed records and old doc references are legacy but must keep
+ * resolving — plus the case where the automerge doc's blobId was
+ * overwritten by a Tauri peer with an id that doesn't match the local
+ * primary key.
  */
 export async function resolveBlob(
   blobId: string,
@@ -546,15 +557,20 @@ export async function resolveBlob(
 ): Promise<SkeinBlobRecord | null> {
   if (!blobId) return null;
 
-  // 1. try primary key (most common case — blobId IS the sha256)
+  // 1. try primary key (most common case — blobId IS the canonical id)
   const byKey = await getBlobRecord(blobId);
   if (byKey) return byKey;
 
-  // 2. try sha256 index (blobId might be stored as sha256 but under a different primary key)
+  // 2. the doc's blobId may be a blake3 while the local record is a
+  //    legacy sha256-keyed one — try the blake3 index with the id itself
+  const byIdAsBlake3 = await getBlobRecordByBlake3(blobId);
+  if (byIdAsBlake3) return byIdAsBlake3;
+
+  // 3. legacy: blobId might be a sha256 stored under a different primary key
   const bySha = await getBlobRecordBySha256(blobId);
   if (bySha) return bySha;
 
-  // 3. try blake3 index if available
+  // 4. try blake3 index with the separately-known hash, if available
   if (blake3) {
     const byBlake3 = await getBlobRecordByBlake3(blake3);
     if (byBlake3) return byBlake3;
@@ -587,6 +603,27 @@ export async function resolveBlobData(
 export async function hasBlob(blobId: string): Promise<boolean> {
   const record = await getBlobRecord(blobId);
   return record !== null;
+}
+
+/**
+ * check whether the raw bytes for a blob are actually present in OPFS
+ * (cheap file-handle existence check, no read). browser mode only — in
+ * tauri mode bytes live in the rust store, which `getBlobData()` falls
+ * back to anyway.
+ *
+ * a metadata record without bytes (e.g. an old snatch whose best-effort
+ * OPFS write silently failed) must NOT count as local — that stranded
+ * state made playback fail forever with no re-snatch offered.
+ */
+export async function hasBlobBytes(blobId: string): Promise<boolean> {
+  try {
+    const dir = await getOpfsDir(false);
+    if (!dir) return false;
+    await dir.getFileHandle(blobId, { create: false });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
