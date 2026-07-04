@@ -9,6 +9,7 @@ import {
   discardPausedDownload,
   formatFileSize,
   formatUploadError,
+  freeUpLocalBlobCopy,
   getDocumentPages,
   getLocalBlobUrl,
   getLocalNodeId,
@@ -66,6 +67,15 @@ export const fileSchema = z.object({
   /** list of node IDs that have snatched (or uploaded) this blob.
    *  used to target blob downloads — only probe peers in this list. */
   snatchedBy: z.array(z.string()).default([]),
+  /** upload lock: node id of the peer currently uploading into this widget
+   *  (empty = none). peers render a locked progress view and refuse to
+   *  start a competing upload while a fresh lock is held. */
+  uploadingBy: z.string().default(""),
+  /** upload progress 0..1, written (throttled) by the uploading peer */
+  uploadingProgress: z.number().default(0),
+  /** ms epoch of the last uploadingBy/uploadingProgress write — locks older
+   *  than the staleness window are ignored (crashed uploader recovery) */
+  uploadingAt: z.number().default(0),
 });
 
 export type FileState = z.infer<typeof fileSchema>;
@@ -92,6 +102,10 @@ const BUTTON_PAD_H = 8;
 const BUTTON_PAD_V = 2;
 const BUTTON_RADIUS = 3;
 const BUTTON_FONT_SIZE = 10;
+
+/** an upload lock whose last heartbeat is older than this is considered
+ *  abandoned (uploader crashed / closed the tab) and can be taken over. */
+const UPLOAD_LOCK_STALE_MS = 30_000;
 
 /**
  * truncate a string to a maximum length, appending "..." if truncated.
@@ -268,6 +282,11 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     // kept open across a disk-snatch pause so resume can keep writing to the
     // same user-chosen file (chunk offsets are explicit, rewrites are safe)
     let diskSnatchWritable: FileSystemWritableFileStream | null = null;
+    // upload cancel + cross-peer lock state. uploadAbort cancels the local
+    // in-flight upload; remoteUploadLock mirrors a fresh uploadingBy claim
+    // from ANOTHER peer (renders the locked progress view).
+    let uploadAbort: AbortController | null = null;
+    let uploadCancelled = false;
     // browser capability check — computed once, doesn't change at runtime.
     const diskSnatchSupported = canSnatchToDisk();
     let lastRequestedBlobId = "";
@@ -383,6 +402,17 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     loadingText.x = currentWidth / 2;
     loadingText.y = currentHeight / 2;
     loadingText.visible = false;
+    // tapping the loading text cancels a LOCAL in-flight upload (no-op for
+    // the remote-peer locked view, where uploadAbort is null)
+    loadingText.eventMode = "static";
+    loadingText.cursor = "pointer";
+    loadingText.on("pointertap", (e) => {
+      e.stopPropagation();
+      if (uploadAbort) {
+        uploadCancelled = true;
+        uploadAbort.abort();
+      }
+    });
     container.addChild(loadingText);
 
     // -- error text -----------------------------------------------------------
@@ -1325,6 +1355,19 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       if (loadState !== "empty") return;
       if (ctx.canvasStore?.isLocalViewer()) return;
 
+      // respect another peer's fresh upload lock — no competing uploads.
+      // stale locks (crashed uploader) are ignored via the staleness window.
+      const localNodeId = await getLocalNodeId();
+      const cur = ctx.doc.current;
+      if (
+        cur.uploadingBy &&
+        cur.uploadingBy !== localNodeId &&
+        Date.now() - (cur.uploadingAt || 0) < UPLOAD_LOCK_STALE_MS
+      ) {
+        log.debug("file-widget", "upload refused — another peer holds the upload lock");
+        return;
+      }
+
       try {
         const picked = await pickFiles();
         if (!picked || picked.length === 0) return;
@@ -1334,15 +1377,71 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           const file = picked[0];
           loadState = "loading";
           syncVisibility();
-          loadingText.text = "uploading...";
+          loadingText.text = "uploading... (tap to cancel)";
 
-          const result = await uploadFile(file, {
-            waitForCompletion: true,
-            onProgress: (fraction) => {
-              if (loadState !== "loading") return;
-              loadingText.text = `uploading... ${Math.round(fraction * 100)}%`;
-            },
-          });
+          uploadCancelled = false;
+          uploadAbort = new AbortController();
+
+          // claim the upload lock so peers see progress and don't race
+          if (localNodeId) {
+            ctx.doc.change((draft) => {
+              draft.uploadingBy = localNodeId;
+              draft.uploadingProgress = 0;
+              draft.uploadingAt = Date.now();
+            });
+          }
+
+          // throttled lock heartbeat: write on >=5% delta or >=1s elapsed,
+          // so a big upload doesn't spam the automerge doc every chunk
+          let lastLockFraction = 0;
+          let lastLockWrite = Date.now();
+
+          const releaseLock = () => {
+            if (!localNodeId) return;
+            ctx.doc.change((draft) => {
+              draft.uploadingBy = "";
+              draft.uploadingProgress = 0;
+              draft.uploadingAt = 0;
+            });
+          };
+
+          let result: Awaited<ReturnType<typeof uploadFile>>;
+          try {
+            result = await uploadFile(file, {
+              waitForCompletion: true,
+              signal: uploadAbort.signal,
+              onProgress: (fraction) => {
+                if (loadState !== "loading" || uploadCancelled) return;
+                loadingText.text = `uploading... ${Math.round(fraction * 100)}% (tap to cancel)`;
+                const now = Date.now();
+                if (
+                  localNodeId &&
+                  (fraction - lastLockFraction >= 0.05 || now - lastLockWrite >= 1000)
+                ) {
+                  lastLockFraction = fraction;
+                  lastLockWrite = now;
+                  ctx.doc.change((draft) => {
+                    draft.uploadingProgress = fraction;
+                    draft.uploadingAt = now;
+                  });
+                }
+              },
+            });
+          } catch (err) {
+            releaseLock();
+            if (
+              uploadCancelled ||
+              (err instanceof DOMException && err.name === "AbortError")
+            ) {
+              log.debug("file-widget", "upload cancelled by user");
+              loadState = "empty";
+              syncVisibility();
+              return;
+            }
+            throw err;
+          } finally {
+            uploadAbort = null;
+          }
 
           // if the uploaded file is a PDF (in Tauri mode), poll for rendered
           // page images in the background. once pages are available, replace
@@ -1417,8 +1516,6 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           prevBlobId = result.blobId;
           actionState = "local";
 
-          const localNodeId = await getLocalNodeId();
-
           ctx.doc.change((draft) => {
             draft.blobId = result.blobId;
             draft.domain = result.domain;
@@ -1427,6 +1524,11 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             draft.size = result.size;
             draft.blake3 = result.blake3 ?? "";
             draft.thumbnailDataUrl = result.thumbnailDataUrl ?? "";
+            // release the upload lock in the same change that publishes the
+            // result — peers atomically see "upload done + file present"
+            draft.uploadingBy = "";
+            draft.uploadingProgress = 0;
+            draft.uploadingAt = 0;
             if (localNodeId) {
               if (!draft.snatchedBy) draft.snatchedBy = [];
               if (!draft.snatchedBy.includes(localNodeId)) {
@@ -2196,10 +2298,44 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     // -- doc change subscription ----------------------------------------------
 
+    // cached for the sync doc-change callback (getLocalNodeId is async)
+    let localNodeIdCached = "";
+    void getLocalNodeId().then((id) => {
+      localNodeIdCached = id ?? "";
+    });
+
+    /** true when ANOTHER peer holds a fresh upload lock on this widget */
+    function remoteUploadLockActive(state: FileState): boolean {
+      return (
+        !!state.uploadingBy &&
+        state.uploadingBy !== localNodeIdCached &&
+        Date.now() - (state.uploadingAt || 0) < UPLOAD_LOCK_STALE_MS
+      );
+    }
+
     let prevBlobId = ctx.doc.current.blobId;
     let prevThumbDataUrl = ctx.doc.current.thumbnailDataUrl;
     const unsub = ctx.doc.on("change", (state) => {
       drawBg(currentWidth, currentHeight);
+
+      // cross-peer upload lock: while another peer uploads into this widget,
+      // render a locked progress view (and handleUpload refuses to start).
+      // only relevant before a blob lands — once blobId is set the normal
+      // loaded path below takes over.
+      if (!state.blobId && !uploadAbort) {
+        if (remoteUploadLockActive(state)) {
+          loadState = "loading";
+          syncVisibility();
+          loadingText.text = `peer uploading... ${Math.round((state.uploadingProgress || 0) * 100)}%`;
+          return;
+        }
+        if (loadState === "loading") {
+          // the lock cleared without a blob (uploader cancelled/failed)
+          loadState = "empty";
+          syncVisibility();
+          return;
+        }
+      }
 
       if (state.blobId !== prevBlobId) {
         prevBlobId = state.blobId;
@@ -2251,16 +2387,100 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       }
 
       checkLocality(ctx.doc.current.blobId);
+    } else if (remoteUploadLockActive(ctx.doc.current)) {
+      // mounted mid-upload (another peer holds a fresh lock) — show the
+      // locked progress view instead of the upload placeholder
+      loadState = "loading";
+      syncVisibility();
+      loadingText.text = `peer uploading... ${Math.round((ctx.doc.current.uploadingProgress || 0) * 100)}%`;
     }
 
     // -- return controller ----------------------------------------------------
 
+    /** delete the LOCAL copy of the blob to reclaim disk space — the widget
+     *  stays on the canvas and the blob flips back to "remote" (snatchable
+     *  from whoever still has it, e.g. a hub peer). browser-only. */
+    async function handleFreeUpSpace() {
+      const state = ctx.doc.current;
+      if (!state.blobId) return;
+      if (actionState !== "local" && actionState !== "snatched") {
+        log.debug("file-widget", "free up space: no local copy to remove");
+        return;
+      }
+      try {
+        await freeUpLocalBlobCopy(String(state.blobId), String(state.blake3 || "") || null);
+      } catch (err) {
+        log.warn("file-widget", "free up space failed:", err);
+        return;
+      }
+      // remove ourselves from snatchedBy so peers stop probing us for a
+      // blob we no longer have
+      const me = await getLocalNodeId();
+      if (me) {
+        ctx.doc.change((draft) => {
+          if (draft.snatchedBy) {
+            const idx = draft.snatchedBy.indexOf(me);
+            if (idx >= 0) draft.snatchedBy.splice(idx, 1);
+          }
+        });
+      }
+      if (destroyed) return;
+      uploadedLocally = false;
+      actionState = "remote";
+      syncActionButtons();
+      positionInfoBar(currentWidth, currentHeight);
+      log.debug("file-widget", "local copy freed — blob is remote again");
+    }
+
     return {
       container,
+      // property-tray extras: "free up space" (browser only — tauri blob
+      // storage is the durable native store) + who-has-this-file info rows
+      widgetActions: isTauriMode()
+        ? []
+        : [
+            {
+              id: "free-up-space",
+              label: "free up space",
+              onClick: () => {
+                void handleFreeUpSpace();
+              },
+            },
+          ],
+      widgetInfoRows: () => {
+        const state = ctx.doc.current;
+        if (!state.blobId) return [];
+        const holders = (state.snatchedBy ?? []).map(String);
+        const hubs = holders.filter((id) => ctx.canvasStore?.isHubNode(id) ?? false);
+        const rows: { label: string; value: string }[] = [
+          { label: "hub synced", value: hubs.length > 0 ? "yes" : "no" },
+        ];
+        if (holders.length === 0) {
+          rows.push({ label: "have it", value: "nobody yet" });
+        } else {
+          rows.push({
+            label: "have it",
+            value: `${holders.length} peer${holders.length === 1 ? "" : "s"}${
+              hubs.length ? ` (${hubs.length} hub)` : ""
+            }`,
+          });
+          for (const id of holders) {
+            const isHub = ctx.canvasStore?.isHubNode(id) ?? false;
+            const you = id === localNodeIdCached ? " (you)" : "";
+            rows.push({ label: isHub ? "hub" : "peer", value: `${id.slice(0, 16)}...${you}` });
+          }
+        }
+        return rows;
+      },
       destroy() {
         if (loadingAbort) {
           loadingAbort.abort();
           loadingAbort = null;
+        }
+        if (uploadAbort) {
+          uploadCancelled = true;
+          uploadAbort.abort();
+          uploadAbort = null;
         }
         if (snatchAbort) {
           snatchAbort.abort();

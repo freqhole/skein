@@ -101,6 +101,27 @@ pub struct HubKnockSummary {
     pub knocked_at: i64,
 }
 
+/// per-canvas blob usage summary, as reported by `AdminRequest::CanvasUsage`.
+///
+/// blobs referenced by multiple canvases count independently in each entry:
+/// a blob shared between two canvases contributes its full size to both.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasUsageSummary {
+    pub canvas_doc_id: String,
+    pub blob_count: u64,
+    pub total_bytes: u64,
+}
+
+/// a single blob row, as reported by `AdminRequest::BlobUsage`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlobUsageSummary {
+    pub blake3: String,
+    pub filename: Option<String>,
+    pub mime: Option<String>,
+    pub size: u64,
+    pub external: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdminRequest {
     /// pre-approve a peer (mirrors `reliquary friend allow`).
@@ -132,6 +153,19 @@ pub enum AdminRequest {
     /// writes directly to the canvas doc's `pendingKnocks` map, not
     /// through this admin protocol.
     ListPendingKnocks,
+    /// report total blob bytes, blob count, and best-effort disk space stats
+    /// for the filesystem containing the blob-files directory.
+    DiskUsage,
+    /// for each canvas the hub holds, sum the sizes of all blobs referenced
+    /// by its file widgets. blobs shared across canvases count in each.
+    CanvasUsage,
+    /// list every blob row from the blobz store (no pagination).
+    BlobUsage,
+    /// delete blobs by blake3 hash. for non-external blobs the on-disk file
+    /// is also removed; for external blobs only the blobz row is deleted
+    /// (the underlying file belongs to the user and is never touched).
+    /// reports per-hash failures rather than short-circuiting.
+    DeleteBlobs { blake3s: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +199,30 @@ pub enum AdminResponse {
     PendingKnocks {
         knocks: Vec<HubKnockSummary>,
     },
+    /// response to `AdminRequest::DiskUsage`.
+    DiskUsage {
+        total_blob_bytes: u64,
+        blob_count: u64,
+        /// bytes available to unprivileged users on the blob-dir filesystem.
+        /// `None` on non-unix platforms or if the stat call fails.
+        disk_available_bytes: Option<u64>,
+        /// total bytes on the blob-dir filesystem.
+        /// `None` on non-unix platforms or if the stat call fails.
+        disk_total_bytes: Option<u64>,
+    },
+    /// response to `AdminRequest::CanvasUsage`.
+    CanvasUsage {
+        canvases: Vec<CanvasUsageSummary>,
+    },
+    /// response to `AdminRequest::BlobUsage`.
+    BlobUsage {
+        blobs: Vec<BlobUsageSummary>,
+    },
+    /// response to `AdminRequest::DeleteBlobs`.
+    DeleteBlobsResult {
+        deleted: u64,
+        failed: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +254,10 @@ struct Inner {
     /// it holds, so it's a legitimate integration point for live
     /// cancellation, unlike the CLI's `friend remove` (see `main.rs`).
     hub_repo: HubRepo,
+    /// absolute path to the blob-files directory — used by `DiskUsage` to
+    /// stat the filesystem. derived from `blobz.blob_dir()` at construction
+    /// time so no extra field is needed on the public `new()` signature.
+    blob_dir: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for HubAdminHandler {
@@ -212,6 +274,7 @@ impl HubAdminHandler {
         blobz: blobz::Store,
         hub_repo: HubRepo,
     ) -> Self {
+        let blob_dir = blobz.blob_dir().to_path_buf();
         Self {
             inner: Arc::new(Inner {
                 adminz,
@@ -219,6 +282,7 @@ impl HubAdminHandler {
                 userz,
                 blobz,
                 hub_repo,
+                blob_dir,
             }),
         }
     }
@@ -469,6 +533,68 @@ async fn handle_request(
         AdminRequest::ListPendingKnocks => AdminResponse::PendingKnocks {
             knocks: list_pending_knocks(&handler.inner.hub_repo).await,
         },
+        AdminRequest::DiskUsage => {
+            let (total_blob_bytes, blob_count) =
+                match handler.inner.blobz.total_usage().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return AdminResponse::Error {
+                            message: format!("blobz query failed: {e}"),
+                        }
+                    }
+                };
+            let (disk_available_bytes, disk_total_bytes) =
+                match disk_space(&handler.inner.blob_dir) {
+                    Some((avail, total)) => (Some(avail), Some(total)),
+                    None => (None, None),
+                };
+            AdminResponse::DiskUsage {
+                total_blob_bytes,
+                blob_count,
+                disk_available_bytes,
+                disk_total_bytes,
+            }
+        }
+        AdminRequest::CanvasUsage => {
+            let canvases =
+                canvas_usage(&handler.inner.hub_repo, &handler.inner.blobz).await;
+            AdminResponse::CanvasUsage { canvases }
+        }
+        AdminRequest::BlobUsage => match handler.inner.blobz.list_all().await {
+            Ok(blobs) => AdminResponse::BlobUsage {
+                blobs: blobs
+                    .into_iter()
+                    .map(|b| BlobUsageSummary {
+                        blake3: b.blake3,
+                        filename: b.filename,
+                        mime: b.mime,
+                        size: b.size as u64,
+                        external: b.external,
+                    })
+                    .collect(),
+            },
+            Err(e) => AdminResponse::Error {
+                message: format!("blobz list failed: {e}"),
+            },
+        },
+        AdminRequest::DeleteBlobs { blake3s } => {
+            let mut deleted = 0u64;
+            let mut failed = Vec::new();
+            for hash in blake3s {
+                match handler.inner.blobz.delete(&hash).await {
+                    Ok(()) => deleted += 1,
+                    Err(e) => {
+                        tracing::warn!(blake3 = %hash, error = %e, "admin delete blob failed");
+                        failed.push(hash);
+                    }
+                }
+            }
+            // note: iroh-blobs FsStore blob deletion is not reachable here.
+            // the `Blobs::delete` method is pub(crate) inside iroh-blobs and
+            // not exposed externally; blob eviction from the iroh-blobs layer
+            // relies on tag-based GC, which is not triggered here.
+            AdminResponse::DeleteBlobsResult { deleted, failed }
+        }
     }
 }
 
@@ -587,6 +713,110 @@ fn read_pending_knocks(
             });
         }
     });
+
+    summaries
+}
+
+// ---------------------------------------------------------------------------
+// disk and canvas usage helpers
+// ---------------------------------------------------------------------------
+
+/// query bytes available to unprivileged users and total bytes on the
+/// filesystem containing `path`. returns `None` on failure or non-unix.
+#[cfg(unix)]
+fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return None;
+    }
+    let available = (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)?;
+    let total = (stat.f_blocks as u64).checked_mul(stat.f_frsize as u64)?;
+    Some((available, total))
+}
+
+#[cfg(not(unix))]
+fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// for each canvas the hub holds, sum the sizes of blobs referenced by its
+/// file widgets. only blobs already present in the local blobz store are
+/// counted; widgets whose blake3 has not been snatched yet are skipped.
+///
+/// blobs shared across canvases count independently in each canvas entry —
+/// see `CanvasUsageSummary`'s doc comment.
+async fn canvas_usage(hub_repo: &HubRepo, blobz: &blobz::Store) -> Vec<CanvasUsageSummary> {
+    use crate::snatch::{classify_doc, read_canvas_for_file_widgets, read_widget_state, DocKind};
+
+    let doc_ids = hub_repo.all_doc_ids().await;
+    let mut summaries = Vec::new();
+
+    for doc_id in &doc_ids {
+        let handle = match hub_repo.find(doc_id).await {
+            Some(h) => h,
+            None => continue,
+        };
+
+        // only process canvas docs
+        let kind = {
+            let h = handle.clone();
+            tokio::task::spawn_blocking(move || classify_doc(&h))
+                .await
+                .unwrap_or(DocKind::Unknown)
+        };
+        if kind != DocKind::Canvas {
+            continue;
+        }
+
+        // collect widget doc IDs from this canvas
+        let doc_id_owned = doc_id.clone();
+        let placeholder_refs = tokio::task::spawn_blocking(move || {
+            let (refs, _peers) =
+                read_canvas_for_file_widgets(&handle, &doc_id_owned, "");
+            refs
+        })
+        .await
+        .unwrap_or_default();
+
+        let mut blob_count = 0u64;
+        let mut total_bytes = 0u64;
+
+        for placeholder in &placeholder_refs {
+            let whandle = match hub_repo.find(&placeholder.widget_doc_id).await {
+                Some(h) => h,
+                None => continue,
+            };
+            let canvas_id = doc_id.clone();
+            let wdoc_id = placeholder.widget_doc_id.clone();
+            let widget_ref = tokio::task::spawn_blocking(move || {
+                read_widget_state(&whandle, &canvas_id, &wdoc_id)
+            })
+            .await
+            .ok()
+            .flatten();
+
+            let Some(wref) = widget_ref else { continue };
+            if wref.blake3.is_empty() {
+                continue;
+            }
+
+            // only count blobs already in the local store
+            if let Ok(Some(blob)) = blobz.get(&wref.blake3).await {
+                blob_count += 1;
+                total_bytes += blob.size as u64;
+            }
+        }
+
+        summaries.push(CanvasUsageSummary {
+            canvas_doc_id: doc_id.clone(),
+            blob_count,
+            total_bytes,
+        });
+    }
 
     summaries
 }
@@ -1429,5 +1659,184 @@ mod tests {
             matches!(response, AdminResponse::NotAdmin),
             "non-admin must not receive pending-knock data"
         );
+    }
+
+    // -- DiskUsage -------------------------------------------------------
+
+    #[tokio::test]
+    async fn disk_usage_sums_blobz_sizes_and_counts_rows() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        // empty store
+        let resp = handle_request(&handler, admin_node, AdminRequest::DiskUsage).await;
+        match resp {
+            AdminResponse::DiskUsage {
+                total_blob_bytes,
+                blob_count,
+                ..
+            } => {
+                assert_eq!(blob_count, 0);
+                assert_eq!(total_blob_bytes, 0);
+            }
+            other => panic!("expected DiskUsage, got {other:?}"),
+        }
+
+        blobz_store
+            .insert("h1".into(), None, None, b"hello")
+            .await
+            .unwrap();
+        blobz_store
+            .insert("h2".into(), None, None, b"world!!")
+            .await
+            .unwrap();
+
+        let resp = handle_request(&handler, admin_node, AdminRequest::DiskUsage).await;
+        match resp {
+            AdminResponse::DiskUsage {
+                total_blob_bytes,
+                blob_count,
+                ..
+            } => {
+                assert_eq!(blob_count, 2);
+                assert_eq!(
+                    total_blob_bytes,
+                    (b"hello".len() + b"world!!".len()) as u64
+                );
+            }
+            other => panic!("expected DiskUsage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_request_disk_usage() {
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
+        let resp = handle_request(&handler, "stranger", AdminRequest::DiskUsage).await;
+        assert!(matches!(resp, AdminResponse::NotAdmin));
+    }
+
+    // -- BlobUsage -------------------------------------------------------
+
+    #[tokio::test]
+    async fn blob_usage_returns_all_blob_rows() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        blobz_store
+            .insert("h1".into(), Some("a.txt".into()), Some("text/plain".into()), b"aaa")
+            .await
+            .unwrap();
+        blobz_store
+            .insert("h2".into(), None, None, b"bbbbb")
+            .await
+            .unwrap();
+
+        let resp = handle_request(&handler, admin_node, AdminRequest::BlobUsage).await;
+        match resp {
+            AdminResponse::BlobUsage { blobs } => {
+                assert_eq!(blobs.len(), 2);
+                let a = blobs.iter().find(|b| b.filename == Some("a.txt".to_string()));
+                assert!(a.is_some());
+                assert_eq!(a.unwrap().size, 3);
+                assert!(!a.unwrap().external);
+            }
+            other => panic!("expected BlobUsage, got {other:?}"),
+        }
+    }
+
+    // -- DeleteBlobs -----------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_blobs_removes_row_and_file_for_internal_blobs() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let blob = blobz_store
+            .insert("h1".into(), None, None, b"bye")
+            .await
+            .unwrap();
+        let path = blobz_store.path_for(&blob);
+        assert!(path.exists());
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::DeleteBlobs {
+                blake3s: vec![blob.blake3.clone()],
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::DeleteBlobsResult { deleted, failed } => {
+                assert_eq!(deleted, 1);
+                assert!(failed.is_empty());
+            }
+            other => panic!("expected DeleteBlobsResult, got {other:?}"),
+        }
+        assert!(blobz_store.get(&blob.blake3).await.unwrap().is_none());
+        assert!(!path.exists(), "on-disk file must be removed for internal blobs");
+    }
+
+    #[tokio::test]
+    async fn delete_blobs_does_not_remove_file_for_external_rows() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        // register an external file (user-owned; blobz must never delete it)
+        let src_path = tmp.path().join("external.bin");
+        tokio::fs::write(&src_path, b"external content")
+            .await
+            .unwrap();
+        let blob = blobz_store
+            .register_path(&src_path, Some("external.bin".into()), None, None, None)
+            .await
+            .expect("register_path");
+        assert!(blob.external);
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::DeleteBlobs {
+                blake3s: vec![blob.blake3.clone()],
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::DeleteBlobsResult { deleted, failed } => {
+                assert_eq!(deleted, 1);
+                assert!(failed.is_empty());
+            }
+            other => panic!("expected DeleteBlobsResult, got {other:?}"),
+        }
+        assert!(
+            blobz_store.get(&blob.blake3).await.unwrap().is_none(),
+            "blobz row must be removed"
+        );
+        assert!(
+            src_path.exists(),
+            "external file must NOT be deleted — it belongs to the user"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_delete_blobs() {
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
+        let resp = handle_request(
+            &handler,
+            "stranger",
+            AdminRequest::DeleteBlobs {
+                blake3s: vec!["any-hash".to_string()],
+            },
+        )
+        .await;
+        assert!(matches!(resp, AdminResponse::NotAdmin));
     }
 }

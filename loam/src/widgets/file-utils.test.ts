@@ -81,6 +81,7 @@ import {
   pauseSnatchDownload,
   snatchBlob,
   snatchBlobToDisk,
+  getThumbnailDataUrl,
   uploadFile,
 } from "./file-utils";
 
@@ -1446,5 +1447,73 @@ describe("downloadBlobBytesFromPeer — proxy_request fallback hash verification
     expect(result.sha256).toBe("sha256-of-payload");
     expect(mockStoreBlob).toHaveBeenCalledTimes(1);
     expect(mockStoreBlob.mock.calls[0][0]).toBe("expected-hash-of-real-content");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getThumbnailDataUrl — tauri blob_thumbnail dispatch path
+// ---------------------------------------------------------------------------
+
+describe("getThumbnailDataUrl — tauri blob_thumbnail path", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // all tests in this suite run in tauri mode
+    mockIsTauriMode.mockReturnValue(true);
+  });
+
+  it("returns a data URL when dispatch returns { data, mime }", async () => {
+    const fakeB64 = btoa("webp-bytes");
+    mockDispatch.mockImplementation(async (action: string) => {
+      if (action === "blob_thumbnail") {
+        return { data: fakeB64, mime: "image/webp" };
+      }
+      return null;
+    });
+
+    const result = await getThumbnailDataUrl("test-blake3-id", { size: 200 });
+
+    expect(mockDispatch).toHaveBeenCalledWith("blob_thumbnail", {
+      blake3: "test-blake3-id",
+      size: 200,
+    });
+    expect(result).toBe(`data:image/webp;base64,${fakeB64}`);
+  });
+
+  it("returns null when dispatch returns { data: null }", async () => {
+    mockDispatch.mockImplementation(async (action: string) => {
+      if (action === "blob_thumbnail") {
+        return { data: null };
+      }
+      return null;
+    });
+
+    const result = await getThumbnailDataUrl("unsupported-blob-id", { size: 200 });
+
+    expect(result).toBeNull();
+  });
+
+  it("returns null when dispatch rejects (blob not found)", async () => {
+    mockDispatch.mockRejectedValue(new Error("not found"));
+
+    const result = await getThumbnailDataUrl("missing-blob-id", { size: 200 });
+
+    expect(result).toBeNull();
+  });
+
+  it("passes size from options to dispatch payload", async () => {
+    const fakeB64 = btoa("small-thumb");
+    mockDispatch.mockImplementation(async (action: string) => {
+      if (action === "blob_thumbnail") {
+        return { data: fakeB64, mime: "image/webp" };
+      }
+      return null;
+    });
+
+    await getThumbnailDataUrl("some-blob-id", { size: 64 });
+
+    expect(mockDispatch).toHaveBeenCalledWith("blob_thumbnail", {
+      blake3: "some-blob-id",
+      size: 64,
+    });
   });
 });

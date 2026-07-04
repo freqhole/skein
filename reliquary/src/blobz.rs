@@ -5,6 +5,7 @@
 //! with metadata + iroh hash. no entity_id, no domain — a blob is a blob.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -22,6 +23,9 @@ pub enum BlobError {
 
     #[error("blake3 mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
+
+    #[error("upload cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +195,7 @@ impl Store {
         filename: Option<String>,
         mime: Option<String>,
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+        cancel: Option<&AtomicBool>,
     ) -> Result<BlobRef, BlobError> {
         if !abs_path.is_absolute() {
             return Err(BlobError::Io(std::io::Error::new(
@@ -210,6 +215,11 @@ impl Store {
         const PROGRESS_REPORT_BYTES: u64 = 4 * 1024 * 1024;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
+            if let Some(c) = cancel {
+                if c.load(Ordering::Relaxed) {
+                    return Err(BlobError::Cancelled);
+                }
+            }
             let n = file.read(&mut buf).await?;
             if n == 0 {
                 break;
@@ -343,6 +353,40 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// the absolute path to the blob-files directory.
+    /// used by callers that need to stat the filesystem (e.g. admin DiskUsage).
+    pub fn blob_dir(&self) -> &std::path::Path {
+        &self.blob_dir
+    }
+
+    /// sum of all blob sizes and row count — used by the admin `DiskUsage` request.
+    pub async fn total_usage(&self) -> Result<(u64, u64), BlobError> {
+        let row = sqlx::query!(
+            r#"SELECT COALESCE(SUM(size), 0) as "total_bytes!: i64",
+                      COUNT(*)              as "count!: i64"
+               FROM blobz"#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((row.total_bytes as u64, row.count as u64))
+    }
+
+    /// all blobs, most recently created first, without pagination.
+    /// used by the admin `BlobUsage` request.
+    pub async fn list_all(&self) -> Result<Vec<BlobRef>, BlobError> {
+        let rows = sqlx::query_as!(
+            BlobRow,
+            r#"SELECT blake3 as "blake3!", iroh_hash as "iroh_hash!", filename, mime,
+                      size as "size!", path as "path!", external as "external!",
+                      created_at as "created_at!"
+               FROM blobz
+               ORDER BY created_at DESC"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 }
 
@@ -573,6 +617,7 @@ mod tests {
                 Some("original.bin".into()),
                 Some("application/octet-stream".into()),
                 None,
+                None,
             )
             .await
             .expect("register_path");
@@ -588,7 +633,7 @@ mod tests {
 
         // dedup on a second call with the same content.
         let again = store
-            .register_path(&src_path, None, None, None)
+            .register_path(&src_path, None, None, None, None)
             .await
             .expect("register_path again");
         assert_eq!(again.blake3, blob.blake3);
@@ -614,7 +659,7 @@ mod tests {
         };
 
         let blob = store
-            .register_path(&src_path, None, None, Some(&cb))
+            .register_path(&src_path, None, None, Some(&cb), None)
             .await
             .expect("register_path");
 
@@ -634,9 +679,66 @@ mod tests {
     async fn register_path_rejects_relative_paths() {
         let (store, _tmp) = make_store().await;
         let err = store
-            .register_path(Path::new("relative/path.bin"), None, None, None)
+            .register_path(Path::new("relative/path.bin"), None, None, None, None)
             .await
             .expect_err("relative path must be rejected");
         assert!(matches!(err, BlobError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn register_path_cancelled_flag_returns_cancelled_error() {
+        use std::sync::atomic::AtomicBool;
+        let (store, _tmp) = make_store().await;
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let src_path = src_dir.path().join("cancel.bin");
+        // large enough that the cancel check fires during the read loop.
+        let payload = vec![5u8; 2 * 1024 * 1024];
+        tokio::fs::write(&src_path, &payload).await.unwrap();
+
+        // pre-set the cancel flag before calling register_path so it
+        // fires on the very first loop iteration.
+        let cancel = AtomicBool::new(true);
+        let err = store
+            .register_path(&src_path, None, None, None, Some(&cancel))
+            .await
+            .expect_err("should have been cancelled");
+        assert!(matches!(err, BlobError::Cancelled));
+        assert_eq!(err.to_string(), "upload cancelled");
+    }
+
+    #[tokio::test]
+    async fn total_usage_sums_sizes_and_counts_rows() {
+        let (store, _tmp) = make_store().await;
+
+        // empty store — both values should be zero
+        let (bytes, count) = store.total_usage().await.unwrap();
+        assert_eq!(bytes, 0);
+        assert_eq!(count, 0);
+
+        store
+            .insert("h1".into(), None, None, b"hello")
+            .await
+            .unwrap();
+        store
+            .insert("h2".into(), None, None, b"world!!")
+            .await
+            .unwrap();
+
+        let (bytes, count) = store.total_usage().await.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(bytes, (b"hello".len() + b"world!!".len()) as u64);
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_every_row_without_limit() {
+        let (store, _tmp) = make_store().await;
+        for i in 0u8..5 {
+            store
+                .insert(format!("h{i}"), None, None, &[i; 4])
+                .await
+                .unwrap();
+        }
+        let all = store.list_all().await.unwrap();
+        assert_eq!(all.len(), 5);
     }
 }

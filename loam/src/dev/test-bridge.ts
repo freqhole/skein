@@ -43,13 +43,33 @@ const DEFAULT_MAX_ADMIN_RESPONSE_BYTES = 1024 * 1024;
 export type AdminRequest =
   | { kind: "allow"; nodeId: string }
   | { kind: "list" }
-  | { kind: "remove"; nodeId: string };
+  | { kind: "remove"; nodeId: string }
+  | { kind: "diskUsage" }
+  | { kind: "canvasUsage" }
+  | { kind: "blobUsage" }
+  | { kind: "deleteBlobs"; blake3s: string[] };
 
 /** a single friendz row, as reported by an `AdminResponse::List`. */
 export interface AdminFriendSummary {
   nodeId: string;
   status: string;
   updatedAt: number;
+}
+
+/** per-canvas blob usage, as reported by `AdminResponse::CanvasUsage`. */
+export interface AdminCanvasUsageSummary {
+  canvasDocId: string;
+  blobCount: number;
+  totalBytes: number;
+}
+
+/** a single blob row, as reported by `AdminResponse::BlobUsage`. */
+export interface AdminBlobUsageSummary {
+  blake3: string;
+  filename: string | null;
+  mime: string | null;
+  size: number;
+  external: boolean;
 }
 
 /**
@@ -61,7 +81,17 @@ export type AdminResponse =
   | { kind: "list"; friends: AdminFriendSummary[] }
   | { kind: "removed"; nodeId: string }
   | { kind: "notAdmin" }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string }
+  | {
+      kind: "diskUsage";
+      totalBlobBytes: number;
+      blobCount: number;
+      diskAvailableBytes: number | null;
+      diskTotalBytes: number | null;
+    }
+  | { kind: "canvasUsage"; canvases: AdminCanvasUsageSummary[] }
+  | { kind: "blobUsage"; blobs: AdminBlobUsageSummary[] }
+  | { kind: "deleteBlobsResult"; deleted: number; failed: string[] };
 
 /**
  * build the CBOR-ready wire value for an `AdminRequest`, matching serde's
@@ -78,6 +108,14 @@ function toWireAdminRequest(request: AdminRequest): unknown {
       return "List";
     case "remove":
       return { Remove: { node_id: request.nodeId } };
+    case "diskUsage":
+      return "DiskUsage";
+    case "canvasUsage":
+      return "CanvasUsage";
+    case "blobUsage":
+      return "BlobUsage";
+    case "deleteBlobs":
+      return { DeleteBlobs: { blake3s: request.blake3s } };
   }
 }
 
@@ -112,6 +150,59 @@ function fromWireAdminResponse(wire: unknown): AdminResponse {
     if ("Error" in obj) {
       const v = obj.Error as { message: string };
       return { kind: "error", message: v.message };
+    }
+    if ("DiskUsage" in obj) {
+      const v = obj.DiskUsage as {
+        total_blob_bytes: number;
+        blob_count: number;
+        disk_available_bytes: number | null;
+        disk_total_bytes: number | null;
+      };
+      return {
+        kind: "diskUsage",
+        totalBlobBytes: v.total_blob_bytes,
+        blobCount: v.blob_count,
+        diskAvailableBytes: v.disk_available_bytes ?? null,
+        diskTotalBytes: v.disk_total_bytes ?? null,
+      };
+    }
+    if ("CanvasUsage" in obj) {
+      const v = obj.CanvasUsage as {
+        canvases: Array<{ canvas_doc_id: string; blob_count: number; total_bytes: number }>;
+      };
+      return {
+        kind: "canvasUsage",
+        canvases: v.canvases.map((c) => ({
+          canvasDocId: c.canvas_doc_id,
+          blobCount: c.blob_count,
+          totalBytes: c.total_bytes,
+        })),
+      };
+    }
+    if ("BlobUsage" in obj) {
+      const v = obj.BlobUsage as {
+        blobs: Array<{
+          blake3: string;
+          filename: string | null;
+          mime: string | null;
+          size: number;
+          external: boolean;
+        }>;
+      };
+      return {
+        kind: "blobUsage",
+        blobs: v.blobs.map((b) => ({
+          blake3: b.blake3,
+          filename: b.filename,
+          mime: b.mime,
+          size: b.size,
+          external: b.external,
+        })),
+      };
+    }
+    if ("DeleteBlobsResult" in obj) {
+      const v = obj.DeleteBlobsResult as { deleted: number; failed: string[] };
+      return { kind: "deleteBlobsResult", deleted: v.deleted, failed: v.failed };
     }
   }
   throw new Error(`unrecognized AdminResponse wire shape: ${JSON.stringify(wire)}`);

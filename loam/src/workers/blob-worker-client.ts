@@ -230,19 +230,30 @@ export async function writeBlobToOpfs(blobId: string, buffer: ArrayBuffer): Prom
  * thread ever holds the whole payload. each chunk buffer is transferred
  * (zero-copy) across the worker boundary.
  *
+ * `onProgress` reports bytes pushed / file size (0..1) per chunk.
+ * `signal` cancels between chunks: the worker session is aborted (temp
+ * file cleaned up) and a DOMException AbortError is thrown.
+ *
  * returns { blake3, size } — the file lands in OPFS under its blake3
  * content address. throws when streaming isn't available (no worker, no
  * OPFS sync handles, midden stub); callers should fall back to the
  * one-shot processBlobBytes path.
  */
-export async function streamFileToOpfs(file: File): Promise<{ blake3: string; size: number }> {
+export async function streamFileToOpfs(
+  file: File,
+  options?: { onProgress?: (fraction: number) => void; signal?: AbortSignal }
+): Promise<{ blake3: string; size: number }> {
   const worker = await getBlobWorker();
   if (!worker) throw new Error("streaming upload unavailable: no blob worker");
 
   const sessionId = await worker.uploadBegin();
   const reader = file.stream().getReader();
+  let bytesPushed = 0;
   try {
     for (;;) {
+      if (options?.signal?.aborted) {
+        throw new DOMException("upload cancelled", "AbortError");
+      }
       const { done, value } = await reader.read();
       if (done) break;
       // chunks are usually freshly-allocated exact buffers, but a view into
@@ -251,7 +262,12 @@ export async function streamFileToOpfs(file: File): Promise<{ blake3: string; si
         value.byteOffset === 0 && value.byteLength === value.buffer.byteLength
           ? value.buffer
           : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+      const chunkLen = value.byteLength;
       await worker.uploadPush(sessionId, Comlink.transfer(exact, [exact]));
+      bytesPushed += chunkLen;
+      if (options?.onProgress && file.size > 0) {
+        options.onProgress(Math.min(1, bytesPushed / file.size));
+      }
     }
     return await worker.uploadFinish(sessionId);
   } catch (err) {

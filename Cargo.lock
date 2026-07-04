@@ -3749,6 +3749,7 @@ dependencies = [
  "indexmap",
  "iroh",
  "iroh-blobs",
+ "libc",
  "serde",
  "serde_bytes",
  "serde_json",

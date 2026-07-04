@@ -313,7 +313,8 @@ export class PropertyTray {
       live.widgetDoc,
       live.entry,
       live.ctrl.widgetActions,
-      live.ctrl.editableProps
+      live.ctrl.editableProps,
+      live.ctrl.widgetInfoRows
     );
     this.positionNextTo(live.frame.root.x, live.frame.root.y, live.entry.width);
   }
@@ -327,7 +328,8 @@ export class PropertyTray {
     doc: WidgetDoc<any> | null,
     entry: WidgetEntry,
     widgetActions?: WidgetAction[],
-    controllerProps?: WidgetPropDef[]
+    controllerProps?: WidgetPropDef[],
+    widgetInfoRows?: () => Array<{ label: string; value: string }>
   ): void {
     // tear down any previous tray state
     this.clearControls();
@@ -392,6 +394,33 @@ export class PropertyTray {
           this.relayoutControls();
         }
       });
+    }
+
+    // read-only info rows (e.g. the file widget's "who has this file" list)
+    const infoRows = widgetInfoRows?.() ?? [];
+    if (infoRows.length) {
+      y += ROW_GAP;
+      for (const row of infoRows) {
+        const rowContainer = new Container();
+        const rowText = new Text({
+          text: row.label ? `${row.label}: ${row.value}` : row.value,
+          style: {
+            fontFamily: "system-ui, sans-serif",
+            fontSize: 10,
+            fill: 0x9999aa,
+            align: "left",
+            wordWrap: true,
+            wordWrapWidth: fieldWidth,
+          },
+          resolution: 2,
+        });
+        rowContainer.addChild(rowText);
+        this.contentContainer.addChild(rowContainer);
+        rowContainer.y = Math.round(y);
+        // reuse the action-container cleanup path — clearControls destroys these
+        this.actionContainers.push(rowContainer);
+        y += Math.max(14, rowText.height) + 4;
+      }
     }
 
     // widget actions (e.g. "tidy" in the bin widget)

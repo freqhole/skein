@@ -46,6 +46,28 @@ impl Drop for DownloadCancelGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// cancel registry for in-flight blob uploads (blob_insert_from_path)
+// ---------------------------------------------------------------------------
+
+/// global map from upload_id -> cancel flag for any in-flight `blob_insert_from_path`.
+/// the flag is set by `blob_insert_cancel`; the hashing loop checks it each
+/// iteration and aborts when set.
+static UPLOAD_CANCELS: LazyLock<StdMutex<HashMap<String, Arc<AtomicBool>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// RAII guard that removes the cancel flag for `upload_id` from `UPLOAD_CANCELS`
+/// when dropped, so the registry never accumulates stale entries.
+struct UploadCancelGuard(String);
+
+impl Drop for UploadCancelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = UPLOAD_CANCELS.lock() {
+            map.remove(&self.0);
+        }
+    }
+}
+
 /// runtime state for the one-and-only tauri command.
 ///
 /// the pool and stores are always alive — they exist for the lifetime of
@@ -390,6 +412,9 @@ async fn dispatch(
         "blob_insert_from_path" => {
             blob_insert_from_path(decode("blob_insert_from_path", payload)?, app, state).await
         }
+        "blob_insert_cancel" => {
+            blob_insert_cancel(decode("blob_insert_cancel", payload)?).await
+        }
         "blob_iroh_ensure" => {
             blob_iroh_ensure(decode("blob_iroh_ensure", payload)?, state).await
         }
@@ -406,6 +431,12 @@ async fn dispatch(
         // pdf page rendering (peedeeeff widget)
         "pdf_render_pages" => {
             pdf_render_pages(decode("pdf_render_pages", payload)?, state).await
+        }
+
+        // generate a thumbnail for a stored blob. supports image/*, application/pdf,
+        // and video/* source types. returns { data: <base64>, mime } or { data: null }.
+        "blob_thumbnail" => {
+            blob_thumbnail(decode("blob_thumbnail", payload)?, state).await
         }
 
         // link widget unfurl — fetch a URL server-side (no CORS restriction,
@@ -1249,10 +1280,29 @@ async fn blob_insert_from_path(
     let on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)> =
         progress_cb.as_ref().map(|f| f as &(dyn Fn(u64, u64) + Send + Sync));
 
+    // register a cancel flag so `blob_insert_cancel` can abort the hashing pass.
+    // the guard removes the entry from the registry on ALL exit paths.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let _upload_guard = if let Some(id) = &upload_id {
+        if let Ok(mut map) = UPLOAD_CANCELS.lock() {
+            map.insert(id.clone(), Arc::clone(&cancel_flag));
+        }
+        Some(UploadCancelGuard(id.clone()))
+    } else {
+        None
+    };
+
     let blob = state
         .blobz
-        .register_path(&path, filename, args.mime, on_progress)
-        .await?;
+        .register_path(&path, filename, args.mime, on_progress, Some(&cancel_flag))
+        .await
+        .map_err(|e| {
+            if matches!(e, blobz::BlobError::Cancelled) {
+                DispatchError::Stream("upload cancelled".to_string())
+            } else {
+                DispatchError::Blob(e)
+            }
+        })?;
     prewarm_fs_store(state, &blob).await;
 
     // mirror the bytes back to the JS caller only for small files — see
@@ -1277,6 +1327,29 @@ async fn blob_insert_from_path(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct BlobInsertCancelArgs {
+    upload_id: String,
+}
+
+/// signal an in-flight `blob_insert_from_path` to stop after its current chunk.
+///
+/// sets the cancel flag registered by the upload loop. returns `{ "cancelled": true }`
+/// if the flag was found (upload was still in flight), `false` if it had already
+/// finished or the upload_id was not registered with a cancel flag.
+async fn blob_insert_cancel(args: BlobInsertCancelArgs) -> Result<Value, DispatchError> {
+    let cancelled = match UPLOAD_CANCELS.lock() {
+        Ok(map) => match map.get(&args.upload_id) {
+            Some(flag) => {
+                flag.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        },
+        Err(_) => false,
+    };
+    Ok(json!({ "cancelled": cancelled }))
+}
 
 #[derive(Debug, Deserialize)]
 struct BlobIrohDownloadArgs {
@@ -1720,6 +1793,41 @@ fn persist_hub_state(state: &AppState, hub_enabled: bool) {
 struct PdfRenderPagesArgs {
     /// blake3 hex of the source pdf blob (already inserted via blob_insert).
     blake3: String,
+}
+
+// ---------------------------------------------------------------------------
+// blob thumbnail
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct BlobThumbnailArgs {
+    blake3: String,
+    size: Option<u32>,
+}
+
+async fn blob_thumbnail(
+    args: BlobThumbnailArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    let size = args.size.unwrap_or(200);
+
+    let blob = state
+        .blobz
+        .get(&args.blake3)
+        .await?
+        .ok_or(DispatchError::NotFound)?;
+
+    let path = state.blobz.path_for(&blob);
+    let mime = blob.mime.as_deref().unwrap_or("application/octet-stream");
+
+    let result = crate::thumbnail::generate_thumbnail(&path, mime, size)
+        .await
+        .map_err(|e| DispatchError::Blob(blobz::BlobError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))))?;
+
+    Ok(result)
 }
 
 /// render every page of a pdf to per-page png blobs.

@@ -262,6 +262,12 @@ export interface WidgetController {
   /** optional action buttons shown in the property tray when this widget is selected.
    *  used for widget-specific operations like "tidy" in the bin widget. */
   widgetActions?: WidgetAction[];
+
+  /** read-only label/value rows rendered in the property tray above the
+   *  widget action buttons (e.g. "who has this file" for file widgets).
+   *  called when the tray opens for this widget — values are a snapshot,
+   *  not live-updating. */
+  widgetInfoRows?: () => Array<{ label: string; value: string }>;
   /**
    * instance-level editable props override. when present, the property tray
    * uses these instead of the factory's static `editableProps`. use this

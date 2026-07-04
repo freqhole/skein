@@ -42,6 +42,7 @@ import {
   resolveBlob,
   getBlobData,
   classifyDomain,
+  deleteBlob,
 } from "../storage/skein-blob-store";
 import {
   base64Decode,
@@ -287,13 +288,18 @@ export interface UploadOptions {
   /** wait for thumbnail job to complete before returning (default: true) */
   waitForCompletion?: boolean;
   /**
-   * incremental progress during upload, 0..1. tauri mode only (real,
-   * byte-level progress from the rust-side streaming hash pass — see
-   * `blob_insert_from_path`'s `blob-insert-progress` event). never called
-   * in browser mode (the browser-mode upload path has no incremental
-   * progress source of its own).
+   * incremental progress during upload, 0..1. tauri mode reports the
+   * rust-side streaming hash pass (`blob-insert-progress` events); browser
+   * mode reports bytes streamed into OPFS for large files (small files
+   * complete in one shot and only report 1 at the end).
    */
   onProgress?: (fraction: number) => void;
+  /** abort signal — cancels the upload. browser mode aborts the worker
+   *  upload session between chunks; tauri mode dispatches
+   *  blob_insert_cancel for the in-flight hashing pass. a cancelled upload
+   *  rejects with a DOMException AbortError (browser) or an error whose
+   *  message contains "upload cancelled" (tauri). */
+  signal?: AbortSignal;
 }
 
 /** options for thumbnail fetching */
@@ -354,6 +360,37 @@ const localityCache = new Map<string, BlobLocalityInfo>();
 
 function cacheKey(blobId: string, size: number): string {
   return `${blobId}:${size}`;
+}
+
+/**
+ * delete the LOCAL copy of a blob (OPFS bytes + IndexedDB record + session
+ * caches) to reclaim disk space, without touching the widget doc — the file
+ * widget stays on the canvas and the blob becomes snatchable again from
+ * whoever still has it (e.g. a hub peer). browser-only: tauri blob storage
+ * is the durable native store and is managed separately.
+ *
+ * records can be keyed by either the blake3 or a legacy sha256 blob id, so
+ * both ids are cleaned when known.
+ */
+export async function freeUpLocalBlobCopy(
+  blobId: string,
+  blake3?: string | null
+): Promise<void> {
+  if (isTauriMode()) {
+    throw new Error("free up space is browser-only — tauri manages native blob storage");
+  }
+  const ids = [...new Set([blobId, blake3 ?? ""].filter(Boolean))];
+  for (const id of ids) {
+    try {
+      await deleteBlob(id);
+    } catch (err) {
+      log.debug(TAG, `freeUpLocalBlobCopy: deleteBlob(${id.slice(0, 12)}...) failed:`, err);
+    }
+    localityCache.delete(id);
+    thumbnailCache.delete(cacheKey(id, 200));
+    thumbnailCache.delete(cacheKey(id, 50));
+  }
+  log.debug(TAG, `freed local copy of blob ${blobId.slice(0, 12)}...`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2302,7 +2339,14 @@ export async function uploadFile(
       throw new Error("no File object available in browser mode");
     }
 
-    const record = await storeBlobFromFile(picked.file);
+    const record = await storeBlobFromFile(picked.file, undefined, {
+      onProgress: options?.onProgress,
+      signal: options?.signal,
+    });
+
+    if (options?.signal?.aborted) {
+      throw new DOMException("upload cancelled", "AbortError");
+    }
 
     // generate browser-side thumbnail for images
     let thumbnailDataUrl: string | null = null;
@@ -2346,6 +2390,19 @@ export async function uploadFile(
   const mime = guessMimeFromFilename(picked.filename);
   const uploadId = crypto.randomUUID();
 
+  // wire cancellation: flag the rust-side hashing pass by upload id. the
+  // dispatch rejects with "upload cancelled" in its message when the flag
+  // lands before the pass finishes.
+  let onAbort: (() => void) | null = null;
+  if (options?.signal) {
+    onAbort = () => {
+      void dispatch("blob_insert_cancel", { upload_id: uploadId }).catch((err) => {
+        log.debug(TAG, "blob_insert_cancel dispatch failed (non-fatal):", err);
+      });
+    };
+    options.signal.addEventListener("abort", onAbort, { once: true });
+  }
+
   let unlisten: (() => void) | null = null;
   if (options?.onProgress) {
     const onProgress = options.onProgress;
@@ -2384,9 +2441,15 @@ export async function uploadFile(
       upload_id: uploadId,
     })) as typeof response;
   } catch (err) {
+    if (options?.signal?.aborted) {
+      throw new DOMException("upload cancelled", "AbortError");
+    }
     throw new Error(formatUploadError(err));
   } finally {
     unlisten?.();
+    if (onAbort && options?.signal) {
+      options.signal.removeEventListener("abort", onAbort);
+    }
   }
 
   const meta = response.meta;
@@ -2530,24 +2593,16 @@ async function fetchThumbnailLocal(blobId: string, size: number): Promise<string
   }
 
   try {
-    const response = await invoke<any>("api_call", {
-      path: "/api/blobs/thumbnail_data",
-      body: {
-        blob_id: blobId,
-        size,
-      },
-    });
+    const response = (await dispatch("blob_thumbnail", {
+      blake3: blobId,
+      size,
+    })) as { data: string | null; mime?: string } | null;
 
-    if (!response.success || !response.data) {
+    if (!response?.data || !response.mime) {
       return null;
     }
 
-    const { data, mime } = response.data;
-    if (!data || !mime) {
-      return null;
-    }
-
-    return `data:${mime};base64,${data}`;
+    return `data:${response.mime};base64,${response.data}`;
   } catch {
     // not an error — just means the blob isn't available locally
     return null;
@@ -2571,86 +2626,49 @@ async function fetchThumbnailFromPeers(
     return null;
   }
 
-  if (!isTauriMode()) {
-    try {
-      const node = await getMiddenNode();
-      const nodeAny = node as any;
+  try {
+    const node = await getMiddenNode();
+    const nodeAny = node as any;
 
-      if (typeof nodeAny.proxy_request !== "function") {
-        return null;
-      }
-
-      const fetchFromBrowserPeer = async (peerAddr: string): Promise<string> => {
-        const result = await withPeerTimeout<any>(
-          nodeAny.proxy_request(
-            peerAddr,
-            "POST",
-            "/api/blobs/thumbnail_data",
-            JSON.stringify({ blob_id: blobId, size })
-          )
-        );
-
-        if (result.status !== 200) throw new Error("non-200 status");
-
-        const parsed = JSON.parse(result.body);
-        if (!parsed.success || !parsed.data) throw new Error("unsuccessful response");
-
-        const { data, mime } = parsed.data;
-        if (!data || !mime) throw new Error("missing data or mime");
-
-        log.debug(
-          TAG,
-          `fetched thumbnail for ${blobId.slice(0, 8)}... from browser peer ${peerAddr.slice(0, 16)}...`
-        );
-        return `data:${mime};base64,${data}`;
-      };
-
-      for (let i = 0; i < peerIds.length; i += 2) {
-        const batch = peerIds.slice(i, i + 2);
-        try {
-          return await Promise.any(batch.map((addr) => fetchFromBrowserPeer(addr)));
-        } catch {
-          continue;
-        }
-      }
-    } catch (err) {
-      log.debug(TAG, "browser peer thumbnail fetch setup failed:", err);
+    if (typeof nodeAny.proxy_request !== "function") {
+      return null;
     }
-    return null;
-  }
 
-  const fetchFromTauriPeer = async (peerAddr: string): Promise<string> => {
-    const result = await withPeerTimeout(
-      invoke<any>("p2p_proxy_request", {
-        peerAddr,
-        method: "POST",
-        path: "/api/blobs/thumbnail_data",
-        body: JSON.stringify({ blob_id: blobId, size }),
-      })
-    );
+    const fetchFromPeer = async (peerAddr: string): Promise<string> => {
+      const result = await withPeerTimeout<any>(
+        nodeAny.proxy_request(
+          peerAddr,
+          "POST",
+          "/api/blobs/thumbnail_data",
+          JSON.stringify({ blob_id: blobId, size })
+        )
+      );
 
-    if (result.status !== 200) throw new Error("non-200 status");
+      if (result.status !== 200) throw new Error("non-200 status");
 
-    const parsed = JSON.parse(result.body);
-    if (!parsed.success || !parsed.data) throw new Error("unsuccessful response");
+      const parsed = JSON.parse(result.body);
+      if (!parsed.success || !parsed.data) throw new Error("unsuccessful response");
 
-    const { data, mime } = parsed.data;
-    if (!data || !mime) throw new Error("missing data or mime");
+      const { data, mime } = parsed.data;
+      if (!data || !mime) throw new Error("missing data or mime");
 
-    log.debug(
-      TAG,
-      `fetched thumbnail for ${blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
-    );
-    return `data:${mime};base64,${data}`;
-  };
+      log.debug(
+        TAG,
+        `fetched thumbnail for ${blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
+      );
+      return `data:${mime};base64,${data}`;
+    };
 
-  for (let i = 0; i < peerIds.length; i += 2) {
-    const batch = peerIds.slice(i, i + 2);
-    try {
-      return await Promise.any(batch.map((addr) => fetchFromTauriPeer(addr)));
-    } catch {
-      continue;
+    for (let i = 0; i < peerIds.length; i += 2) {
+      const batch = peerIds.slice(i, i + 2);
+      try {
+        return await Promise.any(batch.map((addr) => fetchFromPeer(addr)));
+      } catch {
+        continue;
+      }
     }
+  } catch (err) {
+    log.debug(TAG, "peer thumbnail fetch setup failed:", err);
   }
 
   return null;

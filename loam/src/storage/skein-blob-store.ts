@@ -258,7 +258,11 @@ export async function storeBlob(
  * sync-access-handle writes) so the whole payload never exists in memory;
  * small files use the one-shot worker pipeline.
  */
-export async function storeBlobFromFile(file: File, domain?: string): Promise<SkeinBlobRecord> {
+export async function storeBlobFromFile(
+  file: File,
+  domain?: string,
+  options?: { onProgress?: (fraction: number) => void; signal?: AbortSignal }
+): Promise<SkeinBlobRecord> {
   const mime = file.type || "application/octet-stream";
   const resolvedDomainEarly = domain ?? classifyDomain(mime);
 
@@ -267,7 +271,7 @@ export async function storeBlobFromFile(file: File, domain?: string): Promise<Sk
   // can't be referenced by an old sha256 doc id, so it isn't computed here.
   if (file.size >= STREAM_UPLOAD_THRESHOLD) {
     try {
-      const { blake3, size } = await streamFileToOpfs(file);
+      const { blake3, size } = await streamFileToOpfs(file, options);
       const existingStreamed = await getBlobRecord(blake3);
       if (existingStreamed) return existingStreamed;
       const streamedRecord: SkeinBlobRecord = {
@@ -286,8 +290,14 @@ export async function storeBlobFromFile(file: File, domain?: string): Promise<Sk
       await putBlobRecord(streamedRecord);
       return (await getBlobRecord(blake3))!;
     } catch (err) {
+      // a deliberate cancel must not fall through to the buffered path
+      if (err instanceof DOMException && err.name === "AbortError") throw err;
       log.warn(TAG, "streaming upload failed, falling back to buffered path:", err);
     }
+  }
+
+  if (options?.signal?.aborted) {
+    throw new DOMException("upload cancelled", "AbortError");
   }
 
   const buffer = await file.arrayBuffer();
