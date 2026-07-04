@@ -657,17 +657,11 @@ impl BlobSnatcher {
             "downloading blob from peer"
         );
 
-        // download via iroh-blobs verified transfer
-        let data = self.download_blob(&blob_ref.blake3, &provider).await?;
+        // download via iroh-blobs verified transfer, stream to canonical blobz path
+        self.download_blob(&blob_ref.blake3, &provider).await?;
 
-        tracing::info!(
-            blake3 = trunc(&blob_ref.blake3),
-            size = data.len(),
-            "blob downloaded, ingesting into grimoire"
-        );
-
-        // ingest into grimoire
-        self.ingest_blob(blob_ref, data).await?;
+        // register metadata in blobz
+        self.ingest_blob(blob_ref).await?;
 
         // mark ourselves in the widget state doc's snatchedBy list
         self.mark_snatched(&blob_ref.widget_doc_id).await;
@@ -814,12 +808,13 @@ impl BlobSnatcher {
         }
     }
 
-    /// download a blob via iroh-blobs verified transfer.
+    /// download a blob via iroh-blobs verified transfer and stream it to the
+    /// canonical blobz content-addressed path. no full in-memory buffer.
     async fn download_blob(
         &self,
         blake3_hash: &str,
         provider_node_id: &str,
-    ) -> Result<Vec<u8>, SnatchError> {
+    ) -> Result<(), SnatchError> {
         let hash: Hash = blake3_hash
             .parse()
             .map_err(|e| SnatchError::InvalidHash(format!("{e}")))?;
@@ -837,65 +832,45 @@ impl BlobSnatcher {
             .await
             .map_err(|_| SnatchError::DownloadFailed("peer semaphore closed".into()))?;
 
-        // start the download
+        // start the download; use an inactivity timeout (resets on each progress event)
+        // so large/slow transfers aren't killed by a wall-clock limit
         let progress = self.downloader.download(hash_and_format, [node_id]);
-
-        // consume the progress stream, watching for errors
-        let stream_result = tokio::time::timeout(
-            Duration::from_secs(DOWNLOAD_TIMEOUT_SECS),
-            consume_download_progress(progress, blake3_hash),
-        )
-        .await
-        .map_err(|_| SnatchError::DownloadTimeout)?;
-
-        stream_result?;
+        consume_download_progress(progress, blake3_hash).await?;
 
         tracing::debug!(
             blake3 = trunc(blake3_hash),
-            "download stream completed, reading blob from store"
+            "download stream completed, exporting to blobz canonical path"
         );
 
-        // read the downloaded blob from the store
-        let bytes = match self.fs_store.get_bytes(hash).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(
-                    blake3 = trunc(blake3_hash),
-                    error = %e,
-                    error_debug = ?e,
-                    hash = %hash,
-                    "store.get_bytes failed after download — blob may not have been persisted"
-                );
-                return Err(SnatchError::StoreRead(format!("{e}")));
-            }
-        };
+        // stream-export from the FsStore straight to blobz's canonical path —
+        // no Vec<u8> allocation regardless of blob size
+        let target = self
+            .blobz
+            .prepare_canonical_path(blake3_hash)
+            .await
+            .map_err(|e| SnatchError::DownloadFailed(format!("prepare blobz path: {e}")))?;
+        self.fs_store
+            .blobs()
+            .export(hash, &target)
+            .await
+            .map_err(|e| SnatchError::DownloadFailed(format!("export to blobz path: {e}")))?;
 
         tracing::debug!(
             blake3 = trunc(blake3_hash),
-            size = bytes.len(),
-            "blob read from store successfully"
+            path = %target.display(),
+            "blob exported to canonical blobz path"
         );
 
-        Ok(bytes.to_vec())
+        Ok(())
     }
 
-    /// ingest downloaded blob data into the skein blobz store.
+    /// register blob metadata into the skein blobz store.
     ///
-    /// blake3 is canonical here — sha256 is no longer computed (see phase-2
-    /// design decisions). `blobz::Store::insert` handles disk write +
-    /// metadata row, recomputes blake3 from `data`, and is idempotent if
-    /// the blob is already present.
-    async fn ingest_blob(&self, blob_ref: &BlobRef, data: Vec<u8>) -> Result<(), SnatchError> {
-        // race-condition guard: another task may have ingested this blob
-        // while the download was in flight
-        if let Ok(Some(_)) = self.blobz.get(&blob_ref.blake3).await {
-            tracing::debug!(
-                blake3 = trunc(&blob_ref.blake3),
-                "blob appeared in blobz during download"
-            );
-            return Ok(());
-        }
-
+    /// the bytes must already be on disk at the canonical content-addressed
+    /// path (written by `download_blob` via `prepare_canonical_path` +
+    /// `fs_store.blobs().export`). `register_ingested` reads size from fs
+    /// metadata and inserts the DB row; no re-hashing or full buffer needed.
+    async fn ingest_blob(&self, blob_ref: &BlobRef) -> Result<(), SnatchError> {
         let filename = if blob_ref.filename.is_empty() {
             None
         } else {
@@ -907,11 +882,9 @@ impl BlobSnatcher {
             Some(blob_ref.mime.clone())
         };
 
-        // iroh_hash for verified-download lookup is the same blake3 hex
-        // (iroh-blobs uses BLAKE3 internally).
         let stored = self
             .blobz
-            .insert(blob_ref.blake3.clone(), filename, mime, &data)
+            .register_ingested(blob_ref.blake3.clone(), filename, mime)
             .await
             .map_err(|e| SnatchError::Ingest(format!("{e}")))?;
 
@@ -1081,7 +1054,18 @@ async fn consume_download_progress(
     let mut last_error: Option<String> = None;
     let mut event_count: u32 = 0;
 
-    while let Some(event) = stream.next().await {
+    // inactivity timeout: resets on each progress event so large/slow blobs
+    // aren't killed mid-transfer. DOWNLOAD_TIMEOUT_SECS is the maximum gap
+    // between events, not a wall-clock budget for the whole transfer.
+    loop {
+        let maybe_event =
+            tokio::time::timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS), stream.next())
+                .await
+                .map_err(|_| SnatchError::DownloadTimeout)?;
+        let event = match maybe_event {
+            Some(e) => e,
+            None => break,
+        };
         event_count += 1;
         match &event {
             DownloadProgressItem::Error(e) => {

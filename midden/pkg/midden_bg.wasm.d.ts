@@ -40,8 +40,8 @@ export const middennode_download_verified_by_id_progress: (a: number, b: number,
 export const middennode_download_verified_streaming: (a: number, b: number, c: number, d: number, e: number, f: number, g: any, h: any, i: number) => any;
 export const middennode_download_verified_streaming_with_ensure: (a: number, b: number, c: number, d: number, e: number, f: number, g: any, h: any, i: number) => any;
 export const middennode_download_verified_with_ensure: (a: number, b: number, c: number, d: number, e: number) => any;
-export const middennode_download_verified_with_ensure_progress: (a: number, b: number, c: number, d: number, e: number, f: number, g: any) => any;
-export const middennode_download_verified_with_progress: (a: number, b: number, c: number, d: number, e: number, f: number, g: any) => any;
+export const middennode_download_verified_with_ensure_progress: (a: number, b: number, c: number, d: number, e: number, f: number, g: any, h: number) => any;
+export const middennode_download_verified_with_progress: (a: number, b: number, c: number, d: number, e: number, f: number, g: any, h: number) => any;
 export const middennode_ensure_blob: (a: number, b: number, c: number, d: number, e: number) => any;
 export const middennode_fetch_hello_image: (a: number, b: number, c: number) => any;
 export const middennode_has_active_blob: (a: number, b: number, c: number) => number;

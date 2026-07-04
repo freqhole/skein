@@ -1285,12 +1285,15 @@ impl MiddenNode {
     /// same as download_verified but calls on_progress(fraction) where
     /// fraction is bytes_received / total_size (0.0 to 1.0).
     /// total_size should come from the automerge doc's size field.
+    /// `cancel`: optional cooperative cancellation (pause) — see
+    /// download_verified_streaming for the semantics.
     pub async fn download_verified_with_progress(
         &self,
         peer_addr: &str,
         blake3_hash: &str,
         total_size: f64,
         on_progress: &JsFunction,
+        cancel: Option<CancelToken>,
     ) -> Result<Uint8Array, JsError> {
         let addr = parse_peer_addr(peer_addr).map_err(|e| JsError::new(&e))?;
 
@@ -1315,7 +1318,24 @@ impl MiddenNode {
         let mut had_error = false;
         let mut last_error: Option<String> = None;
 
-        while let Some(event) = stream.next().await {
+        loop {
+            // cooperative cancellation between progress events. the partial
+            // stays in the store and the hash is pinned so gc won't sweep it
+            // before a resume.
+            let event = if let Some(token) = &cancel {
+                tokio::select! {
+                    event = stream.next() => event,
+                    _ = token.cancelled() => {
+                        if let Ok(mut set) = self.protected_hashes.lock() {
+                            set.insert(hash);
+                        }
+                        return Err(JsError::new(DOWNLOAD_CANCELLED_MSG));
+                    }
+                }
+            } else {
+                stream.next().await
+            };
+            let Some(event) = event else { break };
             match &event {
                 DownloadProgressItem::Progress(bytes) => {
                     if total_size > 0.0 {
@@ -1448,14 +1468,26 @@ impl MiddenNode {
         blake3_hash: &str,
         total_size: f64,
         on_progress: &JsFunction,
+        cancel: Option<CancelToken>,
     ) -> Result<Uint8Array, JsError> {
+        let cancel_ref = cancel.as_ref();
         // first attempt
         match self
-            .download_verified_with_progress(peer_addr, blake3_hash, total_size, on_progress)
+            .download_verified_with_progress(
+                peer_addr,
+                blake3_hash,
+                total_size,
+                on_progress,
+                cancel_ref.map(|t| t.clone_token()),
+            )
             .await
         {
             Ok(data) => return Ok(data),
             Err(e) => {
+                // deliberate pause/cancel: do NOT fall into ensure+retry
+                if cancel_ref.map(|t| t.is_cancelled()).unwrap_or(false) {
+                    return Err(e);
+                }
                 // retry with ensure_blob (normal for first download, but
                 // also the fallback for a late failure after a partial or
                 // full transfer — see the doc comment above).
@@ -1479,8 +1511,14 @@ impl MiddenNode {
         }
 
         // retry verified download with progress
-        self.download_verified_with_progress(peer_addr, blake3_hash, total_size, on_progress)
-            .await
+        self.download_verified_with_progress(
+            peer_addr,
+            blake3_hash,
+            total_size,
+            on_progress,
+            cancel_ref.map(|t| t.clone_token()),
+        )
+        .await
     }
 
     /// download a verified blob and stream chunks to JS via callback
@@ -1910,7 +1948,7 @@ impl MiddenNode {
             .ok_or_else(|| JsError::new("blob not found on peer"))?;
 
         let data = self
-            .download_verified_with_ensure_progress(peer_addr, &blake3, total_size, on_progress)
+            .download_verified_with_ensure_progress(peer_addr, &blake3, total_size, on_progress, None)
             .await?;
 
         let result = js_sys::Array::new();

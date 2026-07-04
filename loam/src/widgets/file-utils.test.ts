@@ -75,7 +75,10 @@ vi.mock("../workers/blob-worker-client", () => ({
 import {
   canSnatchToDisk,
   checkBlobLocality,
+  discardPausedDownload,
   formatUploadError,
+  isDownloadCancelled,
+  pauseSnatchDownload,
   snatchBlob,
   snatchBlobToDisk,
   uploadFile,
@@ -749,6 +752,167 @@ describe("file-utils — tauri-mode branches", () => {
       expect(result.size).toBe(3);
       expect(writable.write).toHaveBeenCalledTimes(1);
       expect(writable.close).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("pause/cancel semantics", () => {
+    const blobInfo = {
+      blobId: "doc-blob-id",
+      filename: "movie.mp4",
+      mime: "video/mp4",
+      size: 8,
+      blake3: "deadbeef",
+      domain: "video",
+    };
+
+    function makeWritable() {
+      return {
+        write: vi.fn(async () => {}),
+        close: vi.fn(async () => {}),
+        truncate: vi.fn(async () => {}),
+      };
+    }
+
+    it("isDownloadCancelled recognizes deliberate cancellations only", () => {
+      expect(isDownloadCancelled(new Error("download cancelled"))).toBe(true);
+      expect(isDownloadCancelled(new Error("first attempt: download cancelled by user"))).toBe(
+        true
+      );
+      expect(isDownloadCancelled(new DOMException("snatch cancelled", "AbortError"))).toBe(true);
+      expect(isDownloadCancelled(new Error("connection lost"))).toBe(false);
+      expect(isDownloadCancelled(new Error("blob not available on peer"))).toBe(false);
+    });
+
+    it("snatchBlobToDisk (streamed): a paused download propagates without truncate or next-peer retry", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      const streamFn = vi.fn(async () => {
+        throw new Error("download cancelled");
+      });
+      mockGetMiddenNode.mockResolvedValue({
+        ensure_blob: vi.fn(async () => true),
+        download_verified_streaming_with_ensure: streamFn,
+      });
+
+      const writable = makeWritable();
+
+      await expect(
+        snatchBlobToDisk(
+          blobInfo,
+          {
+            peer1: { nodeId: "remote-node-id-1" },
+            peer2: { nodeId: "remote-node-id-2" },
+          },
+          writable as unknown as FileSystemWritableFileStream
+        )
+      ).rejects.toThrow("download cancelled");
+
+      // no next-peer retry, no truncate (resume rewrites the same offsets)
+      expect(streamFn).toHaveBeenCalledTimes(1);
+      expect(writable.truncate).not.toHaveBeenCalled();
+      expect(writable.close).not.toHaveBeenCalled();
+    });
+
+    it("snatchBlob (buffered): a paused download propagates instead of falling to the next strategy/peer", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      const strategy1 = vi.fn(async () => {
+        throw new Error("download cancelled");
+      });
+      const strategy2 = vi.fn();
+      mockGetMiddenNode.mockResolvedValue({
+        ensure_blob: vi.fn(async () => true),
+        download_verified_with_ensure_progress: strategy1,
+        download_verified_by_id_progress: strategy2,
+      });
+
+      await expect(
+        snatchBlob(blobInfo, {
+          peer1: { nodeId: "remote-node-id-1" },
+          peer2: { nodeId: "remote-node-id-2" },
+        })
+      ).rejects.toThrow("download cancelled");
+
+      expect(strategy1).toHaveBeenCalledTimes(1);
+      // the unverified fallback strategies must not run after a pause
+      expect(strategy2).not.toHaveBeenCalled();
+    });
+
+    it("snatchBlobToDisk threads options.downloadId into the streaming download call", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      const streamFn = vi.fn(
+        async (
+          _peerAddr: string,
+          _blake3: string,
+          _size: number,
+          onChunk: (chunk: Uint8Array, offset: number) => void
+        ) => {
+          onChunk(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 0);
+          return 8;
+        }
+      );
+      mockGetMiddenNode.mockResolvedValue({
+        ensure_blob: vi.fn(async () => true),
+        download_verified_streaming_with_ensure: streamFn,
+      });
+
+      const writable = makeWritable();
+      await snatchBlobToDisk(
+        blobInfo,
+        { peer1: { nodeId: "remote-node-id" } },
+        writable as unknown as FileSystemWritableFileStream,
+        { downloadId: "dl-123" }
+      );
+
+      expect(streamFn).toHaveBeenCalledWith(
+        expect.any(String),
+        "deadbeef",
+        8,
+        expect.any(Function),
+        expect.any(Function),
+        "dl-123"
+      );
+    });
+
+    it("pauseSnatchDownload: browser mode flags the worker cancel token by downloadId", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      const downloadCancel = vi.fn(async () => true);
+      mockGetMiddenNode.mockResolvedValue({ download_cancel: downloadCancel });
+
+      const flagged = await pauseSnatchDownload({ downloadId: "dl-456", blake3: "deadbeef" });
+
+      expect(flagged).toBe(true);
+      expect(downloadCancel).toHaveBeenCalledWith("dl-456");
+    });
+
+    it("pauseSnatchDownload: tauri mode cancels the native download by blake3", async () => {
+      mockIsTauriMode.mockReturnValue(true);
+      const cancelNative = vi.fn(async () => true);
+      mockGetMiddenNode.mockResolvedValue({ cancel_native_download: cancelNative });
+
+      const flagged = await pauseSnatchDownload({ downloadId: "dl-789", blake3: "deadbeef" });
+
+      expect(flagged).toBe(true);
+      expect(cancelNative).toHaveBeenCalledWith("deadbeef");
+    });
+
+    it("pauseSnatchDownload: returns false when the node has no cancel capability", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      mockGetMiddenNode.mockResolvedValue({});
+
+      expect(await pauseSnatchDownload({ downloadId: "dl-000" })).toBe(false);
+    });
+
+    it("discardPausedDownload releases the gc pin in browser mode and no-ops in tauri mode", async () => {
+      mockIsTauriMode.mockReturnValue(false);
+      const unprotect = vi.fn(async () => {});
+      mockGetMiddenNode.mockResolvedValue({ unprotect_blob: unprotect });
+
+      await discardPausedDownload("deadbeef");
+      expect(unprotect).toHaveBeenCalledWith("deadbeef");
+
+      unprotect.mockClear();
+      mockIsTauriMode.mockReturnValue(true);
+      await discardPausedDownload("deadbeef");
+      expect(unprotect).not.toHaveBeenCalled();
     });
   });
 });

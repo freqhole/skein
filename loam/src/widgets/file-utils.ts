@@ -214,6 +214,69 @@ export interface SnatchOptions {
   /** called when switching to a new peer attempt. useful for UI feedback like
    *  "trying peer 2/3..." between download attempts. */
   onPeerAttempt?: (peerIndex: number, peerCount: number, online: boolean) => void;
+  /** opaque id registered with the midden worker for this download — pass the
+   *  same id to pauseSnatchDownload() to pause the in-flight transfer. the
+   *  partial stays in the persistent store (pinned against gc), so a later
+   *  snatch of the same blake3 resumes: only the missing ranges transfer. */
+  downloadId?: string;
+}
+
+/** error message midden/tauri use for a deliberately cancelled download */
+const DOWNLOAD_CANCELLED_MSG = "download cancelled";
+
+/** true when an error came from a deliberate pause/cancel of the transfer
+ *  (midden CancelToken or tauri blob_iroh_download_cancel), as opposed to a
+ *  genuine failure. paused snatches must NOT fall through to next-peer retry. */
+export function isDownloadCancelled(err: unknown): boolean {
+  if (err instanceof DOMException && err.name === "AbortError") return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes(DOWNLOAD_CANCELLED_MSG);
+}
+
+/**
+ * pause an in-flight snatch download. the transfer stops at the next chunk
+ * boundary and the snatch promise rejects with a cancelled error
+ * (recognizable via isDownloadCancelled). the partial data stays in the
+ * persistent store, pinned against gc — resume by calling snatchBlob again
+ * with the same blake3 (only missing ranges transfer).
+ *
+ * browser mode pauses by downloadId (registered with the midden worker);
+ * tauri mode pauses by blake3 (the native download registry key).
+ * returns true when an in-flight download was actually flagged.
+ */
+export async function pauseSnatchDownload(opts: {
+  downloadId?: string;
+  blake3?: string | null;
+}): Promise<boolean> {
+  const node = (await getMiddenNode()) as any;
+  if (isTauriMode()) {
+    if (opts.blake3 && typeof node.cancel_native_download === "function") {
+      return (await node.cancel_native_download(opts.blake3)) === true;
+    }
+    return false;
+  }
+  if (opts.downloadId && typeof node.download_cancel === "function") {
+    return (await node.download_cancel(opts.downloadId)) === true;
+  }
+  return false;
+}
+
+/**
+ * discard a paused partial: releases the gc pin that a paused download left
+ * behind so the store can reclaim the partial data. browser mode only
+ * (tauri's FsStore keeps partials on disk; harmless). call when the user
+ * cancels for good rather than pausing.
+ */
+export async function discardPausedDownload(blake3: string | null | undefined): Promise<void> {
+  if (!blake3 || isTauriMode()) return;
+  try {
+    const node = (await getMiddenNode()) as any;
+    if (typeof node.unprotect_blob === "function") {
+      await node.unprotect_blob(blake3);
+    }
+  } catch (err) {
+    log.debug(TAG, "discardPausedDownload failed (non-fatal):", err);
+  }
 }
 
 /** options for file upload */
@@ -558,6 +621,8 @@ async function snatchBlobUncached(
       const result = await snatchFromBrowserPeer(info, bestPeer, options);
       return result;
     } catch (err) {
+      // a deliberate pause propagates immediately — never next-peer retry
+      if (isDownloadCancelled(err)) throw err;
       lastError = err;
       log.debug(TAG, `download from probed peer ${bestPeer.slice(0, 16)}... failed:`, err);
       remaining = remaining.filter((p) => p !== bestPeer);
@@ -789,12 +854,15 @@ async function downloadBlobBytesFromPeer(
           peerAddr,
           blake3Hash,
           info.size || 0,
-          progressFn
+          progressFn,
+          options?.downloadId
         ) as Promise<Uint8Array>,
         10 * 60_000
       );
       downloaded = true;
     } catch (err) {
+      // a deliberate pause must not fall through to the unverified fallbacks
+      if (isDownloadCancelled(err)) throw err;
       log.warn(TAG, `strategy 1 (verified, blake3 known) failed:`, err);
     }
   } else if (!downloaded) {
@@ -1103,10 +1171,12 @@ async function downloadBlobToWritableFromPeer(
   // must not await, so writes are chained and drained afterwards.
   let writeChain: Promise<void> = Promise.resolve();
   let writeError: unknown = null;
+  let bytesReceived = 0;
 
   // wasm-bindgen delivers each chunk as a fresh, plain-ArrayBuffer-backed
   // Uint8Array (never a SharedArrayBuffer view), so the narrower type is safe
   const onChunk = (chunk: Uint8Array<ArrayBuffer>, offset: number) => {
+    bytesReceived += chunk.length;
     if (writeError) return; // stop queueing after the first failure
     writeChain = writeChain.then(async () => {
       if (writeError) return;
@@ -1130,10 +1200,25 @@ async function downloadBlobToWritableFromPeer(
       info.blake3,
       info.size || 0,
       onChunk,
-      onProgress
+      onProgress,
+      options?.downloadId
     ) as Promise<number>,
     10 * 60_000
   )) as number;
+
+  // when the node lives in a worker, on_chunk arrives as fire-and-forget
+  // comlink proxy messages on a DIFFERENT message channel than the download
+  // RPC's return value — the promise above can resolve while the last few
+  // chunk messages are still in flight. wait until every byte has actually
+  // landed before draining the write chain (found by the pause/resume e2e:
+  // the tail ~350KB of a 24MiB transfer lost this race).
+  const deadline = Date.now() + 30_000;
+  while (bytesReceived < total && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  if (bytesReceived < total) {
+    throw new Error(`chunk stream incomplete: received ${bytesReceived} of ${total} bytes`);
+  }
 
   // drain any writes still in flight, then surface the first write error
   await writeChain;
@@ -1226,6 +1311,10 @@ export async function snatchBlobToDisk(
         );
         return { size, mime: info.mime, blake3: info.blake3 || null };
       } catch (err) {
+        // a deliberate pause propagates immediately — no truncate (chunk
+        // offsets are explicit, a resume rewrites the same positions) and
+        // no next-peer retry
+        if (isDownloadCancelled(err)) throw err;
         lastError = err;
         log.warn(
           TAG,
@@ -1249,6 +1338,8 @@ export async function snatchBlobToDisk(
       blake3 = downloaded.blake3;
       mime = downloaded.mime;
     } catch (err) {
+      // a deliberate pause propagates immediately — no next-peer retry
+      if (isDownloadCancelled(err)) throw err;
       lastError = err;
       log.warn(TAG, `snatch-to-disk from probed peer ${bestPeer.slice(0, 16)}... failed:`, err);
       remaining = remaining.filter((p) => p !== bestPeer);

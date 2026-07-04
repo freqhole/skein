@@ -13,7 +13,7 @@
 // store, endpoint, and protocols must share one wasm instance.
 
 import * as Comlink from "comlink";
-import { MiddenNode } from "midden";
+import { CancelToken, MiddenNode } from "midden";
 
 let node: MiddenNode | null = null;
 
@@ -53,6 +53,25 @@ let nextStreamId = 1;
 
 const sessions = new Map<number, WasmImportSession>();
 let nextSessionId = 1;
+
+// ---- download cancel registry ----------------------------------------------
+
+// pause/cancel for in-flight verified downloads. keyed by a caller-supplied
+// download id (the client generates one per download call). the wasm call
+// consumes a clone of the token; the original stays here so downloadCancel
+// can flip it, and is freed when the download settles.
+const cancelTokens = new Map<string, CancelToken>();
+
+function registerCancelToken(downloadId: string): CancelToken {
+  const token = new CancelToken();
+  cancelTokens.set(downloadId, token);
+  return token;
+}
+
+function releaseCancelToken(downloadId: string, token: CancelToken): void {
+  cancelTokens.delete(downloadId);
+  token.free();
+}
 
 function registerStream(stream: WasmBiStream): StreamInfo {
   const streamId = nextStreamId++;
@@ -266,15 +285,22 @@ async function downloadVerifiedWithEnsureProgress(
   peerAddr: string,
   blake3Hash: string,
   totalSize: number,
-  onProgress: (fraction: number) => void
+  onProgress: (fraction: number) => void,
+  downloadId?: string
 ): Promise<Uint8Array> {
-  const result = await requireNode().download_verified_with_ensure_progress(
-    peerAddr,
-    blake3Hash,
-    totalSize,
-    onProgress
-  );
-  return Comlink.transfer(result, [result.buffer as ArrayBuffer]);
+  const token = downloadId ? registerCancelToken(downloadId) : null;
+  try {
+    const result = await requireNode().download_verified_with_ensure_progress(
+      peerAddr,
+      blake3Hash,
+      totalSize,
+      onProgress,
+      token ? token.clone_token() : undefined
+    );
+    return Comlink.transfer(result, [result.buffer as ArrayBuffer]);
+  } finally {
+    if (downloadId && token) releaseCancelToken(downloadId, token);
+  }
 }
 
 async function downloadVerifiedById(
@@ -307,15 +333,42 @@ async function downloadVerifiedStreamingWithEnsure(
   blake3Hash: string,
   totalSize: number,
   onChunk: (chunk: Uint8Array, offset: number) => void,
-  onProgress: (fraction: number) => void
+  onProgress: (fraction: number) => void,
+  downloadId?: string
 ): Promise<number> {
-  return requireNode().download_verified_streaming_with_ensure(
-    peerAddr,
-    blake3Hash,
-    totalSize,
-    onChunk,
-    onProgress
-  );
+  const token = downloadId ? registerCancelToken(downloadId) : null;
+  try {
+    return await requireNode().download_verified_streaming_with_ensure(
+      peerAddr,
+      blake3Hash,
+      totalSize,
+      onChunk,
+      onProgress,
+      token ? token.clone_token() : undefined
+    );
+  } finally {
+    if (downloadId && token) releaseCancelToken(downloadId, token);
+  }
+}
+
+/** flip the cancel token for an in-flight download (pause). no-op when the
+ *  download already settled. the partial stays in the (persistent) store and
+ *  the wasm side pins the hash against gc until resumed or unprotected. */
+function downloadCancel(downloadId: string): boolean {
+  const token = cancelTokens.get(downloadId);
+  if (!token) return false;
+  token.cancel();
+  return true;
+}
+
+/** pin a hash against gc (e.g. keep a paused partial alive). */
+function protectBlob(blake3Hash: string): void {
+  requireNode().protect_blob(blake3Hash);
+}
+
+/** remove a gc pin (paused partial resumed to completion or discarded). */
+function unprotectBlob(blake3Hash: string): void {
+  requireNode().unprotect_blob(blake3Hash);
 }
 
 async function computeBlake3(peerAddr: string, blobId: string): Promise<string | null> {
@@ -363,6 +416,9 @@ const api = {
   downloadVerifiedById,
   downloadVerifiedByIdProgress,
   downloadVerifiedStreamingWithEnsure,
+  downloadCancel,
+  protectBlob,
+  unprotectBlob,
   computeBlake3,
   proxyRequest,
 };

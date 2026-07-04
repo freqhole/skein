@@ -860,16 +860,25 @@ export class MiddenNode {
      * @param {string} blake3_hash
      * @param {number} total_size
      * @param {Function} on_progress
+     * @param {CancelToken | null} [cancel]
      * @returns {Promise<Uint8Array>}
      */
-    download_verified_with_ensure_progress(peer_addr, blake3_hash, total_size, on_progress) {
+    download_verified_with_ensure_progress(peer_addr, blake3_hash, total_size, on_progress, cancel) {
         if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
         _assertNum(this.__wbg_ptr);
         const ptr0 = passStringToWasm0(peer_addr, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(blake3_hash, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.middennode_download_verified_with_ensure_progress(this.__wbg_ptr, ptr0, len0, ptr1, len1, total_size, on_progress);
+        let ptr2 = 0;
+        if (!isLikeNone(cancel)) {
+            _assertClass(cancel, CancelToken);
+            if (cancel.__wbg_ptr === 0) {
+                throw new Error('Attempt to use a moved value');
+            }
+            ptr2 = cancel.__destroy_into_raw();
+        }
+        const ret = wasm.middennode_download_verified_with_ensure_progress(this.__wbg_ptr, ptr0, len0, ptr1, len1, total_size, on_progress, ptr2);
         return ret;
     }
     /**
@@ -878,20 +887,31 @@ export class MiddenNode {
      * same as download_verified but calls on_progress(fraction) where
      * fraction is bytes_received / total_size (0.0 to 1.0).
      * total_size should come from the automerge doc's size field.
+     * `cancel`: optional cooperative cancellation (pause) — see
+     * download_verified_streaming for the semantics.
      * @param {string} peer_addr
      * @param {string} blake3_hash
      * @param {number} total_size
      * @param {Function} on_progress
+     * @param {CancelToken | null} [cancel]
      * @returns {Promise<Uint8Array>}
      */
-    download_verified_with_progress(peer_addr, blake3_hash, total_size, on_progress) {
+    download_verified_with_progress(peer_addr, blake3_hash, total_size, on_progress, cancel) {
         if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
         _assertNum(this.__wbg_ptr);
         const ptr0 = passStringToWasm0(peer_addr, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(blake3_hash, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.middennode_download_verified_with_progress(this.__wbg_ptr, ptr0, len0, ptr1, len1, total_size, on_progress);
+        let ptr2 = 0;
+        if (!isLikeNone(cancel)) {
+            _assertClass(cancel, CancelToken);
+            if (cancel.__wbg_ptr === 0) {
+                throw new Error('Attempt to use a moved value');
+            }
+            ptr2 = cancel.__destroy_into_raw();
+        }
+        const ret = wasm.middennode_download_verified_with_progress(this.__wbg_ptr, ptr0, len0, ptr1, len1, total_size, on_progress, ptr2);
         return ret;
     }
     /**

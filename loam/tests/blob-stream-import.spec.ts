@@ -98,3 +98,117 @@ test("a blob imported via chunked ImportSession is servable to another peer @p2p
   const fetchedBytes = await fetchBlobWithRetry(fetcher.page, owner.nodeId, blake3);
   expect(fromEvaluateArray(fetchedBytes)).toEqual(sourceBytes);
 });
+
+test("a paused download keeps its partial and resumes to a byte-identical blob @p2p", async ({
+  p2pPage,
+}) => {
+  test.setTimeout(240_000);
+
+  const owner = await p2pPage();
+  const fetcher = await p2pPage();
+
+  // generate the content in-page (24MiB as an evaluate arg would serialize
+  // a 24M-element array) — deterministic mulberry32, same seed both pages
+  const SIZE = 24 * 1024 * 1024;
+  const SEED = 0xc0ffee;
+
+  const blake3 = await owner.page.evaluate(
+    async ([size, seed]) => {
+      const bridge = (window as any).__skeinTest;
+      let state = seed >>> 0;
+      const next = (): number => {
+        state |= 0;
+        state = (state + 0x6d2b79f5) | 0;
+        let t = Math.imul(state ^ (state >>> 15), 1 | state);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+      const bytes = new Uint8Array(size);
+      for (let i = 0; i < size; i++) bytes[i] = Math.floor(next() * 256);
+      return bridge.p2p.importBlob(bytes, { filename: "pause-resume.bin" }) as Promise<string>;
+    },
+    [SIZE, SEED] as const
+  );
+
+  // pause at the first progress event, verify the store only has a partial,
+  // then resume (fresh downloadId) and byte-compare against regenerated
+  // source content — all in-page to avoid hauling 24MiB through evaluate.
+  const result = await fetcher.page.evaluate(
+    async ([peerId, hash, size, seed]) => {
+      const bridge = (window as any).__skeinTest;
+
+      // first attempt, cancelled from the first progress event. transient
+      // dial failures (peer discovery still warming) retry; a cancelled
+      // result is the success condition here.
+      let paused: { completed: boolean; cancelled: boolean } | null = null;
+      let lastErr = "";
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          paused = await bridge.p2p.fetchBlobStreamingPausable(
+            peerId,
+            hash,
+            size,
+            `dl-pause-${attempt}`,
+            0
+          );
+          break;
+        } catch (err) {
+          lastErr = err instanceof Error ? err.message : String(err);
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+      }
+      if (!paused) return { error: `pause attempt never ran: ${lastErr}` };
+
+      const completeAfterPause = await bridge.p2p.hasCompleteBlob(hash);
+
+      // resume: no pause fraction — runs to completion. the persisted
+      // partial means the downloader only requests the missing ranges.
+      const resumed = await bridge.p2p.fetchBlobStreamingPausable(
+        peerId,
+        hash,
+        size,
+        "dl-resume"
+      );
+
+      // verify content against the regenerated deterministic source
+      let mismatches = -1;
+      if (resumed.bytes) {
+        let state = seed >>> 0;
+        const next = (): number => {
+          state |= 0;
+          state = (state + 0x6d2b79f5) | 0;
+          let t = Math.imul(state ^ (state >>> 15), 1 | state);
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+        mismatches = 0;
+        for (let i = 0; i < size; i++) {
+          if (resumed.bytes[i] !== Math.floor(next() * 256)) mismatches++;
+        }
+      }
+
+      return {
+        pausedCancelled: paused.cancelled,
+        pausedCompleted: paused.completed,
+        completeAfterPause,
+        resumedCompleted: resumed.completed,
+        resumedSize: resumed.bytes ? resumed.bytes.length : 0,
+        mismatches,
+        completeAfterResume: await bridge.p2p.hasCompleteBlob(hash),
+      };
+    },
+    [owner.nodeId, blake3, SIZE, SEED] as const
+  );
+
+  expect(result).not.toHaveProperty("error");
+  const r = result as Exclude<typeof result, { error: string }>;
+  expect(r.pausedCancelled).toBe(true);
+  expect(r.pausedCompleted).toBe(false);
+  // the partial survived the pause but the blob is not complete yet
+  expect(r.completeAfterPause).toBe(false);
+  // resume ran to a complete, byte-identical blob
+  expect(r.resumedCompleted).toBe(true);
+  expect(r.resumedSize).toBe(SIZE);
+  expect(r.mismatches).toBe(0);
+  expect(r.completeAfterResume).toBe(true);
+});

@@ -180,6 +180,27 @@ export interface SkeinP2PBridge {
    */
   fetchBlob(peerNodeId: string, blake3Hash: string): Promise<Uint8Array>;
   /**
+   * streaming variant of fetchBlob with pause support — the e2e guard for
+   * the download pause/resume work. drives midden's
+   * `download_verified_streaming_with_ensure` with a worker-registered
+   * cancel token (`downloadId`). when `pauseAtFraction` is given, the first
+   * progress event at or past that fraction flips the cancel token — the
+   * transfer stops at the next chunk boundary, the partial stays in the
+   * store (gc-pinned), and the result reports `cancelled: true`. a
+   * follow-up call without `pauseAtFraction` resumes: the downloader
+   * subtracts the persisted ranges and only fetches what's missing.
+   */
+  fetchBlobStreamingPausable(
+    peerNodeId: string,
+    blake3Hash: string,
+    totalSize: number,
+    downloadId: string,
+    pauseAtFraction?: number
+  ): Promise<{ completed: boolean; cancelled: boolean; bytes: Uint8Array | null }>;
+  /** whether this peer's midden store holds the COMPLETE blob (partials
+   *  report false). */
+  hasCompleteBlob(blake3Hash: string): Promise<boolean>;
+  /**
    * test hook for the blob-ACL gate (see `midden::build_gated_blobs_events`
    * / `MiddenNode::restrict_blob_to_peers` in `midden/src/lib.rs`):
    * restricts a blob (by blake3 hash) on THIS peer's
@@ -649,6 +670,86 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
         download_verified_with_ensure(peerAddr: string, blake3: string): Promise<Uint8Array>;
       };
       return nodeAny.download_verified_with_ensure(peerNodeId, blake3Hash);
+    },
+
+    async fetchBlobStreamingPausable(
+      peerNodeId: string,
+      blake3Hash: string,
+      totalSize: number,
+      downloadId: string,
+      pauseAtFraction?: number
+    ): Promise<{ completed: boolean; cancelled: boolean; bytes: Uint8Array | null }> {
+      const node = await adapter.getNode();
+      const nodeAny = node as unknown as {
+        download_verified_streaming_with_ensure(
+          peerAddr: string,
+          blake3: string,
+          totalSize: number,
+          onChunk: (chunk: Uint8Array, offset: number) => void,
+          onProgress: (fraction: number) => void,
+          downloadId?: string
+        ): Promise<number>;
+        download_cancel?(downloadId: string): Promise<boolean>;
+      };
+      if (typeof nodeAny.download_cancel !== "function") {
+        throw new Error(
+          "fetchBlobStreamingPausable requires the worker-hosted midden node (download_cancel)"
+        );
+      }
+
+      const chunks: { offset: number; data: Uint8Array }[] = [];
+      let bytesReceived = 0;
+      let pauseRequested = false;
+      const onChunk = (chunk: Uint8Array, offset: number) => {
+        bytesReceived += chunk.length;
+        chunks.push({ offset, data: chunk });
+      };
+      const onProgress = (fraction: number) => {
+        if (pauseAtFraction !== undefined && !pauseRequested && fraction >= pauseAtFraction) {
+          pauseRequested = true;
+          void nodeAny.download_cancel!(downloadId);
+        }
+      };
+
+      try {
+        const total = await nodeAny.download_verified_streaming_with_ensure(
+          peerNodeId,
+          blake3Hash,
+          totalSize,
+          onChunk,
+          onProgress,
+          downloadId
+        );
+        // comlink proxy chunk messages ride a different channel than the
+        // RPC return — wait until every byte has actually arrived (same
+        // race as downloadBlobToWritableFromPeer in file-utils.ts)
+        const deadline = Date.now() + 30_000;
+        while (bytesReceived < total && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        if (bytesReceived < total) {
+          throw new Error(`chunk stream incomplete: ${bytesReceived} of ${total} bytes`);
+        }
+        const bytes = new Uint8Array(total);
+        for (const { offset, data } of chunks) {
+          bytes.set(data, offset);
+        }
+        return { completed: true, cancelled: false, bytes };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("download cancelled")) {
+          return { completed: false, cancelled: true, bytes: null };
+        }
+        throw err;
+      }
+    },
+
+    async hasCompleteBlob(blake3Hash: string): Promise<boolean> {
+      const node = await adapter.getNode();
+      const nodeAny = node as unknown as {
+        has_complete_blob(blake3: string): Promise<boolean>;
+      };
+      return nodeAny.has_complete_blob(blake3Hash);
     },
 
     async restrictBlobToPeers(blake3Hash: string, peerNodeIds: string[]): Promise<void> {

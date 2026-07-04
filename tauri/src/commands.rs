@@ -8,8 +8,10 @@
 //! see [docs/tauri-progress.md](../../../docs/tauri-progress.md) for the
 //! current action list and what's stubbed.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -21,6 +23,28 @@ use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+// ---------------------------------------------------------------------------
+// cancel registry for in-flight blob downloads
+// ---------------------------------------------------------------------------
+
+/// global map from blake3 hex -> cancel flag for any in-flight `blob_iroh_download`.
+/// the flag is set by `blob_iroh_download_cancel`; the download loop checks it
+/// each iteration and aborts when set.
+static DOWNLOAD_CANCELS: LazyLock<StdMutex<HashMap<String, Arc<AtomicBool>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// RAII guard that removes the cancel flag for `blake3` from `DOWNLOAD_CANCELS`
+/// when dropped, so the registry never accumulates stale entries.
+struct DownloadCancelGuard(String);
+
+impl Drop for DownloadCancelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = DOWNLOAD_CANCELS.lock() {
+            map.remove(&self.0);
+        }
+    }
+}
 
 /// runtime state for the one-and-only tauri command.
 ///
@@ -371,6 +395,9 @@ async fn dispatch(
         }
         "blob_iroh_download" => {
             blob_iroh_download(decode("blob_iroh_download", payload)?, app, state).await
+        }
+        "blob_iroh_download_cancel" => {
+            blob_iroh_download_cancel(decode("blob_iroh_download_cancel", payload)?).await
         }
         "blob_iroh_probe" => {
             blob_iroh_probe(decode("blob_iroh_probe", payload)?, state).await
@@ -1308,6 +1335,17 @@ async fn blob_iroh_download(
         "blob_iroh_download: starting"
     );
 
+    // register a cancel flag so `blob_iroh_download_cancel` can abort this download.
+    // the guard removes the entry from the registry on ALL exit paths.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut map = DOWNLOAD_CANCELS
+            .lock()
+            .map_err(|_| DispatchError::Stream("cancel registry poisoned".to_string()))?;
+        map.insert(args.blake3.clone(), Arc::clone(&cancel_flag));
+    }
+    let _guard = DownloadCancelGuard(args.blake3.clone());
+
     let (endpoint, _, _) = ensure_network(state).await?;
     let downloader = Downloader::new(state.fs_store, &endpoint);
     let progress = downloader.download(HashAndFormat::raw(hash), [node_id]);
@@ -1323,6 +1361,10 @@ async fn blob_iroh_download(
     let total_size = args.size.unwrap_or(0);
     let mut event_count: u64 = 0;
     while let Some(event) = stream.next().await {
+        if cancel_flag.load(Ordering::Relaxed) {
+            tracing::info!(blake3 = %args.blake3, "blob_iroh_download: cancelled");
+            return Err(DispatchError::Stream("download cancelled".to_string()));
+        }
         event_count += 1;
         match event {
             DownloadProgressItem::Error(e) => {
@@ -1432,6 +1474,33 @@ async fn blob_iroh_download(
     Ok(json!({
         "meta": BlobDto::from(blob),
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobIrohDownloadCancelArgs {
+    /// blake3 hex hash of the in-flight download to cancel.
+    blake3: String,
+}
+
+/// signal an in-flight `blob_iroh_download` to stop after its current event.
+///
+/// sets the cancel flag registered by the download loop. the partial blob
+/// stays in the FsStore — a re-dispatch of `blob_iroh_download` later will
+/// resume from where it left off automatically.
+async fn blob_iroh_download_cancel(
+    args: BlobIrohDownloadCancelArgs,
+) -> Result<Value, DispatchError> {
+    let cancelled = match DOWNLOAD_CANCELS.lock() {
+        Ok(map) => match map.get(&args.blake3) {
+            Some(flag) => {
+                flag.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        },
+        Err(_) => false,
+    };
+    Ok(json!({ "cancelled": cancelled }))
 }
 
 #[derive(Debug, Deserialize)]

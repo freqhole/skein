@@ -347,15 +347,17 @@ export class MiddenNode {
      * discarded) and explicitly resetting progress to 0 here makes this
      * restart visible/diagnosable instead of looking like a silent glitch.
      */
-    download_verified_with_ensure_progress(peer_addr: string, blake3_hash: string, total_size: number, on_progress: Function): Promise<Uint8Array>;
+    download_verified_with_ensure_progress(peer_addr: string, blake3_hash: string, total_size: number, on_progress: Function, cancel?: CancelToken | null): Promise<Uint8Array>;
     /**
      * download a blob with progress reporting via JS callback
      *
      * same as download_verified but calls on_progress(fraction) where
      * fraction is bytes_received / total_size (0.0 to 1.0).
      * total_size should come from the automerge doc's size field.
+     * `cancel`: optional cooperative cancellation (pause) — see
+     * download_verified_streaming for the semantics.
      */
-    download_verified_with_progress(peer_addr: string, blake3_hash: string, total_size: number, on_progress: Function): Promise<Uint8Array>;
+    download_verified_with_progress(peer_addr: string, blake3_hash: string, total_size: number, on_progress: Function, cancel?: CancelToken | null): Promise<Uint8Array>;
     /**
      * ensure a blob is loaded into the peer's FsStore by blake3 hash
      *

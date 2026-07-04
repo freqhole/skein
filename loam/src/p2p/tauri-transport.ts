@@ -313,9 +313,30 @@ export class TauriStreamNode implements MiddenStreamNode {
         mime: meta.mime ?? null,
         filename: meta.filename ?? null,
       };
+    } catch (err) {
+      // rethrow all errors unchanged — deliberate cancellations ("download cancelled")
+      // propagate as-is so the caller can string-match without extra wrapping.
+      throw err;
     } finally {
       unlisten?.();
     }
+  }
+
+  /**
+   * signal an in-flight `download_to_native_store` call to stop.
+   *
+   * sets the cancel flag on the rust side; the download loop exits after
+   * its next progress event and returns an error containing "download cancelled".
+   * the partial blob remains in the FsStore — re-dispatching `download_to_native_store`
+   * later will resume automatically.
+   *
+   * returns `true` if a download for this hash was in-flight, `false` otherwise.
+   */
+  async cancel_native_download(blake3: string): Promise<boolean> {
+    const resp = (await dispatch("blob_iroh_download_cancel", { blake3 })) as {
+      cancelled?: boolean;
+    };
+    return resp?.cancelled === true;
   }
 
   /**

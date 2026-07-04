@@ -232,13 +232,15 @@ export class WorkerMiddenNode {
     peerAddr: string,
     blake3Hash: string,
     totalSize: number,
-    onProgress: (fraction: number) => void
+    onProgress: (fraction: number) => void,
+    downloadId?: string
   ): Promise<Uint8Array> {
     return this.api.downloadVerifiedWithEnsureProgress(
       peerAddr,
       blake3Hash,
       totalSize,
-      Comlink.proxy(onProgress)
+      Comlink.proxy(onProgress),
+      downloadId
     );
   }
 
@@ -265,15 +267,35 @@ export class WorkerMiddenNode {
     blake3Hash: string,
     totalSize: number,
     onChunk: (chunk: Uint8Array, offset: number) => void,
-    onProgress: (fraction: number) => void
+    onProgress: (fraction: number) => void,
+    downloadId?: string
   ): Promise<number> {
     return this.api.downloadVerifiedStreamingWithEnsure(
       peerAddr,
       blake3Hash,
       totalSize,
       Comlink.proxy(onChunk),
-      Comlink.proxy(onProgress)
+      Comlink.proxy(onProgress),
+      downloadId
     );
+  }
+
+  /** pause/cancel an in-flight download by the id passed to the download
+   *  call. returns false when the download already settled. the partial
+   *  stays in the persistent store, pinned against gc — a later download
+   *  of the same hash resumes from the persisted bitfield. */
+  async download_cancel(downloadId: string): Promise<boolean> {
+    return this.api.downloadCancel(downloadId);
+  }
+
+  /** pin a hash against gc (keep a paused partial alive). */
+  async protect_blob(blake3Hash: string): Promise<void> {
+    return this.api.protectBlob(blake3Hash);
+  }
+
+  /** remove a gc pin added by protect_blob or a cancelled download. */
+  async unprotect_blob(blake3Hash: string): Promise<void> {
+    return this.api.unprotectBlob(blake3Hash);
   }
 
   async compute_blake3(peerAddr: string, blobId: string): Promise<string | null> {
