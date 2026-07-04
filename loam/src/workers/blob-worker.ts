@@ -422,6 +422,19 @@ async function opfsStoreSelftest(): Promise<string> {
   return fn();
 }
 
+/**
+ * persistence selftest — blobs + tags must survive a store shutdown and
+ * reopen over the same OPFS directory (the whole point of the store:
+ * cross-reload resume without re-import). worker context required.
+ */
+async function opfsStoreSelftestPersistence(): Promise<string> {
+  const fn = (middenWasm as any).opfs_store_selftest_persistence;
+  if (typeof fn !== "function") {
+    throw new Error("opfs_store_selftest_persistence missing from midden wasm build");
+  }
+  return fn();
+}
+
 const api = {
   hashBlake3,
   hashSha256,
@@ -437,6 +450,7 @@ const api = {
   uploadFinish,
   uploadAbort,
   opfsStoreSelftest,
+  opfsStoreSelftestPersistence,
 };
 
 export type BlobWorkerApi = typeof api;

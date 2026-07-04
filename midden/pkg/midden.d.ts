@@ -429,8 +429,14 @@ export function hash_blake3(data: Uint8Array): string;
 /**
  * stage-0 opfs store spike selftest — runs the full import/export round
  * trip against real OPFS through the real iroh-blobs api. worker context
- * required (sync access handles). see src/opfs_store.rs.
+ * required (sync access handles). see src/opfs_store/.
  */
 export function opfs_store_selftest(): Promise<string>;
+
+/**
+ * persistence selftest: blobs + tags survive a store shutdown/reopen over
+ * the same OPFS directory. worker context required.
+ */
+export function opfs_store_selftest_persistence(): Promise<string>;
 
 export function start(): void;

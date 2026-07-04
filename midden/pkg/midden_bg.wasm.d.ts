@@ -51,6 +51,7 @@ export const middennode_restrict_blob_to_peers: (a: number, b: number, c: number
 export const middennode_secret_key: (a: number) => any;
 export const middennode_start_import: (a: number) => number;
 export const opfs_store_selftest: () => any;
+export const opfs_store_selftest_persistence: () => any;
 export const start: () => void;
 export const __wbg_intounderlyingbytesource_free: (a: number, b: number) => void;
 export const __wbg_intounderlyingsource_free: (a: number, b: number) => void;

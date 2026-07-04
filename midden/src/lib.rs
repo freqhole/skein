@@ -335,10 +335,21 @@ pub fn hash_blake3(data: &[u8]) -> String {
 
 /// stage-0 opfs store spike selftest — runs the full import/export round
 /// trip against real OPFS through the real iroh-blobs api. worker context
-/// required (sync access handles). see src/opfs_store.rs.
+/// required (sync access handles). see src/opfs_store/.
+#[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 pub async fn opfs_store_selftest() -> Result<String, JsError> {
     opfs_store::selftest().await.map_err(|e| JsError::new(&e))
+}
+
+/// persistence selftest: blobs + tags survive a store shutdown/reopen over
+/// the same OPFS directory. worker context required.
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen]
+pub async fn opfs_store_selftest_persistence() -> Result<String, JsError> {
+    opfs_store::selftest_persistence()
+        .await
+        .map_err(|e| JsError::new(&e))
 }
 
 /// incremental blake3 hasher for streaming uploads — feed fixed-size chunks

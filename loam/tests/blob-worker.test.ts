@@ -91,3 +91,20 @@ test("opfs store spike: full import/export round trip through the real iroh-blob
   expect(summary).toContain("opfs store selftest OK");
   expect(summary).toContain("1500000 bytes");
 });
+
+// phase C: blobs + tags must survive a store shutdown/reopen over the same
+// OPFS directory — the cross-reload persistence the store exists for.
+test("opfs store: blobs and tags survive a store restart (persistence)", async ({
+  canvasPage,
+}) => {
+  test.setTimeout(90_000);
+  const { page } = await canvasPage();
+
+  const summary = await page.evaluate(async () => {
+    const helpers = (window as any).__skeinHelpers;
+    const worker = await helpers.getBlobWorker();
+    return worker.opfsStoreSelftestPersistence() as Promise<string>;
+  });
+
+  expect(summary).toContain("persistence selftest OK");
+});
