@@ -43,7 +43,7 @@ use std::ops::Deref;
 use iroh_blobs::store::mem::MemStore;
 
 pub use actor::spawn_store;
-pub use gc::GcOptions;
+pub use gc::{GcOptions, ProtectCb, ProtectOutcome};
 
 /// public handle: an iroh-blobs Store backed by the storage-generic actor.
 /// wraps MemStore purely for its pub from_sender constructor + Deref<Store>.
@@ -55,6 +55,14 @@ impl Deref for OpfsStore {
     type Target = iroh_blobs::api::Store;
     fn deref(&self) -> &Self::Target {
         self.inner.deref()
+    }
+}
+
+impl OpfsStore {
+    /// clone the underlying api Store handle (a cheap client clone). the
+    /// actor stays alive as long as any clone exists.
+    pub fn clone_store(&self) -> iroh_blobs::api::Store {
+        self.inner.deref().clone()
     }
 }
 

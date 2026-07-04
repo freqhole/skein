@@ -68,16 +68,63 @@ function requireStream(streamId: number): WasmBiStream {
 
 // ---- node lifecycle --------------------------------------------------------
 
+/** directory name for the persistent OPFS blob store. */
+const OPFS_STORE_DIR = "midden-blob-store";
+
+/** web lock name guarding single-tab ownership of the OPFS store. */
+const STORE_LOCK_NAME = "skein-midden-blob-store";
+
+/** resolves when we know whether this worker owns the store lock. the lock
+ *  (when granted) is held for the worker's lifetime via a never-resolving
+ *  promise — worker termination releases it automatically. */
+async function acquireStoreLock(): Promise<boolean> {
+  const locks = (navigator as { locks?: LockManager }).locks;
+  if (!locks) return false;
+  return new Promise<boolean>((resolve) => {
+    void locks
+      .request(STORE_LOCK_NAME, { ifAvailable: true }, async (lock) => {
+        if (!lock) {
+          resolve(false);
+          return;
+        }
+        resolve(true);
+        // hold the lock until the worker dies
+        await new Promise<never>(() => {});
+      })
+      .catch(() => resolve(false));
+  });
+}
+
 /**
  * create the MiddenNode (restoring from a persisted secret key when given).
  * returns the identity material so the main thread can cache the sync
  * getters (node_id/secret_key) and persist a fresh identity.
+ *
+ * blob persistence: when this worker wins the store web-lock (single-tab
+ * ownership, v1 policy), the node gets the persistent OPFS-backed blob
+ * store; otherwise (second tab) it degrades gracefully to the in-memory
+ * store. a best-effort `navigator.storage.persist()` asks the browser not
+ * to evict the origin's storage under pressure.
  */
 async function init(
   secretKey: Uint8Array | null
 ): Promise<{ nodeId: string; secretKey: Uint8Array }> {
   if (node) throw new Error("midden-worker: already initialized");
-  node = secretKey ? await MiddenNode.create_from_key(secretKey) : await MiddenNode.create();
+
+  const ownsStore = await acquireStoreLock();
+  if (ownsStore) {
+    // best-effort durability request; result is advisory
+    void navigator.storage?.persist?.().catch(() => {});
+  } else {
+    console.warn(
+      "[midden-worker] store lock unavailable (another tab owns it) — using in-memory blob store"
+    );
+  }
+  const storeDir = ownsStore ? OPFS_STORE_DIR : undefined;
+
+  node = secretKey
+    ? await MiddenNode.create_from_key(secretKey, storeDir)
+    : await MiddenNode.create(storeDir);
   const sk = node.secret_key();
   return { nodeId: node.node_id(), secretKey: Comlink.transfer(sk, [sk.buffer as ArrayBuffer]) };
 }
@@ -147,6 +194,11 @@ async function importBao(blake3Hash: string, baoData: Uint8Array): Promise<strin
 
 function hasActiveBlob(blake3Hash: string): boolean {
   return requireNode().has_active_blob(blake3Hash);
+}
+
+async function hasCompleteBlob(blake3Hash: string): Promise<boolean> {
+  return (requireNode() as unknown as { has_complete_blob(h: string): Promise<boolean> })
+    .has_complete_blob(blake3Hash);
 }
 
 function releaseBlob(blake3Hash: string): void {
@@ -297,6 +349,7 @@ const api = {
   importBlobAndExportBao,
   importBao,
   hasActiveBlob,
+  hasCompleteBlob,
   releaseBlob,
   restrictBlobToPeers,
   clearBlobRestriction,

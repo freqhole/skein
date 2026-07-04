@@ -218,14 +218,17 @@ export class MiddenNode {
     compute_blake3(peer_addr: string, blob_id: string): Promise<string | undefined>;
     /**
      * create a new node with random identity
-     * waits for relay connection before returning
+     * waits for relay connection before returning.
+     * `opfs_store_dir`: when given, blobs persist in an OPFS-backed store
+     * under this directory (worker context required); otherwise (or when
+     * OPFS is unavailable) an in-memory store is used.
      */
-    static create(): Promise<MiddenNode>;
+    static create(opfs_store_dir?: string | null): Promise<MiddenNode>;
     /**
      * create a node from existing secret key bytes (for persistence)
      * key_bytes must be exactly 32 bytes
      */
-    static create_from_key(key_bytes: Uint8Array): Promise<MiddenNode>;
+    static create_from_key(key_bytes: Uint8Array, opfs_store_dir?: string | null): Promise<MiddenNode>;
     /**
      * create a node from existing secret key with additional ALPN protocols.
      *
@@ -339,11 +342,18 @@ export class MiddenNode {
      */
     fetch_hello_image(peer_addr: string): Promise<HelloImageResult>;
     /**
-     * check whether a blob with the given blake3 hash is currently held in the MemStore
+     * check whether a blob with the given blake3 hash is currently held in the store
      * via an active TempTag. avoids expensive OPFS read + bao recomputation when the
      * blob is already loaded.
      */
     has_active_blob(blake3_hash: string): boolean;
+    /**
+     * check whether a COMPLETE blob with this hash exists in the blob
+     * store itself — with the persistent opfs store this is true across
+     * reloads, even when no TempTag pins it. lets serving paths skip
+     * re-imports entirely.
+     */
+    has_complete_blob(blake3_hash: string): Promise<boolean>;
     /**
      * import a blob from its pre-computed bao-encoded bytes, skipping the
      * expensive bao tree computation. `blake3_hash` is the 64-char hex hash,

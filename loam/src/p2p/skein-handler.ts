@@ -512,6 +512,21 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
       }
     }
 
+    // persistent-store fast path: with the opfs blob store, a previously
+    // imported/downloaded blob survives reloads INSIDE the store — no
+    // re-import (and no bao recomputation) needed at all.
+    if (typeof (node as any).has_complete_blob === "function") {
+      const inStore = await (node as any).has_complete_blob(blake3_hash);
+      if (inStore) {
+        log.debug(
+          TAG,
+          `blob ${blake3_hash.slice(0, 16)}... complete in persistent store, skipping re-import`
+        );
+        await sendRawResponse(stream, { type: "ensure_blob_response", id, available: true });
+        return;
+      }
+    }
+
     // try fast path: import from cached bao data (skips bao tree recomputation).
     // the bao cache is populated by handleComputeBlake3 / import_blob_and_export_bao.
     const store = blobStore;

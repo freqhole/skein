@@ -417,7 +417,7 @@ impl<T> n0_future::Stream for ReceiverStream<T> {
 pub struct ImportSession {
     sender: RefCell<Option<tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>>>,
     result_rx: RefCell<Option<tokio::sync::oneshot::Receiver<Result<TempTag, String>>>>,
-    active_tags: Rc<RefCell<IndexMap<Hash, TempTag>>>,
+    active_tags: Arc<Mutex<IndexMap<Hash, TempTag>>>,
 }
 
 #[wasm_bindgen]
@@ -453,7 +453,9 @@ impl ImportSession {
             .map_err(|_| JsError::new("import task dropped before completing"))?
             .map_err(|e| JsError::new(&e))?;
         let hash = tt.hash();
-        self.active_tags.borrow_mut().insert(hash, tt);
+        if let Ok(mut tags) = self.active_tags.lock() {
+            tags.insert(hash, tt);
+        }
         Ok(hash.to_hex().to_string())
     }
 
@@ -605,6 +607,26 @@ fn make_gc_config(protected_hashes: Arc<Mutex<HashSet<Hash>>>) -> GcConfig {
     }
 }
 
+/// protect callback covering BOTH protection sources: `protected_hashes`
+/// (in-flight downloads, RAII-guarded) and `active_tags` (imported blobs
+/// pinned until release_blob). needed for the opfs store, whose
+/// GLOBAL-scope temp tags are untracked (iroh-blobs' TagDrop is
+/// crate-private) — without this, gc would sweep pinned imports.
+fn make_protect_cb(
+    protected_hashes: Arc<Mutex<HashSet<Hash>>>,
+    active_tags: Arc<Mutex<IndexMap<Hash, TempTag>>>,
+) -> opfs_store::ProtectCb {
+    Arc::new(move |live: &mut HashSet<Hash>| {
+        if let Ok(set) = protected_hashes.lock() {
+            live.extend(set.iter().copied());
+        }
+        if let Ok(tags) = active_tags.lock() {
+            live.extend(tags.keys().copied());
+        }
+        Box::pin(async move { opfs_store::ProtectOutcome::Continue })
+    })
+}
+
 /// RAII guard: inserts a hash into the protected set on construction,
 /// removes it on drop. used to keep an in-flight download alive across
 /// the download -> read phases without relying on TempTags.
@@ -644,10 +666,10 @@ pub struct MiddenNode {
     blobs_downloader: Downloader,
     blobs_protocol: BlobsProtocol,
     /// active TempTags keyed by blob hash — prevents GC of imported blobs
-    /// until release_blob() drops the tag. Rc-shared so ImportSession can
-    /// pin its finished import into the same map.
+    /// until release_blob() drops the tag. Arc<Mutex> so ImportSession and
+    /// the gc protect callback (Send + Sync required) can share it.
     #[wasm_bindgen(skip)]
-    pub active_tags: Rc<RefCell<IndexMap<Hash, TempTag>>>,
+    pub active_tags: Arc<Mutex<IndexMap<Hash, TempTag>>>,
     /// hashes currently being downloaded/streamed; protected from GC sweeps.
     /// the downloader does not auto-create TempTags, so without this an
     /// in-flight download can be wiped by the periodic GC between
@@ -660,21 +682,71 @@ pub struct MiddenNode {
     pub blob_acl: BlobAcl,
 }
 
+/// build the node's blob store: persistent OPFS-backed when a directory is
+/// given and OPFS is available (worker context), otherwise in-memory. both
+/// get gc with the combined protect callback (in-flight downloads +
+/// pinned imports).
+async fn build_blobs_store(
+    opfs_store_dir: Option<String>,
+    protected_hashes: Arc<Mutex<HashSet<Hash>>>,
+    active_tags: Arc<Mutex<IndexMap<Hash, TempTag>>>,
+) -> Store {
+    #[cfg(target_family = "wasm")]
+    if let Some(dir) = &opfs_store_dir {
+        match opfs_store::OpfsStore::new(
+            dir,
+            Some(opfs_store::GcOptions {
+                interval: std::time::Duration::from_secs(30),
+                add_protected: Some(make_protect_cb(
+                    protected_hashes.clone(),
+                    active_tags.clone(),
+                )),
+            }),
+        )
+        .await
+        {
+            Ok(store) => {
+                info!("using persistent opfs blob store: {dir}");
+                return store.clone_store();
+            }
+            Err(e) => {
+                warn!("opfs blob store unavailable ({e}), falling back to in-memory");
+            }
+        }
+    }
+    #[cfg(not(target_family = "wasm"))]
+    let _ = &opfs_store_dir;
+
+    // in-memory fallback: same protection sources via the mem gc config
+    let _ = &active_tags; // mem store pins via TempTags natively; keep the combined cb anyway
+    let mem_store =
+        iroh_blobs::store::mem::MemStore::new_with_opts(iroh_blobs::store::mem::Options {
+            gc_config: Some(make_gc_config(protected_hashes)),
+        });
+    mem_store.as_ref().clone()
+}
+
 #[wasm_bindgen]
 impl MiddenNode {
     /// create a new node with random identity
-    /// waits for relay connection before returning
-    pub async fn create() -> Result<MiddenNode, JsError> {
+    /// waits for relay connection before returning.
+    /// `opfs_store_dir`: when given, blobs persist in an OPFS-backed store
+    /// under this directory (worker context required); otherwise (or when
+    /// OPFS is unavailable) an in-memory store is used.
+    pub async fn create(opfs_store_dir: Option<String>) -> Result<MiddenNode, JsError> {
         // generate random secret key
         let mut bytes = [0u8; 32];
         getrandom::getrandom(&mut bytes).map_err(|e| JsError::new(&e.to_string()))?;
 
-        Self::create_with_secret_key(bytes).await
+        Self::create_with_secret_key(bytes, opfs_store_dir).await
     }
 
     /// create a node from existing secret key bytes (for persistence)
     /// key_bytes must be exactly 32 bytes
-    pub async fn create_from_key(key_bytes: &[u8]) -> Result<MiddenNode, JsError> {
+    pub async fn create_from_key(
+        key_bytes: &[u8],
+        opfs_store_dir: Option<String>,
+    ) -> Result<MiddenNode, JsError> {
         if key_bytes.len() != 32 {
             return Err(JsError::new("secret key must be exactly 32 bytes"));
         }
@@ -682,11 +754,14 @@ impl MiddenNode {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(key_bytes);
 
-        Self::create_with_secret_key(bytes).await
+        Self::create_with_secret_key(bytes, opfs_store_dir).await
     }
 
     /// internal: create node with given secret key bytes
-    async fn create_with_secret_key(bytes: [u8; 32]) -> Result<MiddenNode, JsError> {
+    async fn create_with_secret_key(
+        bytes: [u8; 32],
+        opfs_store_dir: Option<String>,
+    ) -> Result<MiddenNode, JsError> {
         let secret_key = SecretKey::from_bytes(&bytes);
 
         // use N0 preset for relay + DNS discovery (peers can find each other)
@@ -702,16 +777,12 @@ impl MiddenNode {
             .await
             .map_err(to_js_err)?;
 
-        // setup iroh-blobs with MemStore + GC. periodic GC keeps memory
-        // bounded; a protect callback (fed by `protected_hashes`) keeps
-        // in-flight downloads alive until the read phase has drained them.
         let protected_hashes = Arc::new(Mutex::new(HashSet::new()));
-        let mem_store =
-            iroh_blobs::store::mem::MemStore::new_with_opts(iroh_blobs::store::mem::Options {
-                gc_config: Some(make_gc_config(protected_hashes.clone())),
-            });
-        let blobs_downloader = Downloader::new(&mem_store, &endpoint);
-        let blobs_store = mem_store.as_ref().clone();
+        let active_tags: Arc<Mutex<IndexMap<Hash, TempTag>>> =
+            Arc::new(Mutex::new(IndexMap::new()));
+        let blobs_store =
+            build_blobs_store(opfs_store_dir, protected_hashes.clone(), active_tags.clone()).await;
+        let blobs_downloader = Downloader::new(&blobs_store, &endpoint);
         let blob_acl: BlobAcl = Rc::new(RefCell::new(HashMap::new()));
         let blobs_protocol =
             BlobsProtocol::new(&blobs_store, Some(build_gated_blobs_events(blob_acl.clone())));
@@ -728,7 +799,7 @@ impl MiddenNode {
             blobs_store,
             blobs_downloader,
             blobs_protocol,
-            active_tags: Rc::new(RefCell::new(IndexMap::new())),
+            active_tags,
             protected_hashes,
             blob_acl,
         })
@@ -827,12 +898,13 @@ impl MiddenNode {
             .map_err(to_js_err)?;
 
         let protected_hashes = Arc::new(Mutex::new(HashSet::new()));
-        let mem_store =
-            iroh_blobs::store::mem::MemStore::new_with_opts(iroh_blobs::store::mem::Options {
-                gc_config: Some(make_gc_config(protected_hashes.clone())),
-            });
-        let blobs_downloader = Downloader::new(&mem_store, &endpoint);
-        let blobs_store = mem_store.as_ref().clone();
+        let active_tags: Arc<Mutex<IndexMap<Hash, TempTag>>> =
+            Arc::new(Mutex::new(IndexMap::new()));
+        // create_with_alpns is only used by test/dev harness paths — no
+        // opfs dir plumbed; in-memory store with the same gc protection
+        let blobs_store =
+            build_blobs_store(None, protected_hashes.clone(), active_tags.clone()).await;
+        let blobs_downloader = Downloader::new(&blobs_store, &endpoint);
         let blob_acl: BlobAcl = Rc::new(RefCell::new(HashMap::new()));
         let blobs_protocol =
             BlobsProtocol::new(&blobs_store, Some(build_gated_blobs_events(blob_acl.clone())));
@@ -848,7 +920,7 @@ impl MiddenNode {
             blobs_store,
             blobs_downloader,
             blobs_protocol,
-            active_tags: Rc::new(RefCell::new(IndexMap::new())),
+            active_tags,
             protected_hashes,
             blob_acl,
         })
@@ -1734,7 +1806,7 @@ impl MiddenNode {
         let hash = Hash::from_bytes(*hash_bytes.as_bytes());
 
         {
-            let tags = self.active_tags.borrow();
+            let tags = self.active_tags.lock().map_err(|_| JsError::new("tags lock"))?;
             if tags.contains_key(&hash) {
                 return Ok(hash.to_hex().to_string());
             }
@@ -1749,11 +1821,12 @@ impl MiddenNode {
             .await
             .map_err(|e| JsError::new(&format!("failed to import blob: {}", e)))?;
 
-        // no eviction cap: gc protection (protected_hashes) covers in-flight
-        // downloads, and imported blobs stay pinned until release_blob().
-        // NOTE: memory stays bounded only if JS releases blobs it no longer
-        // serves — a real budget arrives with the persistent opfs store.
-        self.active_tags.borrow_mut().insert(hash, tt);
+        // no eviction cap: gc protection (protected_hashes + active_tags via
+        // the protect callback) covers in-flight downloads, and imported
+        // blobs stay pinned until release_blob().
+        if let Ok(mut tags) = self.active_tags.lock() {
+            tags.insert(hash, tt);
+        }
         Ok(hash.to_hex().to_string())
     }
 
@@ -1789,7 +1862,9 @@ impl MiddenNode {
             .map_err(|e| JsError::new(&format!("failed to export bao: {}", e)))?;
 
         // pin until release_blob() (no eviction cap — see import_blob)
-        self.active_tags.borrow_mut().insert(hash, tt);
+        if let Ok(mut tags) = self.active_tags.lock() {
+            tags.insert(hash, tt);
+        }
 
         // return { hash, bao } to JS
         let bao_array = Uint8Array::new_with_length(bao_bytes.len() as u32);
@@ -1819,7 +1894,7 @@ impl MiddenNode {
 
         // check active_tags first — no need to re-import
         {
-            let tags = self.active_tags.borrow();
+            let tags = self.active_tags.lock().map_err(|_| JsError::new("tags lock"))?;
             if tags.contains_key(&hash) {
                 return Ok(hash.to_hex().to_string());
             }
@@ -1845,7 +1920,9 @@ impl MiddenNode {
             .map_err(|e| JsError::new(&format!("failed to create temp tag: {}", e)))?;
 
         // pin until release_blob() (no eviction cap — see import_blob)
-        self.active_tags.borrow_mut().insert(hash, tt);
+        if let Ok(mut tags) = self.active_tags.lock() {
+            tags.insert(hash, tt);
+        }
 
         Ok(hash.to_hex().to_string())
     }
@@ -1857,17 +1934,19 @@ impl MiddenNode {
         let hash: Hash = blake3_hash
             .parse()
             .map_err(|_| JsError::new("invalid blake3 hash"))?;
-        self.active_tags.borrow_mut().shift_remove(&hash);
+        if let Ok(mut tags) = self.active_tags.lock() {
+            tags.shift_remove(&hash);
+        }
         Ok(())
     }
 
     /// return the number of blobs currently held in the store via active TempTags.
     #[wasm_bindgen]
     pub fn active_blob_count(&self) -> usize {
-        self.active_tags.borrow().len()
+        self.active_tags.lock().map(|t| t.len()).unwrap_or(0)
     }
 
-    /// check whether a blob with the given blake3 hash is currently held in the MemStore
+    /// check whether a blob with the given blake3 hash is currently held in the store
     /// via an active TempTag. avoids expensive OPFS read + bao recomputation when the
     /// blob is already loaded.
     #[wasm_bindgen]
@@ -1876,7 +1955,26 @@ impl MiddenNode {
             Ok(h) => h,
             Err(_) => return false,
         };
-        self.active_tags.borrow().contains_key(&hash)
+        self.active_tags
+            .lock()
+            .map(|t| t.contains_key(&hash))
+            .unwrap_or(false)
+    }
+
+    /// check whether a COMPLETE blob with this hash exists in the blob
+    /// store itself — with the persistent opfs store this is true across
+    /// reloads, even when no TempTag pins it. lets serving paths skip
+    /// re-imports entirely.
+    #[wasm_bindgen]
+    pub async fn has_complete_blob(&self, blake3_hash: &str) -> bool {
+        let hash: Hash = match blake3_hash.parse() {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        matches!(
+            self.blobs_store.blobs().status(hash).await,
+            Ok(iroh_blobs::api::blobs::BlobStatus::Complete { .. })
+        )
     }
 }
 

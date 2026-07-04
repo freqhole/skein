@@ -195,6 +195,13 @@ export class WorkerMiddenNode {
     return this.api.hasActiveBlob(blake3Hash);
   }
 
+  /** true when a COMPLETE blob with this hash exists in the blob store
+   *  itself — with the persistent opfs store this survives reloads even
+   *  without an active TempTag. */
+  has_complete_blob(blake3Hash: string): Promise<boolean> {
+    return this.api.hasCompleteBlob(blake3Hash);
+  }
+
   release_blob(blake3Hash: string): Promise<void> {
     return this.api.releaseBlob(blake3Hash);
   }
