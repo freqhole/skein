@@ -200,6 +200,59 @@ describe("file-utils — tauri-mode branches", () => {
         existing: true,
       });
     });
+
+    it("downloads into the native store (no IPC payload, no storeBlob) when the peer has the blob", async () => {
+      mockIsTauriMode.mockReturnValue(true);
+      // blob_get_path misses -> not local -> proceeds to the peer snatch
+      mockDispatch.mockRejectedValue(new Error("not found"));
+
+      const downloadToNativeStore = vi.fn(async () => ({
+        size: 4321,
+        mime: "video/mp4",
+        filename: "movie.mp4",
+      }));
+      mockGetMiddenNode.mockResolvedValue({
+        ensure_blob: vi.fn(async () => true),
+        download_to_native_store: downloadToNativeStore,
+        // the buffered method must never be needed on this path
+        download_verified_with_ensure_progress: vi.fn(async () => {
+          throw new Error("buffered path should not run");
+        }),
+      });
+
+      const result = await snatchBlob(
+        {
+          blobId: "doc-blob-id",
+          filename: "movie.mp4",
+          mime: "video/mp4",
+          size: 4321,
+          blake3: "cafebabe",
+          domain: "video",
+        },
+        { peer1: { nodeId: "remote-node-id" } }
+      );
+
+      expect(downloadToNativeStore).toHaveBeenCalledWith(
+        expect.any(String), // peer addr
+        "cafebabe",
+        4321,
+        undefined, // no onProgress passed in this test
+        "movie.mp4",
+        "video/mp4"
+      );
+      // the rust store is the destination — nothing persisted JS-side
+      expect(mockStoreBlob).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        blobId: "cafebabe",
+        domain: "video",
+        jobId: null,
+        sha256: "",
+        blake3: "cafebabe",
+        size: 4321,
+        mime: "video/mp4",
+        existing: false,
+      });
+    });
   });
 
   describe("uploadFile (tauri mode)", () => {

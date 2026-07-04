@@ -939,12 +939,54 @@ async function downloadBlobBytesFromPeer(
 /**
  * download and ingest a blob from a single browser peer via midden WASM.
  * persists the result into OPFS + IndexedDB via storeBlob.
+ *
+ * in tauri mode, prefers the native download path: the rust side streams
+ * the blob into the FsStore and exports it straight into blobz — the
+ * payload never crosses the IPC boundary and never exists in JS memory
+ * (previously: whole blob as base64 over IPC + OPFS re-write). progress
+ * arrives via real `blob-download-progress` events.
  */
 async function snatchFromBrowserPeer(
   info: SnatchBlobInfo,
   peerAddr: string,
   options?: SnatchOptions
 ): Promise<FileUploadResult> {
+  if (isTauriMode() && info.blake3) {
+    const node = (await getMiddenNode()) as any;
+    if (typeof node.download_to_native_store === "function") {
+      const meta = await withPeerTimeout(
+        node.download_to_native_store(
+          peerAddr,
+          info.blake3,
+          info.size || 0,
+          options?.onProgress,
+          info.filename,
+          info.mime
+        ) as Promise<{ size: number; mime: string | null }>,
+        10 * 60_000
+      );
+      if (options?.signal?.aborted) {
+        throw new DOMException("snatch cancelled", "AbortError");
+      }
+      localityCache.set(info.blobId, { locality: "local" });
+      localityCache.set(info.blake3, { locality: "local" });
+      log.debug(
+        TAG,
+        `tauri native snatch complete: ${formatFileSize(meta.size)} into blobz (no IPC payload)`
+      );
+      return {
+        blobId: info.blake3,
+        domain: info.domain,
+        jobId: null,
+        sha256: "",
+        blake3: info.blake3,
+        size: meta.size || info.size || 0,
+        mime: meta.mime || info.mime,
+        existing: false,
+      };
+    }
+  }
+
   const { bytes, blake3: blake3Hash, mime } = await downloadBlobBytesFromPeer(
     info,
     peerAddr,

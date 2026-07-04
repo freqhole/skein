@@ -370,7 +370,7 @@ async fn dispatch(
             blob_iroh_ensure(decode("blob_iroh_ensure", payload)?, state).await
         }
         "blob_iroh_download" => {
-            blob_iroh_download(decode("blob_iroh_download", payload)?, state).await
+            blob_iroh_download(decode("blob_iroh_download", payload)?, app, state).await
         }
         "blob_iroh_probe" => {
             blob_iroh_probe(decode("blob_iroh_probe", payload)?, state).await
@@ -1261,6 +1261,10 @@ struct BlobIrohDownloadArgs {
     filename: Option<String>,
     /// optional mime to record in `blobz`.
     mime: Option<String>,
+    /// optional expected total size in bytes — used only to compute the
+    /// fraction in `blob-download-progress` events (progress still works
+    /// without it; events then carry `bytesDone` with `totalSize: 0`).
+    size: Option<u64>,
 }
 
 /// download a blob from a peer over iroh-blobs verified transfer, ingest
@@ -1272,6 +1276,7 @@ struct BlobIrohDownloadArgs {
 /// canonical native-rust impl of the iroh-blobs consumer side.
 async fn blob_iroh_download(
     args: BlobIrohDownloadArgs,
+    app: &AppHandle,
     state: &AppState,
 ) -> Result<Value, DispatchError> {
     use iroh_blobs::api::downloader::{DownloadProgressItem, Downloader};
@@ -1314,6 +1319,8 @@ async fn blob_iroh_download(
     let mut last_error: Option<String> = None;
     let started = std::time::Instant::now();
     let mut last_log = std::time::Instant::now();
+    let mut last_emit = std::time::Instant::now();
+    let total_size = args.size.unwrap_or(0);
     let mut event_count: u64 = 0;
     while let Some(event) = stream.next().await {
         event_count += 1;
@@ -1325,6 +1332,32 @@ async fn blob_iroh_download(
             DownloadProgressItem::DownloadError => {
                 last_error = Some("download error".to_string());
                 tracing::warn!(blake3 = %args.blake3, "download progress: DownloadError");
+            }
+            DownloadProgressItem::Progress(bytes_done) => {
+                // real progress to the frontend — throttled to ~4/s. the
+                // frontend listens on this event and maps it to the snatch
+                // progress callback (same emit/listen pattern as
+                // blob_insert_from_path's "blob-insert-progress").
+                if last_emit.elapsed() >= std::time::Duration::from_millis(250) {
+                    last_emit = std::time::Instant::now();
+                    let _ = app.emit(
+                        "blob-download-progress",
+                        json!({
+                            "blake3": args.blake3,
+                            "bytesDone": bytes_done,
+                            "totalSize": total_size,
+                        }),
+                    );
+                }
+                if last_log.elapsed() >= std::time::Duration::from_secs(2) {
+                    tracing::info!(
+                        blake3 = %args.blake3,
+                        bytes_done,
+                        elapsed_s = started.elapsed().as_secs(),
+                        "blob_iroh_download: progress"
+                    );
+                    last_log = std::time::Instant::now();
+                }
             }
             other => {
                 // heartbeat at info every ~2s so a hanging/slow relay download
@@ -1355,36 +1388,49 @@ async fn blob_iroh_download(
         return Err(DispatchError::Stream(format!("download failed: {err}")));
     }
 
-    let bytes = state
-        .fs_store
-        .get_bytes(hash)
+    // ingest into blobz WITHOUT the bytes ever passing through memory or
+    // IPC: stream-export the (verified, complete) blob from the FsStore
+    // straight to blobz's canonical content-addressed path, then record
+    // metadata trusting the hash the transfer already verified.
+    // (previously this did get_bytes -> blobz.insert -> base64 over IPC:
+    // three full in-memory copies of the payload.)
+    let target = state
+        .blobz
+        .prepare_canonical_path(&args.blake3)
         .await
-        .map_err(|e| DispatchError::Stream(format!("FsStore.get_bytes: {e}")))?;
+        .map_err(|e| DispatchError::Stream(format!("prepare blobz path: {e}")))?;
+    state
+        .fs_store
+        .blobs()
+        .export(hash, &target)
+        .await
+        .map_err(|e| DispatchError::Stream(format!("export to blobz path: {e}")))?;
+    let blob = state
+        .blobz
+        .register_ingested(args.blake3.clone(), args.filename, args.mime)
+        .await?;
 
     tracing::info!(
         blake3 = %args.blake3,
-        size = bytes.len(),
-        "blob_iroh_download: download complete, ingesting into blobz"
+        size = blob.size,
+        elapsed_s = started.elapsed().as_secs(),
+        "blob_iroh_download: complete (streamed to blobz, no IPC payload)"
     );
 
-    // ingest into blobz so subsequent `blob_get` / `blob_get_path` succeed
-    // and asset:// playback works without a re-download. iroh_hash mirrors
-    // blake3 (same as blob_insert when no override given).
-    let blob = state
-        .blobz
-        .insert(
-            args.blake3.clone(),
-            args.filename,
-            args.mime,
-            bytes.as_ref(),
-        )
-        .await?;
-    // FsStore is already populated (the download itself wrote it) — no
-    // need to re-prewarm.
+    // final 100% progress event so listeners always see completion
+    let _ = app.emit(
+        "blob-download-progress",
+        json!({
+            "blake3": args.blake3,
+            "bytesDone": blob.size,
+            "totalSize": blob.size,
+        }),
+    );
 
+    // meta only — the bytes live in blobz, reachable via blob_get_path /
+    // asset:// for playback. no base64 payload over IPC.
     Ok(json!({
         "meta": BlobDto::from(blob),
-        "data": B64.encode(&bytes),
     }))
 }
 

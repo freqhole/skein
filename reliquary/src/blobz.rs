@@ -111,10 +111,69 @@ impl Store {
         Ok(stored)
     }
 
+    /// the canonical content-addressed absolute path for a blake3 hash
+    /// (`<blob_dir>/<2-char-prefix>/<rest>`), creating the parent directory.
+    /// used by callers that place the bytes themselves (e.g. a streamed
+    /// export from an iroh-blobs store) before `register_ingested`.
+    pub async fn prepare_canonical_path(&self, blake3: &str) -> Result<PathBuf, BlobError> {
+        let (prefix, rest) = blake3.split_at(2);
+        let dir = self.blob_dir.join(prefix);
+        tokio::fs::create_dir_all(&dir).await?;
+        Ok(dir.join(rest))
+    }
+
+    /// record metadata for a blob whose bytes were already written to the
+    /// canonical content-addressed path by the caller (see
+    /// `prepare_canonical_path`). unlike `insert`, the bytes never pass
+    /// through memory here, and unlike `register_path`, no hashing pass
+    /// runs — the caller vouches for the blake3 (e.g. it came out of a
+    /// cryptographically verified iroh-blobs transfer). dedupes on blake3.
+    pub async fn register_ingested(
+        &self,
+        blake3: String,
+        filename: Option<String>,
+        mime: Option<String>,
+    ) -> Result<BlobRef, BlobError> {
+        if let Some(existing) = self.get(&blake3).await? {
+            return Ok(existing);
+        }
+
+        let (prefix, rest) = blake3.split_at(2);
+        let rel_path = format!("{prefix}/{rest}");
+        let abs_path = self.blob_dir.join(prefix).join(rest);
+        let size = tokio::fs::metadata(&abs_path).await?.len() as i64;
+
+        let iroh_hash = blake3.clone();
+        let created_at = now_secs();
+
+        // same ON CONFLICT reasoning as `insert` — racing duplicates no-op
+        sqlx::query!(
+            r#"
+            INSERT INTO blobz (blake3, iroh_hash, filename, mime, size, path, external, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)
+            ON CONFLICT (blake3) DO NOTHING
+            "#,
+            blake3,
+            iroh_hash,
+            filename,
+            mime,
+            size,
+            rel_path,
+            created_at,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        let stored = self
+            .get(&blake3)
+            .await?
+            .expect("row must exist immediately after insert-or-ignore");
+        Ok(stored)
+    }
+
     /// register an existing on-disk file as a blob without copying its bytes.
     /// the file remains where it is; only metadata is recorded. callers are
-    /// responsible for not deleting/moving the file out from under the store.
-    ///
+    /// responsible for not deleting/moving the file out from under the store.    ///
     /// streams the file through blake3 so large files don't have to be loaded
     /// into memory. dedupes on blake3 — if the same content is already
     /// registered (external or not), returns the existing ref.

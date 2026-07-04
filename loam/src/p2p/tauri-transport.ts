@@ -14,6 +14,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { BiStreamLike, MiddenStreamNode } from "./iroh-network-adapter";
 import { log } from "../utils/log";
 
@@ -259,28 +260,62 @@ export class TauriStreamNode implements MiddenStreamNode {
   }
 
   /**
-   * iroh-blobs verified download — mirrors midden's
-   * `MiddenNode::download_verified_with_ensure_progress`. dispatches to the
-   * rust-side `blob_iroh_download` action which uses iroh-blobs'
-   * `Downloader` to fetch the blob into the local FsStore, then ingests it
-   * into `blobz` and returns the bytes (base64). progress callback is
-   * accepted for API compatibility but not currently wired through.
+   * iroh-blobs verified download INTO THE NATIVE STORE — dispatches the
+   * rust-side `blob_iroh_download`, which streams the blob into the local
+   * FsStore and exports it straight to blobz's content-addressed layout.
+   * the bytes NEVER cross the IPC boundary (previously this returned the
+   * whole payload as base64: three full in-memory copies + 1.33x IPC).
+   * playback/serving read the file natively via blob_get_path / asset://.
+   *
+   * real progress: the rust side emits throttled `blob-download-progress`
+   * events ({ blake3, bytesDone, totalSize }) which map onto the
+   * `on_progress(fraction)` callback here.
+   *
+   * returns the recorded blob metadata.
    */
-  async download_verified_with_ensure_progress(
+  async download_to_native_store(
     peer_addr: string,
     blake3_hash: string,
-    _total_size: number,
-    _on_progress?: (fraction: number) => void
-  ): Promise<Uint8Array> {
-    const resp = await dispatch("blob_iroh_download", {
-      peer_addr,
-      blake3: blake3_hash,
-    });
-    const data = (resp && typeof resp === "object" ? (resp as any).data : null) as string | null;
-    if (typeof data !== "string") {
-      throw new Error("blob_iroh_download: missing data field in response");
+    total_size: number,
+    on_progress?: (fraction: number) => void,
+    filename?: string,
+    mime?: string
+  ): Promise<{ size: number; mime: string | null; filename: string | null }> {
+    // listen before dispatching so no early events are missed. events are
+    // filtered by blake3 — concurrent downloads of different blobs don't
+    // cross-talk (same-blob concurrent downloads share progress, which is
+    // fine: they share the underlying transfer too).
+    let unlisten: (() => void) | null = null;
+    if (on_progress) {
+      unlisten = await listen<{ blake3: string; bytesDone: number; totalSize: number }>(
+        "blob-download-progress",
+        (event) => {
+          const p = event.payload;
+          if (p?.blake3 !== blake3_hash) return;
+          const total = p.totalSize > 0 ? p.totalSize : total_size;
+          if (total > 0) {
+            on_progress(Math.min(p.bytesDone / total, 1));
+          }
+        }
+      );
     }
-    return fromBase64(data);
+    try {
+      const resp = (await dispatch("blob_iroh_download", {
+        peer_addr,
+        blake3: blake3_hash,
+        size: total_size > 0 ? total_size : undefined,
+        filename: filename || undefined,
+        mime: mime || undefined,
+      })) as { meta?: { size?: number; mime?: string | null; filename?: string | null } };
+      const meta = resp?.meta ?? {};
+      return {
+        size: typeof meta.size === "number" ? meta.size : 0,
+        mime: meta.mime ?? null,
+        filename: meta.filename ?? null,
+      };
+    } finally {
+      unlisten?.();
+    }
   }
 
   /**
