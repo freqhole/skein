@@ -224,6 +224,44 @@ export async function writeBlobToOpfs(blobId: string, buffer: ArrayBuffer): Prom
   // sync access handle path anyway. silently no-op.
 }
 
+/**
+ * stream a File into OPFS via the worker's chunked upload session:
+ * incremental blake3 + incremental sync-access-handle writes, so neither
+ * thread ever holds the whole payload. each chunk buffer is transferred
+ * (zero-copy) across the worker boundary.
+ *
+ * returns { blake3, size } — the file lands in OPFS under its blake3
+ * content address. throws when streaming isn't available (no worker, no
+ * OPFS sync handles, midden stub); callers should fall back to the
+ * one-shot processBlobBytes path.
+ */
+export async function streamFileToOpfs(file: File): Promise<{ blake3: string; size: number }> {
+  const worker = await getBlobWorker();
+  if (!worker) throw new Error("streaming upload unavailable: no blob worker");
+
+  const sessionId = await worker.uploadBegin();
+  const reader = file.stream().getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      // chunks are usually freshly-allocated exact buffers, but a view into
+      // a larger buffer is legal — slice to exact bytes before transferring
+      const exact =
+        value.byteOffset === 0 && value.byteLength === value.buffer.byteLength
+          ? value.buffer
+          : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+      await worker.uploadPush(sessionId, Comlink.transfer(exact, [exact]));
+    }
+    return await worker.uploadFinish(sessionId);
+  } catch (err) {
+    await worker.uploadAbort(sessionId).catch(() => {});
+    throw err;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 // ---- thumbnail / image resize -------------------------------------------
 
 export interface ResizeImageOptions {

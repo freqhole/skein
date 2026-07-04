@@ -2,7 +2,9 @@
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
 export const __wbg_bistream_free: (a: number, b: number) => void;
+export const __wbg_blake3hasher_free: (a: number, b: number) => void;
 export const __wbg_helloimageresult_free: (a: number, b: number) => void;
+export const __wbg_importsession_free: (a: number, b: number) => void;
 export const __wbg_middennode_free: (a: number, b: number) => void;
 export const bistream_alpn: (a: number) => [number, number];
 export const bistream_close: (a: number) => void;
@@ -11,9 +13,15 @@ export const bistream_read_message: (a: number) => any;
 export const bistream_read_to_end: (a: number, b: number) => any;
 export const bistream_write_message: (a: number, b: number, c: number) => any;
 export const bistream_write_raw_and_finish: (a: number, b: number, c: number) => any;
+export const blake3hasher_finalize: (a: number) => [number, number];
+export const blake3hasher_new: () => number;
+export const blake3hasher_update: (a: number, b: number, c: number) => void;
 export const hash_blake3: (a: number, b: number) => [number, number];
 export const helloimageresult_content_type: (a: number) => [number, number];
 export const helloimageresult_data: (a: number) => any;
+export const importsession_abort: (a: number) => void;
+export const importsession_finish: (a: number) => any;
+export const importsession_push: (a: number, b: number, c: number) => any;
 export const middennode_accept: (a: number) => any;
 export const middennode_active_blob_count: (a: number) => number;
 export const middennode_clear_blob_restriction: (a: number, b: number, c: number) => [number, number];
@@ -41,6 +49,7 @@ export const middennode_proxy_request: (a: number, b: number, c: number, d: numb
 export const middennode_release_blob: (a: number, b: number, c: number) => [number, number];
 export const middennode_restrict_blob_to_peers: (a: number, b: number, c: number, d: any) => [number, number];
 export const middennode_secret_key: (a: number) => any;
+export const middennode_start_import: (a: number) => number;
 export const start: () => void;
 export const __wbg_intounderlyingbytesource_free: (a: number, b: number) => void;
 export const __wbg_intounderlyingsource_free: (a: number, b: number) => void;

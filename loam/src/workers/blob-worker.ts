@@ -289,6 +289,126 @@ async function generateThumbnailDataUrl(blob: Blob, maxSize = 200): Promise<stri
   });
 }
 
+// ---- streaming upload sessions --------------------------------------------
+// chunked counterpart to processBlobBytes: the main thread feeds a File's
+// stream() chunks one at a time, so neither thread ever holds the whole
+// payload. bytes land incrementally in a temp OPFS file (sync access
+// handle), blake3 is computed incrementally via midden's Blake3Hasher, and
+// on finish the temp file is renamed to the final blake3 content address.
+
+interface UploadSession {
+  handle: SyncAccessHandle;
+  tmpName: string;
+  hasher: { update(chunk: Uint8Array): void; finalize(): string; free(): void };
+  size: number;
+}
+
+const uploadSessions = new Map<number, UploadSession>();
+let nextUploadSessionId = 1;
+
+/**
+ * begin a streaming upload session. throws when the environment can't
+ * support it (no OPFS sync access handles, or the midden wasm stub without
+ * Blake3Hasher) — callers fall back to the one-shot processBlobBytes path.
+ */
+async function uploadBegin(): Promise<number> {
+  const Blake3HasherCtor = (middenWasm as any).Blake3Hasher;
+  if (typeof Blake3HasherCtor !== "function") {
+    throw new Error("streaming upload unavailable: midden Blake3Hasher missing");
+  }
+  const dir = await getOpfsDir(true);
+  if (!dir) throw new Error("streaming upload unavailable: OPFS inaccessible");
+
+  const id = nextUploadSessionId++;
+  const tmpName = `.upload-${id}-${Date.now()}`;
+  const fileHandle = await dir.getFileHandle(tmpName, { create: true });
+  const createSync = (
+    fileHandle as unknown as { createSyncAccessHandle?: () => Promise<SyncAccessHandle> }
+  ).createSyncAccessHandle;
+  if (typeof createSync !== "function") {
+    await dir.removeEntry(tmpName).catch(() => {});
+    throw new Error("streaming upload unavailable: no sync access handle support");
+  }
+  const handle = await createSync.call(fileHandle);
+  handle.truncate(0);
+
+  uploadSessions.set(id, { handle, tmpName, hasher: new Blake3HasherCtor(), size: 0 });
+  return id;
+}
+
+/** append the next chunk (transferred buffer) to a session. */
+async function uploadPush(id: number, buffer: ArrayBuffer): Promise<void> {
+  const session = uploadSessions.get(id);
+  if (!session) throw new Error(`unknown upload session ${id}`);
+  const bytes = new Uint8Array(buffer);
+  session.hasher.update(bytes);
+  session.handle.write(bytes, { at: session.size });
+  session.size += bytes.byteLength;
+}
+
+/**
+ * finish a session: flush + close the temp file, then rename it to the
+ * final blake3 content address. returns { blake3, size }.
+ */
+async function uploadFinish(id: number): Promise<{ blake3: string; size: number }> {
+  const session = uploadSessions.get(id);
+  if (!session) throw new Error(`unknown upload session ${id}`);
+  uploadSessions.delete(id);
+
+  let blake3 = "";
+  try {
+    session.handle.flush();
+    session.handle.close();
+    blake3 = session.hasher.finalize();
+  } finally {
+    session.hasher.free();
+  }
+
+  const dir = await getOpfsDir(true);
+  if (!dir) throw new Error("OPFS inaccessible at upload finish");
+  const tmpHandle = await dir.getFileHandle(session.tmpName);
+
+  // dedup: if the content-addressed file already exists, drop the temp copy
+  let exists = false;
+  try {
+    await dir.getFileHandle(blake3, { create: false });
+    exists = true;
+  } catch {
+    // target doesn't exist — rename below
+  }
+  if (exists) {
+    await dir.removeEntry(session.tmpName).catch(() => {});
+    return { blake3, size: session.size };
+  }
+
+  const move = (tmpHandle as unknown as { move?: (name: string) => Promise<void> }).move;
+  if (typeof move === "function") {
+    await move.call(tmpHandle, blake3);
+  } else {
+    // rare fallback (no FileSystemFileHandle.move): copy then remove.
+    // buffers once in the worker — still better than failing the upload.
+    const file = await tmpHandle.getFile();
+    await writeBlobToOpfs(blake3, await file.arrayBuffer());
+    await dir.removeEntry(session.tmpName).catch(() => {});
+  }
+  return { blake3, size: session.size };
+}
+
+/** abort a session: close and delete the temp file. */
+async function uploadAbort(id: number): Promise<void> {
+  const session = uploadSessions.get(id);
+  if (!session) return;
+  uploadSessions.delete(id);
+  try {
+    session.handle.close();
+  } catch {
+    // already closed
+  }
+  session.hasher.free();
+  const dir = await getOpfsDir(false);
+  await dir?.removeEntry(session.tmpName).catch(() => {});
+}
+
 const api = {
   hashBlake3,
   hashSha256,
@@ -299,6 +419,10 @@ const api = {
   processBlobBytes,
   resizeImageToWebpDataUrl,
   generateThumbnailDataUrl,
+  uploadBegin,
+  uploadPush,
+  uploadFinish,
+  uploadAbort,
 };
 
 export type BlobWorkerApi = typeof api;

@@ -19,6 +19,7 @@ const HEAVY_TEST_FILES = [
   "blob-acl-gate-prototype.spec.ts",
   "blob-acl-cross-canvas.spec.ts",
   "blob-proxy-friend-gate.spec.ts",
+  "blob-stream-import.spec.ts",
   "friendz-hub.spec.ts",
   "hub-admin.spec.ts",
   "hub-profile-panel.spec.ts",

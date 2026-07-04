@@ -156,6 +156,63 @@ export class BiStream {
 if (Symbol.dispose) BiStream.prototype[Symbol.dispose] = BiStream.prototype.free;
 
 /**
+ * incremental blake3 hasher for streaming uploads — feed fixed-size chunks
+ * via update() and read the final hex hash from finalize(). lets JS hash a
+ * File while streaming it (file.stream() reader loop) instead of holding
+ * the whole payload in memory for a one-shot hash_blake3().
+ */
+export class Blake3Hasher {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        Blake3HasherFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_blake3hasher_free(ptr, 0);
+    }
+    /**
+     * finish and return the hash as a 64-char hex string. the hasher can
+     * keep absorbing after this (blake3 finalize is non-destructive), but
+     * callers should treat the session as done.
+     * @returns {string}
+     */
+    finalize() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+            _assertNum(this.__wbg_ptr);
+            const ret = wasm.blake3hasher_finalize(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    constructor() {
+        const ret = wasm.blake3hasher_new();
+        this.__wbg_ptr = ret >>> 0;
+        Blake3HasherFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * absorb the next chunk of data.
+     * @param {Uint8Array} chunk
+     */
+    update(chunk) {
+        if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+        _assertNum(this.__wbg_ptr);
+        const ptr0 = passArray8ToWasm0(chunk, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.blake3hasher_update(this.__wbg_ptr, ptr0, len0);
+    }
+}
+if (Symbol.dispose) Blake3Hasher.prototype[Symbol.dispose] = Blake3Hasher.prototype.free;
+
+/**
  * result from fetching the server hello image from a peer
  */
 export class HelloImageResult {
@@ -204,6 +261,75 @@ export class HelloImageResult {
     }
 }
 if (Symbol.dispose) HelloImageResult.prototype[Symbol.dispose] = HelloImageResult.prototype.free;
+
+/**
+ * chunked import session — the streaming counterpart to import_blob.
+ *
+ * created via MiddenNode::start_import(). JS feeds fixed-size chunks with
+ * push() (backpressured: the promise resolves only once the chunk is
+ * queued), then finish() completes the import and returns the blake3 hash.
+ * the wasm boundary never sees the whole payload at once; the store's
+ * ImportByteStream machinery computes the bao tree incrementally.
+ *
+ * the finished blob is pinned in the node's active_tags (same as
+ * import_blob) until release_blob() is called.
+ */
+export class ImportSession {
+    constructor() {
+        throw new Error('cannot invoke `new` directly');
+    }
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(ImportSession.prototype);
+        obj.__wbg_ptr = ptr;
+        ImportSessionFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ImportSessionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_importsession_free(ptr, 0);
+    }
+    /**
+     * abort the import. any partially-imported data is left to GC.
+     */
+    abort() {
+        if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+        _assertNum(this.__wbg_ptr);
+        wasm.importsession_abort(this.__wbg_ptr);
+    }
+    /**
+     * signal end-of-stream, wait for the import to complete, pin the
+     * resulting blob, and return its blake3 hash as a hex string.
+     * @returns {Promise<string>}
+     */
+    finish() {
+        if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+        _assertNum(this.__wbg_ptr);
+        const ret = wasm.importsession_finish(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * queue the next chunk. resolves once the chunk has been accepted by
+     * the import stream (bounded channel — this is the backpressure point).
+     * @param {Uint8Array} chunk
+     * @returns {Promise<void>}
+     */
+    push(chunk) {
+        if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+        _assertNum(this.__wbg_ptr);
+        const ptr0 = passArray8ToWasm0(chunk, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.importsession_push(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+}
+if (Symbol.dispose) ImportSession.prototype[Symbol.dispose] = ImportSession.prototype.free;
 
 export class IntoUnderlyingByteSource {
     constructor() {
@@ -892,6 +1018,18 @@ export class MiddenNode {
         const ret = wasm.middennode_secret_key(this.__wbg_ptr);
         return ret;
     }
+    /**
+     * begin a chunked import — the streaming counterpart to import_blob for
+     * payloads that shouldn't be materialized as one contiguous &[u8] across
+     * the wasm boundary. see ImportSession for the push/finish protocol.
+     * @returns {ImportSession}
+     */
+    start_import() {
+        if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');
+        _assertNum(this.__wbg_ptr);
+        const ret = wasm.middennode_start_import(this.__wbg_ptr);
+        return ImportSession.__wrap(ret);
+    }
 }
 if (Symbol.dispose) MiddenNode.prototype[Symbol.dispose] = MiddenNode.prototype.free;
 
@@ -1547,42 +1685,42 @@ export function __wbg_wasClean_69f68dc4ed2d2cc7() { return logError(function (ar
     return ret;
 }, arguments); }
 export function __wbindgen_cast_0000000000000001() { return logError(function (arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { dtor_idx: 1799, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1800, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { dtor_idx: 1815, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1816, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h8a53bd0852c03e8f, wasm_bindgen__convert__closures_____invoke__h4394260d1fa039a2);
     return ret;
 }, arguments); }
 export function __wbindgen_cast_0000000000000002() { return logError(function (arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { dtor_idx: 2657, function: Function { arguments: [], shim_idx: 2674, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { dtor_idx: 2673, function: Function { arguments: [], shim_idx: 2690, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h533c804771f56470, wasm_bindgen__convert__closures_____invoke__h6ec366631b1a6c0f);
     return ret;
 }, arguments); }
 export function __wbindgen_cast_0000000000000003() { return logError(function (arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { dtor_idx: 2696, function: Function { arguments: [Externref], shim_idx: 2695, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { dtor_idx: 2712, function: Function { arguments: [Externref], shim_idx: 2711, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h6e71a26170572e7e, wasm_bindgen__convert__closures_____invoke__h43c0887aa8c2aab2);
     return ret;
 }, arguments); }
 export function __wbindgen_cast_0000000000000004() { return logError(function (arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { dtor_idx: 2870, function: Function { arguments: [], shim_idx: 2871, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { dtor_idx: 2886, function: Function { arguments: [], shim_idx: 2887, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h892c0dd4a933db0c, wasm_bindgen__convert__closures_____invoke__h8770eb7f257eb651);
     return ret;
 }, arguments); }
 export function __wbindgen_cast_0000000000000005() { return logError(function (arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { dtor_idx: 2873, function: Function { arguments: [], shim_idx: 2874, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { dtor_idx: 2889, function: Function { arguments: [], shim_idx: 2890, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
     const ret = makeClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h98e101558c36976e, wasm_bindgen__convert__closures_____invoke__hf96f32181bacebbd);
     return ret;
 }, arguments); }
 export function __wbindgen_cast_0000000000000006() { return logError(function (arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { dtor_idx: 3168, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 3169, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { dtor_idx: 3184, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 3185, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hddb69167355faa9c, wasm_bindgen__convert__closures_____invoke__hc7d3642a2cc8960e);
     return ret;
 }, arguments); }
 export function __wbindgen_cast_0000000000000007() { return logError(function (arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { dtor_idx: 4674, function: Function { arguments: [], shim_idx: 4675, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { dtor_idx: 4690, function: Function { arguments: [], shim_idx: 4691, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h7f674ba4405d1be8, wasm_bindgen__convert__closures_____invoke__hf8a7cc390d8a47e7);
     return ret;
 }, arguments); }
 export function __wbindgen_cast_0000000000000008() { return logError(function (arg0, arg1) {
-    // Cast intrinsic for `Closure(Closure { dtor_idx: 4685, function: Function { arguments: [Externref], shim_idx: 4717, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+    // Cast intrinsic for `Closure(Closure { dtor_idx: 4701, function: Function { arguments: [Externref], shim_idx: 4733, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
     const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h83cbdcc45848a00e, wasm_bindgen__convert__closures_____invoke__h08ae2a844f8a5b5b);
     return ret;
 }, arguments); }
@@ -1693,9 +1831,15 @@ const __wbindgen_enum_RequestMode = ["same-origin", "no-cors", "cors", "navigate
 const BiStreamFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_bistream_free(ptr >>> 0, 1));
+const Blake3HasherFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_blake3hasher_free(ptr >>> 0, 1));
 const HelloImageResultFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_helloimageresult_free(ptr >>> 0, 1));
+const ImportSessionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_importsession_free(ptr >>> 0, 1));
 const IntoUnderlyingByteSourceFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_intounderlyingbytesource_free(ptr >>> 0, 1));

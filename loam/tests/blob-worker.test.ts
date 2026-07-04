@@ -31,3 +31,41 @@ test("blob worker initialises and hashes + writes to OPFS", async ({ canvasPage 
 
   expect(opfsBytesLength).toBe(28);
 });
+
+test("streaming upload session: chunked blake3 + OPFS write matches the one-shot path", async ({
+  canvasPage,
+}) => {
+  const { page } = await canvasPage();
+
+  const result = await page.evaluate(async () => {
+    const helpers = (window as any).__skeinHelpers;
+
+    // ~2.5MB of deterministic bytes, in a File so streamFileToOpfs can
+    // consume file.stream() exactly like a real picker upload
+    const size = 2_500_000;
+    const bytes = new Uint8Array(size);
+    for (let i = 0; i < size; i++) bytes[i] = (i * 31 + 7) % 256;
+    const file = new File([bytes], "stream-test.bin", { type: "application/octet-stream" });
+
+    const streamed = await helpers.streamFileToOpfs(file);
+
+    // one-shot hash of the same content for comparison
+    const worker = await helpers.getBlobWorker();
+    const oneShotHash = await worker.hashBlake3(bytes);
+    const opfsBytes = await worker.readBlobFromOpfs(streamed.blake3);
+
+    return {
+      streamedHash: streamed.blake3,
+      streamedSize: streamed.size,
+      oneShotHash,
+      opfsByteLength: opfsBytes ? opfsBytes.byteLength : null,
+    };
+  });
+
+  // incremental blake3 must agree with the one-shot hash
+  expect(result.streamedHash).toBe(result.oneShotHash);
+  expect(result.streamedHash).toHaveLength(64);
+  expect(result.streamedSize).toBe(2_500_000);
+  // and the bytes must have landed under the blake3 content address
+  expect(result.opfsByteLength).toBe(2_500_000);
+});

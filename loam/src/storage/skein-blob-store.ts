@@ -6,7 +6,12 @@
 // operation, close it when done. no idb library dependency.
 // ---------------------------------------------------------------------------
 
-import { writeBlobToOpfs, processBlobBytes, base64Decode } from "../workers/blob-worker-client";
+import {
+  writeBlobToOpfs,
+  processBlobBytes,
+  base64Decode,
+  streamFileToOpfs,
+} from "../workers/blob-worker-client";
 import { isTauriMode, dispatch } from "../p2p/tauri-transport";
 import { log } from "../utils/log";
 
@@ -34,6 +39,11 @@ const BLOB_DB_NAME = "skein-blobs";
 const BLOB_STORE = "blobs";
 const OPFS_DIR = "skein-blobs";
 const BAO_OPFS_DIR = "skein-blobs-bao";
+
+/** files at or above this size are streamed into OPFS chunk-by-chunk
+ *  (incremental blake3 + sync-access-handle writes) instead of being
+ *  buffered whole for the one-shot hash+write pipeline. */
+const STREAM_UPLOAD_THRESHOLD = 8 * 1024 * 1024;
 
 // ---- session url cache ----------------------------------------------------
 
@@ -240,13 +250,47 @@ export async function storeBlob(
 /**
  * convenience method to store a browser File object as a blob.
  *
- * uses the SHA-256 hash of the file content as the blob_id for
+ * uses the blake3 hash of the file content as the blob_id for
  * content-addressed deduplication. if a blob with the same id already
  * exists, the existing record is returned without writing again.
+ *
+ * large files stream into OPFS chunk-by-chunk (incremental blake3 +
+ * sync-access-handle writes) so the whole payload never exists in memory;
+ * small files use the one-shot worker pipeline.
  */
 export async function storeBlobFromFile(file: File, domain?: string): Promise<SkeinBlobRecord> {
-  const buffer = await file.arrayBuffer();
   const mime = file.type || "application/octet-stream";
+  const resolvedDomainEarly = domain ?? classifyDomain(mime);
+
+  // streaming path for large files. sha256 is legacy-only (kept on records
+  // created before blake3 became the canonical id): brand-new content
+  // can't be referenced by an old sha256 doc id, so it isn't computed here.
+  if (file.size >= STREAM_UPLOAD_THRESHOLD) {
+    try {
+      const { blake3, size } = await streamFileToOpfs(file);
+      const existingStreamed = await getBlobRecord(blake3);
+      if (existingStreamed) return existingStreamed;
+      const streamedRecord: SkeinBlobRecord = {
+        blob_id: blake3,
+        sha256: "",
+        blake3,
+        filename: file.name,
+        mime,
+        size,
+        domain: resolvedDomainEarly,
+        blob_type: "original",
+        parent_blob_id: null,
+        metadata: {},
+        created_at: Date.now(),
+      };
+      await putBlobRecord(streamedRecord);
+      return (await getBlobRecord(blake3))!;
+    } catch (err) {
+      log.warn(TAG, "streaming upload failed, falling back to buffered path:", err);
+    }
+  }
+
+  const buffer = await file.arrayBuffer();
 
   // hand the whole upload pipeline to the blob worker: sha256 + blake3
   // hashing AND the OPFS write happen off the main thread in a single
@@ -296,6 +340,23 @@ export async function storeBlobFromFile(file: File, domain?: string): Promise<Sk
 
   const stored = await getBlobRecord(blobId);
   return stored!;
+}
+
+/** persist a metadata record to IndexedDB (bytes are assumed already written). */
+async function putBlobRecord(record: SkeinBlobRecord): Promise<void> {
+  const db = await openBlobDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(BLOB_STORE, "readwrite");
+    tx.objectStore(BLOB_STORE).put(record);
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error);
+    };
+  });
 }
 
 /**
@@ -623,6 +684,25 @@ export async function hasBlobBytes(blobId: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * get a blob's OPFS bytes as a lazily-read File object (no bytes are
+ * loaded until the caller reads/streams it). the chunked alternative to
+ * getBlobData() for large blobs — pair with `file.stream()` to feed a
+ * chunked consumer (e.g. midden's ImportSession) without ever
+ * materializing the whole payload. browser OPFS only; returns null when
+ * the file is missing (no tauri fallback — tauri callers never need this).
+ */
+export async function getBlobFile(blobId: string): Promise<File | null> {
+  try {
+    const dir = await getOpfsDir(false);
+    if (!dir) return null;
+    const fileHandle = await dir.getFileHandle(blobId, { create: false });
+    return await fileHandle.getFile();
+  } catch {
+    return null;
   }
 }
 

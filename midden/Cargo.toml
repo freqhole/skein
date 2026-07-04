@@ -29,9 +29,13 @@ n0-future = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-wasm-bindgen = "0.6"
-# io-util only: AsyncReadExt for the chunked BlobReader loop in
-# download_verified_streaming (wasm-safe, no runtime features)
-tokio = { version = "1", default-features = false, features = ["io-util"] }
+# io-util: AsyncReadExt for the chunked BlobReader loop in
+# download_verified_streaming. sync: mpsc/oneshot channels backing
+# ImportSession's chunked add_stream import. both wasm-safe (no runtime).
+tokio = { version = "1", default-features = false, features = [
+    "io-util",
+    "sync",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-subscriber-wasm = "0.1"

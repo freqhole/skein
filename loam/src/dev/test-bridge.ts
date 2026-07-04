@@ -160,6 +160,16 @@ export interface SkeinP2PBridge {
    */
   importBlob(data: Uint8Array, options?: { filename?: string; mime?: string }): Promise<string>;
   /**
+   * chunked-import variant of importBlob driving midden's ImportSession
+   * (start_import/push/finish over iroh-blobs add_stream). verifies the
+   * streaming import path e2e without requiring a large fixture.
+   */
+  importBlobStreaming(
+    data: Uint8Array,
+    chunkSize?: number,
+    options?: { filename?: string; mime?: string }
+  ): Promise<string>;
+  /**
    * fetch a blob's bytes directly from another peer by node id + blake3
    * hash, using midden's `download_verified_with_ensure` (the same
    * verified iroh-blobs transfer `widgets/file-utils.ts` uses for full
@@ -560,6 +570,59 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
       // only looks at IndexedDB/OPFS) reports it as remote.
       const mime = options?.mime ?? "application/octet-stream";
       const filename = options?.filename ?? "test-blob";
+      const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+      await storeBlob(blake3, buffer, {
+        blob_id: blake3,
+        sha256: "",
+        blake3,
+        filename,
+        mime,
+        size: data.byteLength,
+        domain: classifyDomain(mime),
+        blob_type: "original",
+        parent_blob_id: null,
+        metadata: {},
+      });
+
+      return blake3;
+    },
+
+    /** chunked-import variant of importBlob — drives midden's ImportSession
+     *  (start_import/push/finish, backed by iroh-blobs add_stream) exactly
+     *  like the production streaming-serve path in skein-handler. lets e2e
+     *  tests verify the chunked import produces the same hash + servable
+     *  blob as the one-shot import_blob, without needing a >8MB fixture. */
+    async importBlobStreaming(
+      data: Uint8Array,
+      chunkSize = 256 * 1024,
+      options?: { filename?: string; mime?: string }
+    ): Promise<string> {
+      const node = await adapter.getNode();
+      const nodeAny = node as unknown as {
+        start_import(): {
+          push(chunk: Uint8Array): Promise<void>;
+          finish(): Promise<string>;
+          abort(): void;
+        };
+      };
+      const session = nodeAny.start_import();
+      let blake3: string;
+      try {
+        for (let offset = 0; offset < data.byteLength; offset += chunkSize) {
+          await session.push(data.subarray(offset, Math.min(offset + chunkSize, data.byteLength)));
+        }
+        blake3 = await session.finish();
+      } catch (err) {
+        try {
+          session.abort();
+        } catch {
+          // already finished/aborted
+        }
+        throw err;
+      }
+
+      const mime = options?.mime ?? "application/octet-stream";
+      const filename = options?.filename ?? "test-blob-streamed";
       const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
       await storeBlob(blake3, buffer, {
         blob_id: blake3,

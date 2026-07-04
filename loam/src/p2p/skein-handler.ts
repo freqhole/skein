@@ -322,6 +322,40 @@ async function handleBlobMetadata(
 
 // ---- compute_blake3 request -----------------------------------------------
 
+/** blobs at or above this size are imported into the iroh-blobs store via
+ *  midden's chunked ImportSession (add_stream) instead of a whole-buffer
+ *  import_blob call — the wasm boundary never sees the full payload. below
+ *  it, the bao-caching whole-buffer path stays (fast re-import for modest
+ *  files, and the bao export is a whole-buffer operation anyway). */
+const STREAM_IMPORT_THRESHOLD = 8 * 1024 * 1024;
+
+/**
+ * chunk-stream a blob's OPFS bytes into the node's iroh-blobs store via
+ * ImportSession. `file` is a lazily-read File handle (no bytes loaded
+ * until streamed). returns the blake3 hash reported by the store.
+ */
+async function importBlobStreaming(node: any, file: File): Promise<string> {
+  const session = node.start_import();
+  const reader = file.stream().getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await session.push(value);
+    }
+    return (await session.finish()) as string;
+  } catch (err) {
+    try {
+      session.abort();
+    } catch {
+      // already finished/aborted
+    }
+    throw err;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 async function handleComputeBlake3(stream: BiStreamLike, msg: ComputeBlake3Request): Promise<void> {
   const { id, blob_id } = msg;
   const peerId = stream.peer_node_id().slice(0, 16);
@@ -329,6 +363,33 @@ async function handleComputeBlake3(stream: BiStreamLike, msg: ComputeBlake3Reque
   log.debug(TAG, `compute_blake3 for ${blob_id.slice(0, 8)}... from ${peerId}...`);
 
   const store = blobStore;
+
+  // streaming path for large blobs: resolve the record, then chunk-stream
+  // the OPFS file into the store — no whole-buffer copy on either side.
+  try {
+    const record = await store.resolveBlob(blob_id);
+    if (record) {
+      const node = await getMiddenNodeFromIdentity();
+      if (
+        typeof (node as any).start_import === "function" &&
+        (record.size ?? 0) >= STREAM_IMPORT_THRESHOLD
+      ) {
+        const file = await store.getBlobFile(record.blob_id);
+        if (file) {
+          const hash = await importBlobStreaming(node, file);
+          log.debug(
+            TAG,
+            `computed blake3 for ${blob_id.slice(0, 8)}... via streaming import: ${hash.slice(0, 16)}...`
+          );
+          await sendRawResponse(stream, { type: "compute_blake3_response", id, blake3: hash });
+          return;
+        }
+      }
+    }
+  } catch (err) {
+    log.warn(TAG, "streaming compute_blake3 failed, falling back to buffered path:", err);
+  }
+
   const resolved = await store.resolveBlobData(blob_id);
 
   if (!resolved) {
@@ -477,6 +538,37 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
         error: "no blob with this blake3 hash found locally",
       });
       return;
+    }
+
+    // streaming import for large blobs: chunk the OPFS file straight into
+    // the store via ImportSession — the whole payload never crosses the
+    // wasm boundary as one buffer. (no bao caching on this path; the bao
+    // export is a whole-buffer operation and large blobs are exactly where
+    // that hurts.)
+    if (
+      typeof (node as any).start_import === "function" &&
+      (record.size ?? 0) >= STREAM_IMPORT_THRESHOLD
+    ) {
+      const file = await store.getBlobFile(record.blob_id);
+      if (file) {
+        try {
+          const hash = await importBlobStreaming(node, file);
+          log.debug(
+            TAG,
+            `ensured blob ${blake3_hash.slice(0, 16)}... via streaming import (${file.size} bytes)`
+          );
+          if (hash !== blake3_hash) {
+            log.warn(
+              TAG,
+              `streaming import hash mismatch: expected ${blake3_hash.slice(0, 16)}..., got ${hash.slice(0, 16)}...`
+            );
+          }
+          await sendRawResponse(stream, { type: "ensure_blob_response", id, available: true });
+          return;
+        } catch (err) {
+          log.warn(TAG, "streaming ensure_blob import failed, falling back to buffered:", err);
+        }
+      }
     }
 
     const data = await store.getBlobData(record.blob_id);

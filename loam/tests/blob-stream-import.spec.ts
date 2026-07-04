@@ -1,0 +1,100 @@
+/**
+ * chunked import (midden ImportSession over iroh-blobs add_stream): proves
+ * the streaming import path produces the same content address as the
+ * one-shot import_blob AND that the resulting blob is actually servable to
+ * another peer over a real iroh-blobs verified transfer.
+ *
+ * this is the e2e guard for the phase B "upload streaming" work (see
+ * docs/opfs-store-implementation-plan.md): skein-handler's ensure_blob /
+ * compute_blake3 use this exact session machinery for large blobs, so a
+ * regression here means large-blob serving silently falls back or breaks.
+ *
+ * uses a deliberately-small payload (256KB chunks over ~1.5MB) — the
+ * chunking mechanics are identical at any size, and small fixtures keep
+ * this heavy-lane test fast. blob-worker.test.ts covers the worker-side
+ * streaming upload (incremental blake3 + OPFS) separately.
+ *
+ * tag: @p2p
+ * run with: npx playwright test tests/blob-stream-import.spec.ts --workers=1
+ */
+
+import { test, expect } from "./fixtures/p2p-page";
+import type { Page } from "@playwright/test";
+import { fromEvaluateArray, randomBlobBytes, toEvaluateArray } from "./helpers/blob-fixtures";
+
+/** import bytes on `page` via the chunked ImportSession bridge method. */
+async function importBlobStreaming(page: Page, bytes: Uint8Array): Promise<string> {
+  return page.evaluate(async (byteArray: number[]) => {
+    const bridge = (window as any).__skeinTest;
+    const bytes = Uint8Array.from(byteArray);
+    return bridge.p2p.importBlobStreaming(bytes) as Promise<string>;
+  }, toEvaluateArray(bytes));
+}
+
+/** one-shot import (existing import_blob path) for hash comparison. */
+async function importBlobOneShot(page: Page, bytes: Uint8Array): Promise<string> {
+  return page.evaluate(async (byteArray: number[]) => {
+    const bridge = (window as any).__skeinTest;
+    const bytes = Uint8Array.from(byteArray);
+    return bridge.p2p.importBlob(bytes) as Promise<string>;
+  }, toEvaluateArray(bytes));
+}
+
+/** fetch a blob directly from `peerNodeId` by hash, retrying transient dial failures. */
+async function fetchBlobWithRetry(
+  page: Page,
+  peerNodeId: string,
+  blake3Hash: string,
+  attempts = 4,
+  delayMs = 1000
+): Promise<number[]> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await page.evaluate(
+        async ([peerId, hash]) => {
+          const bridge = (window as any).__skeinTest;
+          const bytes: Uint8Array = await bridge.p2p.fetchBlob(peerId, hash);
+          return Array.from(bytes);
+        },
+        [peerNodeId, blake3Hash] as const
+      );
+    } catch (err) {
+      lastErr = err;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+test("chunked ImportSession produces the same blake3 as one-shot import_blob @p2p", async ({
+  p2pPage,
+}) => {
+  test.setTimeout(120_000);
+
+  const peer = await p2pPage();
+  const bytes = randomBlobBytes();
+
+  const streamedHash = await importBlobStreaming(peer.page, bytes);
+  const oneShotHash = await importBlobOneShot(peer.page, bytes);
+
+  expect(streamedHash).toHaveLength(64);
+  expect(streamedHash).toBe(oneShotHash);
+});
+
+test("a blob imported via chunked ImportSession is servable to another peer @p2p", async ({
+  p2pPage,
+}) => {
+  test.setTimeout(180_000);
+
+  const owner = await p2pPage();
+  const fetcher = await p2pPage();
+
+  const sourceBytes = randomBlobBytes();
+  const blake3 = await importBlobStreaming(owner.page, sourceBytes);
+
+  const fetchedBytes = await fetchBlobWithRetry(fetcher.page, owner.nodeId, blake3);
+  expect(fromEvaluateArray(fetchedBytes)).toEqual(sourceBytes);
+});

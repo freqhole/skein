@@ -82,6 +82,28 @@ export class BiStream {
 }
 
 /**
+ * incremental blake3 hasher for streaming uploads — feed fixed-size chunks
+ * via update() and read the final hex hash from finalize(). lets JS hash a
+ * File while streaming it (file.stream() reader loop) instead of holding
+ * the whole payload in memory for a one-shot hash_blake3().
+ */
+export class Blake3Hasher {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * finish and return the hash as a 64-char hex string. the hasher can
+     * keep absorbing after this (blake3 finalize is non-destructive), but
+     * callers should treat the session as done.
+     */
+    finalize(): string;
+    constructor();
+    /**
+     * absorb the next chunk of data.
+     */
+    update(chunk: Uint8Array): void;
+}
+
+/**
  * result from fetching the server hello image from a peer
  */
 export class HelloImageResult {
@@ -90,6 +112,38 @@ export class HelloImageResult {
     [Symbol.dispose](): void;
     readonly content_type: string | undefined;
     readonly data: Uint8Array;
+}
+
+/**
+ * chunked import session — the streaming counterpart to import_blob.
+ *
+ * created via MiddenNode::start_import(). JS feeds fixed-size chunks with
+ * push() (backpressured: the promise resolves only once the chunk is
+ * queued), then finish() completes the import and returns the blake3 hash.
+ * the wasm boundary never sees the whole payload at once; the store's
+ * ImportByteStream machinery computes the bao tree incrementally.
+ *
+ * the finished blob is pinned in the node's active_tags (same as
+ * import_blob) until release_blob() is called.
+ */
+export class ImportSession {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * abort the import. any partially-imported data is left to GC.
+     */
+    abort(): void;
+    /**
+     * signal end-of-stream, wait for the import to complete, pin the
+     * resulting blob, and return its blake3 hash as a hex string.
+     */
+    finish(): Promise<string>;
+    /**
+     * queue the next chunk. resolves once the chunk has been accepted by
+     * the import stream (bounded channel — this is the backpressure point).
+     */
+    push(chunk: Uint8Array): Promise<void>;
 }
 
 export class IntoUnderlyingByteSource {
@@ -358,6 +412,12 @@ export class MiddenNode {
      * store this in IndexedDB to maintain the same identity across sessions
      */
     secret_key(): Uint8Array;
+    /**
+     * begin a chunked import — the streaming counterpart to import_blob for
+     * payloads that shouldn't be materialized as one contiguous &[u8] across
+     * the wasm boundary. see ImportSession for the push/finish protocol.
+     */
+    start_import(): ImportSession;
 }
 
 /**

@@ -332,6 +332,122 @@ pub fn hash_blake3(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
+/// incremental blake3 hasher for streaming uploads — feed fixed-size chunks
+/// via update() and read the final hex hash from finalize(). lets JS hash a
+/// File while streaming it (file.stream() reader loop) instead of holding
+/// the whole payload in memory for a one-shot hash_blake3().
+#[wasm_bindgen]
+pub struct Blake3Hasher {
+    inner: blake3::Hasher,
+}
+
+#[wasm_bindgen]
+impl Blake3Hasher {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Blake3Hasher {
+        Blake3Hasher {
+            inner: blake3::Hasher::new(),
+        }
+    }
+
+    /// absorb the next chunk of data.
+    pub fn update(&mut self, chunk: &[u8]) {
+        self.inner.update(chunk);
+    }
+
+    /// finish and return the hash as a 64-char hex string. the hasher can
+    /// keep absorbing after this (blake3 finalize is non-destructive), but
+    /// callers should treat the session as done.
+    pub fn finalize(&self) -> String {
+        self.inner.finalize().to_hex().to_string()
+    }
+}
+
+impl Default for Blake3Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// adapter: tokio mpsc receiver -> Stream, for feeding add_stream.
+/// (tokio_stream::wrappers::ReceiverStream without the extra dependency.)
+struct ReceiverStream<T>(tokio::sync::mpsc::Receiver<T>);
+
+impl<T> n0_future::Stream for ReceiverStream<T> {
+    type Item = T;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<T>> {
+        self.get_mut().0.poll_recv(cx)
+    }
+}
+
+/// chunked import session — the streaming counterpart to import_blob.
+///
+/// created via MiddenNode::start_import(). JS feeds fixed-size chunks with
+/// push() (backpressured: the promise resolves only once the chunk is
+/// queued), then finish() completes the import and returns the blake3 hash.
+/// the wasm boundary never sees the whole payload at once; the store's
+/// ImportByteStream machinery computes the bao tree incrementally.
+///
+/// the finished blob is pinned in the node's active_tags (same as
+/// import_blob) until release_blob() is called.
+#[wasm_bindgen]
+pub struct ImportSession {
+    sender: RefCell<Option<tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>>>,
+    result_rx: RefCell<Option<tokio::sync::oneshot::Receiver<Result<TempTag, String>>>>,
+    active_tags: Rc<RefCell<IndexMap<Hash, TempTag>>>,
+}
+
+#[wasm_bindgen]
+impl ImportSession {
+    /// queue the next chunk. resolves once the chunk has been accepted by
+    /// the import stream (bounded channel — this is the backpressure point).
+    pub async fn push(&self, chunk: &[u8]) -> Result<(), JsError> {
+        // clone the sender out of the RefCell so no borrow is held across await
+        let sender = self
+            .sender
+            .borrow()
+            .clone()
+            .ok_or_else(|| JsError::new("import session already finished or aborted"))?;
+        sender
+            .send(Ok(bytes::Bytes::copy_from_slice(chunk)))
+            .await
+            .map_err(|_| JsError::new("import task ended unexpectedly"))?;
+        Ok(())
+    }
+
+    /// signal end-of-stream, wait for the import to complete, pin the
+    /// resulting blob, and return its blake3 hash as a hex string.
+    pub async fn finish(&self) -> Result<String, JsError> {
+        // drop the sender — end-of-stream for the import task
+        self.sender.borrow_mut().take();
+        let rx = self
+            .result_rx
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| JsError::new("finish already called or session aborted"))?;
+        let tt = rx
+            .await
+            .map_err(|_| JsError::new("import task dropped before completing"))?
+            .map_err(|e| JsError::new(&e))?;
+        let hash = tt.hash();
+        self.active_tags.borrow_mut().insert(hash, tt);
+        Ok(hash.to_hex().to_string())
+    }
+
+    /// abort the import. any partially-imported data is left to GC.
+    pub fn abort(&self) {
+        if let Some(tx) = self.sender.borrow_mut().take() {
+            // best-effort: fail the import stream fast instead of letting it
+            // complete as a truncated-but-valid blob
+            let _ = tx.try_send(Err(std::io::Error::other("import aborted")));
+        }
+        self.result_rx.borrow_mut().take();
+    }
+}
+
 /// parse peer address - accepts either:
 /// - plain node_id (64 hex chars): "13a257b5367d6b5b7ceb67ec6246c3dafbe886af8ed429408cd7619c7a4787b1"
 /// - full endpoint JSON: {"id":"...","addrs":[{"Relay":"..."},{"Ip":"..."}]}
@@ -508,9 +624,10 @@ pub struct MiddenNode {
     blobs_downloader: Downloader,
     blobs_protocol: BlobsProtocol,
     /// active TempTags keyed by blob hash — prevents GC of imported blobs
-    /// until release_blob() drops the tag.
+    /// until release_blob() drops the tag. Rc-shared so ImportSession can
+    /// pin its finished import into the same map.
     #[wasm_bindgen(skip)]
-    pub active_tags: RefCell<IndexMap<Hash, TempTag>>,
+    pub active_tags: Rc<RefCell<IndexMap<Hash, TempTag>>>,
     /// hashes currently being downloaded/streamed; protected from GC sweeps.
     /// the downloader does not auto-create TempTags, so without this an
     /// in-flight download can be wiped by the periodic GC between
@@ -591,7 +708,7 @@ impl MiddenNode {
             blobs_store,
             blobs_downloader,
             blobs_protocol,
-            active_tags: RefCell::new(IndexMap::new()),
+            active_tags: Rc::new(RefCell::new(IndexMap::new())),
             protected_hashes,
             blob_acl,
         })
@@ -711,7 +828,7 @@ impl MiddenNode {
             blobs_store,
             blobs_downloader,
             blobs_protocol,
-            active_tags: RefCell::new(IndexMap::new()),
+            active_tags: Rc::new(RefCell::new(IndexMap::new())),
             protected_hashes,
             blob_acl,
         })
@@ -1557,6 +1674,33 @@ impl MiddenNode {
         result.push(&data.into());
         result.push(&JsValue::from_str(&blake3));
         Ok(result)
+    }
+
+    /// begin a chunked import — the streaming counterpart to import_blob for
+    /// payloads that shouldn't be materialized as one contiguous &[u8] across
+    /// the wasm boundary. see ImportSession for the push/finish protocol.
+    pub fn start_import(&self) -> ImportSession {
+        // small bound: each queued chunk is typically ~1MB from JS, so the
+        // channel holds at most a few MB while providing real backpressure.
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<TempTag, String>>();
+
+        let store = self.blobs_store.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let progress = store.blobs().add_stream(ReceiverStream(rx)).await;
+            let res = progress
+                .temp_tag()
+                .await
+                .map_err(|e| format!("chunked import failed: {:?}", e));
+            // receiver dropped (abort) => temp tag dropped => gc reclaims
+            let _ = result_tx.send(res);
+        });
+
+        ImportSession {
+            sender: RefCell::new(Some(tx)),
+            result_rx: RefCell::new(Some(result_rx)),
+            active_tags: self.active_tags.clone(),
+        }
     }
 
     /// import raw bytes into the iroh-blobs store, returning the blake3 hash.
