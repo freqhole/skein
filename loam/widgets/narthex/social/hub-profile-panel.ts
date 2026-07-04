@@ -27,7 +27,6 @@ import {
   type HubAdminCanvasUsageSummary,
   type HubAdminBlobUsageSummary,
   type HubAdminSoftDeletedBlob,
-  type HubAdminResponse,
 } from "../../../src/p2p/hub-admin-client";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
 import { colorForName, isValidNodeId, truncate } from "./helpers";
@@ -71,9 +70,11 @@ const ACTION_BTN_H = 20;
 const ACTION_BTN_GAP = 6;
 const COPY_BTN_FEEDBACK_MS = 1500;
 const ALLOW_BTN_W = 70;
-const CANVAS_ROW_HEIGHT = 34;
+const CANVAS_ROW_HEIGHT = 36;
 const BLOB_ROW_HEIGHT = 28;
 const CONFIRM_TIMEOUT_MS = 5000;
+const BLOB_PAGE_SIZE = 10;
+const UNSYNC_BTN_W = 64;
 
 // ---------------------------------------------------------------------------
 // public types
@@ -106,8 +107,14 @@ export type HubProfilePanelState =
       friends: HubAdminFriendSummary[];
       pendingKnocks: HubAdminPendingKnockSummary[];
       diskUsage: HubAdminDiskUsage | null;
-      canvasUsage: HubAdminCanvasUsageSummary[] | null;
     };
+
+/** pagination state snapshot exposed via test hooks. */
+export interface HubProfilePageState {
+  page: number;
+  pageCount: number;
+  total: number;
+}
 
 export interface HubProfilePanelHandle {
   /** the pixi container this panel's content was mounted into (same as the `container` argument). */
@@ -118,6 +125,18 @@ export interface HubProfilePanelHandle {
   refresh(): Promise<void>;
   /** current render state — see `HubProfilePanelState`. */
   getState(): HubProfilePanelState;
+  // -- pagination state / positions --
+  getBlobPageState(): HubProfilePageState;
+  getSoftDeletedPageState(): HubProfilePageState;
+  getCanvasPageState(): HubProfilePageState;
+  getBlobPrevButtonGlobalPos(): { x: number; y: number } | null;
+  getBlobNextButtonGlobalPos(): { x: number; y: number } | null;
+  getSoftDeletedPrevButtonGlobalPos(): { x: number; y: number } | null;
+  getSoftDeletedNextButtonGlobalPos(): { x: number; y: number } | null;
+  getCanvasPrevButtonGlobalPos(): { x: number; y: number } | null;
+  getCanvasNextButtonGlobalPos(): { x: number; y: number } | null;
+  // -- un-sync --
+  getUnsyncButtonGlobalPos(canvasDocId: string): { x: number; y: number } | null;
   /**
    * dev/test-only: global (screen-space) center position of the "allow"
    * input field, or null if the panel isn't currently in its "ready" state
@@ -173,11 +192,15 @@ export function mountHubProfilePanel(
   const blockInFlight = new Set<string>();
   const promoteInFlight = new Set<string>();
 
-  // blob section state (lazy-loaded on demand)
+  // blob / soft-deleted section state (lazy-loaded on demand)
   type BlobSectionState = "idle" | "loading" | "loaded" | "error";
   let blobState: BlobSectionState = "idle";
   let blobRows: HubAdminBlobUsageSummary[] = [];
+  let blobTotal = 0;
+  let blobPage = 0;
   let softDeletedRows: HubAdminSoftDeletedBlob[] = [];
+  let softDeletedTotal = 0;
+  let softDeletedPage = 0;
   let blobErrorMsg: string | null = null;
   let blobDeleteFailures: string[] = [];
   let softDeleteInFlight = false;
@@ -186,13 +209,32 @@ export function mountHubProfilePanel(
   let confirmHardDeleteAll = false;
   let confirmHardDeleteAllTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // dev/test-only refs to rendered buttons — see getAllowButtonGlobalPos()/
-  // getRemoveButtonGlobalPos() below. reset at the top of every rebuild().
+  // canvas section state (lazy-loaded on demand)
+  let canvasState: BlobSectionState = "idle";
+  let canvasRows: HubAdminCanvasUsageSummary[] = [];
+  let canvasTotal = 0;
+  let canvasPage = 0;
+  let canvasErrorMsg: string | null = null;
+
+  // un-sync confirm state
+  let confirmUnsyncCanvas: string | null = null;
+  let confirmUnsyncTimer: ReturnType<typeof setTimeout> | null = null;
+  let unsyncInFlight = false;
+  let unsyncSweptMsg: string | null = null;
+
+  // dev/test-only refs to rendered buttons
   let allowButtonRef: Container | null = null;
   const removeButtonRefs = new Map<string, Container>();
   const blockButtonRefs = new Map<string, Container>();
   const adminButtonRefs = new Map<string, Container>();
   const copyButtonRefs = new Map<string, Container>();
+  let blobPrevBtnRef: Container | null = null;
+  let blobNextBtnRef: Container | null = null;
+  let softDeletedPrevBtnRef: Container | null = null;
+  let softDeletedNextBtnRef: Container | null = null;
+  let canvasPrevBtnRef: Container | null = null;
+  let canvasNextBtnRef: Container | null = null;
+  const unsyncButtonRefs = new Map<string, Container>();
 
   function globalCenter(c: Container): { x: number; y: number } {
     const pos = c.getGlobalPosition();
@@ -236,18 +278,13 @@ export function mountHubProfilePanel(
 
     let listResponse;
     let knocksResponse;
-    let diskRes: HubAdminResponse | null = null;
-    let canvasRes: HubAdminResponse | null = null;
+    let diskRes: { kind: string; usage?: HubAdminDiskUsage } | null = null;
     try {
-      [listResponse, knocksResponse, diskRes, canvasRes] = await Promise.all([
+      [listResponse, knocksResponse, diskRes] = await Promise.all([
         client.hubAdminList(hubNodeId),
         client.hubAdminListPendingKnocks(hubNodeId),
         client.hubAdminDiskUsage(hubNodeId).catch((e: unknown) => {
           log.warn(TAG, "disk usage fetch failed:", e);
-          return null;
-        }),
-        client.hubAdminCanvasUsage(hubNodeId).catch((e: unknown) => {
-          log.warn(TAG, "canvas usage fetch failed:", e);
           return null;
         }),
       ]);
@@ -294,15 +331,24 @@ export function mountHubProfilePanel(
       status: "ready",
       friends: listResponse.friends,
       pendingKnocks: knocksResponse.knocks,
-      diskUsage: diskRes?.kind === "diskUsage" ? diskRes.usage : null,
-      canvasUsage: canvasRes?.kind === "canvasUsage" ? canvasRes.canvases : null,
+      diskUsage: diskRes?.kind === "diskUsage" ? (diskRes.usage ?? null) : null,
     };
-    // reset blob section so it reloads on the next rebuild() cycle
+    // reset blob + canvas sections so they reload on the next rebuild() cycle
     blobState = "idle";
     blobRows = [];
+    blobTotal = 0;
+    blobPage = 0;
     softDeletedRows = [];
+    softDeletedTotal = 0;
+    softDeletedPage = 0;
     blobErrorMsg = null;
     blobDeleteFailures = [];
+    canvasState = "idle";
+    canvasRows = [];
+    canvasTotal = 0;
+    canvasPage = 0;
+    canvasErrorMsg = null;
+    unsyncSweptMsg = null;
     rebuild();
   }
 
@@ -480,8 +526,8 @@ export function mountHubProfilePanel(
     rebuild();
     try {
       const [blobRes, softDeletedRes] = await Promise.all([
-        client.hubAdminBlobUsage(hubNodeId),
-        client.hubAdminListSoftDeleted(hubNodeId),
+        client.hubAdminBlobUsage(hubNodeId, blobPage * BLOB_PAGE_SIZE, BLOB_PAGE_SIZE),
+        client.hubAdminListSoftDeleted(hubNodeId, softDeletedPage * BLOB_PAGE_SIZE, BLOB_PAGE_SIZE),
       ]);
       if (destroyed) return;
       if (blobRes.kind === "notAdmin" || softDeletedRes.kind === "notAdmin") {
@@ -502,7 +548,9 @@ export function mountHubProfilePanel(
         return;
       }
       blobRows = blobRes.blobs;
+      blobTotal = blobRes.total;
       softDeletedRows = softDeletedRes.blobs;
+      softDeletedTotal = softDeletedRes.total;
       blobState = "loaded";
       rebuild();
     } catch (err) {
@@ -510,6 +558,37 @@ export function mountHubProfilePanel(
       if (destroyed) return;
       blobState = "error";
       blobErrorMsg = (err as Error)?.message ?? String(err);
+      rebuild();
+    }
+  }
+
+  async function loadCanvases(): Promise<void> {
+    canvasState = "loading";
+    canvasErrorMsg = null;
+    rebuild();
+    try {
+      const res = await client.hubAdminCanvasUsage(hubNodeId, canvasPage * BLOB_PAGE_SIZE, BLOB_PAGE_SIZE);
+      if (destroyed) return;
+      if (res.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (res.kind !== "canvasUsage") {
+        canvasState = "error";
+        canvasErrorMsg = `unexpected response: ${res.kind}`;
+        rebuild();
+        return;
+      }
+      canvasRows = res.canvases;
+      canvasTotal = res.total;
+      canvasState = "loaded";
+      rebuild();
+    } catch (err) {
+      log.warn(TAG, "loadCanvases failed:", err);
+      if (destroyed) return;
+      canvasState = "error";
+      canvasErrorMsg = (err as Error)?.message ?? String(err);
       rebuild();
     }
   }
@@ -525,7 +604,7 @@ export function mountHubProfilePanel(
         log.warn(TAG, "disk usage refresh failed:", err);
       }
     }
-    await loadBlobs();
+    await Promise.all([loadBlobs(), loadCanvases()]);
   }
 
   function handleHardDeleteAllClick(): void {
@@ -640,6 +719,116 @@ export function mountHubProfilePanel(
     }
   }
 
+  // -- canvas un-sync --------------------------------------------------------
+
+  function handleUnsyncCanvasClick(canvasDocId: string): void {
+    if (unsyncInFlight) return;
+    if (confirmUnsyncCanvas === canvasDocId) {
+      // second tap: confirm
+      if (confirmUnsyncTimer !== null) {
+        clearTimeout(confirmUnsyncTimer);
+        confirmUnsyncTimer = null;
+      }
+      confirmUnsyncCanvas = null;
+      executeUnsyncCanvas(canvasDocId).catch(() => {});
+    } else {
+      // first tap: arm
+      if (confirmUnsyncTimer !== null) clearTimeout(confirmUnsyncTimer);
+      confirmUnsyncCanvas = canvasDocId;
+      rebuild();
+      confirmUnsyncTimer = setTimeout(() => {
+        confirmUnsyncCanvas = null;
+        confirmUnsyncTimer = null;
+        if (!destroyed) rebuild();
+      }, CONFIRM_TIMEOUT_MS);
+    }
+  }
+
+  async function executeUnsyncCanvas(canvasDocId: string): Promise<void> {
+    if (unsyncInFlight) return;
+    unsyncInFlight = true;
+    rebuild();
+    try {
+      const res = await client.hubAdminUnsyncCanvas(hubNodeId, canvasDocId);
+      if (destroyed) return;
+      if (res.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (res.kind === "canvasUnsynced") {
+        unsyncSweptMsg = `unsynced (${res.swept} blob${res.swept === 1 ? "" : "s"} swept)`;
+      }
+      blobPage = 0;
+      softDeletedPage = 0;
+      canvasPage = 0;
+      await refreshAfterBlobMutation();
+    } catch (err) {
+      log.warn(TAG, "hubAdminUnsyncCanvas failed:", err);
+    } finally {
+      unsyncInFlight = false;
+      if (!destroyed) rebuild();
+    }
+  }
+
+  // -- pagination helpers ----------------------------------------------------
+
+  function pageCount(total: number): number {
+    return Math.max(1, Math.ceil(total / BLOB_PAGE_SIZE));
+  }
+
+  function buildPaginationRow(opts2: {
+    page: number;
+    total: number;
+    onPrev: () => void;
+    onNext: () => void;
+    prevRef: (c: Container | null) => void;
+    nextRef: (c: Container | null) => void;
+  }): { row: Container; height: number } {
+    const pc = pageCount(opts2.total);
+    const row = new Container();
+    row.eventMode = "static";
+
+    const PILL_W = 36;
+    const PILL_H = 18;
+    const GAP = 6;
+
+    const prevBtn = buildOutlinedButton({
+      label: "prev",
+      width: PILL_W,
+      height: PILL_H,
+      color: ACCENT,
+      disabled: opts2.page <= 0,
+      onTap: opts2.onPrev,
+    });
+    opts2.prevRef(prevBtn);
+    row.addChild(prevBtn);
+
+    const label = new Text({
+      text: `page ${opts2.page + 1}/${pc} (${opts2.total} total)`,
+      style: { fontFamily: FONT, fontSize: 9, fill: MUTED_TEXT },
+      resolution: RESOLUTION,
+    });
+    label.eventMode = "none";
+    label.x = PILL_W + GAP;
+    label.y = (PILL_H - label.height) / 2;
+    row.addChild(label);
+
+    const nextBtn = buildOutlinedButton({
+      label: "next",
+      width: PILL_W,
+      height: PILL_H,
+      color: ACCENT,
+      disabled: opts2.page >= pc - 1,
+      onTap: opts2.onNext,
+    });
+    nextBtn.x = PILL_W + GAP + label.width + GAP;
+    opts2.nextRef(nextBtn);
+    row.addChild(nextBtn);
+
+    return { row, height: PILL_H + 4 };
+  }
+
   // -- small button builder --------------------------------------------------
 
   function buildOutlinedButton(opts2: {
@@ -695,6 +884,13 @@ export function mountHubProfilePanel(
     blockButtonRefs.clear();
     adminButtonRefs.clear();
     copyButtonRefs.clear();
+    unsyncButtonRefs.clear();
+    blobPrevBtnRef = null;
+    blobNextBtnRef = null;
+    softDeletedPrevBtnRef = null;
+    softDeletedNextBtnRef = null;
+    canvasPrevBtnRef = null;
+    canvasNextBtnRef = null;
 
     if (allowInputHandle) {
       allowInputHandle.destroy();
@@ -1340,11 +1536,9 @@ export function mountHubProfilePanel(
         inner.addChild(emptyBlobsText);
         dy += emptyBlobsText.height + 8;
       } else {
-        const MAX_BLOB_ROWS = 20;
-        const visibleBlobs = blobRows.slice(0, MAX_BLOB_ROWS);
         const softDelBtnW = 68;
-        for (let i = 0; i < visibleBlobs.length; i++) {
-          const blob = visibleBlobs[i];
+        for (let i = 0; i < blobRows.length; i++) {
+          const blob = blobRows[i];
           const row = new Container();
           row.eventMode = "none";
           row.y = dy;
@@ -1394,17 +1588,25 @@ export function mountHubProfilePanel(
 
           dy += BLOB_ROW_HEIGHT;
         }
-        if (blobRows.length > MAX_BLOB_ROWS) {
-          const moreText = new Text({
-            text: `+${blobRows.length - MAX_BLOB_ROWS} more`,
-            style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
-            resolution: RESOLUTION,
+
+        // pagination row
+        if (blobTotal > BLOB_PAGE_SIZE) {
+          const { row: pagRow, height: pagH } = buildPaginationRow({
+            page: blobPage,
+            total: blobTotal,
+            onPrev: () => {
+              if (blobPage > 0) { blobPage--; loadBlobs().catch(() => {}); }
+            },
+            onNext: () => {
+              if (blobPage < pageCount(blobTotal) - 1) { blobPage++; loadBlobs().catch(() => {}); }
+            },
+            prevRef: (c) => { blobPrevBtnRef = c; },
+            nextRef: (c) => { blobNextBtnRef = c; },
           });
-          moreText.eventMode = "none";
-          moreText.x = PADDING_X;
-          moreText.y = dy;
-          inner.addChild(moreText);
-          dy += moreText.height + 4;
+          pagRow.x = PADDING_X;
+          pagRow.y = dy;
+          inner.addChild(pagRow);
+          dy += pagH;
         }
       }
 
@@ -1474,13 +1676,11 @@ export function mountHubProfilePanel(
         inner.addChild(emptySoftDelText);
         dy += emptySoftDelText.height + 8;
       } else {
-        const MAX_SOFT_ROWS = 20;
         const SDH = BLOB_ROW_HEIGHT + 10;
-        const visibleSoftDel = softDeletedRows.slice(0, MAX_SOFT_ROWS);
         const restoreBtnW = 52;
         const hardDelOneBtnW = 60;
-        for (let i = 0; i < visibleSoftDel.length; i++) {
-          const blob = visibleSoftDel[i];
+        for (let i = 0; i < softDeletedRows.length; i++) {
+          const blob = softDeletedRows[i];
           const row = new Container();
           row.eventMode = "none";
           row.y = dy;
@@ -1545,47 +1745,120 @@ export function mountHubProfilePanel(
 
           dy += SDH;
         }
-        if (softDeletedRows.length > MAX_SOFT_ROWS) {
-          const moreText = new Text({
-            text: `+${softDeletedRows.length - MAX_SOFT_ROWS} more`,
-            style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
-            resolution: RESOLUTION,
+
+        // pagination row
+        if (softDeletedTotal > BLOB_PAGE_SIZE) {
+          const { row: pagRow, height: pagH } = buildPaginationRow({
+            page: softDeletedPage,
+            total: softDeletedTotal,
+            onPrev: () => {
+              if (softDeletedPage > 0) { softDeletedPage--; loadBlobs().catch(() => {}); }
+            },
+            onNext: () => {
+              if (softDeletedPage < pageCount(softDeletedTotal) - 1) { softDeletedPage++; loadBlobs().catch(() => {}); }
+            },
+            prevRef: (c) => { softDeletedPrevBtnRef = c; },
+            nextRef: (c) => { softDeletedNextBtnRef = c; },
           });
-          moreText.eventMode = "none";
-          moreText.x = PADDING_X;
-          moreText.y = dy;
-          inner.addChild(moreText);
-          dy += moreText.height + 4;
+          pagRow.x = PADDING_X;
+          pagRow.y = dy;
+          inner.addChild(pagRow);
+          dy += pagH;
         }
         dy += 4;
       }
 
       // -- canvases section --
-      if (state.canvasUsage !== null && state.canvasUsage.length > 0) {
-        const canvasSubSep = new Graphics();
-        canvasSubSep.moveTo(PADDING_X + 8, dy);
-        canvasSubSep.lineTo(contentW - PADDING_X - 8, dy);
-        canvasSubSep.stroke({ color: BORDER, width: 1, alpha: 0.3 });
-        inner.addChild(canvasSubSep);
-        dy += 10;
+      const canvasSubSep = new Graphics();
+      canvasSubSep.moveTo(PADDING_X + 8, dy);
+      canvasSubSep.lineTo(contentW - PADDING_X - 8, dy);
+      canvasSubSep.stroke({ color: BORDER, width: 1, alpha: 0.3 });
+      inner.addChild(canvasSubSep);
+      dy += 10;
 
-        const canvasesLabel = new Text({
-          text: `canvases (${state.canvasUsage.length})`,
-          style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
+      const canvasesLabel = new Text({
+        text: canvasState === "loaded" ? `canvases (${canvasTotal})` : "canvases",
+        style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
+        resolution: RESOLUTION,
+      });
+      canvasesLabel.eventMode = "none";
+      canvasesLabel.x = PADDING_X;
+      canvasesLabel.y = dy;
+      inner.addChild(canvasesLabel);
+      dy += LABEL_SIZE + 6;
+
+      if (unsyncSweptMsg) {
+        const sweptText = new Text({
+          text: unsyncSweptMsg,
+          style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: ONLINE_COLOR },
           resolution: RESOLUTION,
         });
-        canvasesLabel.eventMode = "none";
-        canvasesLabel.x = PADDING_X;
-        canvasesLabel.y = dy;
-        inner.addChild(canvasesLabel);
-        dy += LABEL_SIZE + 6;
+        sweptText.eventMode = "none";
+        sweptText.x = PADDING_X;
+        sweptText.y = dy;
+        inner.addChild(sweptText);
+        dy += sweptText.height + 4;
+      }
 
-        const MAX_CANVAS_ROWS = 20;
-        const visibleCanvases = state.canvasUsage.slice(0, MAX_CANVAS_ROWS);
-        for (let i = 0; i < visibleCanvases.length; i++) {
-          const canvas = visibleCanvases[i];
+      if (canvasState === "idle") {
+        loadCanvases().catch(() => {});
+      }
+
+      if (canvasState === "idle" || canvasState === "loading") {
+        const canvasLoadingText = new Text({
+          text: "loading canvases\u2026",
+          style: { fontFamily: FONT, fontSize: TEXT_SIZE, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        canvasLoadingText.eventMode = "none";
+        canvasLoadingText.x = PADDING_X;
+        canvasLoadingText.y = dy;
+        inner.addChild(canvasLoadingText);
+        dy += canvasLoadingText.height + SECTION_GAP;
+      } else if (canvasState === "error") {
+        const canvasErrText = new Text({
+          text: canvasErrorMsg ? `canvas load failed: ${canvasErrorMsg}` : "hub offline?",
+          style: {
+            fontFamily: FONT,
+            fontSize: TEXT_SIZE,
+            fill: REJECT_COLOR,
+            wordWrap: true,
+            wordWrapWidth: Math.max(80, currentWidth - PADDING_X * 2),
+          },
+          resolution: RESOLUTION,
+        });
+        canvasErrText.eventMode = "none";
+        canvasErrText.x = PADDING_X;
+        canvasErrText.y = dy;
+        inner.addChild(canvasErrText);
+        dy += canvasErrText.height + 6;
+        const canvasRetryBtn = buildOutlinedButton({
+          label: "retry",
+          width: 60,
+          height: 24,
+          color: ACCENT,
+          onTap: () => { loadCanvases().catch(() => {}); },
+        });
+        canvasRetryBtn.x = PADDING_X;
+        canvasRetryBtn.y = dy;
+        inner.addChild(canvasRetryBtn);
+        dy += 24 + SECTION_GAP;
+      } else if (canvasRows.length === 0) {
+        const emptyCanvasText = new Text({
+          text: "no canvases",
+          style: { fontFamily: FONT, fontSize: TEXT_SIZE, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        emptyCanvasText.eventMode = "none";
+        emptyCanvasText.x = PADDING_X;
+        emptyCanvasText.y = dy;
+        inner.addChild(emptyCanvasText);
+        dy += emptyCanvasText.height + 8;
+      } else {
+        for (let i = 0; i < canvasRows.length; i++) {
+          const canvas = canvasRows[i];
           const row = new Container();
-          row.eventMode = "none";
+          row.eventMode = "static";
           row.y = dy;
           if (i % 2 === 1) {
             const rowBg = new Graphics();
@@ -1616,19 +1889,42 @@ export function mountHubProfilePanel(
           canvasStatsText.y = canvasIdText.y + LABEL_SIZE + 2;
           row.addChild(canvasStatsText);
 
+          const isArmed = confirmUnsyncCanvas === canvas.canvasDocId;
+          const unsyncBtn = buildOutlinedButton({
+            label: unsyncInFlight ? "\u2026" : isArmed ? "really un-sync?" : "un-sync",
+            width: UNSYNC_BTN_W,
+            height: ACTION_BTN_H,
+            color: isArmed ? REJECT_COLOR : MUTED_TEXT,
+            fillColor: isArmed ? REJECT_COLOR : undefined,
+            disabled: unsyncInFlight,
+            onTap: () => { handleUnsyncCanvasClick(canvas.canvasDocId); },
+          });
+          unsyncBtn.x = contentW - UNSYNC_BTN_W - ROW_PADDING_X;
+          unsyncBtn.y = (CANVAS_ROW_HEIGHT - ACTION_BTN_H) / 2;
+          row.addChild(unsyncBtn);
+          unsyncButtonRefs.set(canvas.canvasDocId, unsyncBtn);
+
           dy += CANVAS_ROW_HEIGHT;
         }
-        if (state.canvasUsage.length > MAX_CANVAS_ROWS) {
-          const moreText = new Text({
-            text: `+${state.canvasUsage.length - MAX_CANVAS_ROWS} more`,
-            style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
-            resolution: RESOLUTION,
+
+        // pagination row
+        if (canvasTotal > BLOB_PAGE_SIZE) {
+          const { row: pagRow, height: pagH } = buildPaginationRow({
+            page: canvasPage,
+            total: canvasTotal,
+            onPrev: () => {
+              if (canvasPage > 0) { canvasPage--; loadCanvases().catch(() => {}); }
+            },
+            onNext: () => {
+              if (canvasPage < pageCount(canvasTotal) - 1) { canvasPage++; loadCanvases().catch(() => {}); }
+            },
+            prevRef: (c) => { canvasPrevBtnRef = c; },
+            nextRef: (c) => { canvasNextBtnRef = c; },
           });
-          moreText.eventMode = "none";
-          moreText.x = PADDING_X;
-          moreText.y = dy;
-          inner.addChild(moreText);
-          dy += moreText.height + 4;
+          pagRow.x = PADDING_X;
+          pagRow.y = dy;
+          inner.addChild(pagRow);
+          dy += pagH;
         }
       }
 
@@ -1700,6 +1996,9 @@ export function mountHubProfilePanel(
     if (confirmHardDeleteAllTimer !== null) {
       clearTimeout(confirmHardDeleteAllTimer);
     }
+    if (confirmUnsyncTimer !== null) {
+      clearTimeout(confirmUnsyncTimer);
+    }
     if (allowInputHandle) {
       allowInputHandle.destroy();
       allowInputHandle = null;
@@ -1716,6 +2015,37 @@ export function mountHubProfilePanel(
     layout,
     refresh,
     getState,
+    getBlobPageState(): HubProfilePageState {
+      return { page: blobPage, pageCount: pageCount(blobTotal), total: blobTotal };
+    },
+    getSoftDeletedPageState(): HubProfilePageState {
+      return { page: softDeletedPage, pageCount: pageCount(softDeletedTotal), total: softDeletedTotal };
+    },
+    getCanvasPageState(): HubProfilePageState {
+      return { page: canvasPage, pageCount: pageCount(canvasTotal), total: canvasTotal };
+    },
+    getBlobPrevButtonGlobalPos(): { x: number; y: number } | null {
+      return blobPrevBtnRef ? globalCenter(blobPrevBtnRef) : null;
+    },
+    getBlobNextButtonGlobalPos(): { x: number; y: number } | null {
+      return blobNextBtnRef ? globalCenter(blobNextBtnRef) : null;
+    },
+    getSoftDeletedPrevButtonGlobalPos(): { x: number; y: number } | null {
+      return softDeletedPrevBtnRef ? globalCenter(softDeletedPrevBtnRef) : null;
+    },
+    getSoftDeletedNextButtonGlobalPos(): { x: number; y: number } | null {
+      return softDeletedNextBtnRef ? globalCenter(softDeletedNextBtnRef) : null;
+    },
+    getCanvasPrevButtonGlobalPos(): { x: number; y: number } | null {
+      return canvasPrevBtnRef ? globalCenter(canvasPrevBtnRef) : null;
+    },
+    getCanvasNextButtonGlobalPos(): { x: number; y: number } | null {
+      return canvasNextBtnRef ? globalCenter(canvasNextBtnRef) : null;
+    },
+    getUnsyncButtonGlobalPos(canvasDocId: string): { x: number; y: number } | null {
+      const btn = unsyncButtonRefs.get(canvasDocId);
+      return btn ? globalCenter(btn) : null;
+    },
     getAllowInputGlobalPos,
     getAllowButtonGlobalPos,
     getRemoveButtonGlobalPos,

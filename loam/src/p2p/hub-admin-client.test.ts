@@ -348,57 +348,79 @@ describe("hubAdminDiskUsage", () => {
 });
 
 describe("hubAdminCanvasUsage", () => {
-  it("sends CanvasUsage unit request and parses CanvasUsage response", async () => {
+  it("sends CanvasUsage struct request and parses CanvasUsage response with total", async () => {
     const fake = createFakeNode({
       CanvasUsage: {
         canvases: [
           { canvas_doc_id: "doc-abc", blob_count: 5, total_bytes: 2048 },
           { canvas_doc_id: "doc-xyz", blob_count: 0, total_bytes: 0 },
         ],
+        total: 7,
       },
     });
     const client = createHubAdminClient(transportFor(fake.node));
 
     const response = await client.hubAdminCanvasUsage(PEER_NODE_ID);
 
-    expect(fake.getWrittenRequest()).toEqual("CanvasUsage");
+    expect(fake.getWrittenRequest()).toEqual({ CanvasUsage: { offset: 0, limit: 50 } });
     expect(response).toEqual({
       kind: "canvasUsage",
+      total: 7,
       canvases: [
         { canvasDocId: "doc-abc", blobCount: 5, totalBytes: 2048 },
         { canvasDocId: "doc-xyz", blobCount: 0, totalBytes: 0 },
       ],
     });
   });
+
+  it("passes pagination params as offset/limit in the struct variant", async () => {
+    const fake = createFakeNode({ CanvasUsage: { canvases: [], total: 42 } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    await client.hubAdminCanvasUsage(PEER_NODE_ID, 20, 10);
+
+    expect(fake.getWrittenRequest()).toEqual({ CanvasUsage: { offset: 20, limit: 10 } });
+  });
 });
 
 describe("hubAdminBlobUsage", () => {
-  it("sends BlobUsage unit request and parses BlobUsage response", async () => {
+  it("sends BlobUsage struct request and parses BlobUsage response with total", async () => {
     const fake = createFakeNode({
       BlobUsage: {
         blobs: [
           { blake3: "aabbcc", filename: "photo.jpg", mime: "image/jpeg", size: 4096, external: false, soft_deleted: false },
           { blake3: "ddeeff", filename: null, mime: null, size: 512, external: true, soft_deleted: true },
         ],
+        total: 2,
       },
     });
     const client = createHubAdminClient(transportFor(fake.node));
 
     const response = await client.hubAdminBlobUsage(PEER_NODE_ID);
 
-    expect(fake.getWrittenRequest()).toEqual("BlobUsage");
+    expect(fake.getWrittenRequest()).toEqual({ BlobUsage: { offset: 0, limit: 50 } });
     expect(response).toEqual({
       kind: "blobUsage",
+      total: 2,
       blobs: [
         { blake3: "aabbcc", filename: "photo.jpg", mime: "image/jpeg", size: 4096, external: false, softDeleted: false },
         { blake3: "ddeeff", filename: null, mime: null, size: 512, external: true, softDeleted: true },
       ],
     });
   });
+
+  it("passes pagination params as offset/limit in the struct variant", async () => {
+    const fake = createFakeNode({ BlobUsage: { blobs: [], total: 100 } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    await client.hubAdminBlobUsage(PEER_NODE_ID, 10, 10);
+
+    expect(fake.getWrittenRequest()).toEqual({ BlobUsage: { offset: 10, limit: 10 } });
+  });
 });
 
 describe("hubAdminListSoftDeleted", () => {
-  it("sends ListSoftDeleted unit request and parses SoftDeleted response with new shape", async () => {
+  it("sends ListSoftDeleted struct request and parses SoftDeleted response with total", async () => {
     const fake = createFakeNode({
       SoftDeleted: {
         blobs: [
@@ -411,15 +433,17 @@ describe("hubAdminListSoftDeleted", () => {
             soft_deleted_by: "node-admin-123",
           },
         ],
+        total: 1,
       },
     });
     const client = createHubAdminClient(transportFor(fake.node));
 
     const response = await client.hubAdminListSoftDeleted(PEER_NODE_ID);
 
-    expect(fake.getWrittenRequest()).toEqual("ListSoftDeleted");
+    expect(fake.getWrittenRequest()).toEqual({ ListSoftDeleted: { offset: 0, limit: 50 } });
     expect(response).toEqual({
       kind: "softDeleted",
+      total: 1,
       blobs: [
         {
           blake3: "aabbcc",
@@ -434,12 +458,21 @@ describe("hubAdminListSoftDeleted", () => {
   });
 
   it("returns empty list when no soft-deleted blobs", async () => {
-    const fake = createFakeNode({ SoftDeleted: { blobs: [] } });
+    const fake = createFakeNode({ SoftDeleted: { blobs: [], total: 0 } });
     const client = createHubAdminClient(transportFor(fake.node));
 
     const response = await client.hubAdminListSoftDeleted(PEER_NODE_ID);
 
-    expect(response).toEqual({ kind: "softDeleted", blobs: [] });
+    expect(response).toEqual({ kind: "softDeleted", total: 0, blobs: [] });
+  });
+
+  it("passes pagination params as offset/limit in the struct variant", async () => {
+    const fake = createFakeNode({ SoftDeleted: { blobs: [], total: 5 } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    await client.hubAdminListSoftDeleted(PEER_NODE_ID, 5, 10);
+
+    expect(fake.getWrittenRequest()).toEqual({ ListSoftDeleted: { offset: 5, limit: 10 } });
   });
 });
 
@@ -473,6 +506,37 @@ describe("hubAdminRestoreBlobs", () => {
 
     expect(fake.getWrittenRequest()).toEqual({ RestoreBlobs: { blake3s: ["hash1"] } });
     expect(response).toEqual({ kind: "blobsMutation", affected: 1, failed: [] });
+  });
+});
+
+describe("hubAdminUnsyncCanvas", () => {
+  it("sends UnsyncCanvas struct request and parses CanvasUnsynced response", async () => {
+    const fake = createFakeNode({
+      CanvasUnsynced: { canvas_doc_id: "canvas-doc-abc", swept: 3 },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminUnsyncCanvas(PEER_NODE_ID, "canvas-doc-abc");
+
+    expect(fake.getWrittenRequest()).toEqual({
+      UnsyncCanvas: { canvas_doc_id: "canvas-doc-abc" },
+    });
+    expect(response).toEqual({
+      kind: "canvasUnsynced",
+      canvasDocId: "canvas-doc-abc",
+      swept: 3,
+    });
+  });
+
+  it("handles a zero swept count", async () => {
+    const fake = createFakeNode({
+      CanvasUnsynced: { canvas_doc_id: "canvas-empty", swept: 0 },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminUnsyncCanvas(PEER_NODE_ID, "canvas-empty");
+
+    expect(response).toEqual({ kind: "canvasUnsynced", canvasDocId: "canvas-empty", swept: 0 });
   });
 });
 

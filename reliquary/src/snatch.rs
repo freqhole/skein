@@ -99,6 +99,10 @@ pub struct BlobSnatcher {
     /// blob metadata + filesystem store (the skein equivalent of grimoire's
     /// `media_blobz` + `blob_data`).
     blobz: blobz::Store,
+    /// hashes currently being downloaded. kept in sync with the iroh-blobs
+    /// gc protect callback so an in-progress download is never swept before
+    /// it has been ingested into blobz.
+    in_flight: Arc<std::sync::Mutex<HashSet<Hash>>>,
 }
 
 impl BlobSnatcher {
@@ -113,6 +117,7 @@ impl BlobSnatcher {
         peer_blob_inventory: Arc<Mutex<HashMap<String, HashSet<String>>>>,
         fs_store: &'static FsStore,
         blobz: blobz::Store,
+        in_flight: Arc<std::sync::Mutex<HashSet<Hash>>>,
     ) -> Self {
         Self {
             repo,
@@ -124,6 +129,7 @@ impl BlobSnatcher {
             peer_blob_inventory,
             fs_store,
             blobz,
+            in_flight,
         }
     }
 
@@ -826,6 +832,11 @@ impl BlobSnatcher {
 
         let hash_and_format = HashAndFormat::raw(hash);
 
+        // register this hash as in-flight so the gc protect callback keeps it
+        // alive until ingest_blob writes it into blobz. the guard removes it
+        // on all exit paths (ok, error, or cancellation).
+        let _in_flight_guard = InFlightGuard::new(Arc::clone(&self.in_flight), hash);
+
         // acquire per-peer download semaphore (limits to MAX_PER_PEER_DOWNLOADS per peer)
         let sem = self.peer_semaphore(provider_node_id).await;
         let _permit = sem
@@ -905,6 +916,36 @@ impl BlobSnatcher {
         );
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// in-flight guard
+// ---------------------------------------------------------------------------
+
+/// raii guard that inserts a hash into the in-flight set on construction and
+/// removes it when dropped. ensures the gc protect callback never sweeps a
+/// blob that is mid-download, regardless of which exit path download_blob
+/// takes (success, error, or future cancellation).
+struct InFlightGuard {
+    set: Arc<std::sync::Mutex<HashSet<Hash>>>,
+    hash: Hash,
+}
+
+impl InFlightGuard {
+    fn new(set: Arc<std::sync::Mutex<HashSet<Hash>>>, hash: Hash) -> Self {
+        if let Ok(mut guard) = set.lock() {
+            guard.insert(hash);
+        }
+        Self { set, hash }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.set.lock() {
+            guard.remove(&self.hash);
+        }
     }
 }
 

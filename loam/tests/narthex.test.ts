@@ -51,22 +51,35 @@ async function createCanvasAndWaitForNavigation(
 
 /** navigate back to narthex by clearing the hash, then wait for re-initialization */
 async function navigateBackToNarthex(page: import("@playwright/test").Page): Promise<void> {
-  await page.evaluate(() => {
-    window.location.hash = "";
-  });
-
-  // __skein gets re-assigned when the narthex canvas is created.
-  // wait for it to be a fresh instance with live widgets.
+  // __skein gets re-assigned when the narthex canvas is created. wait for a
+  // fresh instance with live widgets AND an empty hash — an in-flight
+  // navigateToCanvas restores its own hash via history.replaceState, so the
+  // poll keeps re-asserting hash="" until the router actually lands on the
+  // narthex (see boot.ts's pendingNavToNarthex for the production-side fix).
   await page.waitForFunction(
     () => {
+      if (window.location.hash !== "") {
+        window.location.hash = "";
+        return false;
+      }
       const skein = (window as any).__skein;
       return skein?.widgetManager?.getLiveWidgets()?.size > 0;
     },
-    { timeout: 10_000 }
+    { timeout: 15_000 }
   );
 
   // extra settle time for reconciliation
   await page.waitForTimeout(500);
+}
+
+/** flush the automerge repo's debounced IDB writes so a reload can't race
+ *  the 100ms trailing save debounce (the shared root cause of the
+ *  reload-persistence flake family). */
+async function flushRepo(page: import("@playwright/test").Page): Promise<void> {
+  await page.evaluate(async () => {
+    const repo = (window as any).__skein?.repo;
+    if (repo?.flush) await repo.flush();
+  });
 }
 
 /** collect all canvas-card live widgets from the narthex */
@@ -234,7 +247,9 @@ test.describe("narthex navigation", () => {
     // navigate back to the narthex
     await navigateBackToNarthex(page);
 
-    // reload the page entirely
+    // reload the page entirely — flush first so the debounced IDB write of
+    // the canvas-card can't be raced by the reload
+    await flushRepo(page);
     await page.reload();
     await waitForNarthex(page);
 

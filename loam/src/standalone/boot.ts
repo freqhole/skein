@@ -91,6 +91,12 @@ class SkeinRouter {
   private currentCanvas: SkeinCanvas | null = null;
   private narthexDocId: string | null = null;
   private navigating = false;
+  // a navigateToNarthex that arrived while another navigation was in flight.
+  // without this, tapping home right after creating a canvas silently drops
+  // the nav (the guard returned early and navigateToCanvas's replaceState
+  // put the canvas hash back) — the confirmed root cause of the flaky
+  // narthex reload e2e AND a real ux bug.
+  private pendingNavToNarthex = false;
   /** stashed by joinCanvasFromNarthex so navigateToCanvas can write it into the doc */
   private pendingPeerNodeId: string | null = null;
 
@@ -550,8 +556,13 @@ class SkeinRouter {
 
   /** navigate to the narthex */
   private async navigateToNarthex(): Promise<void> {
-    if (this.navigating) return;
+    if (this.navigating) {
+      // queue it — the in-flight navigation's finally block re-fires it
+      this.pendingNavToNarthex = true;
+      return;
+    }
     this.navigating = true;
+    this.pendingNavToNarthex = false;
 
     try {
       // stamp lastVisitedAt before tearing down so own edits aren't flagged
@@ -723,6 +734,9 @@ class SkeinRouter {
       })();
     } finally {
       this.navigating = false;
+      // a home-tap queued while already navigating home is satisfied by
+      // this navigation — consume it
+      this.pendingNavToNarthex = false;
     }
   }
 
@@ -1507,6 +1521,11 @@ class SkeinRouter {
 
     if (failure) {
       log.error(TAG, "failed to open canvas, falling back to narthex:", docId, failure);
+      await this.navigateToNarthex();
+    } else if (this.pendingNavToNarthex) {
+      // a nav-home arrived while this canvas navigation was in flight —
+      // honor it now instead of silently dropping it
+      log.debug(TAG, "executing queued narthex navigation");
       await this.navigateToNarthex();
     }
   }

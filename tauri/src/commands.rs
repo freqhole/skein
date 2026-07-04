@@ -68,6 +68,22 @@ impl Drop for UploadCancelGuard {
     }
 }
 
+/// raii guard that removes a hash from the `blobs_in_flight` set when dropped.
+/// ensures the gc protect callback never sees a stale in-flight entry if the
+/// download completes, errors, or is cancelled. mirrors `DownloadCancelGuard`.
+struct BlobsInFlightGuard {
+    set: Arc<std::sync::Mutex<std::collections::HashSet<iroh_blobs::Hash>>>,
+    hash: iroh_blobs::Hash,
+}
+
+impl Drop for BlobsInFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.set.lock() {
+            guard.remove(&self.hash);
+        }
+    }
+}
+
 /// runtime state for the one-and-only tauri command.
 ///
 /// the pool and stores are always alive — they exist for the lifetime of
@@ -96,6 +112,10 @@ pub struct AppState {
     /// can hold a `'static` reference. used by the `blob_iroh_ensure`
     /// dispatch action to import blob bytes from `blobz` on demand.
     pub fs_store: &'static iroh_blobs::store::fs::FsStore,
+    /// hashes currently being downloaded via `blob_iroh_download`. included
+    /// in the gc protect callback so the gc never sweeps a blob mid-download
+    /// before it has been ingested into blobz.
+    pub blobs_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<iroh_blobs::Hash>>>,
 }
 
 /// the "network is up" half of `AppState`: the bound iroh endpoint, our own
@@ -1418,7 +1438,19 @@ async fn blob_iroh_download(
             .map_err(|_| DispatchError::Stream("cancel registry poisoned".to_string()))?;
         map.insert(args.blake3.clone(), Arc::clone(&cancel_flag));
     }
-    let _guard = DownloadCancelGuard(args.blake3.clone());
+    let _cancel_guard = DownloadCancelGuard(args.blake3.clone());
+
+    // register the hash as in-flight so the gc protect callback keeps it alive
+    // until we have finished ingesting it into blobz. guard removes on all exits.
+    {
+        if let Ok(mut inf) = state.blobs_in_flight.lock() {
+            inf.insert(hash);
+        }
+    }
+    let _in_flight_guard = BlobsInFlightGuard {
+        set: Arc::clone(&state.blobs_in_flight),
+        hash,
+    };
 
     let (endpoint, _, _) = ensure_network(state).await?;
     let downloader = Downloader::new(state.fs_store, &endpoint);

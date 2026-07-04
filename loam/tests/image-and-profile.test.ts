@@ -106,8 +106,12 @@ test.describe("profile and image features", () => {
     const nodeIdBefore = await waitForNodeId(page);
     expect(nodeIdBefore).toBeTruthy();
 
-    // give automerge time to flush doc changes to IDB before reloading
-    await page.waitForTimeout(800);
+    // flush automerge's debounced IDB writes before reloading — a fixed
+    // sleep raced the 100ms trailing save debounce under load
+    await page.evaluate(async () => {
+      const repo = (window as any).__skein?.repo;
+      if (repo?.flush) await repo.flush();
+    });
 
     // reload — same browser context keeps IDB alive
     await page.reload();
@@ -229,7 +233,12 @@ test.describe("profile and image features", () => {
     );
     expect(avatarBefore).toMatch(/^data:image\/webp;base64,/);
 
-    await page.waitForTimeout(800);
+    // flush automerge's debounced IDB writes before reloading — a fixed
+    // sleep raced the 100ms trailing save debounce under load
+    await page.evaluate(async () => {
+      const repo = (window as any).__skein?.repo;
+      if (repo?.flush) await repo.flush();
+    });
     await page.reload();
     await waitForNarthex(page);
     await page.waitForTimeout(500);

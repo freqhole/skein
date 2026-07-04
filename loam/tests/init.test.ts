@@ -198,8 +198,12 @@ test("canvas persists widgets across sessions via IndexedDB", async ({ browser }
   });
   expect(countInFirstSession).toBe(1);
 
-  // give IndexedDB a moment to flush
-  await page1.waitForTimeout(500);
+  // flush automerge's debounced IDB writes before closing the page — a
+  // fixed sleep raced the 100ms trailing save debounce under load
+  await page1.evaluate(async () => {
+    const repo = (window as any).__skein?.repo;
+    if (repo?.flush) await repo.flush();
+  });
   await page1.close();
 
   // session 2: new page in the SAME context (shares IndexedDB)

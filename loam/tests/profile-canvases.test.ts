@@ -245,8 +245,13 @@ test.describe("profile tab — my canvases", () => {
     let entries = await getProfileCanvasEntries(page);
     expect(entries.map((e) => e.canvasDocId)).toContain(docId);
 
-    // give automerge time to flush doc changes to IDB before reloading
-    await page.waitForTimeout(800);
+    // flush automerge's debounced IDB writes before reloading — a fixed
+    // sleep raced the 100ms trailing save debounce under load (the
+    // reload-persistence flake family)
+    await page.evaluate(async () => {
+      const repo = (window as any).__skein?.repo;
+      if (repo?.flush) await repo.flush();
+    });
     await page.reload();
     await waitForNarthex(page);
 

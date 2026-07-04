@@ -245,6 +245,30 @@ export interface FriendsTabTestHooks {
   /** global center position of the hub-profile-panel's "‹ back" button,
    *  or null if the panel isn't currently mounted. */
   getHubProfileBackButtonGlobalPos(): { x: number; y: number } | null;
+  // -- pagination state (blobs / soft-deleted / canvases) --
+  /** current page state for the blobs list, or null if the panel isn't open. */
+  getHubProfileBlobPageState(): { page: number; pageCount: number; total: number } | null;
+  /** current page state for the soft-deleted list, or null if the panel isn't open. */
+  getHubProfileSoftDeletedPageState(): { page: number; pageCount: number; total: number } | null;
+  /** current page state for the canvases list, or null if the panel isn't open. */
+  getHubProfileCanvasPageState(): { page: number; pageCount: number; total: number } | null;
+  // -- pagination button positions --
+  /** global position of the blobs list "prev" pill, or null if not rendered. */
+  getHubProfileBlobPrevButtonGlobalPos(): { x: number; y: number } | null;
+  /** global position of the blobs list "next" pill, or null if not rendered. */
+  getHubProfileBlobNextButtonGlobalPos(): { x: number; y: number } | null;
+  /** global position of the soft-deleted list "prev" pill, or null if not rendered. */
+  getHubProfileSoftDeletedPrevButtonGlobalPos(): { x: number; y: number } | null;
+  /** global position of the soft-deleted list "next" pill, or null if not rendered. */
+  getHubProfileSoftDeletedNextButtonGlobalPos(): { x: number; y: number } | null;
+  /** global position of the canvases list "prev" pill, or null if not rendered. */
+  getHubProfileCanvasPrevButtonGlobalPos(): { x: number; y: number } | null;
+  /** global position of the canvases list "next" pill, or null if not rendered. */
+  getHubProfileCanvasNextButtonGlobalPos(): { x: number; y: number } | null;
+  // -- un-sync --
+  /** global position of a canvas row's "un-sync" button by canvas doc id,
+   *  or null if that row isn't currently rendered. */
+  getHubProfileUnsyncButtonGlobalPos(canvasDocId: string): { x: number; y: number } | null;
 }
 
 /**

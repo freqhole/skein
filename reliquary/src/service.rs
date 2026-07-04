@@ -11,13 +11,16 @@
 //! acl changes, and the blob snatcher — those layer back on in phase-2 once the
 //! browser+reliquary flow is validated end-to-end.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use iroh::protocol::Router;
 use iroh::Endpoint;
 use iroh_blobs::api::downloader::Downloader;
-use iroh_blobs::store::fs::FsStore;
-use iroh_blobs::BlobsProtocol;
+use iroh_blobs::store::fs::{options::Options, FsStore};
+use iroh_blobs::store::{GcConfig, ProtectOutcome};
+use iroh_blobs::{Hash, BlobsProtocol};
 use sqlx::SqlitePool;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
@@ -87,12 +90,105 @@ pub struct ServiceConfig {
 
 static FS_STORE: OnceCell<FsStore> = OnceCell::const_new();
 
-async fn fs_store(data_dir: &Path) -> Result<&'static FsStore, ServiceError> {
+/// process-wide in-flight download registry, shared between the gc protect
+/// callback and BlobSnatcher. see `snatcher_in_flight()`.
+static SNATCHER_IN_FLIGHT: std::sync::OnceLock<Arc<std::sync::Mutex<HashSet<Hash>>>> =
+    std::sync::OnceLock::new();
+
+/// return the process-wide in-flight download set. initialized on first call.
+/// the hub's `BlobSnatcher` and the gc protect callback both hold a clone of
+/// this arc so the callback never sweeps a blob mid-download.
+pub fn snatcher_in_flight() -> Arc<std::sync::Mutex<HashSet<Hash>>> {
+    SNATCHER_IN_FLIGHT
+        .get_or_init(|| Arc::new(std::sync::Mutex::new(HashSet::new())))
+        .clone()
+}
+
+async fn fs_store(data_dir: &Path, blobz: blobz::Store) -> Result<&'static FsStore, ServiceError> {
     FS_STORE
         .get_or_try_init(|| async {
             let path = data_dir.join("iroh-blobs");
             tokio::fs::create_dir_all(&path).await?;
-            FsStore::load(&path)
+
+            // protected-hash cache: refreshed every 10 min by a background task.
+            // None = never refreshed yet → abort gc cycle to avoid sweeping blind.
+            let protected: Arc<std::sync::RwLock<Option<HashSet<Hash>>>> =
+                Arc::new(std::sync::RwLock::new(None));
+
+            // spawn background refresher: pulls all blobz hashes (including
+            // soft-deleted, whose files are still live/restorable) every 10 min.
+            let protected_bg = Arc::clone(&protected);
+            let blobz_bg = blobz.clone();
+            tokio::spawn(async move {
+                loop {
+                    match blobz_bg.list_all_iroh_hashes().await {
+                        Ok(hex_hashes) => {
+                            let mut set = HashSet::new();
+                            for hex in &hex_hashes {
+                                if let Ok(h) = hex.parse::<Hash>() {
+                                    set.insert(h);
+                                }
+                            }
+                            if let Ok(mut guard) = protected_bg.write() {
+                                *guard = Some(set);
+                            }
+                            tracing::debug!(
+                                count = hex_hashes.len(),
+                                "gc protect: refreshed protected hashes from blobz"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "gc protect: failed to refresh protected hashes from blobz"
+                            );
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                }
+            });
+
+            // build the protect callback. external blobs (DataLocation::External)
+            // are never deleted by gc sweep anyway — the sweep no-ops on them —
+            // but we include them here so their redb rows survive too. we abort
+            // the cycle if the set has never been populated (safer than sweeping
+            // with an unknown protected set).
+            let in_flight = snatcher_in_flight();
+            let protect_cb: iroh_blobs::store::ProtectCb = Arc::new(
+                move |live: &mut HashSet<Hash>| {
+                    let p = Arc::clone(&protected);
+                    let inf = Arc::clone(&in_flight);
+                    Box::pin(async move {
+                        match p.read() {
+                            Ok(guard) => match guard.as_ref() {
+                                None => {
+                                    // never refreshed — skip cycle
+                                    tracing::debug!(
+                                        "gc protect: protected set not yet initialized, aborting cycle"
+                                    );
+                                    return ProtectOutcome::Abort;
+                                }
+                                Some(set) => {
+                                    live.extend(set.iter().cloned());
+                                }
+                            },
+                            Err(_) => return ProtectOutcome::Abort,
+                        }
+                        // also protect blobs that are mid-download
+                        if let Ok(inf_guard) = inf.lock() {
+                            live.extend(inf_guard.iter().cloned());
+                        }
+                        ProtectOutcome::Continue
+                    })
+                },
+            );
+
+            let mut opts = Options::new(&path);
+            opts.gc = Some(GcConfig {
+                interval: std::time::Duration::from_secs(3600),
+                add_protected: Some(protect_cb),
+            });
+            FsStore::load_with_opts(path.join("blobs.db"), opts)
                 .await
                 .map_err(|e| ServiceError::FsStore(format!("{e}")))
         })
@@ -201,7 +297,7 @@ impl Service {
         // gate than the hub's, but still closes the "any stranger who
         // knows a hash can fetch it" hole for this peer variant too. see
         // `blob_acl`'s module doc comment.
-        let store = fs_store(&config.data_dir).await?;
+        let store = fs_store(&config.data_dir, blobz.clone()).await?;
         let blobs_downloader = Downloader::new(store, &endpoint);
         let blob_acl_gate = crate::blob_acl::BlobAclGate::friend_only(friendz_store.clone());
         let blobs_protocol = BlobsProtocol::new(
@@ -521,7 +617,7 @@ pub async fn start_hub(
         .map_err(|e| ServiceError::HubRepo(format!("{e}")))?;
 
     // shared iroh-blobs FsStore (process-wide singleton)
-    let store = fs_store(&config.data_dir).await?;
+    let store = fs_store(&config.data_dir, blobz.clone()).await?;
 
     let hub_config = HubPeerConfig {
         data_dir: config.data_dir.clone(),

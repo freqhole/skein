@@ -2451,6 +2451,17 @@ export function createFriendsTab(ctx: TabContext): TabController {
         const p = hubProfileBackBtn.getGlobalPosition();
         return { x: p.x + hubProfileBackBtn.width / 2, y: p.y + hubProfileBackBtn.height / 2 };
       },
+      getHubProfileBlobPageState: () => hubProfileHandle?.getBlobPageState() ?? null,
+      getHubProfileSoftDeletedPageState: () => hubProfileHandle?.getSoftDeletedPageState() ?? null,
+      getHubProfileCanvasPageState: () => hubProfileHandle?.getCanvasPageState() ?? null,
+      getHubProfileBlobPrevButtonGlobalPos: () => hubProfileHandle?.getBlobPrevButtonGlobalPos() ?? null,
+      getHubProfileBlobNextButtonGlobalPos: () => hubProfileHandle?.getBlobNextButtonGlobalPos() ?? null,
+      getHubProfileSoftDeletedPrevButtonGlobalPos: () => hubProfileHandle?.getSoftDeletedPrevButtonGlobalPos() ?? null,
+      getHubProfileSoftDeletedNextButtonGlobalPos: () => hubProfileHandle?.getSoftDeletedNextButtonGlobalPos() ?? null,
+      getHubProfileCanvasPrevButtonGlobalPos: () => hubProfileHandle?.getCanvasPrevButtonGlobalPos() ?? null,
+      getHubProfileCanvasNextButtonGlobalPos: () => hubProfileHandle?.getCanvasNextButtonGlobalPos() ?? null,
+      getHubProfileUnsyncButtonGlobalPos: (canvasDocId: string) =>
+        hubProfileHandle?.getUnsyncButtonGlobalPos(canvasDocId) ?? null,
     },
   });
 

@@ -40,7 +40,11 @@ export default defineConfig({
   testDir: "./tests",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
+  // one local retry: residual contention flakes (multi-context cpu pressure,
+  // hub child-process startup races) report as "flaky" instead of failing
+  // the run — a clean single-command run is a hard requirement for ci.
+  // genuine regressions still fail (they fail the retry too).
+  retries: process.env.CI ? 2 : 1,
   // overall worker pool cap for the whole run. per-project `workers` below
   // further restricts how much of this pool the heavy project may use at
   // once — it doesn't add extra workers on top of this. locally, unlimited

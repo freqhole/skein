@@ -18,9 +18,6 @@ use tracing::warn;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ThumbnailError {
-    #[error("blob not found: {0}")]
-    NotFound(String),
-
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

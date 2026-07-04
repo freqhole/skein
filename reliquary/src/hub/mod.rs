@@ -206,6 +206,19 @@ impl HubPeerService {
         );
         let blob_proxy = BlobProxyHandler::new(fs_store, blobz.clone(), friendz_store.clone());
 
+        // resume tracking canvases from previous runs (moved before hub_admin
+        // so the admin handler can receive a clone of the live set).
+        let canvas_doc_ids = {
+            let persisted = hub_repo.load_canvas_ids().await;
+            if !persisted.is_empty() {
+                tracing::info!(
+                    count = persisted.len(),
+                    "loaded persisted canvas doc IDs from storage"
+                );
+            }
+            Arc::new(Mutex::new(persisted.into_iter().collect::<HashSet<String>>()))
+        };
+
         // remote hub administration: lets a privileged remote peer manage
         // this hub's friendz allow-list over the network (see
         // `protocol::hub_admin`), instead of requiring local CLI access.
@@ -218,6 +231,8 @@ impl HubPeerService {
             userz.clone(),
             blobz.clone(),
             hub_repo.clone(),
+            node_id_str.clone(),
+            Arc::clone(&canvas_doc_ids),
         );
 
         let router = iroh::protocol::Router::builder(endpoint.clone())
@@ -230,18 +245,6 @@ impl HubPeerService {
         tracing::info!(
             "iroh router started: automerge-repo + friendz + skein-blob-proxy + iroh-blobs + skein-hub-admin"
         );
-
-        // resume tracking canvases from previous runs
-        let canvas_doc_ids = {
-            let persisted = hub_repo.load_canvas_ids().await;
-            if !persisted.is_empty() {
-                tracing::info!(
-                    count = persisted.len(),
-                    "loaded persisted canvas doc IDs from storage"
-                );
-            }
-            Arc::new(Mutex::new(persisted.into_iter().collect()))
-        };
 
         // construct the change-driven blob snatcher.
         // it subscribes to hub_repo's doc_notify channel internally, so we
@@ -263,6 +266,7 @@ impl HubPeerService {
             peer_blob_inventory.clone(),
             fs_store,
             blobz.clone(),
+            crate::service::snatcher_in_flight(),
         ));
 
         Ok(Self {

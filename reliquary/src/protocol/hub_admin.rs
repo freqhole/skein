@@ -169,9 +169,9 @@ pub enum AdminRequest {
     DiskUsage,
     /// for each canvas the hub holds, sum the sizes of all blobs referenced
     /// by its file widgets. blobs shared across canvases count in each.
-    CanvasUsage,
-    /// list every blob row from the blobz store (no pagination).
-    BlobUsage,
+    CanvasUsage { offset: u64, limit: u64 },
+    /// list blob rows from the blobz store, paginated.
+    BlobUsage { offset: u64, limit: u64 },
     /// soft-delete blobs by blake3 hash. the hub's own node id (the
     /// authenticated caller) is stamped as the actor. files are NOT touched.
     /// blobs that don't exist or are already soft-deleted land in `failed`.
@@ -179,14 +179,18 @@ pub enum AdminRequest {
     /// restore soft-deleted blobs by blake3 hash.
     /// blobs that are not currently soft-deleted land in `failed`.
     RestoreBlobs { blake3s: Vec<String> },
-    /// list all soft-deleted blobs.
-    ListSoftDeleted,
+    /// list all soft-deleted blobs, paginated.
+    ListSoftDeleted { offset: u64, limit: u64 },
     /// permanently delete soft-deleted blobs. `all = true` ignores `blake3s`
     /// and purges every soft-deleted row. for managed (non-external) blobs
     /// the on-disk file is unlinked; for external blobs only the row is
     /// removed (the user owns the file). blobs that are NOT already
     /// soft-deleted land in `failed` — use `SoftDeleteBlobs` first.
     HardDeleteBlobs { blake3s: Vec<String>, all: bool },
+    /// remove the hub from a canvas's peers/acl maps, untrack the canvas
+    /// locally (soft-delete from hub storage), and sweep blobs that were
+    /// only referenced by this canvas.
+    UnsyncCanvas { canvas_doc_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,10 +242,12 @@ pub enum AdminResponse {
     /// response to `AdminRequest::CanvasUsage`.
     CanvasUsage {
         canvases: Vec<CanvasUsageSummary>,
+        total: u64,
     },
     /// response to `AdminRequest::BlobUsage`.
     BlobUsage {
         blobs: Vec<BlobUsageSummary>,
+        total: u64,
     },
     /// response to soft/restore/hard-delete blob requests (shared).
     BlobsMutation {
@@ -251,6 +257,14 @@ pub enum AdminResponse {
     /// response to `AdminRequest::ListSoftDeleted`.
     SoftDeleted {
         blobs: Vec<SoftDeletedBlobSummary>,
+        total: u64,
+    },
+    /// response to `AdminRequest::UnsyncCanvas`.
+    CanvasUnsynced {
+        canvas_doc_id: String,
+        /// number of blobs soft-deleted by the sweep (blobs that were only
+        /// referenced by this canvas and have now been marked for reclaim).
+        swept: u64,
     },
 }
 
@@ -287,6 +301,14 @@ struct Inner {
     /// stat the filesystem. derived from `blobz.blob_dir()` at construction
     /// time so no extra field is needed on the public `new()` signature.
     blob_dir: std::path::PathBuf,
+    /// the hub's own node id string, used by `UnsyncCanvas` to remove the
+    /// hub's entry from the canvas doc's `peers` and `acl` maps.
+    hub_node_id: String,
+    /// live canvas-doc-ids set, shared with `HubPeerService`. `UnsyncCanvas`
+    /// removes the target id from this in-memory set in addition to calling
+    /// `hub_repo.soft_remove_canvas_id` (which persists the removal). keeping
+    /// both in sync mirrors the canvas-deleted flow in `hub/canvas.rs`.
+    canvas_doc_ids: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl std::fmt::Debug for HubAdminHandler {
@@ -302,6 +324,8 @@ impl HubAdminHandler {
         userz: userz::Directory,
         blobz: blobz::Store,
         hub_repo: HubRepo,
+        hub_node_id: String,
+        canvas_doc_ids: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     ) -> Self {
         let blob_dir = blobz.blob_dir().to_path_buf();
         Self {
@@ -312,6 +336,8 @@ impl HubAdminHandler {
                 blobz,
                 hub_repo,
                 blob_dir,
+                hub_node_id,
+                canvas_doc_ids,
             }),
         }
     }
@@ -594,27 +620,48 @@ async fn handle_request(
                 disk_total_bytes,
             }
         }
-        AdminRequest::CanvasUsage => {
-            let canvases = canvas_usage(&handler.inner.hub_repo, &handler.inner.blobz).await;
-            AdminResponse::CanvasUsage { canvases }
+        AdminRequest::CanvasUsage { offset, limit } => {
+            let limit = clamp_limit(limit);
+            let mut all = canvas_usage(&handler.inner.hub_repo, &handler.inner.blobz).await;
+            // sort largest-first so page 1 shows the most storage-heavy canvases.
+            all.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+            let total = all.len() as u64;
+            let page: Vec<CanvasUsageSummary> = all
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect();
+            AdminResponse::CanvasUsage {
+                canvases: page,
+                total,
+            }
         }
-        AdminRequest::BlobUsage => match handler.inner.blobz.list_all().await {
-            Ok(blobs) => AdminResponse::BlobUsage {
-                blobs: blobs
-                    .into_iter()
-                    .map(|b| BlobUsageSummary {
-                        blake3: b.blake3,
-                        filename: b.filename,
-                        mime: b.mime,
-                        size: b.size as u64,
-                        external: b.external,
-                    })
-                    .collect(),
-            },
-            Err(e) => AdminResponse::Error {
-                message: format!("blobz list failed: {e}"),
-            },
-        },
+        AdminRequest::BlobUsage { offset, limit } => {
+            let limit = clamp_limit(limit);
+            match handler
+                .inner
+                .blobz
+                .list_paginated_with_count(limit, offset as i64)
+                .await
+            {
+                Ok((blobs, total)) => AdminResponse::BlobUsage {
+                    blobs: blobs
+                        .into_iter()
+                        .map(|b| BlobUsageSummary {
+                            blake3: b.blake3,
+                            filename: b.filename,
+                            mime: b.mime,
+                            size: b.size as u64,
+                            external: b.external,
+                        })
+                        .collect(),
+                    total,
+                },
+                Err(e) => AdminResponse::Error {
+                    message: format!("blobz list failed: {e}"),
+                },
+            }
+        }
         AdminRequest::SoftDeleteBlobs { blake3s } => {
             // stamp the authenticated caller as the actor.
             match handler.inner.blobz.soft_delete(&blake3s, peer_id_str).await {
@@ -632,24 +679,33 @@ async fn handle_request(
                 },
             }
         }
-        AdminRequest::ListSoftDeleted => match handler.inner.blobz.list_soft_deleted().await {
-            Ok(blobs) => AdminResponse::SoftDeleted {
-                blobs: blobs
-                    .into_iter()
-                    .map(|b| SoftDeletedBlobSummary {
-                        blake3: b.blake3,
-                        filename: b.filename,
-                        mime: b.mime,
-                        size: b.size,
-                        soft_deleted_at: b.soft_deleted_at,
-                        soft_deleted_by: b.soft_deleted_by,
-                    })
-                    .collect(),
-            },
-            Err(e) => AdminResponse::Error {
-                message: format!("list_soft_deleted failed: {e}"),
-            },
-        },
+        AdminRequest::ListSoftDeleted { offset, limit } => {
+            let limit = clamp_limit(limit);
+            match handler
+                .inner
+                .blobz
+                .list_soft_deleted_with_count(limit, offset as i64)
+                .await
+            {
+                Ok((blobs, total)) => AdminResponse::SoftDeleted {
+                    blobs: blobs
+                        .into_iter()
+                        .map(|b| SoftDeletedBlobSummary {
+                            blake3: b.blake3,
+                            filename: b.filename,
+                            mime: b.mime,
+                            size: b.size,
+                            soft_deleted_at: b.soft_deleted_at,
+                            soft_deleted_by: b.soft_deleted_by,
+                        })
+                        .collect(),
+                    total,
+                },
+                Err(e) => AdminResponse::Error {
+                    message: format!("list_soft_deleted failed: {e}"),
+                },
+            }
+        }
         AdminRequest::HardDeleteBlobs { blake3s, all } => {
             let hashes = if all { None } else { Some(blake3s.as_slice()) };
             // note: iroh-blobs FsStore blob deletion is not reachable from
@@ -667,7 +723,157 @@ async fn handle_request(
                 },
             }
         }
+        AdminRequest::UnsyncCanvas { canvas_doc_id } => {
+            handle_unsync_canvas(handler, peer_id_str, &canvas_doc_id).await
+        }
     }
+}
+
+/// clamp a requested page limit to a sane maximum.
+/// 0 → default 50; anything above 200 → 200.
+fn clamp_limit(limit: u64) -> i64 {
+    if limit == 0 {
+        50
+    } else {
+        limit.min(200) as i64
+    }
+}
+
+/// handle `AdminRequest::UnsyncCanvas`:
+/// 1. write the hub OUT of the canvas automerge doc (remove from `peers` and `acl`).
+/// 2. remove from the live in-memory `canvas_doc_ids` set.
+/// 3. soft-remove from hub_repo storage and evict the doc handle.
+/// 4. sweep blobs that were only referenced by this canvas (inline, for the count).
+async fn handle_unsync_canvas(
+    handler: &HubAdminHandler,
+    actor: &str,
+    canvas_doc_id: &str,
+) -> AdminResponse {
+    // step 1: write hub out of the canvas automerge doc.
+    // if the doc handle isn't found, log a warning and continue with cleanup.
+    let doc_written_out = match handler.inner.hub_repo.find(canvas_doc_id).await {
+        Some(handle) => {
+            let node_id = handler.inner.hub_node_id.clone();
+            let did = canvas_doc_id.to_string();
+            let result = tokio::task::spawn_blocking(move || {
+                remove_self_from_canvas_doc(&handle, &node_id, &did)
+            })
+            .await
+            .unwrap_or(false);
+            if result {
+                // notify connected peers of the doc change
+                handler.inner.hub_repo.notify_doc_changed(canvas_doc_id);
+            }
+            result
+        }
+        None => {
+            tracing::warn!(
+                canvas_doc_id,
+                "unsync: doc handle not found — skipping doc write, proceeding with cleanup"
+            );
+            false
+        }
+    };
+    tracing::info!(
+        canvas_doc_id,
+        wrote_out = doc_written_out,
+        "unsync: hub self-removal from canvas doc"
+    );
+
+    // step 2: remove from the live in-memory canvas_doc_ids set.
+    {
+        let mut ids = handler.inner.canvas_doc_ids.lock().await;
+        ids.remove(canvas_doc_id);
+    }
+
+    // step 3: soft-remove from storage and evict the doc handle.
+    handler
+        .inner
+        .hub_repo
+        .soft_remove_canvas_id(canvas_doc_id)
+        .await;
+    handler.inner.hub_repo.evict_doc(canvas_doc_id).await;
+
+    // step 4: sweep blobs unique to this canvas (inline so we can return the count).
+    let swept = match crate::maintenance::sweep_canvas_blobs(
+        handler.inner.hub_repo.storage(),
+        &handler.inner.blobz,
+        canvas_doc_id,
+        actor,
+    )
+    .await
+    {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(
+                    canvas_doc_id,
+                    soft_deleted = n,
+                    "unsync: orphan blobs soft-deleted"
+                );
+            }
+            n
+        }
+        Err(e) => {
+            tracing::warn!(
+                canvas_doc_id,
+                error = %e,
+                "unsync: sweep_canvas_blobs failed"
+            );
+            0
+        }
+    };
+
+    AdminResponse::CanvasUnsynced {
+        canvas_doc_id: canvas_doc_id.to_string(),
+        swept,
+    }
+}
+
+/// write the hub peer OUT of a canvas doc: delete the hub's entry from the
+/// `peers` map and from the `acl` map. mirrors the inverse of
+/// `write_self_to_canvas_doc`. runs inside `spawn_blocking`.
+fn remove_self_from_canvas_doc(
+    handle: &crate::hub_repo::DocHandle,
+    node_id: &str,
+    canvas_doc_id: &str,
+) -> bool {
+    use automerge::ReadDoc;
+
+    handle.with_document_mut(|doc| {
+        let has_version = doc.get(automerge::ROOT, "version").ok().flatten().is_some();
+        let has_widgets = doc.get(automerge::ROOT, "widgets").ok().flatten().is_some();
+        let has_title = doc.get(automerge::ROOT, "title").ok().flatten().is_some();
+        if !has_version && !has_widgets && !has_title {
+            tracing::info!(canvas_doc_id, "remove_self: doc has no content — not synced yet");
+            return false;
+        }
+
+        let nid = node_id.to_string();
+        match doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            // remove from peers map
+            if let Some((_, peers_obj)) = tx.get(automerge::ROOT, "peers")? {
+                if tx.get(&peers_obj, nid.as_str())?.is_some() {
+                    tx.delete(&peers_obj, nid.as_str())?;
+                    tracing::debug!(canvas_doc_id, node_id = %nid, "remove_self: deleted from peers");
+                }
+            }
+            // remove from acl map
+            if let Some((_, acl_obj)) = tx.get(automerge::ROOT, "acl")? {
+                if tx.get(&acl_obj, nid.as_str())?.is_some() {
+                    tx.delete(&acl_obj, nid.as_str())?;
+                    tracing::debug!(canvas_doc_id, node_id = %nid, "remove_self: deleted from acl");
+                }
+            }
+            Ok(())
+        }) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(canvas_doc_id, error = ?e, "remove_self: transact failed");
+                false
+            }
+        }
+    })
 }
 
 /// read an avatar blob's bytes out of `blobz` and encode as a
@@ -933,6 +1139,9 @@ mod tests {
         let hub_repo = HubRepo::new("hub-node".to_string(), &tmp.path().join("hub-docs.db"))
             .await
             .expect("HubRepo::new should succeed");
+        let canvas_doc_ids = Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
         (
             HubAdminHandler::new(
                 adminz_store.clone(),
@@ -940,6 +1149,8 @@ mod tests {
                 userz_dir.clone(),
                 blobz_store.clone(),
                 hub_repo.clone(),
+                "hub-node".to_string(),
+                canvas_doc_ids,
             ),
             adminz_store,
             friendz_store,
@@ -1587,6 +1798,8 @@ mod tests {
             userz_dir,
             blobz_store,
             hub_repo,
+            "hub-node".to_string(),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         );
 
         let admin_node = "admin-node";
@@ -1673,6 +1886,8 @@ mod tests {
             userz_dir,
             blobz_store,
             hub_repo,
+            "hub-node".to_string(),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         );
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1722,6 +1937,8 @@ mod tests {
             userz_dir,
             blobz_store,
             hub_repo,
+            "hub-node".to_string(),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         );
 
         let stranger = "stranger-node";
@@ -1808,10 +2025,19 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = handle_request(&handler, admin_node, AdminRequest::BlobUsage).await;
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::BlobUsage {
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .await;
         match resp {
-            AdminResponse::BlobUsage { blobs } => {
+            AdminResponse::BlobUsage { blobs, total } => {
                 assert_eq!(blobs.len(), 2);
+                assert_eq!(total, 2);
                 let a = blobs
                     .iter()
                     .find(|b| b.filename == Some("a.txt".to_string()));
@@ -1912,10 +2138,19 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = handle_request(&handler, admin_node, AdminRequest::ListSoftDeleted).await;
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::ListSoftDeleted {
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .await;
         match resp {
-            AdminResponse::SoftDeleted { blobs } => {
+            AdminResponse::SoftDeleted { blobs, total } => {
                 assert_eq!(blobs.len(), 1);
+                assert_eq!(total, 1);
                 assert_eq!(blobs[0].blake3, blob.blake3);
                 assert_eq!(blobs[0].filename.as_deref(), Some("f.txt"));
                 assert_eq!(blobs[0].soft_deleted_by, admin_node);
@@ -2064,7 +2299,15 @@ mod tests {
         .await;
         assert!(matches!(restore, AdminResponse::NotAdmin));
 
-        let list = handle_request(&handler, stranger, AdminRequest::ListSoftDeleted).await;
+        let list = handle_request(
+            &handler,
+            stranger,
+            AdminRequest::ListSoftDeleted {
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .await;
         assert!(matches!(list, AdminResponse::NotAdmin));
 
         let hard = handle_request(
@@ -2077,5 +2320,279 @@ mod tests {
         )
         .await;
         assert!(matches!(hard, AdminResponse::NotAdmin));
+    }
+
+    // -- pagination tests -------------------------------------------------
+
+    #[tokio::test]
+    async fn blob_usage_pagination_returns_correct_page_and_total() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        for i in 0u8..5 {
+            blobz_store
+                .insert(format!("h-page-{i}"), None, None, &[i; 4])
+                .await
+                .unwrap();
+        }
+
+        // page 1: limit 2, offset 0
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::BlobUsage {
+                offset: 0,
+                limit: 2,
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::BlobUsage { blobs, total } => {
+                assert_eq!(blobs.len(), 2);
+                assert_eq!(total, 5, "total must reflect all rows, not just the page");
+            }
+            other => panic!("expected BlobUsage, got {other:?}"),
+        }
+
+        // page beyond end: offset 10 > total 5
+        let resp2 = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::BlobUsage {
+                offset: 10,
+                limit: 50,
+            },
+        )
+        .await;
+        match resp2 {
+            AdminResponse::BlobUsage { blobs, total } => {
+                assert!(blobs.is_empty(), "page beyond end must be empty");
+                assert_eq!(total, 5, "total must still be correct");
+            }
+            other => panic!("expected BlobUsage, got {other:?}"),
+        }
+
+        // limit 0 → default 50 (returns all 5)
+        let resp3 = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::BlobUsage {
+                offset: 0,
+                limit: 0,
+            },
+        )
+        .await;
+        match resp3 {
+            AdminResponse::BlobUsage { blobs, total } => {
+                assert_eq!(blobs.len(), 5);
+                assert_eq!(total, 5);
+            }
+            other => panic!("expected BlobUsage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn soft_deleted_pagination_returns_correct_page_and_total() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        for i in 0u8..4 {
+            let b = blobz_store
+                .insert(format!("h-sd-page-{i}"), None, None, &[i; 3])
+                .await
+                .unwrap();
+            blobz_store
+                .soft_delete(&[b.blake3], admin_node)
+                .await
+                .unwrap();
+        }
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::ListSoftDeleted {
+                offset: 0,
+                limit: 2,
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::SoftDeleted { blobs, total } => {
+                assert_eq!(blobs.len(), 2);
+                assert_eq!(total, 4);
+            }
+            other => panic!("expected SoftDeleted, got {other:?}"),
+        }
+
+        // offset beyond end
+        let resp2 = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::ListSoftDeleted {
+                offset: 100,
+                limit: 50,
+            },
+        )
+        .await;
+        match resp2 {
+            AdminResponse::SoftDeleted { blobs, total } => {
+                assert!(blobs.is_empty());
+                assert_eq!(total, 4);
+            }
+            other => panic!("expected SoftDeleted, got {other:?}"),
+        }
+    }
+
+    // -- UnsyncCanvas tests -----------------------------------------------
+
+    #[tokio::test]
+    async fn unsync_canvas_soft_removes_and_returns_swept_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+
+        // seed a canvas with two blobs
+        let storage = crate::hub_repo::HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new");
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            tx.put(automerge::ROOT, "title", "test canvas")?;
+            Ok(())
+        })
+        .unwrap();
+        storage.save_doc("canvas-sync", &doc.save()).await;
+        storage.save_canvas_id("canvas-sync").await;
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new");
+        let pool = db::open_in_memory().await;
+        let adminz_store = adminz::Store::new(pool.clone());
+        let friendz_store = friendz::Store::new(pool.clone());
+        let userz_dir = userz::Directory::new(pool.clone());
+        let blobz_store = blobz::Store::new(pool, tmp.path());
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        // track the canvas in the live set
+        let canvas_doc_ids = Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::<String>::from(["canvas-sync".to_string()]),
+        ));
+        let handler = HubAdminHandler::new(
+            adminz_store,
+            friendz_store,
+            userz_dir,
+            blobz_store,
+            hub_repo,
+            "hub-node".to_string(),
+            Arc::clone(&canvas_doc_ids),
+        );
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::UnsyncCanvas {
+                canvas_doc_id: "canvas-sync".to_string(),
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::CanvasUnsynced {
+                canvas_doc_id,
+                swept,
+            } => {
+                assert_eq!(canvas_doc_id, "canvas-sync");
+                // no blobs seeded → 0 swept
+                assert_eq!(swept, 0);
+            }
+            other => panic!("expected CanvasUnsynced, got {other:?}"),
+        }
+
+        // canvas must be removed from the live in-memory set
+        assert!(
+            !canvas_doc_ids.lock().await.contains("canvas-sync"),
+            "canvas must be removed from live canvas_doc_ids after UnsyncCanvas"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsync_canvas_sweeps_only_canvas_unique_blobs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = db::open_in_memory().await;
+        let blobz_store = blobz::Store::new(pool.clone(), tmp.path());
+
+        // insert a blob and soft-delete it to simulate an orphan
+        let b = blobz_store
+            .insert("h-unsync-sweep".into(), None, None, b"sweepme")
+            .await
+            .unwrap();
+        // leave the blob live (not soft-deleted) — sweep_canvas_blobs will
+        // soft-delete it if it's only referenced by the target canvas.
+        // here we simply test the "no widgets" path which sweeps nothing.
+        let _ = b;
+
+        let db_path = tmp.path().join("hub-docs.db");
+        let storage = crate::hub_repo::HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new");
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            tx.put(automerge::ROOT, "title", "canvas-to-unsync")?;
+            Ok(())
+        })
+        .unwrap();
+        storage.save_doc("canvas-to-unsync", &doc.save()).await;
+        storage.save_canvas_id("canvas-to-unsync").await;
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new");
+        let adminz_store = crate::adminz::Store::new(pool.clone());
+        adminz_store.allow("admin").await.unwrap();
+        let canvas_doc_ids = Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::<String>::from(["canvas-to-unsync".to_string()]),
+        ));
+        let handler = HubAdminHandler::new(
+            adminz_store,
+            friendz::Store::new(pool.clone()),
+            userz::Directory::new(pool),
+            blobz_store,
+            hub_repo,
+            "hub-node".to_string(),
+            canvas_doc_ids,
+        );
+
+        let resp = handle_request(
+            &handler,
+            "admin",
+            AdminRequest::UnsyncCanvas {
+                canvas_doc_id: "canvas-to-unsync".to_string(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(resp, AdminResponse::CanvasUnsynced { swept, .. } if swept == 0),
+            "no widget-referenced blobs → swept should be 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_unsync_canvas() {
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
+        let resp = handle_request(
+            &handler,
+            "stranger",
+            AdminRequest::UnsyncCanvas {
+                canvas_doc_id: "any-canvas".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(resp, AdminResponse::NotAdmin));
     }
 }

@@ -408,6 +408,21 @@ impl Store {
         Ok((row.total_bytes as u64, row.count as u64))
     }
 
+    /// all blake3 hashes in the blobz table, including soft-deleted rows.
+    ///
+    /// used by the iroh-blobs gc protect callback: soft-deleted blobs keep
+    /// their on-disk files intact (hard-delete is a separate admin action),
+    /// so they must stay protected from gc until explicitly hard-deleted.
+    /// external blobs (ExportMode::TryReference) are never touched by gc
+    /// anyway (DataLocation::External is a no-op in the sweep), but keeping
+    /// their redb rows alive costs nothing and avoids any edge cases.
+    pub async fn list_all_iroh_hashes(&self) -> Result<Vec<String>, BlobError> {
+        let rows = sqlx::query!(r#"SELECT blake3 as "blake3!" FROM blobz"#)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.blake3).collect())
+    }
+
     /// all non-soft-deleted blobs, most recently created first, without pagination.
     /// used by the admin `BlobUsage` request.
     pub async fn list_all(&self) -> Result<Vec<BlobRef>, BlobError> {
@@ -484,6 +499,70 @@ impl Store {
         }
 
         Ok((affected, failed))
+    }
+
+    /// paginated list of non-soft-deleted blobs with total count.
+    /// limit 0 is treated as default 50; capped at 200.
+    pub async fn list_paginated_with_count(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<BlobRef>, u64), BlobError> {
+        let count_row = sqlx::query!(
+            r#"SELECT COUNT(*) as "count!: i64" FROM blobz WHERE soft_deleted_at IS NULL"#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let total = count_row.count as u64;
+
+        let rows = sqlx::query_as!(
+            BlobRow,
+            r#"SELECT blake3 as "blake3!", iroh_hash as "iroh_hash!", filename, mime,
+                      size as "size!", path as "path!", external as "external!",
+                      created_at as "created_at!"
+               FROM blobz
+               WHERE soft_deleted_at IS NULL
+               ORDER BY created_at DESC
+               LIMIT ?1 OFFSET ?2"#,
+            limit,
+            offset,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((rows.into_iter().map(Into::into).collect(), total))
+    }
+
+    /// paginated list of soft-deleted blobs with total count.
+    /// limit 0 is treated as default 50; capped at 200.
+    pub async fn list_soft_deleted_with_count(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<SoftDeletedBlobRef>, u64), BlobError> {
+        let count_row = sqlx::query!(
+            r#"SELECT COUNT(*) as "count!: i64" FROM blobz WHERE soft_deleted_at IS NOT NULL"#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let total = count_row.count as u64;
+
+        let rows = sqlx::query_as!(
+            SoftDeletedRow,
+            r#"SELECT blake3 as "blake3!", filename, mime,
+                      size as "size!", soft_deleted_at as "soft_deleted_at!: i64",
+                      soft_deleted_by as "soft_deleted_by!"
+               FROM blobz
+               WHERE soft_deleted_at IS NOT NULL
+               ORDER BY soft_deleted_at DESC
+               LIMIT ?1 OFFSET ?2"#,
+            limit,
+            offset,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((rows.into_iter().map(Into::into).collect(), total))
     }
 
     /// list all soft-deleted blobs for the admin panel.
