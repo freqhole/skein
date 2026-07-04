@@ -29,6 +29,7 @@ import { dispatch, isTauriMode } from "../p2p/tauri-transport";
 import { log } from "../utils/log";
 import { getStoredIdentity, getMiddenNode } from "../p2p/identity";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
@@ -53,6 +54,15 @@ import {
 const TAG = "file-utils";
 
 const PEER_TIMEOUT_MS = 8000;
+
+/** timeout for an actual blob transfer (strategies 2 + 3 of
+ *  downloadBlobBytesFromPeer) — matches strategy 1's 10-minute allowance.
+ *  these strategies previously used a bare 30s timeout, which is fine for
+ *  small blobs but was too short for large files (multi-hundred-MB+),
+ *  especially strategy 3's single-shot base64 JSON proxy_request fallback
+ *  (used whenever the peer is a tauri app, since its rust backend doesn't
+ *  accept the iroh-blobs ALPN that strategies 1/2 rely on). */
+const PEER_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 
 /** minimal extension -> mime guesser used when the tauri native file picker
  *  hands us only a path (no mime). intentionally tiny: just covers the file
@@ -215,6 +225,14 @@ export interface UploadOptions {
   metadata?: string;
   /** wait for thumbnail job to complete before returning (default: true) */
   waitForCompletion?: boolean;
+  /**
+   * incremental progress during upload, 0..1. tauri mode only (real,
+   * byte-level progress from the rust-side streaming hash pass — see
+   * `blob_insert_from_path`'s `blob-insert-progress` event). never called
+   * in browser mode (the browser-mode upload path has no incremental
+   * progress source of its own).
+   */
+  onProgress?: (fraction: number) => void;
 }
 
 /** options for thumbnail fetching */
@@ -839,7 +857,7 @@ async function downloadBlobBytesFromPeer(
           info.size || 0,
           progressFn
         ) as Promise<any>,
-        30000
+        PEER_DOWNLOAD_TIMEOUT_MS
       );
       bytes = result[0] as Uint8Array;
       blake3Hash = (result[1] as string) || blake3Hash;
@@ -869,7 +887,7 @@ async function downloadBlobBytesFromPeer(
             `/api/blobs/${info.blobId}/data`,
             null
           ) as Promise<{ status: number; body: string }>,
-          30000
+          PEER_DOWNLOAD_TIMEOUT_MS
         );
         // proxy_request returns { status, body }; body is the JSON envelope
         // sent by skein-handler: { success, data: { data, mime } }
@@ -889,6 +907,19 @@ async function downloadBlobBytesFromPeer(
             // mime may have been refined by the responder
             if (typeof parsed.data?.mime === "string" && !mime) {
               mime = parsed.data.mime;
+            }
+            // diagnostic: the proxy_request fallback has no incremental
+            // transport-level integrity checking (see the explicit
+            // post-decode blake3 check below) — logging the decoded size
+            // against the declared size up-front makes a silent truncation
+            // (e.g. a peer-side write/read error, or a body that got cut
+            // off) visible in logs instead of only surfacing later as a
+            // confusing hash-mismatch or a 0-byte-payload rejection.
+            if (info.size && bytes.length !== info.size) {
+              log.warn(
+                TAG,
+                `proxy_request fallback: decoded ${bytes.length} bytes but declared size was ${info.size} — possible truncation`
+              );
             }
             progressFn(1);
             downloaded = true;
@@ -1107,7 +1138,7 @@ export async function snatchBlobToDisk(
       mime = downloaded.mime;
     } catch (err) {
       lastError = err;
-      log.debug(TAG, `snatch-to-disk from probed peer ${bestPeer.slice(0, 16)}... failed:`, err);
+      log.warn(TAG, `snatch-to-disk from probed peer ${bestPeer.slice(0, 16)}... failed:`, err);
       remaining = remaining.filter((p) => p !== bestPeer);
       continue;
     }
@@ -2011,6 +2042,43 @@ async function pickFilesBrowser(): Promise<PickedFile[]> {
 }
 
 // ---------------------------------------------------------------------------
+// formatUploadError
+// ---------------------------------------------------------------------------
+
+/**
+ * turn an upload failure (a plain string from a rejected tauri `dispatch()`
+ * call, an Error, or anything else) into a short, user-facing message.
+ * widgets have very little room for text, so this stays terse (~60 chars)
+ * rather than surfacing the full rust error chain.
+ */
+export function formatUploadError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const lower = raw.toLowerCase();
+
+  if (lower.includes("no space left") || lower.includes("enospc")) {
+    return "upload failed: not enough disk space";
+  }
+  if (lower.includes("permission denied") || lower.includes("eacces")) {
+    return "upload failed: permission denied";
+  }
+  if (
+    lower.includes("no such file or directory") ||
+    lower.includes("enoent")
+  ) {
+    return "upload failed: file not found (moved or deleted?)";
+  }
+  if (lower.includes("must be an absolute path")) {
+    return "upload failed: invalid file path";
+  }
+
+  const trimmed = raw.trim();
+  if (!trimmed) return "upload failed";
+  return trimmed.length > 60
+    ? `upload failed: ${trimmed.slice(0, 57)}...`
+    : `upload failed: ${trimmed}`;
+}
+
+// ---------------------------------------------------------------------------
 // uploadFile
 // ---------------------------------------------------------------------------
 
@@ -2024,7 +2092,7 @@ async function pickFilesBrowser(): Promise<PickedFile[]> {
  */
 export async function uploadFile(
   picked: PickedFile,
-  _options?: UploadOptions
+  options?: UploadOptions
 ): Promise<FileUploadResult> {
   if (!isTauriMode()) {
     if (!picked.file) {
@@ -2053,22 +2121,48 @@ export async function uploadFile(
   }
 
   // ---- tauri mode --------------------------------------------------------
-  // route the raw bytes through the rust side so reliquary owns the file
-  // (and iroh-blobs can serve it to peers), then mirror the bytes into
-  // OPFS / IndexedDB so the widget's existing browser-mode display paths
-  // (thumbnail load, image full-data url, etc.) keep working in tauri.
+  // routes the file through rust's `blobz::Store::register_path()`, which
+  // streams it through blake3 in fixed-size chunks and registers it as an
+  // "external" reference (the file stays exactly where the native picker
+  // found it) — never loads the whole file into memory, unlike the old
+  // read-the-whole-file-then-base64-round-trip path this replaced (see
+  // docs/narthex-widgets-and-file-transfer-plan.md section 7 for the full
+  // "three copies of a multi-gigabyte file in memory" root-cause writeup).
+  //
+  // the base64 `data` mirror (into OPFS/IndexedDB, for the browser-mode
+  // display paths — thumbnail load, image full-data-url) only comes back
+  // for files under `blob_insert_from_path`'s own size threshold; for a
+  // large file `response.data` is `null` and the mirror step below is
+  // skipped entirely — the blob simply stays rust-only, which
+  // `getBlobData()`'s existing tauri fallback already handles gracefully.
 
   if (!picked.path) {
     throw new Error("tauri uploadFile requires picked.path");
   }
 
   const mime = guessMimeFromFilename(picked.filename);
+  const uploadId = crypto.randomUUID();
 
-  const response = (await dispatch("blob_insert_from_path", {
-    local_path: picked.path,
-    filename: picked.filename,
-    mime,
-  })) as {
+  let unlisten: (() => void) | null = null;
+  if (options?.onProgress) {
+    const onProgress = options.onProgress;
+    try {
+      unlisten = await listen<{ uploadId: string; bytesRead: number; total: number }>(
+        "blob-insert-progress",
+        (event) => {
+          if (event.payload.uploadId !== uploadId) return;
+          if (event.payload.total <= 0) return;
+          onProgress(Math.min(1, event.payload.bytesRead / event.payload.total));
+        }
+      );
+    } catch (err) {
+      // progress is a nice-to-have — a failure to subscribe must not block
+      // the actual upload.
+      log.debug(TAG, "failed to subscribe to blob-insert-progress:", err);
+    }
+  }
+
+  let response: {
     meta: {
       blake3: string;
       iroh_hash: string;
@@ -2077,46 +2171,69 @@ export async function uploadFile(
       size: number;
       created_at: number;
     };
-    data: string;
+    data: string | null;
   };
+  try {
+    response = (await dispatch("blob_insert_from_path", {
+      local_path: picked.path,
+      filename: picked.filename,
+      mime,
+      upload_id: uploadId,
+    })) as typeof response;
+  } catch (err) {
+    throw new Error(formatUploadError(err));
+  } finally {
+    unlisten?.();
+  }
 
   const meta = response.meta;
-  const bytes = base64ToBytes(response.data);
-  const buffer = bytes.buffer.slice(
-    bytes.byteOffset,
-    bytes.byteOffset + bytes.byteLength
-  ) as ArrayBuffer;
-
-  // dedup: if we already mirrored this blake3, skip the OPFS write.
-  const existingRecord = await getBlobRecord(meta.blake3);
   const resolvedMime = meta.mime || mime;
   const domain = classifyDomain(resolvedMime);
 
-  if (!existingRecord) {
-    await storeBlob(meta.blake3, buffer, {
-      blob_id: meta.blake3,
-      sha256: "",
-      blake3: meta.blake3,
-      filename: meta.filename || picked.filename,
-      mime: resolvedMime,
-      size: meta.size,
-      domain,
-      blob_type: "original",
-      parent_blob_id: null,
-      metadata: {},
-    });
-  }
-
-  // generate a thumbnail data url for images so the widget can paint
-  // immediately without a follow-up fetch.
   let thumbnailDataUrl: string | null = null;
-  if (resolvedMime.startsWith("image/")) {
-    try {
-      const blob = new Blob([new Uint8Array(buffer)], { type: resolvedMime });
-      thumbnailDataUrl = await generateThumbnailDataUrl(blob);
-    } catch (err) {
-      log.debug(TAG, "tauri thumbnail generation failed:", err);
+  let existing = false;
+
+  if (response.data !== null) {
+    const bytes = base64ToBytes(response.data);
+    const buffer = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength
+    ) as ArrayBuffer;
+
+    // dedup: if we already mirrored this blake3, skip the OPFS write.
+    const existingRecord = await getBlobRecord(meta.blake3);
+    existing = !!existingRecord;
+
+    if (!existingRecord) {
+      await storeBlob(meta.blake3, buffer, {
+        blob_id: meta.blake3,
+        sha256: "",
+        blake3: meta.blake3,
+        filename: meta.filename || picked.filename,
+        mime: resolvedMime,
+        size: meta.size,
+        domain,
+        blob_type: "original",
+        parent_blob_id: null,
+        metadata: {},
+      });
     }
+
+    // generate a thumbnail data url for images so the widget can paint
+    // immediately without a follow-up fetch.
+    if (resolvedMime.startsWith("image/")) {
+      try {
+        const blob = new Blob([new Uint8Array(buffer)], { type: resolvedMime });
+        thumbnailDataUrl = await generateThumbnailDataUrl(blob);
+      } catch (err) {
+        log.debug(TAG, "tauri thumbnail generation failed:", err);
+      }
+    }
+  } else {
+    log.debug(
+      TAG,
+      `blob ${meta.blake3.slice(0, 8)}... (${formatFileSize(meta.size)}) exceeded the mirror-to-browser-storage threshold — staying rust-only`
+    );
   }
 
   return {
@@ -2127,7 +2244,7 @@ export async function uploadFile(
     blake3: meta.blake3,
     size: meta.size,
     mime: resolvedMime,
-    existing: !!existingRecord,
+    existing,
     thumbnailDataUrl,
   };
 }

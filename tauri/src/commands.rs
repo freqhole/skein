@@ -293,7 +293,7 @@ async fn ensure_network(
 async fn dispatch(
     action: &str,
     payload: Value,
-    _app: &AppHandle,
+    app: &AppHandle,
     state: &AppState,
 ) -> Result<Value, DispatchError> {
     match action {
@@ -364,7 +364,7 @@ async fn dispatch(
         "blob_get_path" => blob_get_path(decode("blob_get_path", payload)?, state).await,
         "blob_insert" => blob_insert(decode("blob_insert", payload)?, state).await,
         "blob_insert_from_path" => {
-            blob_insert_from_path(decode("blob_insert_from_path", payload)?, state).await
+            blob_insert_from_path(decode("blob_insert_from_path", payload)?, app, state).await
         }
         "blob_iroh_ensure" => {
             blob_iroh_ensure(decode("blob_iroh_ensure", payload)?, state).await
@@ -1161,12 +1161,26 @@ struct BlobInsertFromPathArgs {
     local_path: String,
     filename: Option<String>,
     mime: Option<String>,
-    /// optional iroh hash override. defaults to mirroring the blake3.
-    iroh_hash: Option<String>,
+    /// caller-generated id echoed back on every `blob-insert-progress` event
+    /// so the frontend can correlate progress with the right upload when
+    /// more than one is in flight. progress is skipped entirely if omitted.
+    upload_id: Option<String>,
 }
+
+/// above this size, `blob_insert_from_path`'s response omits the base64
+/// `data` mirror entirely — a multi-gigabyte file has no real use for a
+/// duplicate copy in browser-managed storage (OPFS/IndexedDB), and paying
+/// for a full base64 encode + a second full-size decode on the JS side just
+/// to store bytes nothing ever reads back is exactly the "three copies of a
+/// multi-gigabyte file in memory at once" pattern that used to crash the
+/// app on large files. widgets already handle "blob only reachable via
+/// tauri dispatch" gracefully (see `getBlobData()`'s tauri fallback), so a
+/// large file simply staying rust-only is fine.
+const MIRROR_DATA_MAX_BYTES: i64 = 25 * 1024 * 1024;
 
 async fn blob_insert_from_path(
     args: BlobInsertFromPathArgs,
+    app: &AppHandle,
     state: &AppState,
 ) -> Result<Value, DispatchError> {
     let path = std::path::PathBuf::from(&args.local_path);
@@ -1180,13 +1194,6 @@ async fn blob_insert_from_path(
         });
     }
 
-    let bytes = tokio::fs::read(&path).await.map_err(|e| {
-        DispatchError::Blob(blobz::BlobError::Io(std::io::Error::new(
-            e.kind(),
-            format!("read {}: {}", path.display(), e),
-        )))
-    })?;
-
     // derive a filename from the path tail when caller didn't pass one.
     let filename = args.filename.or_else(|| {
         path.file_name()
@@ -1194,22 +1201,55 @@ async fn blob_insert_from_path(
             .map(|s| s.to_string())
     });
 
-    let blake3_hex = blake3::hash(&bytes).to_hex().to_string();
-    let iroh_hash = args.iroh_hash.unwrap_or_else(|| blake3_hex.clone());
+    // streams the file through blake3 in fixed-size chunks (see
+    // `blobz::Store::register_path`'s doc comment) — never loads the whole
+    // file into memory, and registers it as an "external" reference (the
+    // file stays exactly where the user's native file picker found it,
+    // rather than also being copied into reliquary's blob-files dir) so a
+    // multi-gigabyte upload costs one streaming read pass, not a read +
+    // a full-file copy + a full-file base64 round-trip.
+    let upload_id = args.upload_id.clone();
+    let progress_cb = upload_id.as_ref().map(|id| {
+        let app = app.clone();
+        let id = id.clone();
+        move |bytes_read: u64, total: u64| {
+            let _ = app.emit(
+                "blob-insert-progress",
+                json!({ "uploadId": id, "bytesRead": bytes_read, "total": total }),
+            );
+        }
+    });
+    let on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)> =
+        progress_cb.as_ref().map(|f| f as &(dyn Fn(u64, u64) + Send + Sync));
+
     let blob = state
         .blobz
-        .insert(iroh_hash, filename, args.mime, &bytes)
+        .register_path(&path, filename, args.mime, on_progress)
         .await?;
     prewarm_fs_store(state, &blob).await;
 
-    // return both the row metadata and the raw bytes so the JS caller can
-    // mirror the file into IndexedDB / OPFS for its existing display paths
-    // without a second filesystem read.
+    // mirror the bytes back to the JS caller only for small files — see
+    // `MIRROR_DATA_MAX_BYTES`'s doc comment. `null` (not an empty string)
+    // signals "no mirror" explicitly so the JS side can't mistake it for a
+    // genuinely-empty (0-byte) file.
+    let data = if blob.size <= MIRROR_DATA_MAX_BYTES {
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+            DispatchError::Blob(blobz::BlobError::Io(std::io::Error::new(
+                e.kind(),
+                format!("read {}: {}", path.display(), e),
+            )))
+        })?;
+        Value::String(B64.encode(&bytes))
+    } else {
+        Value::Null
+    };
+
     Ok(json!({
         "meta": BlobDto::from(blob),
-        "data": B64.encode(&bytes),
+        "data": data,
     }))
 }
+
 
 #[derive(Debug, Deserialize)]
 struct BlobIrohDownloadArgs {

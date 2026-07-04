@@ -72,7 +72,14 @@ vi.mock("../workers/blob-worker-client", () => ({
   hashBlake3: (...args: any[]) => mockHashBlake3(...args),
 }));
 
-import { canSnatchToDisk, checkBlobLocality, snatchBlob, snatchBlobToDisk, uploadFile } from "./file-utils";
+import {
+  canSnatchToDisk,
+  checkBlobLocality,
+  formatUploadError,
+  snatchBlob,
+  snatchBlobToDisk,
+  uploadFile,
+} from "./file-utils";
 
 describe("file-utils — tauri-mode branches", () => {
   beforeEach(() => {
@@ -178,6 +185,7 @@ describe("file-utils — tauri-mode branches", () => {
         local_path: "/Users/x/notes.txt",
         filename: "notes.txt",
         mime: "text/plain",
+        upload_id: expect.any(String),
       });
       expect(mockStoreBlob).toHaveBeenCalledTimes(1);
       expect(result.existing).toBe(false);
@@ -218,6 +226,77 @@ describe("file-utils — tauri-mode branches", () => {
         uploadFile({ path: null, filename: "notes.txt", size: 0, file: null })
       ).rejects.toThrow("tauri uploadFile requires picked.path");
       expect(mockDispatch).not.toHaveBeenCalled();
+    });
+
+    it("skips the OPFS mirror entirely when rust reports data: null (large file over the mirror threshold)", async () => {
+      mockIsTauriMode.mockReturnValue(true);
+      mockDispatch.mockResolvedValue({
+        meta: {
+          blake3: "hugefileblake3",
+          iroh_hash: "irohhash",
+          filename: "huge.bin",
+          mime: "application/octet-stream",
+          size: 7_000_000_000,
+          created_at: Date.now(),
+        },
+        data: null,
+      });
+
+      const result = await uploadFile({
+        path: "/Users/x/huge.bin",
+        filename: "huge.bin",
+        size: 0,
+        file: null,
+      });
+
+      expect(mockGetBlobRecord).not.toHaveBeenCalled();
+      expect(mockStoreBlob).not.toHaveBeenCalled();
+      expect(result.existing).toBe(false);
+      expect(result.blake3).toBe("hugefileblake3");
+      expect(result.thumbnailDataUrl).toBeNull();
+      expect(result.size).toBe(7_000_000_000);
+    });
+
+    it("wraps a rejected dispatch through formatUploadError", async () => {
+      mockIsTauriMode.mockReturnValue(true);
+      mockDispatch.mockRejectedValue("blob: io error: No space left on device (os error 28)");
+
+      await expect(
+        uploadFile({ path: "/Users/x/huge.bin", filename: "huge.bin", size: 0, file: null })
+      ).rejects.toThrow("upload failed: not enough disk space");
+    });
+  });
+
+  describe("formatUploadError", () => {
+    it("recognizes a disk-space error", () => {
+      expect(formatUploadError("blob: io error: No space left on device (os error 28)")).toBe(
+        "upload failed: not enough disk space"
+      );
+    });
+
+    it("recognizes a permission error", () => {
+      expect(formatUploadError(new Error("Permission denied (os error 13)"))).toBe(
+        "upload failed: permission denied"
+      );
+    });
+
+    it("recognizes a missing-file error", () => {
+      expect(formatUploadError("No such file or directory (os error 2)")).toBe(
+        "upload failed: file not found (moved or deleted?)"
+      );
+    });
+
+    it("falls back to a truncated generic message for anything else", () => {
+      expect(formatUploadError("some totally unexpected rust panic message")).toBe(
+        "upload failed: some totally unexpected rust panic message"
+      );
+    });
+
+    it("truncates a very long message", () => {
+      const long = "x".repeat(200);
+      const result = formatUploadError(long);
+      expect(result.length).toBeLessThanOrEqual(60 + "upload failed: ".length);
+      expect(result.endsWith("...")).toBe(true);
     });
   });
 

@@ -118,11 +118,20 @@ impl Store {
     /// streams the file through blake3 so large files don't have to be loaded
     /// into memory. dedupes on blake3 — if the same content is already
     /// registered (external or not), returns the existing ref.
+    ///
+    /// `on_progress`, if provided, is called periodically (roughly every 4MB
+    /// read, plus once at 100% completion) with `(bytes_read, total_size)` —
+    /// throttled internally so a large file doesn't fire thousands of calls.
+    /// callers (e.g. tauri's `blob_insert_from_path`) can use this to push
+    /// incremental progress to the frontend during the hashing pass, which is
+    /// the only genuinely slow part of registering a large file (the file
+    /// itself is never copied — see above).
     pub async fn register_path(
         &self,
         abs_path: &Path,
         filename: Option<String>,
         mime: Option<String>,
+        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
     ) -> Result<BlobRef, BlobError> {
         if !abs_path.is_absolute() {
             return Err(BlobError::Io(std::io::Error::new(
@@ -131,11 +140,15 @@ impl Store {
             )));
         }
 
+        let total_size = tokio::fs::metadata(abs_path).await?.len();
+
         // stream the file through blake3 + count bytes.
         use tokio::io::AsyncReadExt;
         let mut file = tokio::fs::File::open(abs_path).await?;
         let mut hasher = blake3::Hasher::new();
         let mut size: i64 = 0;
+        let mut since_last_report: u64 = 0;
+        const PROGRESS_REPORT_BYTES: u64 = 4 * 1024 * 1024;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             let n = file.read(&mut buf).await?;
@@ -144,8 +157,18 @@ impl Store {
             }
             hasher.update(&buf[..n]);
             size += n as i64;
+            since_last_report += n as u64;
+            if since_last_report >= PROGRESS_REPORT_BYTES {
+                since_last_report = 0;
+                if let Some(cb) = on_progress {
+                    cb(size as u64, total_size);
+                }
+            }
         }
         drop(file);
+        if let Some(cb) = on_progress {
+            cb(size as u64, total_size);
+        }
         let blake3_hex = hasher.finalize().to_hex().to_string();
 
         // see `insert()` for why a racing duplicate here is expected and
@@ -475,5 +498,86 @@ mod tests {
         assert_eq!(blake3s.len(), 1);
         let rows = store.list(100, 0).await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_path_streams_without_copying_the_file() {
+        let (store, tmp) = make_store().await;
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let src_path = src_dir.path().join("original.bin");
+        let payload = vec![7u8; 1024 * 1024]; // 1MB, distinct from any other test's bytes
+        tokio::fs::write(&src_path, &payload).await.unwrap();
+
+        let blob = store
+            .register_path(
+                &src_path,
+                Some("original.bin".into()),
+                Some("application/octet-stream".into()),
+                None,
+            )
+            .await
+            .expect("register_path");
+
+        let expected_blake3 = blake3::hash(&payload).to_hex().to_string();
+        assert_eq!(blob.blake3, expected_blake3);
+        assert_eq!(blob.size, payload.len() as i64);
+        // "external" — path_for() must point straight at the original file,
+        // not a copy under the store's own blob-files dir.
+        let resolved = store.path_for(&blob);
+        assert_eq!(resolved, src_path);
+        assert!(!resolved.starts_with(tmp.path().join(BLOB_FILES_DIR)));
+
+        // dedup on a second call with the same content.
+        let again = store
+            .register_path(&src_path, None, None, None)
+            .await
+            .expect("register_path again");
+        assert_eq!(again.blake3, blob.blake3);
+        let rows = store.list(100, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_path_reports_progress_and_reaches_100_percent() {
+        let (store, _tmp) = make_store().await;
+        let src_dir = tempfile::tempdir().expect("src tempdir");
+        let src_path = src_dir.path().join("big.bin");
+        // large enough to cross the 4MB progress-report threshold at least
+        // once, so this test actually exercises the throttled-report path,
+        // not just the unconditional final call.
+        let payload = vec![9u8; 5 * 1024 * 1024];
+        tokio::fs::write(&src_path, &payload).await.unwrap();
+
+        let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+        let reports_clone = reports.clone();
+        let cb = move |read: u64, total: u64| {
+            reports_clone.lock().unwrap().push((read, total));
+        };
+
+        let blob = store
+            .register_path(&src_path, None, None, Some(&cb))
+            .await
+            .expect("register_path");
+
+        let calls = reports.lock().unwrap();
+        assert!(!calls.is_empty(), "expected at least one progress report");
+        let (last_read, last_total) = *calls.last().unwrap();
+        assert_eq!(last_read, blob.size as u64);
+        assert_eq!(last_total, payload.len() as u64);
+        // every reported total must agree — this file's size never changes
+        // mid-read.
+        assert!(calls
+            .iter()
+            .all(|(_, total)| *total == payload.len() as u64));
+    }
+
+    #[tokio::test]
+    async fn register_path_rejects_relative_paths() {
+        let (store, _tmp) = make_store().await;
+        let err = store
+            .register_path(Path::new("relative/path.bin"), None, None, None)
+            .await
+            .expect_err("relative path must be rejected");
+        assert!(matches!(err, BlobError::Io(_)));
     }
 }

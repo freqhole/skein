@@ -7,6 +7,7 @@ import {
   canSnatchToDisk,
   checkBlobLocality,
   formatFileSize,
+  formatUploadError,
   getDocumentPages,
   getLocalBlobUrl,
   getLocalNodeId,
@@ -376,6 +377,8 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         fontSize: 12,
         fill: 0xdd4444,
         align: "center",
+        wordWrap: true,
+        wordWrapWidth: currentWidth - 16,
       },
       resolution: 2,
     });
@@ -1263,7 +1266,13 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           syncVisibility();
           loadingText.text = "uploading...";
 
-          const result = await uploadFile(file, { waitForCompletion: true });
+          const result = await uploadFile(file, {
+            waitForCompletion: true,
+            onProgress: (fraction) => {
+              if (loadState !== "loading") return;
+              loadingText.text = `uploading... ${Math.round(fraction * 100)}%`;
+            },
+          });
 
           // if the uploaded file is a PDF (in Tauri mode), poll for rendered
           // page images in the background. once pages are available, replace
@@ -1374,6 +1383,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         await handleMultiFileUpload(picked);
       } catch (err) {
         log.error("file-widget", "upload failed:", err);
+        errorText.text = formatUploadError(err);
         loadState = "error";
         syncVisibility();
       }
@@ -1742,13 +1752,22 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         syncActionButtons();
         positionInfoBar(currentWidth, currentHeight);
       } catch (err) {
+        // `handle.createWritable()` already reserved (and, per the File
+        // System Access API, typically truncated) the destination file
+        // before the download even started — if we don't abort here on a
+        // genuine failure, that reserved file is left sitting on disk as
+        // an empty (0-byte) file with no indication anything went wrong.
+        // this previously only ran on the user-cancelled path; a real
+        // download failure (e.g. all peers/strategies exhausted) fell
+        // through without ever aborting the writable, which is the
+        // confirmed cause of the "saved file is 0 bytes" symptom.
+        try {
+          await writable.abort();
+        } catch {
+          // nothing more we can do here
+        }
+
         if (diskSnatchCancelled) {
-          // best-effort: discard the partially-opened file handle
-          try {
-            await writable.abort();
-          } catch {
-            // nothing more we can do here
-          }
           log.debug("file-widget", "snatch-to-disk aborted (cancelled)");
           return;
         }
@@ -1947,6 +1966,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       loadingText.y = h / 2;
       errorText.x = w / 2;
       errorText.y = h / 2;
+      errorText.style.wordWrapWidth = Math.max(40, w - 16);
     };
 
     // -- doc change subscription ----------------------------------------------

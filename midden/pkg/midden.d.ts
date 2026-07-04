@@ -219,6 +219,18 @@ export class MiddenNode {
      *
      * tries download first; if blob not in peer's FsStore, calls ensure_blob
      * then retries. progress callback receives fraction (0.0 to 1.0).
+     *
+     * NOTE: any failure on the first attempt triggers this same
+     * ensure-then-retry fallback, not just the "blob not in FsStore yet"
+     * case the fallback was designed for. for a large blob, the first
+     * attempt can stream a substantial fraction of the bytes (driving
+     * `on_progress` most/all of the way to 1.0) before failing late (e.g.
+     * the peer's FsStore didn't have every chunk materialized yet even
+     * though iroh-blobs offered to serve it), so the caller-visible symptom
+     * is a full 0->100% progress cycle that silently restarts from 0 for a
+     * second full cycle. logging the first attempt's error (previously
+     * discarded) and explicitly resetting progress to 0 here makes this
+     * restart visible/diagnosable instead of looking like a silent glitch.
      */
     download_verified_with_ensure_progress(peer_addr: string, blake3_hash: string, total_size: number, on_progress: Function): Promise<Uint8Array>;
     /**
