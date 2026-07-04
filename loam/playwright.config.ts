@@ -44,9 +44,11 @@ export default defineConfig({
   // overall worker pool cap for the whole run. per-project `workers` below
   // further restricts how much of this pool the heavy project may use at
   // once — it doesn't add extra workers on top of this. locally, unlimited
-  // workers (one per core) causes contention flakes in app-boot-heavy specs
-  // (midden wasm + iroh init under cpu pressure) — cap at 4.
-  workers: process.env.CI ? 1 : 4,
+  // workers (one per core) causes contention flakes in app-boot-heavy specs;
+  // since the midden worker migration every page/reload also spawns a
+  // dedicated worker that fetches + compiles the ~19MB wasm, so the cap sits
+  // at 3 (reload-persistence specs flaked at 4).
+  workers: process.env.CI ? 1 : 3,
   reporter: [["html", { outputFolder: "playwright-report" }], ["list"]],
   use: {
     baseURL: "http://localhost:5897",

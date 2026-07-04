@@ -692,23 +692,46 @@ describe("IrohNetworkAdapter", () => {
       await flush(50);
     });
 
-    it("closes old stream when a new one for the same peer is registered", async () => {
+    it("simultaneous connect: the newest stream takes writes and NEITHER live stream is closed", async () => {
       const peerId = "b".repeat(64);
-      const firstStream = createMockBiStream(peerId);
-      const secondStream = createMockBiStream(peerId);
+      const outbound = createMockBiStream(peerId);
+      const inbound = createMockBiStream(peerId);
 
-      mockMidden.open_bi
-        .mockResolvedValueOnce(firstStream as unknown as BiStreamLike)
-        .mockResolvedValueOnce(secondStream as unknown as BiStreamLike);
+      mockMidden.open_bi.mockResolvedValueOnce(outbound as unknown as BiStreamLike);
 
       await adapter.addPeer(peerId);
 
-      // forcibly "remove" the old entry to allow a second addPeer
-      // (since addPeer short-circuits on existing stream, we simulate via incoming)
-      mockMidden.pushIncoming(secondStream as unknown as BiStreamLike);
+      // peer dialed us at the same time — inbound arrives while our
+      // outbound is registered. closing either stream is wrong: with the
+      // old "close the replaced one" behavior, both sides of a
+      // simultaneous connect closed the stream the OTHER side kept,
+      // killing both connections.
+      mockMidden.pushIncoming(inbound as unknown as BiStreamLike);
       await flush(50);
 
-      expect(firstStream.close).toHaveBeenCalled();
+      expect(outbound.close).not.toHaveBeenCalled();
+      expect(inbound.close).not.toHaveBeenCalled();
+      // both streams are being drained
+      expect(outbound.read_message).toHaveBeenCalled();
+      expect(inbound.read_message).toHaveBeenCalled();
+    });
+
+    it("a fresh inbound stream takes over from a zombie incumbent without the zombie's death blocking it (peer restart recovery)", async () => {
+      const peerId = "b".repeat(64);
+      const zombie = createMockBiStream(peerId);
+      const fresh = createMockBiStream(peerId);
+
+      mockMidden.open_bi.mockResolvedValueOnce(zombie as unknown as BiStreamLike);
+      await adapter.addPeer(peerId);
+
+      // the peer process restarted and redialed — its fresh inbound must
+      // become the write target immediately (writes to the zombie would
+      // silently vanish and deadlock recovery)
+      mockMidden.pushIncoming(fresh as unknown as BiStreamLike);
+      await flush(50);
+
+      expect(fresh.close).not.toHaveBeenCalled();
+      expect(fresh.read_message).toHaveBeenCalled();
     });
   });
 

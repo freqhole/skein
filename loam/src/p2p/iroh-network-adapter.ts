@@ -284,7 +284,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     const midden = await this.ensureMidden();
     const stream = await this.openBiWithRetry(midden, nodeId);
 
-    this.registerStream(nodeId, stream);
+    this.registerStream(nodeId, stream, "outbound");
   }
 
   /**
@@ -518,10 +518,13 @@ export class IrohNetworkAdapter extends NetworkAdapter {
   async restrictBlobToPeers(blake3Hash: string, peerNodeIds: string[]): Promise<void> {
     const node = await this.ensureMidden();
     const nodeAny = node as unknown as {
-      restrict_blob_to_peers?: (blake3: string, peerNodeIds: string[]) => void;
+      restrict_blob_to_peers?: (blake3: string, peerNodeIds: string[]) => void | Promise<void>;
     };
     if (typeof nodeAny.restrict_blob_to_peers !== "function") return;
-    nodeAny.restrict_blob_to_peers(blake3Hash, peerNodeIds);
+    // await — on the worker-hosted node this is a Promise, and callers
+    // (blob-acl-sync, e2e assertions) rely on the gate being live when
+    // this method resolves
+    await nodeAny.restrict_blob_to_peers(blake3Hash, peerNodeIds);
   }
 
   // --- internals ---
@@ -590,7 +593,7 @@ export class IrohNetworkAdapter extends NetworkAdapter {
           if (alpn === SYNC_ALPN) {
             // automerge-repo sync — handle internally
             log.debug(TAG, "accepted sync connection from:", peerId.slice(0, 16) + "...");
-            this.registerStream(peerId, stream);
+            this.registerStream(peerId, stream, "inbound");
           } else {
             const handler = this.alpnHandlers.get(alpn);
             if (handler) {
@@ -625,18 +628,50 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     });
   }
 
-  private registerStream(peerId: string, stream: BiStreamLike): void {
-    // if we already have a stream for this peer, close the old one.
-    // the old read loop will detect the closed stream and exit, but
-    // won't call removePeer() because the stream reference won't match.
+  private registerStream(
+    peerId: string,
+    stream: BiStreamLike,
+    direction: "inbound" | "outbound"
+  ): void {
+    // duplicate-stream handling (simultaneous connect, peer restart): the
+    // NEWEST stream always takes over for writes, and the replaced stream
+    // is NEVER closed — its read loop keeps draining it until it actually
+    // dies (guarded cleanup below ignores non-active streams).
+    //
+    // why not close the old one (the previous behavior)? when both peers
+    // dial each other at once, "last one wins + close the loser" resolves
+    // differently on each side — A keeps its dial, B keeps its dial, then
+    // each closes the stream the other kept, killing BOTH connections and
+    // any in-flight sync requests (doc-sync stalls in the profile-gossip
+    // e2e). and why not a deterministic keep-the-incumbent tiebreak? the
+    // incumbent can be a zombie whose death we haven't detected (peer
+    // process killed + restarted — the hub-restart e2e): writes routed to
+    // it silently vanish and recovery deadlocks. writing to the newest
+    // stream and reading from all of them is correct in every case — sync
+    // flows regardless of which stream each side picks for its writes,
+    // and dead streams get reaped by their own read-loop errors.
     const existing = this.streams.get(peerId);
+    let reannounceDelayMs = 0;
     if (existing) {
-      log.debug(TAG, "replacing existing stream for peer:", peerId.slice(0, 16) + "...");
-      existing.close();
+      log.debug(
+        TAG,
+        `duplicate stream for ${peerId.slice(0, 16)}...: new ${direction} stream takes writes; old stream stays open for reads until it dies`
+      );
+      // cycle the repo-level peer: automerge-repo ignores a repeated
+      // peer-candidate for a peer it already considers connected, so a
+      // superseding stream (e.g. a restarted hub redialing before we've
+      // noticed the old stream died) would otherwise never restart doc
+      // sync — the hub-restart e2e deadlocks exactly there. an explicit
+      // disconnected -> candidate cycle resets the repo's sync state for
+      // this peer; the candidate is re-announced a tick later so the
+      // repo's own async disconnect cleanup finishes first.
+      if (!this._disconnected && !this._stopped) {
+        this.emit("peer-disconnected", { peerId: peerId as PeerId });
+        reannounceDelayMs = 100;
+      }
     }
 
     this.streams.set(peerId, stream);
-
     // connection established — clear any reconnection backoff state
     this.clearReconnectState(peerId);
     this.emitConnectionStateChange();
@@ -644,14 +679,23 @@ export class IrohNetworkAdapter extends NetworkAdapter {
     // notify peer-connect listeners
     for (const h of this.peerConnectListeners) h(peerId);
 
-    // emit peer-candidate so automerge-repo starts syncing
-    this.emit("peer-candidate", {
-      peerId: peerId as PeerId,
-      peerMetadata: { isEphemeral: false },
-    });
-
-    // start read loop for this peer
+    // emit peer-candidate so automerge-repo starts syncing. the read loop
+    // starts first either way — sync messages can arrive as soon as the
+    // candidate is announced.
     this.startReadLoop(peerId, stream);
+    const announce = (): void => {
+      if (this._disconnected || this._stopped) return;
+      if (this.streams.get(peerId) !== stream) return; // superseded already
+      this.emit("peer-candidate", {
+        peerId: peerId as PeerId,
+        peerMetadata: { isEphemeral: false },
+      });
+    };
+    if (reannounceDelayMs > 0) {
+      setTimeout(announce, reannounceDelayMs);
+    } else {
+      announce();
+    }
   }
 
   private startReadLoop(peerId: string, stream: BiStreamLike): void {
@@ -682,12 +726,15 @@ export class IrohNetworkAdapter extends NetworkAdapter {
         }
       }
 
-      // only clean up if this stream is still the active one for this peer.
-      // if registerStream() replaced our stream with a newer one, the replacement
-      // already closed us and started its own read loop — calling removePeer here
-      // would incorrectly kill the new stream.
+      // only clean up the PEER if this stream is still the active one. if
+      // registerStream() superseded us with a newer stream, that one owns
+      // the peer now — calling removePeer here would incorrectly kill it.
+      // either way, close our own stream so its resources (including the
+      // worker-side registry entry) are released.
       if (this.streams.get(peerId) === stream) {
         this.removePeer(peerId);
+      } else {
+        stream.close();
       }
     };
 
@@ -695,6 +742,8 @@ export class IrohNetworkAdapter extends NetworkAdapter {
       log.error(TAG, "read loop crashed for peer:", peerId.slice(0, 16) + "...", err);
       if (this.streams.get(peerId) === stream) {
         this.removePeer(peerId);
+      } else {
+        stream.close();
       }
     });
   }
@@ -807,8 +856,8 @@ export class IrohNetworkAdapter extends NetworkAdapter {
       const midden = await this.ensureMidden();
       const stream = await midden.open_bi(peerId, SYNC_ALPN);
       log.debug(TAG, "reconnected to peer:", peerId.slice(0, 16) + "...");
-      this.registerStream(peerId, stream);
       // registerStream calls clearReconnectState, so no need to do it here
+      this.registerStream(peerId, stream, "outbound");
     } catch (err) {
       log.warn(TAG, "reconnect attempt failed for peer:", peerId.slice(0, 16) + "...", err);
       // schedule next attempt with increased backoff

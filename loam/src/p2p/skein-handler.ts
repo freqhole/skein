@@ -498,7 +498,10 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
     // check if already in MemStore (avoids expensive OPFS read + bao recomputation)
     const node = await getMiddenNodeFromIdentity();
     if (typeof (node as any).has_active_blob === "function") {
-      const alreadyLoaded = (node as any).has_active_blob(blake3_hash);
+      // NOTE: awaited — on the worker-hosted node this returns a Promise,
+      // and a bare truthiness check on a Promise is always true (which
+      // would silently skip every re-import).
+      const alreadyLoaded = await (node as any).has_active_blob(blake3_hash);
       if (alreadyLoaded) {
         log.debug(
           TAG,

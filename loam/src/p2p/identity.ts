@@ -12,6 +12,7 @@
 import { deleteMetaRecord, getMetaRecord, setMetaRecord } from "../storage/meta-db";
 import { checkTauriIdentityStatus, isTauriMode, TauriStreamNode } from "./tauri-transport";
 import { MiddenNode } from "midden";
+import { WorkerMiddenNode } from "../workers/midden-worker-client";
 import { log } from "../utils/log";
 
 // ---------------------------------------------------------------------------
@@ -57,6 +58,35 @@ const TAG = "p2p.identity";
 
 let middenNode: MiddenNodeLike | null = null;
 let middenNodePromise: Promise<MiddenNodeLike> | null = null;
+
+/**
+ * browser mode hosts the node in a dedicated worker by default (required
+ * for the OPFS blob store — see docs/midden-worker-design.md). set
+ * VITE_MIDDEN_MAIN_THREAD=1 to keep the old in-thread wasm node for
+ * debugging.
+ */
+function useMainThreadNode(): boolean {
+  return (import.meta as any).env?.VITE_MIDDEN_MAIN_THREAD === "1";
+}
+
+/** create the browser node: worker-hosted by default, in-thread behind the
+ *  escape hatch. `secretKey` null means "generate a fresh identity". */
+async function createBrowserNode(secretKey: Uint8Array | null): Promise<MiddenNodeLike> {
+  if (useMainThreadNode()) {
+    log.warn(TAG, "VITE_MIDDEN_MAIN_THREAD=1 — using in-thread midden node");
+    return secretKey ? MiddenNode.create_from_key(secretKey) : MiddenNode.create();
+  }
+  return WorkerMiddenNode.create(secretKey);
+}
+
+/** tear down the current node, terminating its worker when applicable. */
+function teardownNode(): void {
+  if (middenNode instanceof WorkerMiddenNode) {
+    middenNode.terminate();
+  }
+  middenNode = null;
+  middenNodePromise = null;
+}
 
 // ---------------------------------------------------------------------------
 // change subscription
@@ -168,10 +198,10 @@ export async function getMiddenNode(): Promise<MiddenNodeLike> {
       // restore from the persisted secret key
       const truncated = existing.node_id.slice(0, 16) + "...";
       log.debug(TAG, "restoring identity from IndexedDB:", truncated);
-      node = await MiddenNode.create_from_key(existing.secret_key);
+      node = await createBrowserNode(existing.secret_key);
     } else {
       // generate a brand-new identity
-      node = await MiddenNode.create();
+      node = await createBrowserNode(null);
       const identity: P2PIdentity = {
         secret_key: node.secret_key(),
         node_id: node.node_id(),
@@ -354,12 +384,11 @@ export async function importIdentity(secretKey: Uint8Array): Promise<P2PIdentity
     throw new Error(TAG + " identity import not supported in tauri mode");
   }
 
-  // tear down existing node
-  middenNode = null;
-  middenNodePromise = null;
+  // tear down existing node (terminates its worker when applicable)
+  teardownNode();
 
   // start a new node from the provided key
-  const node = await MiddenNode.create_from_key(secretKey);
+  const node = await createBrowserNode(secretKey);
 
   const identity: P2PIdentity = {
     secret_key: secretKey,
@@ -406,9 +435,8 @@ export async function importIdentityFromBundle(
  * `ensureIdentity()` will generate a fresh identity.
  */
 export async function deleteIdentity(): Promise<void> {
-  // tear down the running node if any
-  middenNode = null;
-  middenNodePromise = null;
+  // tear down the running node if any (terminates its worker)
+  teardownNode();
 
   await deleteMetaRecord(IDENTITY_KEY);
 

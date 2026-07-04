@@ -79,7 +79,17 @@ async function waitForCanvasPeer(page: Page, nodeId: string, timeoutMs = 45_000)
 test.describe("share a canvas with a real reliquary hub @hub", () => {
   let hub: ReliquaryHubHandle | undefined;
 
-  test.afterEach(async () => {
+  test.afterEach(async ({ page }, testInfo) => {
+    // debugging aid: on failure with PW_BROWSER_LOGS=1, dump the hub's
+    // accumulated log so hub-side behavior (resume loops, sync, dials) is
+    // visible without rerunning under a debugger.
+    if (testInfo.status !== testInfo.expectedStatus && process.env.PW_BROWSER_LOGS && hub) {
+      console.log("[hub log tail]\n" + hub.getLog().slice(-8000));
+      const peers = await page
+        .evaluate(() => Object.keys((window as any).__skein?.store?.peers?.() ?? {}))
+        .catch(() => []);
+      console.log("[browser canvas peers]", peers);
+    }
     await hub?.stop();
     hub = undefined;
   });

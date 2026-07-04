@@ -371,8 +371,16 @@ impl HubPeerService {
                 "schedule_write_self_to_canvas: starting background peer-write task"
             );
 
-            // retry up to 15 times with 2s delay = ~30s total
-            for attempt in 0u32..15 {
+            // retry up to 60 times with 2s delay = ~2min total. patience
+            // matters after a hub restart: a SIGKILL'd process sends no
+            // QUIC close frames, so the inviting browser peer only notices
+            // its stream to the old process is dead after the QUIC idle
+            // timeout (~30s) and only then reconnects and syncs the canvas
+            // doc content — a ~30s retry budget lost that race (observed in
+            // the restart-mid-flight e2e once browser boot got marginally
+            // slower). this is an idle background task; extra patience is
+            // free.
+            for attempt in 0u32..60 {
                 if attempt > 0 {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
@@ -449,7 +457,7 @@ impl HubPeerService {
 
             tracing::warn!(
                 doc_id = %doc_id_str,
-                "peer-write: GAVE UP after 15 attempts — canvas doc never had content"
+                "peer-write: GAVE UP after 60 attempts — canvas doc never had content"
             );
         });
     }

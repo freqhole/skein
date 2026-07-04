@@ -548,11 +548,16 @@ export async function openShareDialog(page: Page): Promise<void> {
 }
 
 /** wait until window.__skeinTest.share has been registered (the share
- *  dialog has been opened at least once). */
+ *  dialog has been opened at least once). checks for the actual hook
+ *  function — a bare `!== null` check passes vacuously while the slot is
+ *  still `undefined` (never-registered), which made this wait a no-op and
+ *  left a boot-timing race (exposed when the midden worker migration
+ *  slowed app boot slightly). */
 export async function waitForShareHooks(page: Page, timeoutMs = 15_000): Promise<void> {
-  await page.waitForFunction(() => (window as any).__skeinTest?.share !== null, {
-    timeout: timeoutMs,
-  });
+  await page.waitForFunction(
+    () => typeof (window as any).__skeinTest?.share?.inviteFriend === "function",
+    { timeout: timeoutMs }
+  );
 }
 
 /** the friend-invite list passed to the most recently opened share dialog

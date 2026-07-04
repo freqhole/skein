@@ -46,6 +46,20 @@ export const test = base.extend<{
       }
 
       const page = await context.newPage();
+
+      // opt-in browser console piping for debugging real-network tests:
+      // PW_BROWSER_LOGS=1 npx playwright test ... (pairs with VITE_LOG_LEVEL /
+      // VITE_LOG_FILTER on the webServer for app-level log verbosity)
+      if (process.env.PW_BROWSER_LOGS) {
+        const peerIdx = handles.length;
+        page.on("console", (msg) => {
+          console.log(`[browser:${peerIdx}]`, msg.text());
+        });
+        page.on("pageerror", (err) => {
+          console.log(`[browser:${peerIdx}] PAGEERROR`, err.message);
+        });
+      }
+
       await page.goto("/test-harness-p2p.html");
 
       // wait for the p2p bootstrap module to load and expose the init function
