@@ -48,8 +48,10 @@ const PREVIEW_RATIO = 0.55;
 const TITLE_FONT_SIZE = 14;
 const DESC_FONT_SIZE = 11;
 const DATE_FONT_SIZE = 10;
-const AUTHOR_BADGE_SIZE = 12;
-const AUTHOR_LETTER_SIZE = 9;
+const AUTHOR_NAME_FONT_SIZE = 10;
+// horizontal gap kept between the date/edited text (left) and the author
+// name (right) in the footer row, so a long username never collides with it.
+const AUTHOR_NAME_GAP = 8;
 const FOOTER_HEIGHT = 24;
 const GRID_STEP = 16;
 const ROLE_PILL_FONT_SIZE = 8;
@@ -309,25 +311,22 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
     dateText.eventMode = "none";
     container.addChild(dateText);
 
-    // author badge — circle + letter
-    const authorBadge = new Graphics();
-    authorBadge.eventMode = "none";
-    container.addChild(authorBadge);
-
-    const authorLetter = new Text({
+    // author name — full display name, right-aligned in the footer (was a
+    // colored circle + single initial letter; replaced with the whole name,
+    // truncated to fit, per user request).
+    const authorNameText = new Text({
       text: "",
       style: {
         fontFamily: "system-ui, sans-serif",
-        fontSize: AUTHOR_LETTER_SIZE,
-        fontWeight: "bold",
-        fill: 0xffffff,
-        align: "center",
+        fontSize: AUTHOR_NAME_FONT_SIZE,
+        fill: DATE_COLOR,
+        align: "right",
       },
       resolution: 3,
     });
-    authorLetter.anchor.set(0.5);
-    authorLetter.eventMode = "none";
-    container.addChild(authorLetter);
+    authorNameText.anchor.set(1, 0.5);
+    authorNameText.eventMode = "none";
+    container.addChild(authorNameText);
 
     // --- remote: corner badge ---
 
@@ -614,28 +613,24 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
         ? state.ownerUsername.trim() || state.ownerNodeId.slice(0, 8)
         : state.authorName.trim();
 
-      const hasName = displayName.length > 0;
-      authorBadge.clear();
-
-      if (!hasName) {
-        authorBadge.visible = false;
-        authorLetter.visible = false;
+      if (displayName.length === 0) {
+        authorNameText.visible = false;
         return;
       }
 
-      authorBadge.visible = true;
-      authorLetter.visible = true;
+      authorNameText.visible = true;
 
-      const badgeX = w - PADDING_X - AUTHOR_BADGE_SIZE / 2;
-      const badgeY = h - FOOTER_HEIGHT / 2 - PADDING_Y / 2;
-      const col = isTransparent(state.color) ? 0x666678 : safeColor(state.color);
+      const footerY = h - FOOTER_HEIGHT;
+      // leave room for the date/edited text sharing this same footer row
+      // (dateText.text/x/y are already set earlier in layout(), before this
+      // is called) — reuse its measured width rather than re-deriving it.
+      const dateReserved = dateText.visible ? dateText.width + AUTHOR_NAME_GAP : 0;
+      const maxWidth = Math.max(20, w - PADDING_X * 2 - dateReserved);
+      const maxChars = estimateMaxChars(maxWidth, AUTHOR_NAME_FONT_SIZE);
 
-      authorBadge.circle(badgeX, badgeY, AUTHOR_BADGE_SIZE / 2);
-      authorBadge.fill({ color: state.isRemote ? REMOTE_BORDER_COLOR : col });
-
-      authorLetter.text = displayName.charAt(0).toUpperCase();
-      authorLetter.x = badgeX;
-      authorLetter.y = badgeY;
+      authorNameText.text = truncate(displayName, maxChars);
+      authorNameText.x = w - PADDING_X;
+      authorNameText.y = footerY + FOOTER_HEIGHT / 2;
     };
 
     const drawRemoteBadge = (w: number, remote: boolean) => {

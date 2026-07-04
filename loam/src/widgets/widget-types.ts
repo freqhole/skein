@@ -183,6 +183,16 @@ export interface WidgetMountContext<S extends z.ZodType = z.ZodType> {
    *  widget's overlay mount (boot.ts); undefined for other widgets and for
    *  headless/test contexts. */
   narthexDocId?: string;
+  /** the narthex's own `CanvasStore` — lets a widget mounted on some OTHER
+   *  canvas (`canvasStore` above) still reach/mutate the narthex directly,
+   *  e.g. profile-tab.ts's "auto-show the own-canvas-bin widget on the
+   *  narthex the first time a canvas is added to the profile" (see
+   *  docs/narthex-widgets-and-file-transfer-plan.md section 1). only
+   *  wired in for the social widget's overlay mount (boot.ts); undefined
+   *  for other widgets and for headless/test contexts. `null` means
+   *  boot.ts tried to resolve it and failed (no narthex doc yet, or the
+   *  open failed) — distinct from `undefined` (never wired in at all). */
+  narthexStore?: CanvasStore | null;
   /** dynamically update the custom header actions shown in the widget frame.
    *  call this whenever the action labels or set of actions changes (e.g. item
    *  count updated, snatch progress). provided by the widget manager at mount time. */

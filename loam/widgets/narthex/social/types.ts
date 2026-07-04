@@ -54,6 +54,14 @@ export interface TabContext {
    *  profile" (it's a private per-user index, not something to publish or
    *  share). undefined in contexts that don't thread it through. */
   narthexDocId?: string;
+  /** the narthex's own `CanvasStore` \u2014 lets profile-tab.ts add/remove
+   *  widgets on the narthex directly, even while the social overlay is
+   *  mounted on top of some OTHER (non-narthex) canvas. used by
+   *  `addCurrentCanvasToProfile()`'s "auto-show the own-canvas-bin widget
+   *  the first time a canvas is added to the profile" wiring. `null` means
+   *  boot.ts tried and failed to resolve it; `undefined` means it was
+   *  never threaded through at all (e.g. some test harnesses). */
+  narthexStore?: CanvasStore | null;
 }
 
 /**

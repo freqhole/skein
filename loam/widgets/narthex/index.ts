@@ -8,6 +8,7 @@ import { canvasWizardWidget } from "./canvas-wizard";
 import { friendCanvasBinWidget } from "./friend-canvas-bin";
 import { joinCanvasWidget } from "./join-canvas";
 import { messagezWidget } from "./messagez-widget";
+import { ownCanvasBinWidget } from "./own-canvas-bin";
 import { socialWidget } from "./social/social-widget";
 import { registerTrashWidget } from "./trash-widget";
 
@@ -30,6 +31,7 @@ export function createNarthexRegistry(): WidgetRegistry {
   registry.register(canvasWizardWidget);
   registry.register(joinCanvasWidget);
   registry.register(friendCanvasBinWidget);
+  registry.register(ownCanvasBinWidget);
   registry.register(socialWidget);
   registry.register(messagezWidget);
   registry.register(labelWidget);

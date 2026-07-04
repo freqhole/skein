@@ -168,7 +168,7 @@ fn is_social_mutation(action: &str) -> bool {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum DispatchError {
+pub(crate) enum DispatchError {
     #[error("unknown action: {0}")]
     UnknownAction(String),
     #[error("invalid payload for {action}: {source}")]
@@ -191,6 +191,8 @@ enum DispatchError {
     NotFound,
     #[error("identity: {0}")]
     Identity(String),
+    #[error("fetch: {0}")]
+    Fetch(String),
 }
 
 /// read the current node id without any side effects — never generates a
@@ -378,6 +380,11 @@ async fn dispatch(
         "pdf_render_pages" => {
             pdf_render_pages(decode("pdf_render_pages", payload)?, state).await
         }
+
+        // link widget unfurl — fetch a URL server-side (no CORS restriction,
+        // unlike the browser-mode fallback in loam/src/widgets/link-unfurl.ts)
+        // and extract a small opengraph-ish summary.
+        "link_unfurl" => crate::unfurl::link_unfurl(decode("link_unfurl", payload)?).await,
 
         // hub control
         "hub_start" => hub_start_inner(state).await,
@@ -1636,3 +1643,4 @@ async fn pdf_render_pages(
 
     Ok(Value::Array(out))
 }
+

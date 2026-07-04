@@ -4,6 +4,7 @@
 
 import { Assets, Circle, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
 import { ensureMyCanvasBinDoc } from "../../../src/canvas/canvas-bin-doc";
+import { findEmptySpot } from "../../../src/canvas/layout-placement";
 import { registerSocialBridge } from "../../../src/dev/test-bridge-registry";
 import {
   ensureIdentity,
@@ -13,6 +14,7 @@ import {
 } from "../../../src/p2p/identity";
 import { pickImageAsDataUrl } from "../../../src/widgets/image-utils";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
+import { OWN_CANVAS_BIN_WIDGET_ID, OWN_CANVAS_BIN_WIDGET_TYPE, ownCanvasBinWidget } from "../own-canvas-bin";
 import {
   ACCENT,
   AVATAR_EXPORT_SIZE,
@@ -802,6 +804,12 @@ export function createProfileTab(ctx: TabContext): TabController {
     // to a profile, even if this got called from somewhere other than the
     // (already-hidden-on-narthex) button — see computeCanAddCurrentCanvas().
     if (ctx.narthexDocId && canvasStore.handle.documentId === ctx.narthexDocId) return;
+    // was this the very first canvas ever added to the profile? checked
+    // BEFORE the mutating call below — used to decide whether to
+    // auto-show the "my canvas bin" narthex widget (see
+    // ensureOwnCanvasBinWidgetOnNarthex() below and
+    // docs/narthex-widgets-and-file-transfer-plan.md section 1).
+    const wasEmptyBeforeAdd = profileStore.canvases().length === 0;
     const doc = canvasStore.doc();
     profileStore.addCanvasToProfile({
       canvasDocId: canvasStore.handle.documentId,
@@ -817,7 +825,46 @@ export function createProfileTab(ctx: TabContext): TabController {
       // only ever populated by that manual canvas-info.ts flow today.
       previewUrl: doc.previewUrl || undefined,
     });
+    if (wasEmptyBeforeAdd) {
+      ensureOwnCanvasBinWidgetOnNarthex();
+    }
     layout(currentWidth, currentHeight);
+  };
+
+  /**
+   * auto-show the "my canvas bin" narthex widget the first time a canvas
+   * is ever added to the profile (only called from `addCurrentCanvasToProfile()`
+   * when the profile's canvas list was empty just before this add). no-op
+   * if an instance already exists on the narthex, or if `ctx.narthexStore`
+   * wasn't threaded through (see TabContext's doc comment — undefined in
+   * some test harnesses). removing it later is purely local (the frame's
+   * own close button, unrelated to this function) and does NOT re-trigger
+   * this auto-add on a later canvas addition — only the very first-ever
+   * add does, matching the user's own stated intent.
+   */
+  const ensureOwnCanvasBinWidgetOnNarthex = () => {
+    const narthexStore = ctx.narthexStore;
+    if (!narthexStore) return;
+    const alreadyExists = narthexStore.allWidgets().some((w) => w.type === OWN_CANVAS_BIN_WIDGET_TYPE);
+    if (alreadyExists) return;
+
+    const width = ownCanvasBinWidget.metadata.defaultWidth ?? 280;
+    const height = ownCanvasBinWidget.metadata.defaultHeight ?? 320;
+    const { x, y } = findEmptySpot(narthexStore.allWidgets(), width, height);
+
+    narthexStore.addWidget({
+      id: OWN_CANVAS_BIN_WIDGET_ID,
+      type: OWN_CANVAS_BIN_WIDGET_TYPE,
+      x,
+      y,
+      width,
+      height,
+      zIndex: narthexStore.widgetCount() + 1,
+      props: {},
+      collapsed: false,
+      docId: null,
+      parentId: null,
+    });
   };
 
   addCanvasBtn.on("pointertap", (e) => {

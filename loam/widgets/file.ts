@@ -1,4 +1,4 @@
-import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
+import { Assets, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
 import { log } from "../src/utils/log";
 import { getMediaPlaybackUrl } from "../src/media";
@@ -320,6 +320,12 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       placeholderBorder.clear();
       placeholderBorder.rect(inset, inset, w - inset * 2, h - inset * 2);
       placeholderBorder.stroke({ color: 0x444460, width: 1 });
+      // hit area covers the WHOLE widget, not just the drawn inset rect's
+      // stroke line — a stroke-only Graphics (no fill) only hit-tests along
+      // the stroke itself by default, so clicking inside the dashed box
+      // (or anywhere else on the widget) previously missed entirely. a real
+      // reported issue: only the exact text label reliably registered clicks.
+      placeholderBorder.hitArea = new Rectangle(0, 0, w, h);
     };
     drawPlaceholderBorder(currentWidth, currentHeight);
     placeholderBorder.eventMode = "static";

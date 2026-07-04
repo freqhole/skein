@@ -12,6 +12,7 @@
 mod commands;
 mod pdf;
 mod streams;
+mod unfurl;
 
 use std::path::PathBuf;
 use std::sync::Arc;

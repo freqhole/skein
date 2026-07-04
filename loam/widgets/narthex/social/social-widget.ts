@@ -137,6 +137,7 @@ export const socialWidget: WidgetFactory<typeof socialSchema> = {
       canvasStore: ctx.canvasStore,
       profileStore: ctx.profileStore,
       narthexDocId: ctx.narthexDocId,
+      narthexStore: ctx.narthexStore,
     };
 
     const tabs: Record<TabName, TabController> = {

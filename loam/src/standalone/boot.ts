@@ -7,6 +7,7 @@ import type { CanvasDocument, InvitableRole } from "../canvas/canvas-doc";
 import { CanvasStore } from "../canvas/canvas-store";
 import type { ConnectionStateSource } from "../canvas/connection-status";
 import { initCanvas, type SkeinCanvas } from "../canvas/init";
+import { findEmptySpot } from "../canvas/layout-placement";
 import { ensureMyProfileDoc, type ProfileStore } from "../canvas/profile-doc";
 import { showShareDialog, type FriendInfo, type ShareDialogOptions } from "../canvas/share-dialog";
 import { registerSocialBridge } from "../dev/test-bridge-registry";
@@ -102,6 +103,20 @@ class SkeinRouter {
    *  social overlay's mount context so profile-tab.ts can manage the profile's
    *  curated canvas list. */
   private profileStore: ProfileStore | null = null;
+  /** the narthex's own `CanvasStore`, resolved once (eagerly) in boot() —
+   *  threaded into the social overlay's mount context so profile-tab.ts can
+   *  add/remove widgets on the narthex directly, even while the overlay is
+   *  mounted on top of some OTHER (non-narthex) canvas (see
+   *  docs/narthex-widgets-and-file-transfer-plan.md section 1's "own
+   *  canvas bin" auto-show wiring). safe to hold alongside whatever
+   *  `CanvasStore` `navigateToNarthex()` separately constructs for the
+   *  currently-open narthex view — both wrap the same underlying
+   *  automerge `DocHandle` (repo.find()/CanvasStore.open() dedupe by
+   *  documentId), so reads/writes through either stay consistent; this
+   *  mirrors the existing "open narthex store on demand, distinct from
+   *  `this.currentCanvas.store`" pattern already used by
+   *  `acceptCanvasInvite()`/`initFriendzProtocol()`. */
+  private narthexStore: CanvasStore | null = null;
 
   private transportPresenceUnsubs: Array<() => void> = [];
   private canvasWatcherUnsubs: Array<() => void> = [];
@@ -310,6 +325,20 @@ class SkeinRouter {
       }
     }
 
+    // resolve the narthex's own CanvasStore once, eagerly \u2014 so any UI
+    // wired through the social overlay (mounted on any canvas, not just
+    // the narthex) can reach the narthex directly without a network
+    // round-trip mid-interaction. see this field's own doc comment above
+    // for why holding a second CanvasStore instance alongside whatever
+    // navigateToNarthex() separately constructs is safe.
+    if (!this.narthexStore) {
+      try {
+        this.narthexStore = await CanvasStore.open(this.repo, this.narthexDocId as DocumentId);
+      } catch (err) {
+        log.warn(TAG, "failed to open narthex store:", err);
+      }
+    }
+
     // initialize friendz protocol early — works regardless of which canvas is shown.
     // safe to call before navigateToNarthex because initFriendzProtocol now opens
     // the narthex store itself when this.currentCanvas is null.
@@ -384,6 +413,13 @@ class SkeinRouter {
       this.joinCanvasFromNarthex(e.detail).catch((err) => {
         log.error(TAG, "join failed:", err);
       });
+    }) as EventListener);
+
+    // listen for the link-canvas event dispatched from the canvas-link-picker
+    // widget (widgets/canvas-link-picker.ts) — adds a canvas-card widget
+    // pointing at an already-known canvas to whatever canvas is currently open.
+    window.addEventListener("skein:link-canvas", ((e: CustomEvent) => {
+      this.linkCanvasToCurrent(e.detail);
     }) as EventListener);
 
     // listen for accept-canvas-invite event dispatched from the inbox widget
@@ -1596,17 +1632,24 @@ class SkeinRouter {
       });
 
       if (!alreadyExists) {
-        // add a remote canvas-card widget to the narthex
+        // add a remote canvas-card widget to the narthex — placed in the
+        // first empty spot found (layout-placement.ts's findEmptySpot()),
+        // not a naive count-based stagger that ignores actual occupied
+        // space (see docs/narthex-widgets-and-file-transfer-plan.md
+        // section 2).
         const existingCount = narthexStore.widgetCount();
         const shortDate = new Date().toISOString().slice(0, 10);
+        const cardWidth = 280;
+        const cardHeight = 200;
+        const { x: cardX, y: cardY } = findEmptySpot(narthexStore.allWidgets(), cardWidth, cardHeight);
 
         narthexStore.addWidget({
           id: crypto.randomUUID(),
           type: "canvas-card",
-          x: 60 + (existingCount % 4) * 300,
-          y: 60 + Math.floor(existingCount / 4) * 220,
-          width: 280,
-          height: 200,
+          x: cardX,
+          y: cardY,
+          width: cardWidth,
+          height: cardHeight,
           zIndex: existingCount + 1,
           props: {
             canvasDocId: detail.canvasDocId,
@@ -1699,17 +1742,25 @@ class SkeinRouter {
       });
 
       if (!alreadyExists) {
-        // add a canvas-card widget to the narthex
+        // add a canvas-card widget to the narthex — placed in the first
+        // empty spot found, not a naive count-based stagger.
         const existingCount = this.currentCanvas.store.widgetCount();
         const shortDate = new Date().toISOString().slice(0, 10);
+        const cardWidth = 280;
+        const cardHeight = 200;
+        const { x: cardX, y: cardY } = findEmptySpot(
+          this.currentCanvas.store.allWidgets(),
+          cardWidth,
+          cardHeight
+        );
 
         this.currentCanvas.store.addWidget({
           id: crypto.randomUUID(),
           type: "canvas-card",
-          x: 60 + (existingCount % 4) * 300,
-          y: 60 + Math.floor(existingCount / 4) * 220,
-          width: 280,
-          height: 200,
+          x: cardX,
+          y: cardY,
+          width: cardWidth,
+          height: cardHeight,
           zIndex: existingCount + 1,
           props: {
             canvasDocId: decoded.docId,
@@ -1891,18 +1942,26 @@ class SkeinRouter {
 
     // add a canvas-card widget to the narthex doc pointing to the new canvas.
     // props are merged into the widget's schema defaults when the per-widget
-    // automerge doc is created (see widget-manager.ts mountWidget).
+    // automerge doc is created (see widget-manager.ts mountWidget). placed
+    // in the first empty spot found, not a naive count-based stagger.
     const shortDate = now.slice(0, 10);
     const cardId = crypto.randomUUID();
     const existingCount = this.currentCanvas.store.widgetCount();
+    const cardWidth = 280;
+    const cardHeight = 200;
+    const { x: cardX, y: cardY } = findEmptySpot(
+      this.currentCanvas.store.allWidgets(),
+      cardWidth,
+      cardHeight
+    );
 
     this.currentCanvas.store.addWidget({
       id: cardId,
       type: "canvas-card",
-      x: 60 + (existingCount % 4) * 300,
-      y: 60 + Math.floor(existingCount / 4) * 220,
-      width: 280,
-      height: 200,
+      x: cardX,
+      y: cardY,
+      width: cardWidth,
+      height: cardHeight,
       zIndex: existingCount + 1,
       props: {
         canvasDocId: newDocId,
@@ -1923,6 +1982,80 @@ class SkeinRouter {
     window.location.hash = newDocId;
   }
 
+  /**
+   * add a `canvas-card`-shaped widget linking to an already-known canvas
+   * (picked via widgets/canvas-link-picker.ts) to whatever canvas is
+   * CURRENTLY open — unlike `createCanvasFromNarthex()`, this never creates
+   * a new canvas doc or navigates away; it just links two existing canvases.
+   *
+   * this is a same-peer, non-remote link (the target canvas is one THIS
+   * peer already knows about, via their own narthex) — `isRemote`/
+   * `ownerNodeId`/`ownerUsername`/`role` are left at their schema defaults
+   * (`isRemote: false`, `role: "admin"`), matching how
+   * `createCanvasFromNarthex()` seeds a freshly-created LOCAL canvas's own
+   * card above (only `joinCanvasFromNarthex()`'s share-string path sets
+   * `isRemote: true`, since that's the one genuinely cross-peer case).
+   *
+   * "never link a canvas to itself" is enforced twice: the picker's own
+   * candidate list already excludes the current canvas doc id (see
+   * `src/canvas/canvas-directory.ts`'s `filterCanvasCardCandidates()`), and
+   * again here, defensively, in case this handler is ever invoked some
+   * other way.
+   */
+  private linkCanvasToCurrent(detail: {
+    canvasDocId?: string;
+    title?: string;
+    description?: string;
+    previewUrl?: string;
+    color?: number;
+    wizardWidgetId?: string;
+  }): void {
+    if (!this.currentCanvas || !detail?.canvasDocId) return;
+
+    if (detail.wizardWidgetId) {
+      this.currentCanvas.store.removeWidget(detail.wizardWidgetId);
+    }
+
+    // defensive guard — never let a canvas link to itself, even if this
+    // handler is somehow reached some other way than the picker widget.
+    if (detail.canvasDocId === this.currentCanvas.store.handle.documentId) {
+      log.warn(TAG, "refusing to link a canvas to itself:", detail.canvasDocId);
+      return;
+    }
+
+    // viewers can't write to the canvas doc — the picker widget already
+    // hides itself for viewers (see canvas-link-picker.ts's `isReadOnly`
+    // gate) and the toolbar's "+" flyout is hidden entirely for viewers,
+    // but this guard covers any other path that might reach this handler.
+    if (this.currentCanvas.store.isLocalViewer()) return;
+
+    const now = new Date().toISOString();
+    const shortDate = now.slice(0, 10);
+    const existingCount = this.currentCanvas.store.widgetCount();
+
+    this.currentCanvas.store.addWidget({
+      id: crypto.randomUUID(),
+      type: "canvas-card",
+      x: 60 + (existingCount % 4) * 300,
+      y: 60 + Math.floor(existingCount / 4) * 220,
+      width: 280,
+      height: 200,
+      zIndex: existingCount + 1,
+      props: {
+        canvasDocId: detail.canvasDocId,
+        title: detail.title || "untitled canvas",
+        description: detail.description || "",
+        previewUrl: detail.previewUrl || "",
+        color: detail.color ?? 0xd946ef,
+        createdAt: shortDate,
+        modifiedAt: now,
+      },
+      collapsed: false,
+      docId: null,
+      parentId: null,
+    });
+  }
+
   private mountSocialOverlay(canvas: SkeinCanvas): WidgetOverlay | null {
     if (!this.socialDoc) return null;
 
@@ -1940,6 +2073,7 @@ class SkeinRouter {
       canvasStore: canvas.store,
       profileStore: this.profileStore ?? undefined,
       narthexDocId: this.narthexDocId ?? undefined,
+      narthexStore: this.narthexStore,
     };
 
     try {
