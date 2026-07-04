@@ -1047,7 +1047,18 @@ export function buildProfileGossipTestBridge(options: {
     },
   };
 
+  // chain rather than overwrite: buildKnockTestBridge already registered a
+  // gossip-digest handler (mergeGossipDigestKnocks) on this same protocol
+  // instance during bootstrap. `onGossipDigest` is a single field, so a
+  // plain assignment here silently discarded knock digests — the confirmed
+  // root cause of the long-failing knock-flow "offline relay: gossip
+  // digest" e2e (the digest arrived fine, the profile handler dropped it
+  // because msg.profiles was empty). production (initFriendzWiring) builds
+  // ONE combined handler; the test bootstrap builds bridges separately, so
+  // compose explicitly.
+  const prevOnGossipDigest = protocol.onGossipDigest;
   protocol.onGossipDigest = (msg, fromNodeId) => {
+    prevOnGossipDigest?.(msg, fromNodeId);
     mergeGossipDigestProfiles(repo, socialDoc, msg, fromNodeId, (info) =>
       relayedProfiles.push(info)
     ).catch(() => {
