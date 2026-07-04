@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 use iroh::Endpoint;
+use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{Hash, HashAndFormat};
@@ -849,9 +850,17 @@ impl BlobSnatcher {
             .prepare_canonical_path(blake3_hash)
             .await
             .map_err(|e| SnatchError::DownloadFailed(format!("prepare blobz path: {e}")))?;
+        // TryReference renames the Owned .data file to the blobz canonical path
+        // (same filesystem => no copy; EXDEV falls back to copy). the fs store
+        // then tracks it as External and keeps serving it for P2P. the .obao4
+        // outboard (~0.1% of size) stays in the fs store.
         self.fs_store
             .blobs()
-            .export(hash, &target)
+            .export_with_opts(ExportOptions {
+                hash,
+                mode: ExportMode::TryReference,
+                target: target.clone(),
+            })
             .await
             .map_err(|e| SnatchError::DownloadFailed(format!("export to blobz path: {e}")))?;
 
@@ -961,12 +970,16 @@ fn trunc(s: &str) -> &str {
 /// sha256 lookups are gone in phase-2 (see design decisions): blake3 is
 /// canonical, and `blob_ref.blob_id` may be a sha256 from older clients
 /// but we no longer index by it.
+///
+/// uses get_any so that soft-deleted blobs are treated as existing — this
+/// prevents the snatcher from re-downloading a blob that an admin soft-deleted,
+/// which would immediately resurrect it.
 impl BlobSnatcher {
     async fn check_blob_exists(&self, blob_ref: &BlobRef) -> bool {
         if blob_ref.blake3.is_empty() {
             return false;
         }
-        matches!(self.blobz.get(&blob_ref.blake3).await, Ok(Some(_)))
+        matches!(self.blobz.get_any(&blob_ref.blake3).await, Ok(Some(_)))
     }
 }
 

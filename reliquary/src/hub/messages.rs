@@ -514,6 +514,35 @@ impl HubPeerService {
                     }
                     self.hub_repo.soft_remove_canvas_id(&canvas_doc_id).await;
                     self.hub_repo.evict_doc(&canvas_doc_id).await;
+
+                    // sweep orphan blobs — soft-delete blobs unique to this canvas.
+                    {
+                        let blobz = self.blobz.clone();
+                        let storage = self.hub_repo.storage().clone();
+                        let doc_id_owned = canvas_doc_id.clone();
+                        tokio::spawn(async move {
+                            match crate::maintenance::sweep_canvas_blobs(
+                                &storage,
+                                &blobz,
+                                &doc_id_owned,
+                                "system:hub-uninvited",
+                            )
+                            .await
+                            {
+                                Ok(n) if n > 0 => tracing::info!(
+                                    canvas_doc_id = %doc_id_owned,
+                                    soft_deleted = n,
+                                    "acl-removed sweep: orphan blobs soft-deleted"
+                                ),
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!(
+                                    canvas_doc_id = %doc_id_owned,
+                                    error = %e,
+                                    "acl-removed sweep: sweep_canvas_blobs failed"
+                                ),
+                            }
+                        });
+                    }
                 }
             }
             FriendzMessage::FriendReject {

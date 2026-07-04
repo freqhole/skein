@@ -122,6 +122,17 @@ pub struct BlobUsageSummary {
     pub external: bool,
 }
 
+/// a single soft-deleted blob, as reported by `AdminRequest::ListSoftDeleted`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoftDeletedBlobSummary {
+    pub blake3: String,
+    pub filename: Option<String>,
+    pub mime: Option<String>,
+    pub size: u64,
+    pub soft_deleted_at: i64,
+    pub soft_deleted_by: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdminRequest {
     /// pre-approve a peer (mirrors `reliquary friend allow`).
@@ -161,11 +172,21 @@ pub enum AdminRequest {
     CanvasUsage,
     /// list every blob row from the blobz store (no pagination).
     BlobUsage,
-    /// delete blobs by blake3 hash. for non-external blobs the on-disk file
-    /// is also removed; for external blobs only the blobz row is deleted
-    /// (the underlying file belongs to the user and is never touched).
-    /// reports per-hash failures rather than short-circuiting.
-    DeleteBlobs { blake3s: Vec<String> },
+    /// soft-delete blobs by blake3 hash. the hub's own node id (the
+    /// authenticated caller) is stamped as the actor. files are NOT touched.
+    /// blobs that don't exist or are already soft-deleted land in `failed`.
+    SoftDeleteBlobs { blake3s: Vec<String> },
+    /// restore soft-deleted blobs by blake3 hash.
+    /// blobs that are not currently soft-deleted land in `failed`.
+    RestoreBlobs { blake3s: Vec<String> },
+    /// list all soft-deleted blobs.
+    ListSoftDeleted,
+    /// permanently delete soft-deleted blobs. `all = true` ignores `blake3s`
+    /// and purges every soft-deleted row. for managed (non-external) blobs
+    /// the on-disk file is unlinked; for external blobs only the row is
+    /// removed (the user owns the file). blobs that are NOT already
+    /// soft-deleted land in `failed` — use `SoftDeleteBlobs` first.
+    HardDeleteBlobs { blake3s: Vec<String>, all: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +224,10 @@ pub enum AdminResponse {
     DiskUsage {
         total_blob_bytes: u64,
         blob_count: u64,
+        /// bytes used by soft-deleted blobs (not included in total_blob_bytes).
+        soft_deleted_blob_bytes: u64,
+        /// number of soft-deleted blobs.
+        soft_deleted_blob_count: u64,
         /// bytes available to unprivileged users on the blob-dir filesystem.
         /// `None` on non-unix platforms or if the stat call fails.
         disk_available_bytes: Option<u64>,
@@ -218,10 +243,14 @@ pub enum AdminResponse {
     BlobUsage {
         blobs: Vec<BlobUsageSummary>,
     },
-    /// response to `AdminRequest::DeleteBlobs`.
-    DeleteBlobsResult {
-        deleted: u64,
+    /// response to soft/restore/hard-delete blob requests (shared).
+    BlobsMutation {
+        affected: u64,
         failed: Vec<String>,
+    },
+    /// response to `AdminRequest::ListSoftDeleted`.
+    SoftDeleted {
+        blobs: Vec<SoftDeletedBlobSummary>,
     },
 }
 
@@ -534,30 +563,39 @@ async fn handle_request(
             knocks: list_pending_knocks(&handler.inner.hub_repo).await,
         },
         AdminRequest::DiskUsage => {
-            let (total_blob_bytes, blob_count) =
-                match handler.inner.blobz.total_usage().await {
+            let (total_blob_bytes, blob_count) = match handler.inner.blobz.total_usage().await {
+                Ok(v) => v,
+                Err(e) => {
+                    return AdminResponse::Error {
+                        message: format!("blobz query failed: {e}"),
+                    }
+                }
+            };
+            let (soft_deleted_blob_bytes, soft_deleted_blob_count) =
+                match handler.inner.blobz.soft_deleted_usage().await {
                     Ok(v) => v,
                     Err(e) => {
                         return AdminResponse::Error {
-                            message: format!("blobz query failed: {e}"),
+                            message: format!("blobz soft-deleted query failed: {e}"),
                         }
                     }
                 };
-            let (disk_available_bytes, disk_total_bytes) =
-                match disk_space(&handler.inner.blob_dir) {
-                    Some((avail, total)) => (Some(avail), Some(total)),
-                    None => (None, None),
-                };
+            let (disk_available_bytes, disk_total_bytes) = match disk_space(&handler.inner.blob_dir)
+            {
+                Some((avail, total)) => (Some(avail), Some(total)),
+                None => (None, None),
+            };
             AdminResponse::DiskUsage {
                 total_blob_bytes,
                 blob_count,
+                soft_deleted_blob_bytes,
+                soft_deleted_blob_count,
                 disk_available_bytes,
                 disk_total_bytes,
             }
         }
         AdminRequest::CanvasUsage => {
-            let canvases =
-                canvas_usage(&handler.inner.hub_repo, &handler.inner.blobz).await;
+            let canvases = canvas_usage(&handler.inner.hub_repo, &handler.inner.blobz).await;
             AdminResponse::CanvasUsage { canvases }
         }
         AdminRequest::BlobUsage => match handler.inner.blobz.list_all().await {
@@ -577,23 +615,57 @@ async fn handle_request(
                 message: format!("blobz list failed: {e}"),
             },
         },
-        AdminRequest::DeleteBlobs { blake3s } => {
-            let mut deleted = 0u64;
-            let mut failed = Vec::new();
-            for hash in blake3s {
-                match handler.inner.blobz.delete(&hash).await {
-                    Ok(()) => deleted += 1,
-                    Err(e) => {
-                        tracing::warn!(blake3 = %hash, error = %e, "admin delete blob failed");
-                        failed.push(hash);
-                    }
-                }
+        AdminRequest::SoftDeleteBlobs { blake3s } => {
+            // stamp the authenticated caller as the actor.
+            match handler.inner.blobz.soft_delete(&blake3s, peer_id_str).await {
+                Ok((affected, failed)) => AdminResponse::BlobsMutation { affected, failed },
+                Err(e) => AdminResponse::Error {
+                    message: format!("soft_delete failed: {e}"),
+                },
             }
-            // note: iroh-blobs FsStore blob deletion is not reachable here.
-            // the `Blobs::delete` method is pub(crate) inside iroh-blobs and
-            // not exposed externally; blob eviction from the iroh-blobs layer
-            // relies on tag-based GC, which is not triggered here.
-            AdminResponse::DeleteBlobsResult { deleted, failed }
+        }
+        AdminRequest::RestoreBlobs { blake3s } => {
+            match handler.inner.blobz.restore(&blake3s).await {
+                Ok((affected, failed)) => AdminResponse::BlobsMutation { affected, failed },
+                Err(e) => AdminResponse::Error {
+                    message: format!("restore failed: {e}"),
+                },
+            }
+        }
+        AdminRequest::ListSoftDeleted => match handler.inner.blobz.list_soft_deleted().await {
+            Ok(blobs) => AdminResponse::SoftDeleted {
+                blobs: blobs
+                    .into_iter()
+                    .map(|b| SoftDeletedBlobSummary {
+                        blake3: b.blake3,
+                        filename: b.filename,
+                        mime: b.mime,
+                        size: b.size,
+                        soft_deleted_at: b.soft_deleted_at,
+                        soft_deleted_by: b.soft_deleted_by,
+                    })
+                    .collect(),
+            },
+            Err(e) => AdminResponse::Error {
+                message: format!("list_soft_deleted failed: {e}"),
+            },
+        },
+        AdminRequest::HardDeleteBlobs { blake3s, all } => {
+            let hashes = if all { None } else { Some(blake3s.as_slice()) };
+            // note: iroh-blobs FsStore blob deletion is not reachable from
+            // this handler — the FsStore is not held in Inner. disk space is
+            // reclaimed via the on-disk file unlink that hard_delete_soft_deleted
+            // already performs for managed (non-external) blobs, which is the
+            // part that matters now that TryReference means blobz owns the only copy.
+            match handler.inner.blobz.hard_delete_soft_deleted(hashes).await {
+                Ok((deleted, failed)) => AdminResponse::BlobsMutation {
+                    affected: deleted,
+                    failed,
+                },
+                Err(e) => AdminResponse::Error {
+                    message: format!("hard_delete_soft_deleted failed: {e}"),
+                },
+            }
         }
     }
 }
@@ -775,8 +847,7 @@ async fn canvas_usage(hub_repo: &HubRepo, blobz: &blobz::Store) -> Vec<CanvasUsa
         // collect widget doc IDs from this canvas
         let doc_id_owned = doc_id.clone();
         let placeholder_refs = tokio::task::spawn_blocking(move || {
-            let (refs, _peers) =
-                read_canvas_for_file_widgets(&handle, &doc_id_owned, "");
+            let (refs, _peers) = read_canvas_for_file_widgets(&handle, &doc_id_owned, "");
             refs
         })
         .await
@@ -1701,10 +1772,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(blob_count, 2);
-                assert_eq!(
-                    total_blob_bytes,
-                    (b"hello".len() + b"world!!".len()) as u64
-                );
+                assert_eq!(total_blob_bytes, (b"hello".len() + b"world!!".len()) as u64);
             }
             other => panic!("expected DiskUsage, got {other:?}"),
         }
@@ -1727,7 +1795,12 @@ mod tests {
         adminz_store.allow(admin_node).await.unwrap();
 
         blobz_store
-            .insert("h1".into(), Some("a.txt".into()), Some("text/plain".into()), b"aaa")
+            .insert(
+                "h1".into(),
+                Some("a.txt".into()),
+                Some("text/plain".into()),
+                b"aaa",
+            )
             .await
             .unwrap();
         blobz_store
@@ -1739,7 +1812,9 @@ mod tests {
         match resp {
             AdminResponse::BlobUsage { blobs } => {
                 assert_eq!(blobs.len(), 2);
-                let a = blobs.iter().find(|b| b.filename == Some("a.txt".to_string()));
+                let a = blobs
+                    .iter()
+                    .find(|b| b.filename == Some("a.txt".to_string()));
                 assert!(a.is_some());
                 assert_eq!(a.unwrap().size, 3);
                 assert!(!a.unwrap().external);
@@ -1748,95 +1823,259 @@ mod tests {
         }
     }
 
-    // -- DeleteBlobs -----------------------------------------------------
+    // -- SoftDeleteBlobs / RestoreBlobs / ListSoftDeleted / HardDeleteBlobs --
 
     #[tokio::test]
-    async fn delete_blobs_removes_row_and_file_for_internal_blobs() {
+    async fn soft_delete_stamps_caller_as_actor_and_hides_blob() {
         let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 
         let blob = blobz_store
-            .insert("h1".into(), None, None, b"bye")
+            .insert("h-sd-admin".into(), None, None, b"soft del via admin")
+            .await
+            .unwrap();
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::SoftDeleteBlobs {
+                blake3s: vec![blob.blake3.clone()],
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::BlobsMutation { affected, failed } => {
+                assert_eq!(affected, 1);
+                assert!(failed.is_empty());
+            }
+            other => panic!("expected BlobsMutation, got {other:?}"),
+        }
+
+        // blob is hidden from normal get
+        assert!(blobz_store.get(&blob.blake3).await.unwrap().is_none());
+        // but the actor is the admin's node id
+        let sd = blobz_store.list_soft_deleted().await.unwrap();
+        assert_eq!(sd.len(), 1);
+        assert_eq!(sd[0].soft_deleted_by, admin_node);
+    }
+
+    #[tokio::test]
+    async fn restore_blobs_makes_blob_visible_again() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let blob = blobz_store
+            .insert("h-res-admin".into(), None, None, b"restore me")
+            .await
+            .unwrap();
+        blobz_store
+            .soft_delete(&[blob.blake3.clone()], admin_node)
+            .await
+            .unwrap();
+        assert!(blobz_store.get(&blob.blake3).await.unwrap().is_none());
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::RestoreBlobs {
+                blake3s: vec![blob.blake3.clone()],
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::BlobsMutation { affected, failed } => {
+                assert_eq!(affected, 1);
+                assert!(failed.is_empty());
+            }
+            other => panic!("expected BlobsMutation, got {other:?}"),
+        }
+        assert!(blobz_store.get(&blob.blake3).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn list_soft_deleted_returns_soft_deleted_blobs() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let blob = blobz_store
+            .insert("h-lsd".into(), Some("f.txt".into()), None, b"list me")
+            .await
+            .unwrap();
+        blobz_store
+            .soft_delete(&[blob.blake3.clone()], admin_node)
+            .await
+            .unwrap();
+
+        let resp = handle_request(&handler, admin_node, AdminRequest::ListSoftDeleted).await;
+        match resp {
+            AdminResponse::SoftDeleted { blobs } => {
+                assert_eq!(blobs.len(), 1);
+                assert_eq!(blobs[0].blake3, blob.blake3);
+                assert_eq!(blobs[0].filename.as_deref(), Some("f.txt"));
+                assert_eq!(blobs[0].soft_deleted_by, admin_node);
+            }
+            other => panic!("expected SoftDeleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_delete_blobs_removes_managed_file_and_row() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let blob = blobz_store
+            .insert("h-hd-admin".into(), None, None, b"hard del via admin")
             .await
             .unwrap();
         let path = blobz_store.path_for(&blob);
         assert!(path.exists());
 
+        // must soft-delete first
+        blobz_store
+            .soft_delete(&[blob.blake3.clone()], admin_node)
+            .await
+            .unwrap();
+
         let resp = handle_request(
             &handler,
             admin_node,
-            AdminRequest::DeleteBlobs {
+            AdminRequest::HardDeleteBlobs {
                 blake3s: vec![blob.blake3.clone()],
+                all: false,
             },
         )
         .await;
         match resp {
-            AdminResponse::DeleteBlobsResult { deleted, failed } => {
-                assert_eq!(deleted, 1);
+            AdminResponse::BlobsMutation { affected, failed } => {
+                assert_eq!(affected, 1);
                 assert!(failed.is_empty());
             }
-            other => panic!("expected DeleteBlobsResult, got {other:?}"),
+            other => panic!("expected BlobsMutation, got {other:?}"),
         }
-        assert!(blobz_store.get(&blob.blake3).await.unwrap().is_none());
-        assert!(!path.exists(), "on-disk file must be removed for internal blobs");
+        assert!(blobz_store.get_any(&blob.blake3).await.unwrap().is_none());
+        assert!(!path.exists(), "managed file must be unlinked");
     }
 
     #[tokio::test]
-    async fn delete_blobs_does_not_remove_file_for_external_rows() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, tmp) =
+    async fn hard_delete_all_purges_every_soft_deleted_row() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 
-        // register an external file (user-owned; blobz must never delete it)
-        let src_path = tmp.path().join("external.bin");
-        tokio::fs::write(&src_path, b"external content")
-            .await
-            .unwrap();
-        let blob = blobz_store
-            .register_path(&src_path, Some("external.bin".into()), None, None, None)
-            .await
-            .expect("register_path");
-        assert!(blob.external);
+        for i in 0u8..3 {
+            let b = blobz_store
+                .insert(format!("h-all-{i}"), None, None, &[i; 4])
+                .await
+                .unwrap();
+            blobz_store
+                .soft_delete(&[b.blake3], admin_node)
+                .await
+                .unwrap();
+        }
 
         let resp = handle_request(
             &handler,
             admin_node,
-            AdminRequest::DeleteBlobs {
-                blake3s: vec![blob.blake3.clone()],
+            AdminRequest::HardDeleteBlobs {
+                blake3s: vec![],
+                all: true,
             },
         )
         .await;
         match resp {
-            AdminResponse::DeleteBlobsResult { deleted, failed } => {
-                assert_eq!(deleted, 1);
+            AdminResponse::BlobsMutation { affected, failed } => {
+                assert_eq!(affected, 3);
                 assert!(failed.is_empty());
             }
-            other => panic!("expected DeleteBlobsResult, got {other:?}"),
+            other => panic!("expected BlobsMutation, got {other:?}"),
         }
-        assert!(
-            blobz_store.get(&blob.blake3).await.unwrap().is_none(),
-            "blobz row must be removed"
-        );
-        assert!(
-            src_path.exists(),
-            "external file must NOT be deleted — it belongs to the user"
-        );
+        assert!(blobz_store.list_soft_deleted().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn non_admin_cannot_delete_blobs() {
+    async fn disk_usage_includes_soft_deleted_fields() {
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let live = blobz_store
+            .insert("h-du-live".into(), None, None, b"alive")
+            .await
+            .unwrap();
+        let sd = blobz_store
+            .insert("h-du-sd".into(), None, None, b"soft deleted")
+            .await
+            .unwrap();
+        blobz_store
+            .soft_delete(&[sd.blake3.clone()], admin_node)
+            .await
+            .unwrap();
+
+        let resp = handle_request(&handler, admin_node, AdminRequest::DiskUsage).await;
+        match resp {
+            AdminResponse::DiskUsage {
+                total_blob_bytes,
+                blob_count,
+                soft_deleted_blob_bytes,
+                soft_deleted_blob_count,
+                ..
+            } => {
+                assert_eq!(blob_count, 1);
+                assert_eq!(total_blob_bytes, live.size as u64);
+                assert_eq!(soft_deleted_blob_count, 1);
+                assert_eq!(soft_deleted_blob_bytes, sd.size as u64);
+            }
+            other => panic!("expected DiskUsage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_soft_delete_restore_or_hard_delete_blobs() {
         let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
-        let resp = handle_request(
+        let stranger = "stranger-node";
+
+        let sd = handle_request(
             &handler,
-            "stranger",
-            AdminRequest::DeleteBlobs {
-                blake3s: vec!["any-hash".to_string()],
+            stranger,
+            AdminRequest::SoftDeleteBlobs {
+                blake3s: vec!["any".to_string()],
             },
         )
         .await;
-        assert!(matches!(resp, AdminResponse::NotAdmin));
+        assert!(matches!(sd, AdminResponse::NotAdmin));
+
+        let restore = handle_request(
+            &handler,
+            stranger,
+            AdminRequest::RestoreBlobs {
+                blake3s: vec!["any".to_string()],
+            },
+        )
+        .await;
+        assert!(matches!(restore, AdminResponse::NotAdmin));
+
+        let list = handle_request(&handler, stranger, AdminRequest::ListSoftDeleted).await;
+        assert!(matches!(list, AdminResponse::NotAdmin));
+
+        let hard = handle_request(
+            &handler,
+            stranger,
+            AdminRequest::HardDeleteBlobs {
+                blake3s: vec!["any".to_string()],
+                all: false,
+            },
+        )
+        .await;
+        assert!(matches!(hard, AdminResponse::NotAdmin));
     }
 }

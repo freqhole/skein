@@ -16,12 +16,21 @@ help: ## show this help message
 # those targets instead of touching the checked-in-locally .cargo/config.toml.
 DEV_DB := $(CURDIR)/reliquary/dev-data/skein-hub.db
 
-.PHONY: dev-data tauri-dev tauri-build hub-dev hub-friend-allow hub-admin-allow
+.PHONY: dev-data db-migrate tauri-dev tauri-build hub-dev hub-friend-allow hub-admin-allow
 
 # (re)creates the sqlite dev db reliquary's sqlx macros need, by running a
 # side-effect-free reliquary CLI subcommand (applies migrations, nothing else).
 dev-data: ## (re)create the sqlx compile-time-check dev db
 	cargo run -p reliquary -- --data-dir reliquary/dev-data friend list
+
+# reliquary applies sqlx migrations (reliquary/migrationz/) automatically on
+# every startup via sqlx::migrate! (see reliquary/src/db.rs), so "running
+# migrations" = booting reliquary against the target data dir. this applies
+# them to BOTH dev data dirs (sqlx compile-check db + the hub-dev hub's db)
+# so a new migration lands everywhere without waiting for the next
+# tauri-dev/hub-dev boot.
+db-migrate: dev-data ## apply sqlx migrations to the dev dbs (dev-data + hub-dev-data)
+	cargo run -p reliquary -- --data-dir reliquary/hub-dev-data friend list
 
 tauri-dev: dev-data ## run the tauri desktop app in dev mode
 	cd tauri && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri dev

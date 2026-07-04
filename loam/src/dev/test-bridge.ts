@@ -1,4 +1,3 @@
-import { cbor } from "@automerge/automerge-repo";
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 
 import type { SkeinCanvas } from "../canvas/init";
@@ -22,6 +21,13 @@ import type { ProfileCanvasBinTestHooks } from "../../widgets/narthex/social/can
 import type { ProfileCanvasEntry, ProfileStore } from "../canvas/profile-doc";
 import type { FriendInfo } from "../canvas/share-dialog";
 import { storeBlob, classifyDomain } from "../storage/skein-blob-store";
+import {
+  type HubAdminRequest,
+  type HubAdminResponse,
+  toWireAdminRequest,
+  fromWireAdminResponse,
+} from "../p2p/hub-admin-client";
+import { cbor } from "@automerge/automerge-repo";
 
 /**
  * ALPN for reliquary's remote hub-administration protocol
@@ -31,182 +37,23 @@ import { storeBlob, classifyDomain } from "../storage/skein-blob-store";
 const HUB_ADMIN_ALPN = "iroh/skein-hub-admin/1";
 
 /**
- * max response size to read back from a hub admin request. matches
- * reliquary's own `MAX_MESSAGE_SIZE` in `protocol/hub_admin.rs`.
+ * max response size to read back from a hub admin request. matches the
+ * 4MB budget in hub-admin-client.ts.
  */
-const DEFAULT_MAX_ADMIN_RESPONSE_BYTES = 1024 * 1024;
+const DEFAULT_MAX_ADMIN_RESPONSE_BYTES = 4 * 1024 * 1024;
 
-/**
- * request payloads for `iroh/skein-hub-admin/1`, mirroring
- * `reliquary::protocol::hub_admin::AdminRequest`.
- */
-export type AdminRequest =
-  | { kind: "allow"; nodeId: string }
-  | { kind: "list" }
-  | { kind: "remove"; nodeId: string }
-  | { kind: "diskUsage" }
-  | { kind: "canvasUsage" }
-  | { kind: "blobUsage" }
-  | { kind: "deleteBlobs"; blake3s: string[] };
+// re-export the canonical types from hub-admin-client so e2e test files
+// that already import from test-bridge.ts keep working unchanged.
+export type AdminRequest = HubAdminRequest;
+export type AdminResponse = HubAdminResponse;
 
-/** a single friendz row, as reported by an `AdminResponse::List`. */
-export interface AdminFriendSummary {
-  nodeId: string;
-  status: string;
-  updatedAt: number;
-}
-
-/** per-canvas blob usage, as reported by `AdminResponse::CanvasUsage`. */
-export interface AdminCanvasUsageSummary {
-  canvasDocId: string;
-  blobCount: number;
-  totalBytes: number;
-}
-
-/** a single blob row, as reported by `AdminResponse::BlobUsage`. */
-export interface AdminBlobUsageSummary {
-  blake3: string;
-  filename: string | null;
-  mime: string | null;
-  size: number;
-  external: boolean;
-}
-
-/**
- * response payloads for `iroh/skein-hub-admin/1`, mirroring
- * `reliquary::protocol::hub_admin::AdminResponse`.
- */
-export type AdminResponse =
-  | { kind: "allowed"; nodeId: string; status: string }
-  | { kind: "list"; friends: AdminFriendSummary[] }
-  | { kind: "removed"; nodeId: string }
-  | { kind: "notAdmin" }
-  | { kind: "error"; message: string }
-  | {
-      kind: "diskUsage";
-      totalBlobBytes: number;
-      blobCount: number;
-      diskAvailableBytes: number | null;
-      diskTotalBytes: number | null;
-    }
-  | { kind: "canvasUsage"; canvases: AdminCanvasUsageSummary[] }
-  | { kind: "blobUsage"; blobs: AdminBlobUsageSummary[] }
-  | { kind: "deleteBlobsResult"; deleted: number; failed: string[] };
-
-/**
- * build the CBOR-ready wire value for an `AdminRequest`, matching serde's
- * default externally-tagged enum representation (the shape `ciborium`
- * produces/expects on the reliquary side): a unit variant like `List`
- * encodes as just its variant name, a struct variant like `Allow { .. }`
- * encodes as a single-key map `{ Allow: { node_id: .. } }`.
- */
-function toWireAdminRequest(request: AdminRequest): unknown {
-  switch (request.kind) {
-    case "allow":
-      return { Allow: { node_id: request.nodeId } };
-    case "list":
-      return "List";
-    case "remove":
-      return { Remove: { node_id: request.nodeId } };
-    case "diskUsage":
-      return "DiskUsage";
-    case "canvasUsage":
-      return "CanvasUsage";
-    case "blobUsage":
-      return "BlobUsage";
-    case "deleteBlobs":
-      return { DeleteBlobs: { blake3s: request.blake3s } };
-  }
-}
-
-/** parse the CBOR-decoded wire value for an `AdminResponse` back into our TS shape. */
-function fromWireAdminResponse(wire: unknown): AdminResponse {
-  if (wire === "NotAdmin") {
-    return { kind: "notAdmin" };
-  }
-  if (wire && typeof wire === "object") {
-    const obj = wire as Record<string, unknown>;
-    if ("Allowed" in obj) {
-      const v = obj.Allowed as { node_id: string; status: string };
-      return { kind: "allowed", nodeId: v.node_id, status: v.status };
-    }
-    if ("List" in obj) {
-      const v = obj.List as {
-        friends: Array<{ node_id: string; status: string; updated_at: number }>;
-      };
-      return {
-        kind: "list",
-        friends: v.friends.map((f) => ({
-          nodeId: f.node_id,
-          status: f.status,
-          updatedAt: f.updated_at,
-        })),
-      };
-    }
-    if ("Removed" in obj) {
-      const v = obj.Removed as { node_id: string };
-      return { kind: "removed", nodeId: v.node_id };
-    }
-    if ("Error" in obj) {
-      const v = obj.Error as { message: string };
-      return { kind: "error", message: v.message };
-    }
-    if ("DiskUsage" in obj) {
-      const v = obj.DiskUsage as {
-        total_blob_bytes: number;
-        blob_count: number;
-        disk_available_bytes: number | null;
-        disk_total_bytes: number | null;
-      };
-      return {
-        kind: "diskUsage",
-        totalBlobBytes: v.total_blob_bytes,
-        blobCount: v.blob_count,
-        diskAvailableBytes: v.disk_available_bytes ?? null,
-        diskTotalBytes: v.disk_total_bytes ?? null,
-      };
-    }
-    if ("CanvasUsage" in obj) {
-      const v = obj.CanvasUsage as {
-        canvases: Array<{ canvas_doc_id: string; blob_count: number; total_bytes: number }>;
-      };
-      return {
-        kind: "canvasUsage",
-        canvases: v.canvases.map((c) => ({
-          canvasDocId: c.canvas_doc_id,
-          blobCount: c.blob_count,
-          totalBytes: c.total_bytes,
-        })),
-      };
-    }
-    if ("BlobUsage" in obj) {
-      const v = obj.BlobUsage as {
-        blobs: Array<{
-          blake3: string;
-          filename: string | null;
-          mime: string | null;
-          size: number;
-          external: boolean;
-        }>;
-      };
-      return {
-        kind: "blobUsage",
-        blobs: v.blobs.map((b) => ({
-          blake3: b.blake3,
-          filename: b.filename,
-          mime: b.mime,
-          size: b.size,
-          external: b.external,
-        })),
-      };
-    }
-    if ("DeleteBlobsResult" in obj) {
-      const v = obj.DeleteBlobsResult as { deleted: number; failed: string[] };
-      return { kind: "deleteBlobsResult", deleted: v.deleted, failed: v.failed };
-    }
-  }
-  throw new Error(`unrecognized AdminResponse wire shape: ${JSON.stringify(wire)}`);
-}
+// convenience re-exports for tests that use blob/canvas/friend summaries:
+export type {
+  HubAdminFriendSummary as AdminFriendSummary,
+  HubAdminCanvasUsageSummary as AdminCanvasUsageSummary,
+  HubAdminBlobUsageSummary as AdminBlobUsageSummary,
+  HubAdminSoftDeletedBlob as AdminSoftDeletedBlob,
+} from "../p2p/hub-admin-client";
 
 /**
  * p2p test bridge — methods only available when the page was bootstrapped
@@ -851,7 +698,7 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
       return adapter.restrictBlobToPeers(blake3Hash, peerNodeIds);
     },
 
-    async hubAdminRequest(peerNodeId: string, request: AdminRequest): Promise<AdminResponse> {
+  async hubAdminRequest(peerNodeId: string, request: AdminRequest): Promise<AdminResponse> {
       const node = await adapter.getNode();
       // `open_bi` is part of the narrow MiddenStreamNode interface already,
       // but the raw (non-length-delimited) framing methods used by

@@ -280,6 +280,25 @@ impl Store {
             r#"
             SELECT blake3 as "blake3!", iroh_hash as "iroh_hash!", filename, mime,
                    size as "size!", path as "path!", external as "external!", created_at as "created_at!"
+            FROM blobz WHERE blake3 = ?1 AND soft_deleted_at IS NULL
+            "#,
+            blake3,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
+
+    /// like `get`, but also returns soft-deleted blobs. used by the snatcher
+    /// so that an admin-soft-deleted blob isn't re-downloaded on the next
+    /// doc-change scan.
+    pub async fn get_any(&self, blake3: &str) -> Result<Option<BlobRef>, BlobError> {
+        let row = sqlx::query_as!(
+            BlobRow,
+            r#"
+            SELECT blake3 as "blake3!", iroh_hash as "iroh_hash!", filename, mime,
+                   size as "size!", path as "path!", external as "external!", created_at as "created_at!"
             FROM blobz WHERE blake3 = ?1
             "#,
             blake3,
@@ -315,6 +334,7 @@ impl Store {
     }
 
     pub async fn read_bytes(&self, blake3: &str) -> Result<Option<Vec<u8>>, BlobError> {
+        // uses get() which already excludes soft-deleted rows.
         let Some(blob) = self.get(blake3).await? else {
             return Ok(None);
         };
@@ -329,6 +349,7 @@ impl Store {
             SELECT blake3 as "blake3!", iroh_hash as "iroh_hash!", filename, mime,
                    size as "size!", path as "path!", external as "external!", created_at as "created_at!"
             FROM blobz
+            WHERE soft_deleted_at IS NULL
             ORDER BY created_at DESC
             LIMIT ?1 OFFSET ?2
             "#,
@@ -361,19 +382,33 @@ impl Store {
         &self.blob_dir
     }
 
-    /// sum of all blob sizes and row count — used by the admin `DiskUsage` request.
+    /// sum of all non-soft-deleted blob sizes and row count — used by the admin `DiskUsage` request.
     pub async fn total_usage(&self) -> Result<(u64, u64), BlobError> {
         let row = sqlx::query!(
             r#"SELECT COALESCE(SUM(size), 0) as "total_bytes!: i64",
                       COUNT(*)              as "count!: i64"
-               FROM blobz"#
+               FROM blobz
+               WHERE soft_deleted_at IS NULL"#
         )
         .fetch_one(&self.pool)
         .await?;
         Ok((row.total_bytes as u64, row.count as u64))
     }
 
-    /// all blobs, most recently created first, without pagination.
+    /// sum of soft-deleted blob sizes and row count — for the admin DiskUsage report.
+    pub async fn soft_deleted_usage(&self) -> Result<(u64, u64), BlobError> {
+        let row = sqlx::query!(
+            r#"SELECT COALESCE(SUM(size), 0) as "total_bytes!: i64",
+                      COUNT(*)              as "count!: i64"
+               FROM blobz
+               WHERE soft_deleted_at IS NOT NULL"#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((row.total_bytes as u64, row.count as u64))
+    }
+
+    /// all non-soft-deleted blobs, most recently created first, without pagination.
     /// used by the admin `BlobUsage` request.
     pub async fn list_all(&self) -> Result<Vec<BlobRef>, BlobError> {
         let rows = sqlx::query_as!(
@@ -382,11 +417,195 @@ impl Store {
                       size as "size!", path as "path!", external as "external!",
                       created_at as "created_at!"
                FROM blobz
+               WHERE soft_deleted_at IS NULL
                ORDER BY created_at DESC"#,
         )
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// mark the given blake3 hashes as soft-deleted with the given actor.
+    /// rows that don't exist or are already soft-deleted are added to `failed`.
+    /// returns (affected_count, failed_blake3s). does NOT touch files.
+    pub async fn soft_delete(
+        &self,
+        blake3s: &[String],
+        actor: &str,
+    ) -> Result<(u64, Vec<String>), BlobError> {
+        let now = now_secs();
+        let mut affected = 0u64;
+        let mut failed = Vec::new();
+
+        for hash in blake3s {
+            let result = sqlx::query!(
+                r#"UPDATE blobz
+                   SET soft_deleted_at = ?1, soft_deleted_by = ?2
+                   WHERE blake3 = ?3 AND soft_deleted_at IS NULL"#,
+                now,
+                actor,
+                hash,
+            )
+            .execute(&self.pool)
+            .await?;
+
+            if result.rows_affected() == 0 {
+                failed.push(hash.clone());
+            } else {
+                affected += 1;
+            }
+        }
+
+        Ok((affected, failed))
+    }
+
+    /// clear soft-delete markers on the given blake3 hashes (restore them).
+    /// rows that are not currently soft-deleted are added to `failed`.
+    /// returns (affected_count, failed_blake3s).
+    pub async fn restore(&self, blake3s: &[String]) -> Result<(u64, Vec<String>), BlobError> {
+        let mut affected = 0u64;
+        let mut failed = Vec::new();
+
+        for hash in blake3s {
+            let result = sqlx::query!(
+                r#"UPDATE blobz
+                   SET soft_deleted_at = NULL, soft_deleted_by = NULL
+                   WHERE blake3 = ?1 AND soft_deleted_at IS NOT NULL"#,
+                hash,
+            )
+            .execute(&self.pool)
+            .await?;
+
+            if result.rows_affected() == 0 {
+                failed.push(hash.clone());
+            } else {
+                affected += 1;
+            }
+        }
+
+        Ok((affected, failed))
+    }
+
+    /// list all soft-deleted blobs for the admin panel.
+    pub async fn list_soft_deleted(&self) -> Result<Vec<SoftDeletedBlobRef>, BlobError> {
+        let rows = sqlx::query_as!(
+            SoftDeletedRow,
+            r#"SELECT blake3 as "blake3!", filename, mime,
+                      size as "size!", soft_deleted_at as "soft_deleted_at!: i64",
+                      soft_deleted_by as "soft_deleted_by!"
+               FROM blobz
+               WHERE soft_deleted_at IS NOT NULL
+               ORDER BY soft_deleted_at DESC"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// permanently delete soft-deleted blobs.
+    ///
+    /// if `blake3s` is `None`, purges every soft-deleted row. if it's `Some`,
+    /// only rows that are currently soft-deleted qualify — blobs in the list
+    /// that aren't soft-deleted are reported in `failed`. for managed (non-
+    /// external) blobs, the on-disk file is unlinked; for external blobs,
+    /// only the row is removed (the user owns the file). returns
+    /// (deleted_count, failed_blake3s).
+    pub async fn hard_delete_soft_deleted(
+        &self,
+        blake3s: Option<&[String]>,
+    ) -> Result<(u64, Vec<String>), BlobError> {
+        let mut deleted = 0u64;
+        let mut failed: Vec<String> = Vec::new();
+
+        if let Some(hashes) = blake3s {
+            for hash in hashes {
+                // only qualify rows that ARE soft-deleted
+                let maybe_row = sqlx::query_as!(
+                    BlobRow,
+                    r#"SELECT blake3 as "blake3!", iroh_hash as "iroh_hash!", filename, mime,
+                              size as "size!", path as "path!", external as "external!",
+                              created_at as "created_at!"
+                       FROM blobz
+                       WHERE blake3 = ?1 AND soft_deleted_at IS NOT NULL"#,
+                    hash,
+                )
+                .fetch_optional(&self.pool)
+                .await?;
+
+                match maybe_row {
+                    None => failed.push(hash.clone()),
+                    Some(row) => {
+                        let blob: BlobRef = row.into();
+                        if !blob.external {
+                            let _ = tokio::fs::remove_file(self.path_for(&blob)).await;
+                        }
+                        sqlx::query!("DELETE FROM blobz WHERE blake3 = ?1", hash)
+                            .execute(&self.pool)
+                            .await?;
+                        deleted += 1;
+                    }
+                }
+            }
+        } else {
+            // purge ALL soft-deleted rows
+            let rows = sqlx::query_as!(
+                BlobRow,
+                r#"SELECT blake3 as "blake3!", iroh_hash as "iroh_hash!", filename, mime,
+                          size as "size!", path as "path!", external as "external!",
+                          created_at as "created_at!"
+                   FROM blobz
+                   WHERE soft_deleted_at IS NOT NULL"#,
+            )
+            .fetch_all(&self.pool)
+            .await?;
+
+            for row in rows {
+                let blob: BlobRef = row.into();
+                if !blob.external {
+                    let _ = tokio::fs::remove_file(self.path_for(&blob)).await;
+                }
+                sqlx::query!("DELETE FROM blobz WHERE blake3 = ?1", blob.blake3)
+                    .execute(&self.pool)
+                    .await?;
+                deleted += 1;
+            }
+        }
+
+        Ok((deleted, failed))
+    }
+}
+
+/// a soft-deleted blob row, as returned by `list_soft_deleted`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoftDeletedBlobRef {
+    pub blake3: String,
+    pub filename: Option<String>,
+    pub mime: Option<String>,
+    pub size: u64,
+    pub soft_deleted_at: i64,
+    pub soft_deleted_by: String,
+}
+
+#[derive(Debug)]
+struct SoftDeletedRow {
+    blake3: String,
+    filename: Option<String>,
+    mime: Option<String>,
+    size: i64,
+    soft_deleted_at: i64,
+    soft_deleted_by: String,
+}
+
+impl From<SoftDeletedRow> for SoftDeletedBlobRef {
+    fn from(r: SoftDeletedRow) -> Self {
+        Self {
+            blake3: r.blake3,
+            filename: r.filename,
+            mime: r.mime,
+            size: r.size as u64,
+            soft_deleted_at: r.soft_deleted_at,
+            soft_deleted_by: r.soft_deleted_by,
+        }
     }
 }
 
@@ -740,5 +959,191 @@ mod tests {
         }
         let all = store.list_all().await.unwrap();
         assert_eq!(all.len(), 5);
+    }
+
+    // --- soft-delete tests ---
+
+    #[tokio::test]
+    async fn soft_delete_hides_from_get_list_total_usage_but_get_any_finds_it() {
+        let (store, _tmp) = make_store().await;
+        let blob = store
+            .insert("h-sd".into(), Some("f.txt".into()), None, b"soft del me")
+            .await
+            .unwrap();
+
+        let (_, count_before) = store.total_usage().await.unwrap();
+        assert_eq!(count_before, 1);
+
+        let (affected, failed) = store
+            .soft_delete(&[blob.blake3.clone()], "admin-node")
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+        assert!(failed.is_empty());
+
+        // get() returns None after soft-delete
+        assert!(store.get(&blob.blake3).await.unwrap().is_none());
+        // read_bytes() returns None
+        assert!(store.read_bytes(&blob.blake3).await.unwrap().is_none());
+        // list() excludes it
+        assert!(store.list(100, 0).await.unwrap().is_empty());
+        // list_all() excludes it
+        assert!(store.list_all().await.unwrap().is_empty());
+        // total_usage() excludes it
+        let (bytes, count) = store.total_usage().await.unwrap();
+        assert_eq!(bytes, 0);
+        assert_eq!(count, 0);
+
+        // get_any() still finds it
+        let found = store.get_any(&blob.blake3).await.unwrap();
+        assert!(found.is_some());
+    }
+
+    #[tokio::test]
+    async fn soft_delete_stamps_actor_and_list_soft_deleted_returns_it() {
+        let (store, _tmp) = make_store().await;
+        let blob = store
+            .insert("h-actor".into(), None, None, b"actor test")
+            .await
+            .unwrap();
+
+        store
+            .soft_delete(&[blob.blake3.clone()], "node-abc123")
+            .await
+            .unwrap();
+
+        let sd = store.list_soft_deleted().await.unwrap();
+        assert_eq!(sd.len(), 1);
+        assert_eq!(sd[0].blake3, blob.blake3);
+        assert_eq!(sd[0].soft_deleted_by, "node-abc123");
+        assert!(sd[0].soft_deleted_at > 0);
+    }
+
+    #[tokio::test]
+    async fn soft_delete_already_deleted_row_goes_to_failed() {
+        let (store, _tmp) = make_store().await;
+        let blob = store
+            .insert("h-dbl".into(), None, None, b"double del")
+            .await
+            .unwrap();
+
+        store
+            .soft_delete(&[blob.blake3.clone()], "a1")
+            .await
+            .unwrap();
+        // second call: already soft-deleted — should land in failed
+        let (affected, failed) = store
+            .soft_delete(&[blob.blake3.clone()], "a2")
+            .await
+            .unwrap();
+        assert_eq!(affected, 0);
+        assert_eq!(failed, vec![blob.blake3.clone()]);
+    }
+
+    #[tokio::test]
+    async fn restore_clears_soft_delete_marker() {
+        let (store, _tmp) = make_store().await;
+        let blob = store
+            .insert("h-res".into(), None, None, b"restore me")
+            .await
+            .unwrap();
+
+        store
+            .soft_delete(&[blob.blake3.clone()], "actor")
+            .await
+            .unwrap();
+        assert!(store.get(&blob.blake3).await.unwrap().is_none());
+
+        let (affected, failed) = store.restore(&[blob.blake3.clone()]).await.unwrap();
+        assert_eq!(affected, 1);
+        assert!(failed.is_empty());
+
+        // visible again after restore
+        assert!(store.get(&blob.blake3).await.unwrap().is_some());
+        assert!(store.list_soft_deleted().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_non_soft_deleted_row_goes_to_failed() {
+        let (store, _tmp) = make_store().await;
+        let blob = store
+            .insert("h-nores".into(), None, None, b"not deleted")
+            .await
+            .unwrap();
+
+        let (affected, failed) = store.restore(&[blob.blake3.clone()]).await.unwrap();
+        assert_eq!(affected, 0);
+        assert_eq!(failed, vec![blob.blake3.clone()]);
+    }
+
+    #[tokio::test]
+    async fn hard_delete_soft_deleted_unlinks_managed_file_and_row() {
+        let (store, _tmp) = make_store().await;
+        let blob = store
+            .insert("h-hd".into(), None, None, b"hard del me")
+            .await
+            .unwrap();
+        let path = store.path_for(&blob);
+        assert!(path.exists());
+
+        store
+            .soft_delete(&[blob.blake3.clone()], "actor")
+            .await
+            .unwrap();
+        let (deleted, failed) = store
+            .hard_delete_soft_deleted(Some(&[blob.blake3.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(failed.is_empty());
+
+        // row is gone
+        assert!(store.get_any(&blob.blake3).await.unwrap().is_none());
+        // file is unlinked
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn hard_delete_refuses_non_soft_deleted_row() {
+        let (store, _tmp) = make_store().await;
+        let blob = store
+            .insert("h-hd-ref".into(), None, None, b"live blob")
+            .await
+            .unwrap();
+
+        let (deleted, failed) = store
+            .hard_delete_soft_deleted(Some(&[blob.blake3.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(failed, vec![blob.blake3.clone()]);
+        // blob is still present
+        assert!(store.get(&blob.blake3).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn soft_deleted_usage_counts_only_soft_deleted() {
+        let (store, _tmp) = make_store().await;
+        let b1 = store
+            .insert("h-u1".into(), None, None, b"alive")
+            .await
+            .unwrap();
+        let b2 = store
+            .insert("h-u2".into(), None, None, b"soft")
+            .await
+            .unwrap();
+
+        store
+            .soft_delete(&[b2.blake3.clone()], "actor")
+            .await
+            .unwrap();
+
+        let (sd_bytes, sd_count) = store.soft_deleted_usage().await.unwrap();
+        assert_eq!(sd_count, 1);
+        assert_eq!(sd_bytes, b2.size as u64);
+
+        let (live_bytes, live_count) = store.total_usage().await.unwrap();
+        assert_eq!(live_count, 1);
+        assert_eq!(live_bytes, b1.size as u64);
     }
 }

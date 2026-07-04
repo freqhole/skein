@@ -161,6 +161,7 @@ pub struct PeerInfo {
 /// sqlite-backed persistence for automerge documents managed by hub_repo.
 ///
 /// uses a `hub_docs` table for document persistence.
+#[derive(Clone)]
 pub struct HubDocStorage {
     pool: sqlx::SqlitePool,
 }
@@ -1042,6 +1043,12 @@ impl HubRepo {
     /// load all persisted canvas doc IDs from storage.
     pub async fn load_canvas_ids(&self) -> Vec<String> {
         self.storage.load_canvas_ids().await
+    }
+
+    /// access the underlying doc storage — used by maintenance helpers that
+    /// operate on raw doc bytes (e.g. sweep_canvas_blobs, purge).
+    pub fn storage(&self) -> &HubDocStorage {
+        &self.storage
     }
 
     /// persist a canvas doc ID to storage (idempotent).

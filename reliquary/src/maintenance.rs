@@ -21,6 +21,8 @@ use thiserror::Error;
 pub enum MaintenanceError {
     #[error("canvas {0} is not soft-deleted — refusing to purge an actively-tracked canvas")]
     NotRemoved(String),
+    #[error("blobz error: {0}")]
+    Blobz(#[from] crate::blobz::BlobError),
 }
 
 /// a soft-deleted canvas, with its title resolved (best-effort) for display
@@ -85,6 +87,74 @@ pub async fn list_removed(
 /// must restart to pick this up live" caveat.
 pub async fn restore(storage: &HubDocStorage, canvas_doc_id: &str) -> bool {
     storage.restore_canvas_id(canvas_doc_id).await
+}
+
+/// soft-delete blobs that were referenced ONLY by the given canvas.
+///
+/// collects the canvas's blake3 hashes, subtracts any that are also
+/// referenced by another active (non-removed) canvas, and soft-deletes the
+/// remainder with the given actor. unlike `purge`, this does NOT require the
+/// canvas to be in the removed list and does NOT hard-delete anything — the
+/// actual byte reclaim happens later via `HardDeleteBlobs`.
+///
+/// returns the number of blobs soft-deleted.
+pub async fn sweep_canvas_blobs(
+    storage: &HubDocStorage,
+    blobz: &blobz::Store,
+    canvas_doc_id: &str,
+    actor: &str,
+) -> Result<u64, MaintenanceError> {
+    // 1. collect this canvas's blake3 hashes.
+    let this_canvas_widget_docs = widget_doc_ids_for_canvas(storage, canvas_doc_id).await;
+    let mut this_canvas_blake3s: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for widget_doc_id in &this_canvas_widget_docs {
+        if let Some(hash) = blake3_for_widget_doc(storage, widget_doc_id).await {
+            this_canvas_blake3s.insert(hash);
+        }
+    }
+
+    if this_canvas_blake3s.is_empty() {
+        return Ok(0);
+    }
+
+    // 2. collect blake3s referenced by any OTHER active (non-removed) canvas.
+    let mut still_referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for other_canvas_id in storage.load_canvas_ids().await {
+        if other_canvas_id == canvas_doc_id {
+            continue;
+        }
+        for widget_doc_id in widget_doc_ids_for_canvas(storage, &other_canvas_id).await {
+            if let Some(hash) = blake3_for_widget_doc(storage, &widget_doc_id).await {
+                still_referenced.insert(hash);
+            }
+        }
+    }
+
+    // 3. soft-delete blobs unique to this canvas.
+    let to_delete: Vec<String> = this_canvas_blake3s
+        .into_iter()
+        .filter(|h| !still_referenced.contains(h))
+        .collect();
+
+    if to_delete.is_empty() {
+        return Ok(0);
+    }
+
+    let (affected, failed) = blobz
+        .soft_delete(&to_delete, actor)
+        .await
+        .map_err(MaintenanceError::Blobz)?;
+
+    if !failed.is_empty() {
+        tracing::debug!(
+            canvas_doc_id,
+            failed_count = failed.len(),
+            "sweep_canvas_blobs: some blobs were already soft-deleted or missing"
+        );
+    }
+
+    Ok(affected)
 }
 
 /// permanently purge a soft-deleted canvas: its own automerge doc, its
@@ -283,7 +353,10 @@ mod tests {
 
         storage.save_canvas_id("active-canvas").await;
         storage
-            .save_doc("active-canvas", &build_canvas_doc_bytes("still active", &[]))
+            .save_doc(
+                "active-canvas",
+                &build_canvas_doc_bytes("still active", &[]),
+            )
             .await;
 
         storage.soft_remove_canvas_id("trashed-canvas").await;
@@ -344,7 +417,12 @@ mod tests {
 
         let bytes = b"orphan blob content";
         let blob = blobz_store
-            .insert("iroh-hash-1".to_string(), Some("f.txt".to_string()), None, bytes)
+            .insert(
+                "iroh-hash-1".to_string(),
+                Some("f.txt".to_string()),
+                None,
+                bytes,
+            )
             .await
             .expect("insert blob");
         let hash = blob.blake3.clone();
@@ -369,7 +447,12 @@ mod tests {
         let (storage, blobz_store, _tmp) = make_storage().await;
 
         let blob = blobz_store
-            .insert("iroh-hash-2".to_string(), Some("f.txt".to_string()), None, b"shared content")
+            .insert(
+                "iroh-hash-2".to_string(),
+                Some("f.txt".to_string()),
+                None,
+                b"shared content",
+            )
             .await
             .expect("insert blob");
         let hash = blob.blake3.clone();
@@ -402,5 +485,108 @@ mod tests {
         // c2 and its widget doc are completely untouched.
         assert!(storage.load_doc("c2").await.is_some());
         assert!(storage.load_doc("w2").await.is_some());
+    }
+
+    // --- sweep_canvas_blobs tests ---
+
+    #[tokio::test]
+    async fn sweep_soft_deletes_only_blobs_unique_to_deleted_canvas() {
+        let (storage, blobz_store, _tmp) = make_storage().await;
+
+        // shared blob — also referenced by c2
+        let shared = blobz_store
+            .insert(
+                "iroh-shared".into(),
+                Some("shared.bin".into()),
+                None,
+                b"shared",
+            )
+            .await
+            .unwrap();
+        // orphan blob — only referenced by c1
+        let orphan = blobz_store
+            .insert(
+                "iroh-orphan".into(),
+                Some("orphan.bin".into()),
+                None,
+                b"orphan",
+            )
+            .await
+            .unwrap();
+
+        // c1 references both
+        storage.save_canvas_id("c1").await;
+        storage
+            .save_doc(
+                "c1",
+                &build_canvas_doc_bytes("canvas 1", &["w-shared", "w-orphan"]),
+            )
+            .await;
+        storage
+            .save_doc("w-shared", &build_widget_doc_bytes(&shared.blake3))
+            .await;
+        storage
+            .save_doc("w-orphan", &build_widget_doc_bytes(&orphan.blake3))
+            .await;
+
+        // c2 (still active) references only the shared blob
+        storage.save_canvas_id("c2").await;
+        storage
+            .save_doc("c2", &build_canvas_doc_bytes("canvas 2", &["w-shared-2"]))
+            .await;
+        storage
+            .save_doc("w-shared-2", &build_widget_doc_bytes(&shared.blake3))
+            .await;
+
+        let affected = sweep_canvas_blobs(&storage, &blobz_store, "c1", "system:canvas-deleted")
+            .await
+            .expect("sweep ok");
+
+        // only the orphan should be soft-deleted
+        assert_eq!(affected, 1);
+        // shared blob still visible
+        assert!(blobz_store.get(&shared.blake3).await.unwrap().is_some());
+        // orphan is hidden from normal get
+        assert!(blobz_store.get(&orphan.blake3).await.unwrap().is_none());
+        // get_any still finds it (just soft-deleted, not gone)
+        assert!(blobz_store.get_any(&orphan.blake3).await.unwrap().is_some());
+
+        // actor is stamped correctly
+        let sd = blobz_store.list_soft_deleted().await.unwrap();
+        assert_eq!(sd.len(), 1);
+        assert_eq!(sd[0].blake3, orphan.blake3);
+        assert_eq!(sd[0].soft_deleted_by, "system:canvas-deleted");
+    }
+
+    #[tokio::test]
+    async fn sweep_with_no_unique_blobs_returns_zero() {
+        let (storage, blobz_store, _tmp) = make_storage().await;
+
+        let shared = blobz_store
+            .insert("iroh-sh2".into(), None, None, b"shared2")
+            .await
+            .unwrap();
+
+        storage.save_canvas_id("c1").await;
+        storage
+            .save_doc("c1", &build_canvas_doc_bytes("c1", &["w1"]))
+            .await;
+        storage
+            .save_doc("w1", &build_widget_doc_bytes(&shared.blake3))
+            .await;
+
+        storage.save_canvas_id("c2").await;
+        storage
+            .save_doc("c2", &build_canvas_doc_bytes("c2", &["w2"]))
+            .await;
+        storage
+            .save_doc("w2", &build_widget_doc_bytes(&shared.blake3))
+            .await;
+
+        let affected = sweep_canvas_blobs(&storage, &blobz_store, "c1", "system:test")
+            .await
+            .expect("sweep ok");
+        assert_eq!(affected, 0);
+        assert!(blobz_store.get(&shared.blake3).await.unwrap().is_some());
     }
 }

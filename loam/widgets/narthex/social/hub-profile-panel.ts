@@ -18,10 +18,16 @@
 
 import { Assets, Container, Graphics, Rectangle, Sprite, Text } from "pixi.js";
 import { log } from "../../../src/utils/log";
+import { formatFileSize } from "../../../src/widgets/file-utils";
 import {
   type HubAdminClient,
   type HubAdminFriendSummary,
   type HubAdminPendingKnockSummary,
+  type HubAdminDiskUsage,
+  type HubAdminCanvasUsageSummary,
+  type HubAdminBlobUsageSummary,
+  type HubAdminSoftDeletedBlob,
+  type HubAdminResponse,
 } from "../../../src/p2p/hub-admin-client";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
 import { colorForName, isValidNodeId, truncate } from "./helpers";
@@ -65,6 +71,9 @@ const ACTION_BTN_H = 20;
 const ACTION_BTN_GAP = 6;
 const COPY_BTN_FEEDBACK_MS = 1500;
 const ALLOW_BTN_W = 70;
+const CANVAS_ROW_HEIGHT = 34;
+const BLOB_ROW_HEIGHT = 28;
+const CONFIRM_TIMEOUT_MS = 5000;
 
 // ---------------------------------------------------------------------------
 // public types
@@ -96,6 +105,8 @@ export type HubProfilePanelState =
       status: "ready";
       friends: HubAdminFriendSummary[];
       pendingKnocks: HubAdminPendingKnockSummary[];
+      diskUsage: HubAdminDiskUsage | null;
+      canvasUsage: HubAdminCanvasUsageSummary[] | null;
     };
 
 export interface HubProfilePanelHandle {
@@ -162,6 +173,19 @@ export function mountHubProfilePanel(
   const blockInFlight = new Set<string>();
   const promoteInFlight = new Set<string>();
 
+  // blob section state (lazy-loaded on demand)
+  type BlobSectionState = "idle" | "loading" | "loaded" | "error";
+  let blobState: BlobSectionState = "idle";
+  let blobRows: HubAdminBlobUsageSummary[] = [];
+  let softDeletedRows: HubAdminSoftDeletedBlob[] = [];
+  let blobErrorMsg: string | null = null;
+  let blobDeleteFailures: string[] = [];
+  let softDeleteInFlight = false;
+  let restoreInFlight = false;
+  let hardDeleteInFlight = false;
+  let confirmHardDeleteAll = false;
+  let confirmHardDeleteAllTimer: ReturnType<typeof setTimeout> | null = null;
+
   // dev/test-only refs to rendered buttons — see getAllowButtonGlobalPos()/
   // getRemoveButtonGlobalPos() below. reset at the top of every rebuild().
   let allowButtonRef: Container | null = null;
@@ -212,10 +236,20 @@ export function mountHubProfilePanel(
 
     let listResponse;
     let knocksResponse;
+    let diskRes: HubAdminResponse | null = null;
+    let canvasRes: HubAdminResponse | null = null;
     try {
-      [listResponse, knocksResponse] = await Promise.all([
+      [listResponse, knocksResponse, diskRes, canvasRes] = await Promise.all([
         client.hubAdminList(hubNodeId),
         client.hubAdminListPendingKnocks(hubNodeId),
+        client.hubAdminDiskUsage(hubNodeId).catch((e: unknown) => {
+          log.warn(TAG, "disk usage fetch failed:", e);
+          return null;
+        }),
+        client.hubAdminCanvasUsage(hubNodeId).catch((e: unknown) => {
+          log.warn(TAG, "canvas usage fetch failed:", e);
+          return null;
+        }),
       ]);
     } catch (err) {
       log.warn(TAG, "hub admin request failed:", err);
@@ -260,7 +294,15 @@ export function mountHubProfilePanel(
       status: "ready",
       friends: listResponse.friends,
       pendingKnocks: knocksResponse.knocks,
+      diskUsage: diskRes?.kind === "diskUsage" ? diskRes.usage : null,
+      canvasUsage: canvasRes?.kind === "canvasUsage" ? canvasRes.canvases : null,
     };
+    // reset blob section so it reloads on the next rebuild() cycle
+    blobState = "idle";
+    blobRows = [];
+    softDeletedRows = [];
+    blobErrorMsg = null;
+    blobDeleteFailures = [];
     rebuild();
   }
 
@@ -429,6 +471,175 @@ export function mountHubProfilePanel(
     }
   }
 
+  // -- blob section actions --------------------------------------------------
+
+  async function loadBlobs(): Promise<void> {
+    blobState = "loading";
+    blobErrorMsg = null;
+    blobDeleteFailures = [];
+    rebuild();
+    try {
+      const [blobRes, softDeletedRes] = await Promise.all([
+        client.hubAdminBlobUsage(hubNodeId),
+        client.hubAdminListSoftDeleted(hubNodeId),
+      ]);
+      if (destroyed) return;
+      if (blobRes.kind === "notAdmin" || softDeletedRes.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (blobRes.kind !== "blobUsage") {
+        blobState = "error";
+        blobErrorMsg = `unexpected response: ${blobRes.kind}`;
+        rebuild();
+        return;
+      }
+      if (softDeletedRes.kind !== "softDeleted") {
+        blobState = "error";
+        blobErrorMsg = `unexpected response: ${softDeletedRes.kind}`;
+        rebuild();
+        return;
+      }
+      blobRows = blobRes.blobs;
+      softDeletedRows = softDeletedRes.blobs;
+      blobState = "loaded";
+      rebuild();
+    } catch (err) {
+      log.warn(TAG, "loadBlobs failed:", err);
+      if (destroyed) return;
+      blobState = "error";
+      blobErrorMsg = (err as Error)?.message ?? String(err);
+      rebuild();
+    }
+  }
+
+  async function refreshAfterBlobMutation(): Promise<void> {
+    if (state.status === "ready") {
+      try {
+        const diskRes = await client.hubAdminDiskUsage(hubNodeId);
+        if (!destroyed && state.status === "ready" && diskRes.kind === "diskUsage") {
+          state = { ...state, diskUsage: diskRes.usage };
+        }
+      } catch (err) {
+        log.warn(TAG, "disk usage refresh failed:", err);
+      }
+    }
+    await loadBlobs();
+  }
+
+  function handleHardDeleteAllClick(): void {
+    if (hardDeleteInFlight || softDeletedRows.length === 0) return;
+    if (confirmHardDeleteAll) {
+      if (confirmHardDeleteAllTimer !== null) {
+        clearTimeout(confirmHardDeleteAllTimer);
+        confirmHardDeleteAllTimer = null;
+      }
+      confirmHardDeleteAll = false;
+      executeHardDeleteAll().catch(() => {});
+    } else {
+      confirmHardDeleteAll = true;
+      rebuild();
+      confirmHardDeleteAllTimer = setTimeout(() => {
+        confirmHardDeleteAll = false;
+        confirmHardDeleteAllTimer = null;
+        if (!destroyed) rebuild();
+      }, CONFIRM_TIMEOUT_MS);
+    }
+  }
+
+  async function executeHardDeleteAll(): Promise<void> {
+    if (hardDeleteInFlight) return;
+    hardDeleteInFlight = true;
+    rebuild();
+    try {
+      const res = await client.hubAdminHardDeleteBlobs(hubNodeId, [], true);
+      if (destroyed) return;
+      if (res.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (res.kind === "blobsMutation") {
+        blobDeleteFailures = res.failed;
+      }
+      await refreshAfterBlobMutation();
+    } catch (err) {
+      log.warn(TAG, "hardDeleteAllSoftDeleted failed:", err);
+    } finally {
+      hardDeleteInFlight = false;
+      if (!destroyed) rebuild();
+    }
+  }
+
+  // -- per-row blob actions --
+
+  async function handleSoftDeleteOne(blake3: string): Promise<void> {
+    if (softDeleteInFlight) return;
+    softDeleteInFlight = true;
+    rebuild();
+    try {
+      const res = await client.hubAdminSoftDeleteBlobs(hubNodeId, [blake3]);
+      if (destroyed) return;
+      if (res.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      await refreshAfterBlobMutation();
+    } catch (err) {
+      log.warn(TAG, "hubAdminSoftDeleteBlobs (one) failed:", err);
+    } finally {
+      softDeleteInFlight = false;
+      if (!destroyed) rebuild();
+    }
+  }
+
+  async function handleRestoreOne(blake3: string): Promise<void> {
+    if (restoreInFlight) return;
+    restoreInFlight = true;
+    rebuild();
+    try {
+      const res = await client.hubAdminRestoreBlobs(hubNodeId, [blake3]);
+      if (destroyed) return;
+      if (res.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      await refreshAfterBlobMutation();
+    } catch (err) {
+      log.warn(TAG, "hubAdminRestoreBlobs (one) failed:", err);
+    } finally {
+      restoreInFlight = false;
+      if (!destroyed) rebuild();
+    }
+  }
+
+  async function executeHardDeleteOne(blake3: string): Promise<void> {
+    if (hardDeleteInFlight) return;
+    hardDeleteInFlight = true;
+    rebuild();
+    try {
+      const res = await client.hubAdminHardDeleteBlobs(hubNodeId, [blake3]);
+      if (destroyed) return;
+      if (res.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (res.kind === "blobsMutation") {
+        blobDeleteFailures = res.failed;
+      }
+      await refreshAfterBlobMutation();
+    } catch (err) {
+      log.warn(TAG, "hubAdminHardDeleteBlobs (one) failed:", err);
+    } finally {
+      hardDeleteInFlight = false;
+      if (!destroyed) rebuild();
+    }
+  }
+
   // -- small button builder --------------------------------------------------
 
   function buildOutlinedButton(opts2: {
@@ -437,6 +648,7 @@ export function mountHubProfilePanel(
     height: number;
     color: number;
     disabled?: boolean;
+    fillColor?: number;
     onTap: () => void;
   }): Container {
     const btn = new Container();
@@ -447,13 +659,13 @@ export function mountHubProfilePanel(
     const bg = new Graphics();
     bg.eventMode = "none";
     bg.roundRect(0, 0, opts2.width, opts2.height, BUTTON_RADIUS);
-    bg.fill({ color: 0x111118 });
-    bg.stroke({ color: opts2.color, width: 1.5, alpha: opts2.disabled ? 0.4 : 1 });
+    bg.fill({ color: opts2.fillColor ?? 0x111118 });
+    bg.stroke({ color: opts2.fillColor ?? opts2.color, width: 1.5, alpha: opts2.disabled ? 0.4 : 1 });
     btn.addChild(bg);
 
     const label = new Text({
       text: opts2.label,
-      style: { fontFamily: FONT, fontSize: 10, fill: opts2.color },
+      style: { fontFamily: FONT, fontSize: 10, fill: opts2.fillColor !== undefined ? 0xffffff : opts2.color },
       resolution: RESOLUTION,
     });
     label.alpha = opts2.disabled ? 0.5 : 1;
@@ -1001,6 +1213,428 @@ export function mountHubProfilePanel(
       }
     }
 
+    // -- storage section --
+
+    const storageSep = new Graphics();
+    storageSep.moveTo(PADDING_X, dy);
+    storageSep.lineTo(contentW - PADDING_X, dy);
+    storageSep.stroke({ color: BORDER, width: 1, alpha: 0.5 });
+    inner.addChild(storageSep);
+    dy += 12;
+
+    const storageLabel = new Text({
+      text: "storage",
+      style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
+      resolution: RESOLUTION,
+    });
+    storageLabel.eventMode = "none";
+    storageLabel.x = PADDING_X;
+    storageLabel.y = dy;
+    inner.addChild(storageLabel);
+    dy += LABEL_SIZE + 6;
+
+    // disk usage summary (available from the initial refresh)
+    if (state.diskUsage !== null) {
+      const du = state.diskUsage;
+      const diskSummary =
+        `${du.blobCount} blobs \u00b7 ${formatFileSize(du.totalBlobBytes)}` +
+        (du.softDeletedBlobCount > 0
+          ? ` \u00b7 ${du.softDeletedBlobCount} soft-deleted (${formatFileSize(du.softDeletedBlobBytes)})`
+          : "");
+      const diskText = new Text({
+        text: diskSummary,
+        style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
+        resolution: RESOLUTION,
+      });
+      diskText.eventMode = "none";
+      diskText.x = PADDING_X;
+      diskText.y = dy;
+      inner.addChild(diskText);
+      dy += diskText.height + 3;
+
+      if (du.diskAvailableBytes !== null && du.diskTotalBytes !== null) {
+        const freeText = new Text({
+          text: `${formatFileSize(du.diskAvailableBytes)} free of ${formatFileSize(du.diskTotalBytes)} disk`,
+          style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        freeText.eventMode = "none";
+        freeText.x = PADDING_X;
+        freeText.y = dy;
+        inner.addChild(freeText);
+        dy += freeText.height + 3;
+      }
+      dy += 4;
+    }
+
+    // lazy-loaded blob lists: auto-trigger on first render
+    if (blobState === "idle") {
+      loadBlobs().catch(() => {});
+    }
+
+    if (blobState === "idle" || blobState === "loading") {
+      const blobLoadingText = new Text({
+        text: "loading blobs\u2026",
+        style: { fontFamily: FONT, fontSize: TEXT_SIZE, fill: MUTED_TEXT },
+        resolution: RESOLUTION,
+      });
+      blobLoadingText.eventMode = "none";
+      blobLoadingText.x = PADDING_X;
+      blobLoadingText.y = dy;
+      inner.addChild(blobLoadingText);
+      dy += blobLoadingText.height + SECTION_GAP;
+    } else if (blobState === "error") {
+      const blobErrText = new Text({
+        text: blobErrorMsg ? `blob load failed: ${blobErrorMsg}` : "hub offline?",
+        style: {
+          fontFamily: FONT,
+          fontSize: TEXT_SIZE,
+          fill: REJECT_COLOR,
+          wordWrap: true,
+          wordWrapWidth: Math.max(80, currentWidth - PADDING_X * 2),
+        },
+        resolution: RESOLUTION,
+      });
+      blobErrText.eventMode = "none";
+      blobErrText.x = PADDING_X;
+      blobErrText.y = dy;
+      inner.addChild(blobErrText);
+      dy += blobErrText.height + 6;
+      const blobRetryBtn = buildOutlinedButton({
+        label: "retry",
+        width: 60,
+        height: 24,
+        color: ACCENT,
+        onTap: () => {
+          loadBlobs().catch(() => {});
+        },
+      });
+      blobRetryBtn.x = PADDING_X;
+      blobRetryBtn.y = dy;
+      inner.addChild(blobRetryBtn);
+      dy += 24 + SECTION_GAP;
+    } else {
+      // blobState === "loaded"
+
+      // -- blobs list --
+      const blobsListLabel = new Text({
+        text: `blobs (${blobRows.length})`,
+        style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
+        resolution: RESOLUTION,
+      });
+      blobsListLabel.eventMode = "none";
+      blobsListLabel.x = PADDING_X;
+      blobsListLabel.y = dy;
+      inner.addChild(blobsListLabel);
+      dy += LABEL_SIZE + 6;
+
+      if (blobRows.length === 0) {
+        const emptyBlobsText = new Text({
+          text: "no blobs",
+          style: { fontFamily: FONT, fontSize: TEXT_SIZE, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        emptyBlobsText.eventMode = "none";
+        emptyBlobsText.x = PADDING_X;
+        emptyBlobsText.y = dy;
+        inner.addChild(emptyBlobsText);
+        dy += emptyBlobsText.height + 8;
+      } else {
+        const MAX_BLOB_ROWS = 20;
+        const visibleBlobs = blobRows.slice(0, MAX_BLOB_ROWS);
+        const softDelBtnW = 68;
+        for (let i = 0; i < visibleBlobs.length; i++) {
+          const blob = visibleBlobs[i];
+          const row = new Container();
+          row.eventMode = "none";
+          row.y = dy;
+          if (i % 2 === 1) {
+            const rowBg = new Graphics();
+            rowBg.eventMode = "none";
+            rowBg.rect(0, 0, contentW, BLOB_ROW_HEIGHT);
+            rowBg.fill({ color: ROW_ALT_BG, alpha: 0.5 });
+            row.addChild(rowBg);
+          }
+          inner.addChild(row);
+
+          const blobName = blob.filename ?? `${blob.blake3.slice(0, 16)}\u2026`;
+          const nameText = new Text({
+            text: blobName,
+            style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: TEXT_COLOR },
+            resolution: RESOLUTION,
+          });
+          nameText.eventMode = "none";
+          nameText.x = ROW_PADDING_X;
+          nameText.y = (BLOB_ROW_HEIGHT - nameText.height * 2 - 2) / 2;
+          row.addChild(nameText);
+
+          const sizeText = new Text({
+            text: formatFileSize(blob.size),
+            style: { fontFamily: FONT, fontSize: 9, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          sizeText.eventMode = "none";
+          sizeText.x = ROW_PADDING_X;
+          sizeText.y = nameText.y + nameText.height + 2;
+          row.addChild(sizeText);
+
+          const softDelBtn = buildOutlinedButton({
+            label: softDeleteInFlight ? "\u2026" : "soft delete",
+            width: softDelBtnW,
+            height: ACTION_BTN_H,
+            color: REJECT_COLOR,
+            disabled: softDeleteInFlight,
+            onTap: () => {
+              handleSoftDeleteOne(blob.blake3).catch(() => {});
+            },
+          });
+          softDelBtn.x = contentW - softDelBtnW - ROW_PADDING_X;
+          softDelBtn.y = (BLOB_ROW_HEIGHT - ACTION_BTN_H) / 2;
+          row.addChild(softDelBtn);
+
+          dy += BLOB_ROW_HEIGHT;
+        }
+        if (blobRows.length > MAX_BLOB_ROWS) {
+          const moreText = new Text({
+            text: `+${blobRows.length - MAX_BLOB_ROWS} more`,
+            style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          moreText.eventMode = "none";
+          moreText.x = PADDING_X;
+          moreText.y = dy;
+          inner.addChild(moreText);
+          dy += moreText.height + 4;
+        }
+      }
+
+      dy += 8;
+
+      // -- soft-deleted list --
+      const softDelSubSep = new Graphics();
+      softDelSubSep.moveTo(PADDING_X + 8, dy);
+      softDelSubSep.lineTo(contentW - PADDING_X - 8, dy);
+      softDelSubSep.stroke({ color: BORDER, width: 1, alpha: 0.3 });
+      inner.addChild(softDelSubSep);
+      dy += 10;
+
+      const softDeletedLabel = new Text({
+        text: `soft-deleted (${softDeletedRows.length})`,
+        style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
+        resolution: RESOLUTION,
+      });
+      softDeletedLabel.eventMode = "none";
+      softDeletedLabel.x = PADDING_X;
+      softDeletedLabel.y = dy;
+      inner.addChild(softDeletedLabel);
+
+      if (softDeletedRows.length > 0) {
+        const hardDelAllBtnW = 108;
+        const hardDelAllLbl = confirmHardDeleteAll ? "really delete all?" : "hard delete all";
+        const hardDelAllBtn = buildOutlinedButton({
+          label: hardDeleteInFlight ? "\u2026" : hardDelAllLbl,
+          width: hardDelAllBtnW,
+          height: ACTION_BTN_H,
+          color: REJECT_COLOR,
+          fillColor: confirmHardDeleteAll ? REJECT_COLOR : undefined,
+          disabled: hardDeleteInFlight,
+          onTap: () => {
+            handleHardDeleteAllClick();
+          },
+        });
+        hardDelAllBtn.x = contentW - hardDelAllBtnW - ROW_PADDING_X;
+        hardDelAllBtn.y = dy;
+        inner.addChild(hardDelAllBtn);
+      }
+
+      dy += LABEL_SIZE + 6;
+
+      if (blobDeleteFailures.length > 0) {
+        const failText = new Text({
+          text: `failed to delete ${blobDeleteFailures.length} blob(s)`,
+          style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: REJECT_COLOR },
+          resolution: RESOLUTION,
+        });
+        failText.eventMode = "none";
+        failText.x = PADDING_X;
+        failText.y = dy;
+        inner.addChild(failText);
+        dy += failText.height + 4;
+      }
+
+      if (softDeletedRows.length === 0) {
+        const emptySoftDelText = new Text({
+          text: "no soft-deleted blobs",
+          style: { fontFamily: FONT, fontSize: TEXT_SIZE, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        emptySoftDelText.eventMode = "none";
+        emptySoftDelText.x = PADDING_X;
+        emptySoftDelText.y = dy;
+        inner.addChild(emptySoftDelText);
+        dy += emptySoftDelText.height + 8;
+      } else {
+        const MAX_SOFT_ROWS = 20;
+        const SDH = BLOB_ROW_HEIGHT + 10;
+        const visibleSoftDel = softDeletedRows.slice(0, MAX_SOFT_ROWS);
+        const restoreBtnW = 52;
+        const hardDelOneBtnW = 60;
+        for (let i = 0; i < visibleSoftDel.length; i++) {
+          const blob = visibleSoftDel[i];
+          const row = new Container();
+          row.eventMode = "none";
+          row.y = dy;
+          if (i % 2 === 1) {
+            const rowBg = new Graphics();
+            rowBg.eventMode = "none";
+            rowBg.rect(0, 0, contentW, SDH);
+            rowBg.fill({ color: ROW_ALT_BG, alpha: 0.5 });
+            row.addChild(rowBg);
+          }
+          inner.addChild(row);
+
+          const blobName = blob.filename ?? `${blob.blake3.slice(0, 16)}\u2026`;
+          const sdNameText = new Text({
+            text: blobName,
+            style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: TEXT_COLOR },
+            resolution: RESOLUTION,
+          });
+          sdNameText.eventMode = "none";
+          sdNameText.x = ROW_PADDING_X;
+          sdNameText.y = 3;
+          row.addChild(sdNameText);
+
+          const deletedBy = truncate(blob.softDeletedBy, 12);
+          const deletedWhen = new Date(blob.softDeletedAt * 1000).toLocaleString();
+          const sdMetaText = new Text({
+            text: `${formatFileSize(blob.size)} \u00b7 by ${deletedBy} \u00b7 ${deletedWhen}`,
+            style: { fontFamily: FONT, fontSize: 9, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          sdMetaText.eventMode = "none";
+          sdMetaText.x = ROW_PADDING_X;
+          sdMetaText.y = sdNameText.y + sdNameText.height + 2;
+          row.addChild(sdMetaText);
+
+          const restoreBtn = buildOutlinedButton({
+            label: restoreInFlight ? "\u2026" : "restore",
+            width: restoreBtnW,
+            height: ACTION_BTN_H,
+            color: ONLINE_COLOR,
+            disabled: restoreInFlight,
+            onTap: () => {
+              handleRestoreOne(blob.blake3).catch(() => {});
+            },
+          });
+          const hardDelOneBtn = buildOutlinedButton({
+            label: hardDeleteInFlight ? "\u2026" : "hard delete",
+            width: hardDelOneBtnW,
+            height: ACTION_BTN_H,
+            color: REJECT_COLOR,
+            disabled: hardDeleteInFlight,
+            onTap: () => {
+              executeHardDeleteOne(blob.blake3).catch(() => {});
+            },
+          });
+          restoreBtn.x = contentW - restoreBtnW - ROW_PADDING_X;
+          restoreBtn.y = (SDH - ACTION_BTN_H) / 2;
+          hardDelOneBtn.x = restoreBtn.x - hardDelOneBtnW - ACTION_BTN_GAP;
+          hardDelOneBtn.y = restoreBtn.y;
+          row.addChild(hardDelOneBtn);
+          row.addChild(restoreBtn);
+
+          dy += SDH;
+        }
+        if (softDeletedRows.length > MAX_SOFT_ROWS) {
+          const moreText = new Text({
+            text: `+${softDeletedRows.length - MAX_SOFT_ROWS} more`,
+            style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          moreText.eventMode = "none";
+          moreText.x = PADDING_X;
+          moreText.y = dy;
+          inner.addChild(moreText);
+          dy += moreText.height + 4;
+        }
+        dy += 4;
+      }
+
+      // -- canvases section --
+      if (state.canvasUsage !== null && state.canvasUsage.length > 0) {
+        const canvasSubSep = new Graphics();
+        canvasSubSep.moveTo(PADDING_X + 8, dy);
+        canvasSubSep.lineTo(contentW - PADDING_X - 8, dy);
+        canvasSubSep.stroke({ color: BORDER, width: 1, alpha: 0.3 });
+        inner.addChild(canvasSubSep);
+        dy += 10;
+
+        const canvasesLabel = new Text({
+          text: `canvases (${state.canvasUsage.length})`,
+          style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
+          resolution: RESOLUTION,
+        });
+        canvasesLabel.eventMode = "none";
+        canvasesLabel.x = PADDING_X;
+        canvasesLabel.y = dy;
+        inner.addChild(canvasesLabel);
+        dy += LABEL_SIZE + 6;
+
+        const MAX_CANVAS_ROWS = 20;
+        const visibleCanvases = state.canvasUsage.slice(0, MAX_CANVAS_ROWS);
+        for (let i = 0; i < visibleCanvases.length; i++) {
+          const canvas = visibleCanvases[i];
+          const row = new Container();
+          row.eventMode = "none";
+          row.y = dy;
+          if (i % 2 === 1) {
+            const rowBg = new Graphics();
+            rowBg.eventMode = "none";
+            rowBg.rect(0, 0, contentW, CANVAS_ROW_HEIGHT);
+            rowBg.fill({ color: ROW_ALT_BG, alpha: 0.5 });
+            row.addChild(rowBg);
+          }
+          inner.addChild(row);
+
+          const canvasIdText = new Text({
+            text: truncate(canvas.canvasDocId, 24),
+            style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          canvasIdText.eventMode = "none";
+          canvasIdText.x = ROW_PADDING_X;
+          canvasIdText.y = 4;
+          row.addChild(canvasIdText);
+
+          const canvasStatsText = new Text({
+            text: `${canvas.blobCount} blobs \u00b7 ${formatFileSize(canvas.totalBytes)}`,
+            style: { fontFamily: FONT, fontSize: 9, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          canvasStatsText.eventMode = "none";
+          canvasStatsText.x = ROW_PADDING_X;
+          canvasStatsText.y = canvasIdText.y + LABEL_SIZE + 2;
+          row.addChild(canvasStatsText);
+
+          dy += CANVAS_ROW_HEIGHT;
+        }
+        if (state.canvasUsage.length > MAX_CANVAS_ROWS) {
+          const moreText = new Text({
+            text: `+${state.canvasUsage.length - MAX_CANVAS_ROWS} more`,
+            style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          moreText.eventMode = "none";
+          moreText.x = PADDING_X;
+          moreText.y = dy;
+          inner.addChild(moreText);
+          dy += moreText.height + 4;
+        }
+      }
+
+      dy += SECTION_GAP;
+    }
+
     finishLayout(dy);
   }
 
@@ -1063,6 +1697,9 @@ export function mountHubProfilePanel(
 
   function destroy(): void {
     destroyed = true;
+    if (confirmHardDeleteAllTimer !== null) {
+      clearTimeout(confirmHardDeleteAllTimer);
+    }
     if (allowInputHandle) {
       allowInputHandle.destroy();
       allowInputHandle = null;

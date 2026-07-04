@@ -26,10 +26,11 @@ import type { MiddenStreamNode } from "./iroh-network-adapter";
 const HUB_ADMIN_ALPN = "iroh/skein-hub-admin/1";
 
 /**
- * max response size to read back from a hub admin request. matches
- * reliquary's own `MAX_MESSAGE_SIZE` in `protocol/hub_admin.rs`.
+ * max response size to read back from a hub admin request. 4 MB gives
+ * headroom for large BlobUsage lists without hitting reliquary's own
+ * `MAX_MESSAGE_SIZE` in `protocol/hub_admin.rs`.
  */
-const DEFAULT_MAX_ADMIN_RESPONSE_BYTES = 1024 * 1024;
+const DEFAULT_MAX_ADMIN_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // wire types
@@ -78,6 +79,43 @@ export interface HubAdminPendingKnockSummary {
   knockedAt: number;
 }
 
+/** disk/blob usage summary from `AdminResponse::DiskUsage`. */
+export interface HubAdminDiskUsage {
+  totalBlobBytes: number;
+  blobCount: number;
+  diskAvailableBytes: number | null;
+  diskTotalBytes: number | null;
+  softDeletedBlobBytes: number;
+  softDeletedBlobCount: number;
+}
+
+/** per-canvas blob usage row from `AdminResponse::CanvasUsage`. */
+export interface HubAdminCanvasUsageSummary {
+  canvasDocId: string;
+  blobCount: number;
+  totalBytes: number;
+}
+
+/** a single blob row from `AdminResponse::BlobUsage`. */
+export interface HubAdminBlobUsageSummary {
+  blake3: string;
+  filename: string | null;
+  mime: string | null;
+  size: number;
+  external: boolean;
+  softDeleted: boolean;
+}
+
+/** a single soft-deleted blob row from `AdminResponse::SoftDeleted`. */
+export interface HubAdminSoftDeletedBlob {
+  blake3: string;
+  filename: string | null;
+  mime: string | null;
+  size: number;
+  softDeletedAt: number;
+  softDeletedBy: string;
+}
+
 /**
  * request payloads for `iroh/skein-hub-admin/1`, mirroring
  * `reliquary::protocol::hub_admin::AdminRequest`.
@@ -89,7 +127,14 @@ export type HubAdminRequest =
   | { kind: "block"; nodeId: string }
   | { kind: "promoteAdmin"; nodeId: string }
   | { kind: "demoteAdmin"; nodeId: string }
-  | { kind: "listPendingKnocks" };
+  | { kind: "listPendingKnocks" }
+  | { kind: "diskUsage" }
+  | { kind: "canvasUsage" }
+  | { kind: "blobUsage" }
+  | { kind: "softDeleteBlobs"; blake3s: string[] }
+  | { kind: "restoreBlobs"; blake3s: string[] }
+  | { kind: "listSoftDeleted" }
+  | { kind: "hardDeleteBlobs"; blake3s: string[]; all: boolean };
 
 /**
  * response payloads for `iroh/skein-hub-admin/1`, mirroring
@@ -103,7 +148,12 @@ export type HubAdminResponse =
   | { kind: "adminChanged"; nodeId: string; isAdmin: boolean }
   | { kind: "notAdmin" }
   | { kind: "error"; message: string }
-  | { kind: "pendingKnocks"; knocks: HubAdminPendingKnockSummary[] };
+  | { kind: "pendingKnocks"; knocks: HubAdminPendingKnockSummary[] }
+  | { kind: "diskUsage"; usage: HubAdminDiskUsage }
+  | { kind: "canvasUsage"; canvases: HubAdminCanvasUsageSummary[] }
+  | { kind: "blobUsage"; blobs: HubAdminBlobUsageSummary[] }
+  | { kind: "blobsMutation"; affected: number; failed: string[] }
+  | { kind: "softDeleted"; blobs: HubAdminSoftDeletedBlob[] };
 
 /**
  * build the CBOR-ready wire value for an `HubAdminRequest`, matching
@@ -112,7 +162,7 @@ export type HubAdminResponse =
  * `List` encodes as just its variant name, a struct variant like
  * `Allow { .. }` encodes as a single-key map `{ Allow: { node_id: .. } }`.
  */
-function toWireAdminRequest(request: HubAdminRequest): unknown {
+export function toWireAdminRequest(request: HubAdminRequest): unknown {
   switch (request.kind) {
     case "allow":
       return { Allow: { node_id: request.nodeId } };
@@ -128,11 +178,25 @@ function toWireAdminRequest(request: HubAdminRequest): unknown {
       return { DemoteAdmin: { node_id: request.nodeId } };
     case "listPendingKnocks":
       return "ListPendingKnocks";
+    case "diskUsage":
+      return "DiskUsage";
+    case "canvasUsage":
+      return "CanvasUsage";
+    case "blobUsage":
+      return "BlobUsage";
+    case "softDeleteBlobs":
+      return { SoftDeleteBlobs: { blake3s: request.blake3s } };
+    case "restoreBlobs":
+      return { RestoreBlobs: { blake3s: request.blake3s } };
+    case "listSoftDeleted":
+      return "ListSoftDeleted";
+    case "hardDeleteBlobs":
+      return { HardDeleteBlobs: { blake3s: request.blake3s, all: request.all } };
   }
 }
 
 /** parse the CBOR-decoded wire value for an `AdminResponse` back into our TS shape. */
-function fromWireAdminResponse(wire: unknown): HubAdminResponse {
+export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
   if (wire === "NotAdmin") {
     return { kind: "notAdmin" };
   }
@@ -203,6 +267,90 @@ function fromWireAdminResponse(wire: unknown): HubAdminResponse {
           requesterUsername: k.requester_username,
           message: k.message,
           knockedAt: k.knocked_at,
+        })),
+      };
+    }
+    if ("DiskUsage" in obj) {
+      const v = obj.DiskUsage as {
+        total_blob_bytes: number;
+        blob_count: number;
+        disk_available_bytes: number | null;
+        disk_total_bytes: number | null;
+        soft_deleted_blob_bytes: number;
+        soft_deleted_blob_count: number;
+      };
+      return {
+        kind: "diskUsage",
+        usage: {
+          totalBlobBytes: v.total_blob_bytes,
+          blobCount: v.blob_count,
+          diskAvailableBytes: v.disk_available_bytes ?? null,
+          diskTotalBytes: v.disk_total_bytes ?? null,
+          softDeletedBlobBytes: v.soft_deleted_blob_bytes,
+          softDeletedBlobCount: v.soft_deleted_blob_count,
+        },
+      };
+    }
+    if ("CanvasUsage" in obj) {
+      const v = obj.CanvasUsage as {
+        canvases: Array<{ canvas_doc_id: string; blob_count: number; total_bytes: number }>;
+      };
+      return {
+        kind: "canvasUsage",
+        canvases: v.canvases.map((c) => ({
+          canvasDocId: c.canvas_doc_id,
+          blobCount: c.blob_count,
+          totalBytes: c.total_bytes,
+        })),
+      };
+    }
+    if ("BlobUsage" in obj) {
+      const v = obj.BlobUsage as {
+        blobs: Array<{
+          blake3: string;
+          filename: string | null;
+          mime: string | null;
+          size: number;
+          external: boolean;
+          soft_deleted: boolean;
+        }>;
+      };
+      return {
+        kind: "blobUsage",
+        blobs: v.blobs.map((b) => ({
+          blake3: b.blake3,
+          filename: b.filename,
+          mime: b.mime,
+          size: b.size,
+          external: b.external,
+          softDeleted: b.soft_deleted,
+        })),
+      };
+    }
+    if ("BlobsMutation" in obj) {
+      const v = obj.BlobsMutation as { affected: number; failed: string[] };
+      return { kind: "blobsMutation", affected: v.affected, failed: v.failed };
+    }
+    if ("SoftDeleted" in obj) {
+      const v = obj.SoftDeleted as {
+        blobs: Array<{
+          blake3: string;
+          filename: string | null;
+          mime: string | null;
+          size: number;
+          soft_deleted_at: number;
+          soft_deleted_by: string;
+        }>;
+      };
+      return {
+        kind: "softDeleted",
+        blobs: v.blobs.map((b) => ({
+          blake3: b.blake3,
+          filename: b.filename,
+          mime: b.mime,
+          size: b.size,
+          softDeletedAt: b.soft_deleted_at,
+          softDeletedBy: b.soft_deleted_by,
         })),
       };
     }
@@ -303,6 +451,28 @@ export interface HubAdminClient {
    * docs/hub-and-profile-plan.md section 5).
    */
   hubAdminListPendingKnocks(peerNodeId: string): Promise<HubAdminResponse>;
+  /** fetch disk and blob storage usage metrics for the hub. */
+  hubAdminDiskUsage(peerNodeId: string): Promise<HubAdminResponse>;
+  /** fetch per-canvas blob usage breakdown, sorted by caller if desired. */
+  hubAdminCanvasUsage(peerNodeId: string): Promise<HubAdminResponse>;
+  /** fetch the full list of active (non-soft-deleted) blobs stored on the hub. */
+  hubAdminBlobUsage(peerNodeId: string): Promise<HubAdminResponse>;
+  /** soft-delete the given blobs by blake3 hash — marks them for deletion but doesn't free disk. */
+  hubAdminSoftDeleteBlobs(peerNodeId: string, blake3s: string[]): Promise<HubAdminResponse>;
+  /** restore soft-deleted blobs by blake3 hash. */
+  hubAdminRestoreBlobs(peerNodeId: string, blake3s: string[]): Promise<HubAdminResponse>;
+  /** list only the soft-deleted blobs. */
+  hubAdminListSoftDeleted(peerNodeId: string): Promise<HubAdminResponse>;
+  /**
+   * permanently hard-delete blobs — irreversible.
+   * pass `all=true` to purge every soft-deleted blob regardless of `blake3s`.
+   * pass specific `blake3s` with `all=false` (default) to delete only those hashes.
+   */
+  hubAdminHardDeleteBlobs(
+    peerNodeId: string,
+    blake3s: string[],
+    all?: boolean
+  ): Promise<HubAdminResponse>;
 }
 
 /** build a `HubAdminClient` bound to the given transport. */
@@ -334,6 +504,27 @@ export function createHubAdminClient(transport: HubAdminTransport): HubAdminClie
     },
     hubAdminListPendingKnocks(peerNodeId) {
       return sendAdminRequest(transport, peerNodeId, { kind: "listPendingKnocks" });
+    },
+    hubAdminDiskUsage(peerNodeId) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "diskUsage" });
+    },
+    hubAdminCanvasUsage(peerNodeId) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "canvasUsage" });
+    },
+    hubAdminBlobUsage(peerNodeId) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "blobUsage" });
+    },
+    hubAdminSoftDeleteBlobs(peerNodeId, blake3s) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "softDeleteBlobs", blake3s });
+    },
+    hubAdminRestoreBlobs(peerNodeId, blake3s) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "restoreBlobs", blake3s });
+    },
+    hubAdminListSoftDeleted(peerNodeId) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "listSoftDeleted" });
+    },
+    hubAdminHardDeleteBlobs(peerNodeId, blake3s, all = false) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "hardDeleteBlobs", blake3s, all });
     },
   };
 }

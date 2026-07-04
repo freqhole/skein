@@ -1379,6 +1379,7 @@ async fn blob_iroh_download(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<Value, DispatchError> {
+    use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
     use iroh_blobs::api::downloader::{DownloadProgressItem, Downloader};
     use iroh_blobs::{Hash, HashAndFormat};
     use n0_future::StreamExt;
@@ -1514,10 +1515,18 @@ async fn blob_iroh_download(
         .prepare_canonical_path(&args.blake3)
         .await
         .map_err(|e| DispatchError::Stream(format!("prepare blobz path: {e}")))?;
+    // TryReference renames the Owned .data file to the blobz canonical path
+    // (same filesystem => no copy; EXDEV falls back to copy). the fs store
+    // then tracks it as External and keeps serving it for P2P. the .obao4
+    // outboard (~0.1% of size) stays in the fs store.
     state
         .fs_store
         .blobs()
-        .export(hash, &target)
+        .export_with_opts(ExportOptions {
+            hash,
+            mode: ExportMode::TryReference,
+            target: target.clone(),
+        })
         .await
         .map_err(|e| DispatchError::Stream(format!("export to blobz path: {e}")))?;
     let blob = state

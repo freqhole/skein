@@ -290,3 +290,214 @@ describe("hub-admin-client", () => {
     expect(results[1]).toEqual({ kind: "list", friends: [] });
   });
 });
+
+// ---------------------------------------------------------------------------
+// storage / disk management wire shapes
+// ---------------------------------------------------------------------------
+
+describe("hubAdminDiskUsage", () => {
+  it("sends DiskUsage unit request and parses DiskUsage response with new field names", async () => {
+    const fake = createFakeNode({
+      DiskUsage: {
+        total_blob_bytes: 1_000_000,
+        blob_count: 42,
+        disk_available_bytes: 500_000_000,
+        disk_total_bytes: 1_000_000_000,
+        soft_deleted_blob_bytes: 8_192,
+        soft_deleted_blob_count: 3,
+      },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminDiskUsage(PEER_NODE_ID);
+
+    expect(fake.getWrittenRequest()).toEqual("DiskUsage");
+    expect(response).toEqual({
+      kind: "diskUsage",
+      usage: {
+        totalBlobBytes: 1_000_000,
+        blobCount: 42,
+        diskAvailableBytes: 500_000_000,
+        diskTotalBytes: 1_000_000_000,
+        softDeletedBlobBytes: 8_192,
+        softDeletedBlobCount: 3,
+      },
+    });
+  });
+
+  it("handles null disk_available/total_bytes", async () => {
+    const fake = createFakeNode({
+      DiskUsage: {
+        total_blob_bytes: 0,
+        blob_count: 0,
+        disk_available_bytes: null,
+        disk_total_bytes: null,
+        soft_deleted_blob_bytes: 0,
+        soft_deleted_blob_count: 0,
+      },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminDiskUsage(PEER_NODE_ID);
+
+    expect(response).toMatchObject({
+      kind: "diskUsage",
+      usage: { diskAvailableBytes: null, diskTotalBytes: null },
+    });
+  });
+});
+
+describe("hubAdminCanvasUsage", () => {
+  it("sends CanvasUsage unit request and parses CanvasUsage response", async () => {
+    const fake = createFakeNode({
+      CanvasUsage: {
+        canvases: [
+          { canvas_doc_id: "doc-abc", blob_count: 5, total_bytes: 2048 },
+          { canvas_doc_id: "doc-xyz", blob_count: 0, total_bytes: 0 },
+        ],
+      },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminCanvasUsage(PEER_NODE_ID);
+
+    expect(fake.getWrittenRequest()).toEqual("CanvasUsage");
+    expect(response).toEqual({
+      kind: "canvasUsage",
+      canvases: [
+        { canvasDocId: "doc-abc", blobCount: 5, totalBytes: 2048 },
+        { canvasDocId: "doc-xyz", blobCount: 0, totalBytes: 0 },
+      ],
+    });
+  });
+});
+
+describe("hubAdminBlobUsage", () => {
+  it("sends BlobUsage unit request and parses BlobUsage response", async () => {
+    const fake = createFakeNode({
+      BlobUsage: {
+        blobs: [
+          { blake3: "aabbcc", filename: "photo.jpg", mime: "image/jpeg", size: 4096, external: false, soft_deleted: false },
+          { blake3: "ddeeff", filename: null, mime: null, size: 512, external: true, soft_deleted: true },
+        ],
+      },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminBlobUsage(PEER_NODE_ID);
+
+    expect(fake.getWrittenRequest()).toEqual("BlobUsage");
+    expect(response).toEqual({
+      kind: "blobUsage",
+      blobs: [
+        { blake3: "aabbcc", filename: "photo.jpg", mime: "image/jpeg", size: 4096, external: false, softDeleted: false },
+        { blake3: "ddeeff", filename: null, mime: null, size: 512, external: true, softDeleted: true },
+      ],
+    });
+  });
+});
+
+describe("hubAdminListSoftDeleted", () => {
+  it("sends ListSoftDeleted unit request and parses SoftDeleted response with new shape", async () => {
+    const fake = createFakeNode({
+      SoftDeleted: {
+        blobs: [
+          {
+            blake3: "aabbcc",
+            filename: "old-photo.jpg",
+            mime: "image/jpeg",
+            size: 8192,
+            soft_deleted_at: 1_700_000_000,
+            soft_deleted_by: "node-admin-123",
+          },
+        ],
+      },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminListSoftDeleted(PEER_NODE_ID);
+
+    expect(fake.getWrittenRequest()).toEqual("ListSoftDeleted");
+    expect(response).toEqual({
+      kind: "softDeleted",
+      blobs: [
+        {
+          blake3: "aabbcc",
+          filename: "old-photo.jpg",
+          mime: "image/jpeg",
+          size: 8192,
+          softDeletedAt: 1_700_000_000,
+          softDeletedBy: "node-admin-123",
+        },
+      ],
+    });
+  });
+
+  it("returns empty list when no soft-deleted blobs", async () => {
+    const fake = createFakeNode({ SoftDeleted: { blobs: [] } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminListSoftDeleted(PEER_NODE_ID);
+
+    expect(response).toEqual({ kind: "softDeleted", blobs: [] });
+  });
+});
+
+describe("hubAdminSoftDeleteBlobs", () => {
+  it("sends SoftDeleteBlobs request and parses BlobsMutation response", async () => {
+    const fake = createFakeNode({ BlobsMutation: { affected: 2, failed: [] } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminSoftDeleteBlobs(PEER_NODE_ID, ["hash1", "hash2"]);
+
+    expect(fake.getWrittenRequest()).toEqual({ SoftDeleteBlobs: { blake3s: ["hash1", "hash2"] } });
+    expect(response).toEqual({ kind: "blobsMutation", affected: 2, failed: [] });
+  });
+
+  it("reports failures in BlobsMutation", async () => {
+    const fake = createFakeNode({ BlobsMutation: { affected: 1, failed: ["missing-hash"] } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminSoftDeleteBlobs(PEER_NODE_ID, ["ok-hash", "missing-hash"]);
+
+    expect(response).toEqual({ kind: "blobsMutation", affected: 1, failed: ["missing-hash"] });
+  });
+});
+
+describe("hubAdminRestoreBlobs", () => {
+  it("sends RestoreBlobs request and parses BlobsMutation response", async () => {
+    const fake = createFakeNode({ BlobsMutation: { affected: 1, failed: [] } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminRestoreBlobs(PEER_NODE_ID, ["hash1"]);
+
+    expect(fake.getWrittenRequest()).toEqual({ RestoreBlobs: { blake3s: ["hash1"] } });
+    expect(response).toEqual({ kind: "blobsMutation", affected: 1, failed: [] });
+  });
+});
+
+describe("hubAdminHardDeleteBlobs", () => {
+  it("sends HardDeleteBlobs with all=false for targeted deletion", async () => {
+    const fake = createFakeNode({ BlobsMutation: { affected: 1, failed: [] } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminHardDeleteBlobs(PEER_NODE_ID, ["hash1"]);
+
+    expect(fake.getWrittenRequest()).toEqual({
+      HardDeleteBlobs: { blake3s: ["hash1"], all: false },
+    });
+    expect(response).toEqual({ kind: "blobsMutation", affected: 1, failed: [] });
+  });
+
+  it("sends HardDeleteBlobs with all=true to purge all soft-deleted blobs", async () => {
+    const fake = createFakeNode({ BlobsMutation: { affected: 5, failed: [] } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminHardDeleteBlobs(PEER_NODE_ID, [], true);
+
+    expect(fake.getWrittenRequest()).toEqual({
+      HardDeleteBlobs: { blake3s: [], all: true },
+    });
+    expect(response).toEqual({ kind: "blobsMutation", affected: 5, failed: [] });
+  });
+});
