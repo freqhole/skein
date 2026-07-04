@@ -56,6 +56,16 @@ export interface DomOverlayHandle {
   getValue(): string;
   /** true after remove() has been called or the overlay tore itself down */
   readonly removed: boolean;
+  /**
+   * recompute the overlay's on-screen position/size from the anchor
+   * container's *current* global position and re-apply it. call this on
+   * every tick of a live widget drag (the container's local x/y already
+   * moved, but a `position: fixed` DOM element never follows on its own) —
+   * see widget-manager.ts's `onDragDelta`/batch-drag paths, which call the
+   * widget controller's optional `onReposition()` hook for exactly this.
+   * no-op once the overlay has been removed.
+   */
+  reposition(): void;
 }
 
 /**
@@ -93,15 +103,21 @@ export function createDomOverlay(options: DomOverlayOptions): DomOverlayHandle {
   // resolve enterCommits default: true for single-line, false for multiline
   const shouldEnterCommit = enterCommits ?? !multiline;
 
-  // convert PixiJS local coords to screen coords via toGlobal + canvas rect
-  const globalPos = container.toGlobal({ x: 0, y: 0 });
-  const globalEnd = container.toGlobal({ x: width, y: height });
-  const canvasRect = canvasElement.getBoundingClientRect();
-
-  const screenX = canvasRect.left + globalPos.x;
-  const screenY = canvasRect.top + globalPos.y;
-  const screenW = globalEnd.x - globalPos.x;
-  const screenH = globalEnd.y - globalPos.y;
+  // convert PixiJS local coords to screen coords via toGlobal + canvas rect.
+  // extracted as a closure (not just inline at creation time) so `reposition()`
+  // below can recompute it later using the container's then-current position.
+  const computeScreenRect = () => {
+    const globalPos = container.toGlobal({ x: 0, y: 0 });
+    const globalEnd = container.toGlobal({ x: width, y: height });
+    const canvasRect = canvasElement.getBoundingClientRect();
+    return {
+      x: canvasRect.left + globalPos.x,
+      y: canvasRect.top + globalPos.y,
+      w: globalEnd.x - globalPos.x,
+      h: globalEnd.y - globalPos.y,
+    };
+  };
+  const { x: screenX, y: screenY, w: screenW, h: screenH } = computeScreenRect();
 
   // create element
   const el = document.createElement(multiline ? "textarea" : "input") as
@@ -226,6 +242,15 @@ export function createDomOverlay(options: DomOverlayOptions): DomOverlayHandle {
 
     get removed(): boolean {
       return _removed;
+    },
+
+    reposition(): void {
+      if (_removed) return;
+      const rect = computeScreenRect();
+      s.left = `${rect.x}px`;
+      s.top = `${rect.y}px`;
+      s.width = `${rect.w}px`;
+      s.height = `${rect.h}px`;
     },
   };
 }

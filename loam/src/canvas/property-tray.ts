@@ -553,7 +553,16 @@ export class PropertyTray {
     this.root.y = Math.round(frameY - this.theme.frameHeaderHeight);
   }
 
-  private repositionIfNeeded(): void {
+  /**
+   * re-evaluate this tray's position against the currently selected widget's
+   * *live* frame position. safe to call frequently (e.g. on every tick of
+   * a drag, before the drag commits to the store) — no-ops if the tray
+   * isn't visible or the widget isn't currently selected. public so
+   * `init.ts` can wire it to `WidgetManager.onLiveMove()`, keeping the tray
+   * glued to the widget during a drag instead of only updating once the
+   * drag ends and `store.onChange()` fires.
+   */
+  repositionIfNeeded(): void {
     if (!this.currentWidgetId || !this.root.visible) return;
 
     // role can change while the tray is open (an admin downgrades the local

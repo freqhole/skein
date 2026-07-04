@@ -324,6 +324,24 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     connectionStatus.layout();
   }
 
+  // step 13a-resize: keep the top-right toolbar and bottom-left connection-
+  // status pill correctly positioned when the window is resized. pixi's own
+  // `resizeTo` plugin (app.init({resizeTo: mountElement})) only resizes the
+  // renderer/canvas itself — it never re-runs either widget's own layout(),
+  // which is what actually repositions them against the new screen bounds.
+  // debounced (rAF-coalesced) so a drag-resize of the window doesn't thrash
+  // layout on every intermediate `resize` event.
+  let resizeRaf: number | null = null;
+  const handleWindowResize = () => {
+    if (resizeRaf !== null) return;
+    resizeRaf = requestAnimationFrame(() => {
+      resizeRaf = null;
+      toolbar.layout();
+      connectionStatus?.layout();
+    });
+  };
+  window.addEventListener("resize", handleWindowResize);
+
   // step 13b-sync: loading overlay — shown when the canvas doc is empty (syncing).
   // fades out automatically when the first widget appears.
   let syncOverlay: Container | null = null;
@@ -384,6 +402,12 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     registry
   );
 
+  // step 13c-drag: keep the tray glued to the selected widget's *live*
+  // frame position while it's being dragged — store.onChange() (which
+  // repositionIfNeeded() is already subscribed to internally) only fires
+  // once the drag commits on release, not on every intermediate move.
+  const unsubTrayLiveMove = widgetManager.onLiveMove(() => propertyTray.repositionIfNeeded());
+
   // step 14: track local cursor movement and broadcast via presence manager.
   // skipped on the narthex — no cursor broadcasting needed on the home screen.
   const canvasEl = app.canvas as HTMLCanvasElement;
@@ -438,6 +462,13 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
       presenceManager.broadcastOffline();
 
       blobAclSync?.destroy();
+
+      window.removeEventListener("resize", handleWindowResize);
+      if (resizeRaf !== null) {
+        cancelAnimationFrame(resizeRaf);
+        resizeRaf = null;
+      }
+      unsubTrayLiveMove();
 
       if (onPointerMove) {
         canvasEl.removeEventListener("pointermove", onPointerMove);

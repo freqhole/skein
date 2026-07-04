@@ -218,6 +218,25 @@ export interface WidgetController {
   destroy: () => void;
   /** called when the canvas frame resizes. optional. */
   resize?: (width: number, height: number) => void;
+  /**
+   * called on every tick of a live frame drag (own drag or batch-drag as
+   * part of a multi-selection) — the frame's pixi container has already
+   * moved, but anything anchored via `position: fixed` DOM coordinates
+   * (see dom-overlay.ts) doesn't follow on its own. widgets with an active
+   * DOM text-input overlay (label/notepad/markdown) implement this to call
+   * the overlay's own `reposition()`. optional — most widgets have nothing
+   * to do here.
+   */
+  onReposition?: () => void;
+  /**
+   * called whenever a `WidgetOverlay`-hosted widget (social/messages/
+   * canvas-info panels) is shown or hidden via toggle()/close() — NOT
+   * called for ordinary canvas widgets, which are never hidden this way.
+   * used by messagez-widget.ts to reset its "keep this just-accepted
+   * invite row visible" state once the panel is actually closed, instead
+   * of on every re-render.
+   */
+  onVisibilityChange?: (visible: boolean) => void;
   /** declare input/output ports for dataflow wiring between widgets (future) */
   ports?: () => WidgetPortDeclaration;
   /** optional drop target handler — when present, the widget manager will

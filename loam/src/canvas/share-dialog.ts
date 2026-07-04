@@ -2,8 +2,8 @@
  * share dialog for the skein canvas app.
  *
  * uses @pixi/ui Dialog for the modal (backdrop, centering, button layout)
- * and DOM <input readonly> overlays for the share string / URL fields so
- * the user gets native text selection and clipboard support.
+ * and a DOM <input readonly> overlay for the share URL field so the user
+ * gets native text selection and clipboard support.
  *
  * everything else (labels, copy buttons, panel background) is pure pixi.
  */
@@ -40,7 +40,6 @@ export interface FriendInfo {
 export interface ShareDialogOptions {
   app: Application;
   theme: SkeinTheme;
-  shareString: string;
   shareUrl: string;
   /** list of peer node IDs this canvas is shared with (from canvas doc) */
   peers?: Array<{ nodeId: string; joinedAt: string; role?: CanvasRole }>;
@@ -48,6 +47,17 @@ export interface ShareDialogOptions {
   onRemovePeer?: (nodeId: string) => void;
   /** called when user clicks "add friend" on a peer — sends a friend request */
   onAddFriend?: (nodeId: string) => void | Promise<void>;
+  /**
+   * node ids the local peer already considers a friend (any accepted
+   * entry from the social doc's `friends` list, across all of a friend's
+   * `nodeIds`) — used to suppress the "friend" button for a peer row that's
+   * already a friend. without this, the button rendered unconditionally
+   * for every peer whenever `onAddFriend` was provided, even ones already
+   * friended (a real reported bug). omit/leave empty if unknown — the
+   * button then falls back to its old always-shown-when-provided behavior
+   * for that row.
+   */
+  knownFriendNodeIds?: string[] | Set<string>;
   /** called when the user changes an already-invited peer's role via the role toggle */
   onChangeRole?: (nodeId: string, role: InvitableRole) => void;
   /** list of friends who haven't been invited to this canvas yet */
@@ -80,6 +90,18 @@ export interface ShareDialogOptions {
     canvasTitle: string;
     sentAt: string;
   }>;
+  /**
+   * non-admin (member/viewer) mode: hides the "invite friends"/"hub
+   * nodes" sections and the "declined" section entirely — only the share
+   * URL, "shared with", and "pending invites" remain, and without any of
+   * the mutating action callbacks (the caller should also omit
+   * onRemovePeer/onChangeRole/onAddFriend/onInviteFriend/onCancelInvite in
+   * this mode; this flag only controls which *sections* render). the
+   * share URL row itself is always shown, admin or not — anyone shared
+   * with a canvas may reasonably want to re-share/copy the link.
+   * defaults to false (the full admin dialog).
+   */
+  readOnly?: boolean;
 }
 
 export interface ShareDialogHandle {
@@ -297,7 +319,8 @@ function buildPeerRow(
   onAddFriend?: (nodeId: string) => void | Promise<void>,
   displayName?: string,
   role?: CanvasRole,
-  onChangeRole?: (nodeId: string, role: InvitableRole) => void
+  onChangeRole?: (nodeId: string, role: InvitableRole) => void,
+  isAlreadyFriend?: boolean
 ): Container {
   const row = new Container();
 
@@ -342,6 +365,9 @@ function buildPeerRow(
   }
   // role toggle — shown for non-admin peers when a change handler is
   // provided. sits between the "friend" button and the copy button.
+  // the "friend" button/offset only applies when the peer genuinely isn't
+  // already a friend (see isAlreadyFriend param / knownFriendNodeIds).
+  const showFriendBtn = !!onAddFriend && !isAlreadyFriend;
   const showRoleToggle = !!onChangeRole && role !== "admin";
   if (showRoleToggle) {
     const toggle = buildRoleToggle(theme, role === "viewer" ? "viewer" : "member", (newRole) => {
@@ -349,7 +375,7 @@ function buildPeerRow(
     });
     let roleRightOffset = 8;
     if (onRemovePeer) roleRightOffset += 70;
-    if (onAddFriend) roleRightOffset += 70;
+    if (showFriendBtn) roleRightOffset += 70;
     toggle.container.x = scrollBoxWidth - toggle.width - roleRightOffset;
     toggle.container.y = (copyBtnH - toggle.height) / 2;
     row.addChild(toggle.container);
@@ -366,7 +392,7 @@ function buildPeerRow(
     adminText.eventMode = "none";
     let roleRightOffset = 8;
     if (onRemovePeer) roleRightOffset += 70;
-    if (onAddFriend) roleRightOffset += 70;
+    if (showFriendBtn) roleRightOffset += 70;
     adminText.x = scrollBoxWidth - adminText.width - roleRightOffset;
     adminText.y = (copyBtnH - adminText.height) / 2;
     row.addChild(adminText);
@@ -376,7 +402,7 @@ function buildPeerRow(
   const copyBtn = makeCopyButton(theme);
   let rightOffset = 8;
   if (onRemovePeer) rightOffset += 70;
-  if (onAddFriend) rightOffset += 70;
+  if (showFriendBtn) rightOffset += 70;
   if (showRoleToggle || role === "admin") rightOffset += 70;
   copyBtn.btn.x = scrollBoxWidth - copyBtn.width - rightOffset;
   copyBtn.btn.y = 0;
@@ -419,8 +445,8 @@ function buildPeerRow(
     });
   }
 
-  // add friend button (if handler provided)
-  if (onAddFriend) {
+  // add friend button (if handler provided and not already a friend)
+  if (showFriendBtn) {
     const friendBtnText = new Text({
       text: "friend",
       style: {
@@ -865,7 +891,8 @@ function createReadOnlyInput(
  * dismisses on backdrop click, Escape, or the close button.
  */
 export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle {
-  const { app, theme, shareString, shareUrl, onClose } = options;
+  const { app, theme, shareUrl, onClose } = options;
+  const readOnly = options.readOnly === true;
   const peerList = options.peers ?? [];
 
   let removed = false;
@@ -919,8 +946,13 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
     return { container: row, placeholder, copyBtn };
   }
 
-  const row1 = buildRow("share string", shareString);
-  const row2 = buildRow("share URL", shareUrl);
+  // share URL row — shown to everyone (admin or not; see
+  // ShareDialogOptions.readOnly), since anyone shared with a canvas may
+  // reasonably want to re-share/copy the link. "share string" (the raw
+  // encoded nodeId+docId, redundant with the URL and only ever useful to
+  // an admin) was removed entirely per explicit ask — the URL alone is
+  // what anyone actually needs to invite/join.
+  const shareUrlRow = buildRow("share URL", shareUrl);
 
   // -------------------------------------------------------------------------
   // peer list section
@@ -945,6 +977,10 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   } else {
     let peerY = peerLabel.height + LABEL_GAP;
     const nameMap = options.peerDisplayNames;
+    const knownFriends =
+      options.knownFriendNodeIds instanceof Set
+        ? options.knownFriendNodeIds
+        : new Set(options.knownFriendNodeIds ?? []);
     for (const peer of peerList) {
       const peerRow = buildPeerRow(
         peer.nodeId,
@@ -957,7 +993,8 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
         options.onAddFriend,
         nameMap?.get(peer.nodeId),
         peer.role,
-        options.onChangeRole
+        options.onChangeRole,
+        knownFriends.has(peer.nodeId)
       );
       peerRow.y = peerY;
       peerSection.addChild(peerRow);
@@ -966,59 +1003,65 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   }
 
   // -------------------------------------------------------------------------
-  // friend invite section
+  // friend invite section — admin-only (see ShareDialogOptions.readOnly)
   // -------------------------------------------------------------------------
 
   const friendSection = new Container();
   const friendLabel = makeLabel("invite friends", theme);
-  friendSection.addChild(friendLabel);
+  let friendList: FriendInfo[] = [];
+  let hubFriendList: FriendInfo[] = [];
 
   // dev/test-only: rendered display-name text for each friend-invite row,
   // by node id — see ShareDialogHandle.getFriendRowText().
   const friendRowNameTexts = new Map<string, Text>();
 
-  // hub friends get their own section below, always last — see
-  // splitFriendsForInvite()'s doc comment for the grouping rule.
-  const allFriends = options.friends ?? [];
-  const { regular: friendList, hub: hubFriendList } = splitFriendsForInvite(allFriends);
+  if (!readOnly) {
+    friendSection.addChild(friendLabel);
 
-  if (friendList.length === 0) {
-    const noFriendsText = new Text({
-      text: "no friends to invite",
-      style: {
-        fontFamily: theme.fontFamily,
-        fontSize: theme.fontSizeSmall,
-        fill: 0x6b7280,
-      },
-      resolution: theme.textResolution,
-    });
-    noFriendsText.eventMode = "none";
-    noFriendsText.y = friendLabel.height + LABEL_GAP;
-    friendSection.addChild(noFriendsText);
-  } else {
-    let friendY = friendLabel.height + LABEL_GAP;
-    for (const friend of friendList) {
-      const { container: friendRow, nameText } = buildFriendInviteRow(
-        friend,
-        theme,
-        scrollBoxWidth,
-        copyBtnH,
-        isRemoved,
-        options.onInviteFriend
-      );
-      friendRow.y = friendY;
-      friendSection.addChild(friendRow);
-      friendRowNameTexts.set(friend.nodeId, nameText);
-      friendY += copyBtnH + 4;
+    // hub friends get their own section below, always last — see
+    // splitFriendsForInvite()'s doc comment for the grouping rule.
+    const allFriends = options.friends ?? [];
+    ({ regular: friendList, hub: hubFriendList } = splitFriendsForInvite(allFriends));
+
+    if (friendList.length === 0) {
+      const noFriendsText = new Text({
+        text: "no friends to invite",
+        style: {
+          fontFamily: theme.fontFamily,
+          fontSize: theme.fontSizeSmall,
+          fill: 0x6b7280,
+        },
+        resolution: theme.textResolution,
+      });
+      noFriendsText.eventMode = "none";
+      noFriendsText.y = friendLabel.height + LABEL_GAP;
+      friendSection.addChild(noFriendsText);
+    } else {
+      let friendY = friendLabel.height + LABEL_GAP;
+      for (const friend of friendList) {
+        const { container: friendRow, nameText } = buildFriendInviteRow(
+          friend,
+          theme,
+          scrollBoxWidth,
+          copyBtnH,
+          isRemoved,
+          options.onInviteFriend
+        );
+        friendRow.y = friendY;
+        friendSection.addChild(friendRow);
+        friendRowNameTexts.set(friend.nodeId, nameText);
+        friendY += copyBtnH + 4;
+      }
     }
   }
 
   // -------------------------------------------------------------------------
-  // hub friends section — always last, only shown when non-empty
+  // hub friends section — always last, only shown when non-empty (and
+  // never in read-only mode — see ShareDialogOptions.readOnly)
   // -------------------------------------------------------------------------
 
   const hubFriendSection = new Container();
-  if (hubFriendList.length > 0) {
+  if (!readOnly && hubFriendList.length > 0) {
     const hubFriendLabel = makeLabel("hub nodes", theme);
     hubFriendSection.addChild(hubFriendLabel);
 
@@ -1083,42 +1126,43 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   }
 
   // -------------------------------------------------------------------------
-  // declined invites section
+  // declined invites section — admin-only (see ShareDialogOptions.readOnly)
   // -------------------------------------------------------------------------
 
   const declinedSection = new Container();
   const declinedLabel = makeLabel("declined", theme);
-  declinedSection.addChild(declinedLabel);
+  const declinedList = readOnly ? [] : (options.declinedInvites ?? []);
 
-  const declinedList = options.declinedInvites ?? [];
-
-  if (declinedList.length === 0) {
-    const noneText = new Text({
-      text: "none",
-      style: {
-        fontFamily: theme.fontFamily,
-        fontSize: theme.fontSizeSmall,
-        fill: 0x6b7280,
-      },
-      resolution: theme.textResolution,
-    });
-    noneText.eventMode = "none";
-    noneText.y = declinedLabel.height + LABEL_GAP;
-    declinedSection.addChild(noneText);
-  } else {
-    let declinedY = declinedLabel.height + LABEL_GAP;
-    for (const entry of declinedList) {
-      const declinedRow = buildDeclinedRow(
-        entry.toNodeId,
-        entry.toUsername,
-        theme,
-        scrollBoxWidth,
-        copyBtnH,
-        nameMap?.get(entry.toNodeId)
-      );
-      declinedRow.y = declinedY;
-      declinedSection.addChild(declinedRow);
-      declinedY += copyBtnH + 4;
+  if (!readOnly) {
+    declinedSection.addChild(declinedLabel);
+    if (declinedList.length === 0) {
+      const noneText = new Text({
+        text: "none",
+        style: {
+          fontFamily: theme.fontFamily,
+          fontSize: theme.fontSizeSmall,
+          fill: 0x6b7280,
+        },
+        resolution: theme.textResolution,
+      });
+      noneText.eventMode = "none";
+      noneText.y = declinedLabel.height + LABEL_GAP;
+      declinedSection.addChild(noneText);
+    } else {
+      let declinedY = declinedLabel.height + LABEL_GAP;
+      for (const entry of declinedList) {
+        const declinedRow = buildDeclinedRow(
+          entry.toNodeId,
+          entry.toUsername,
+          theme,
+          scrollBoxWidth,
+          copyBtnH,
+          nameMap?.get(entry.toNodeId)
+        );
+        declinedRow.y = declinedY;
+        declinedSection.addChild(declinedRow);
+        declinedY += copyBtnH + 4;
+      }
     }
   }
 
@@ -1172,25 +1216,40 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   //   dialogHeight - 2*padding - buttonContainer.height - titleText.height
   //
   // our content needs:
-  //   row1 height + elementsMargin + row2 height
+  //   shareUrlRow height + elementsMargin + ...
   // -------------------------------------------------------------------------
+
+  // the actual list of top-level content sections, in render order — built
+  // once and reused both for the Dialog's `content` array below and for
+  // gap-count math, so the two can never silently drift apart (e.g. when
+  // `readOnly` hides some of them).
+  const contentSections: Container[] = [
+    shareUrlRow.container,
+    peerSection,
+    ...(readOnly ? [] : [friendSection]),
+    ...(!readOnly && hubFriendList.length > 0 ? [hubFriendSection] : []),
+    pendingSection,
+    ...(readOnly ? [] : [declinedSection]),
+  ];
 
   const rowHeight = titleText.height + LABEL_GAP + INPUT_HEIGHT; // approximate single row
   const peerSectionHeight =
     peerLabel.height + LABEL_GAP + Math.max(1, peerList.length) * (copyBtnH + 4);
-  const friendSectionHeight =
-    friendLabel.height + LABEL_GAP + Math.max(1, friendList.length) * (copyBtnH + 4);
+  const friendSectionHeight = readOnly
+    ? 0
+    : friendLabel.height + LABEL_GAP + Math.max(1, friendList.length) * (copyBtnH + 4);
   const hubFriendSectionHeight =
-    hubFriendList.length > 0
+    !readOnly && hubFriendList.length > 0
       ? hubFriendSection.getChildAt(0).height + LABEL_GAP + hubFriendList.length * (copyBtnH + 4)
       : 0;
   const pendingSectionHeight =
     pendingLabel.height + LABEL_GAP + Math.max(1, pendingList.length) * (copyBtnH + 4);
-  const declinedSectionHeight =
-    declinedLabel.height + LABEL_GAP + Math.max(1, declinedList.length) * (copyBtnH + 4);
+  const declinedSectionHeight = readOnly
+    ? 0
+    : declinedLabel.height + LABEL_GAP + Math.max(1, declinedList.length) * (copyBtnH + 4);
   const contentNeeded =
-    rowHeight * 2 +
-    SECTION_GAP * (5 + (hubFriendList.length > 0 ? 1 : 0)) +
+    rowHeight +
+    SECTION_GAP * Math.max(0, contentSections.length - 1) +
     peerSectionHeight +
     friendSectionHeight +
     hubFriendSectionHeight +
@@ -1218,15 +1277,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
     width: DIALOG_WIDTH,
     height: DIALOG_HEIGHT,
     padding: DIALOG_PADDING,
-    content: [
-      row1.container,
-      row2.container,
-      peerSection,
-      friendSection,
-      ...(hubFriendList.length > 0 ? [hubFriendSection] : []),
-      pendingSection,
-      declinedSection,
-    ],
+    content: contentSections,
     buttons: [closeButton],
     scrollBox: {
       background: 0x141414,
@@ -1254,9 +1305,8 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   app.stage.updateTransform({});
 
   const canvasEl = app.canvas as HTMLCanvasElement;
-  const input1 = createReadOnlyInput(row1.placeholder, canvasEl, shareString, theme);
-  const input2 = createReadOnlyInput(row2.placeholder, canvasEl, shareUrl, theme);
-  domInputs.push(input1, input2);
+  const shareUrlInput = createReadOnlyInput(shareUrlRow.placeholder, canvasEl, shareUrl, theme);
+  domInputs.push(shareUrlInput);
 
   // -------------------------------------------------------------------------
   // close / teardown wiring

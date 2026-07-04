@@ -934,6 +934,11 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
     return {
       container,
 
+      onReposition() {
+        titleOverlay?.reposition();
+        descOverlay?.reposition();
+      },
+
       destroy() {
         if (titleOverlay) {
           titleOverlay.remove();

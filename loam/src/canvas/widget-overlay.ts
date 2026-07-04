@@ -65,11 +65,13 @@ export class WidgetOverlay {
         this.reposition(screenW);
       }
     }
+    this.ctrl.onVisibilityChange?.(this._isOpen);
   }
 
   close(): void {
     this._isOpen = false;
     this.panel.visible = false;
+    this.ctrl.onVisibilityChange?.(false);
   }
 
   layout(screenW: number): void {

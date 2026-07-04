@@ -402,6 +402,10 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
     return {
       container,
 
+      onReposition() {
+        activeOverlay?.reposition();
+      },
+
       destroy() {
         if (activeOverlay) {
           activeOverlay.remove();

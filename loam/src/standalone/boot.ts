@@ -804,14 +804,12 @@ class SkeinRouter {
         },
         onShare: async () => {
           if (!this.currentCanvas) return;
-          // defense in depth: the toolbar already hides the share button for
-          // non-admins (see Toolbar.applyRoleGating()), but guard the actual
-          // handler too in case gating hasn't refreshed yet (e.g. a role
-          // change just landed via sync).
-          if (!this.currentCanvas.store.isLocalAdmin()) {
-            log.debug(TAG, "share blocked — local peer is not an admin on this canvas");
-            return;
-          }
+          // the toolbar itself no longer hides the share button for
+          // non-admins (see Toolbar.applyRoleGating()) — everyone can open
+          // it, but a non-admin only gets a read-only view (who it's
+          // shared with + pending invites, no action controls) built
+          // below via `readOnly`/omitted mutating callbacks.
+          const isAdmin = this.currentCanvas.store.isLocalAdmin();
           const identity = await getStoredIdentity();
           if (!identity) {
             log.debug(TAG, "no identity — generate one first (profile widget)");
@@ -953,14 +951,21 @@ class SkeinRouter {
 
           // build a nodeId -> display name map from friends for the peer list
           const peerDisplayNames = new Map<string, string>();
+          // node ids the local peer already considers a friend (any nodeId
+          // across any confirmed friend entry) — passed to the dialog so
+          // the "friend" button on a peer row is suppressed for someone
+          // who's already a friend instead of showing unconditionally
+          // whenever onAddFriend is present (a real reported bug).
+          const knownFriendNodeIds = new Set<string>();
           if (this.socialDoc) {
             const state = this.socialDoc.current;
             if (state?.friends) {
               for (const friend of state.friends) {
                 const name = friend.alias || friend.username || "";
-                if (!name) continue;
                 for (const n of friend.nodeIds) {
-                  if (n.nodeId) peerDisplayNames.set(n.nodeId, name);
+                  if (!n.nodeId) continue;
+                  if (name) peerDisplayNames.set(n.nodeId, name);
+                  knownFriendNodeIds.add(n.nodeId);
                 }
               }
             }
@@ -1004,11 +1009,14 @@ class SkeinRouter {
           const shareOptions: ShareDialogOptions = {
             app: this.currentCanvas!.app,
             theme: this.currentCanvas!.theme,
-            shareString: shareStr,
             shareUrl,
             peers: peerList,
             peerDisplayNames,
-            onRemovePeer: (nodeId: string) => {
+            readOnly: !isAdmin,
+            knownFriendNodeIds,
+            onRemovePeer: !isAdmin
+              ? undefined
+              : (nodeId: string) => {
               // remove from canvas doc
               this.currentCanvas?.store.removePeer(nodeId);
               // tell the adapter to stop reconnecting to this peer
@@ -1035,7 +1043,9 @@ class SkeinRouter {
               });
               log.debug(TAG, "revoked access for peer:", nodeId.slice(0, 16) + "...");
             },
-            onChangeRole: (nodeId: string, role: InvitableRole) => {
+            onChangeRole: !isAdmin
+              ? undefined
+              : (nodeId: string, role: InvitableRole) => {
               this.currentCanvas?.store.setRole(nodeId, role);
               // best-effort live notification (see onRemovePeer above for
               // why this matters — otherwise a peer's own narthex card
@@ -1056,16 +1066,20 @@ class SkeinRouter {
               });
               log.debug(TAG, "changed role for peer:", nodeId.slice(0, 16) + "...", "->", role);
             },
-            onAddFriend: async (nodeId: string) => {
-              try {
-                await sendFriendRequest(nodeId);
-                log.debug(TAG, "friend request sent to:", nodeId.slice(0, 16) + "...");
-              } catch (err) {
-                log.warn(TAG, "failed to send friend request:", err);
-              }
-            },
-            friends: friendsForInvite,
-            onInviteFriend: async (friend: FriendInfo, role: InvitableRole) => {
+            onAddFriend: !isAdmin
+              ? undefined
+              : async (nodeId: string) => {
+                  try {
+                    await sendFriendRequest(nodeId);
+                    log.debug(TAG, "friend request sent to:", nodeId.slice(0, 16) + "...");
+                  } catch (err) {
+                    log.warn(TAG, "failed to send friend request:", err);
+                  }
+                },
+            friends: isAdmin ? friendsForInvite : undefined,
+            onInviteFriend: !isAdmin
+              ? undefined
+              : async (friend: FriendInfo, role: InvitableRole) => {
               if (!this.friendzProtocol || !this.currentCanvas) return;
               const localIdentity = await getStoredIdentity();
               if (!localIdentity) return;
@@ -1171,8 +1185,10 @@ class SkeinRouter {
               log.debug(TAG, "canvas invite sent to:", friend.nodeId.slice(0, 16) + "...");
             },
             pendingInvites: pendingInvitesList,
-            declinedInvites,
-            onCancelInvite: (targetNodeId: string) => {
+            declinedInvites: isAdmin ? declinedInvites : undefined,
+            onCancelInvite: !isAdmin
+              ? undefined
+              : (targetNodeId: string) => {
               this.currentCanvas?.store.removePendingInvite(targetNodeId);
               // also clear the messagez outbox share entry for this canvas/
               // peer pair — that outbox entry (not the canvas-doc pending

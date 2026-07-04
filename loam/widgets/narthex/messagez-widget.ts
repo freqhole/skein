@@ -313,6 +313,15 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
     // whether to show accepted/declined invites in inbox
     let showAccepted = false;
 
+    // invite ids accepted during the *current* time the messages panel has
+    // been open — kept visible regardless of `showAccepted` so the user
+    // gets a chance to actually open the newly-joined canvas (via the
+    // "open" button below) instead of the row vanishing the instant
+    // acceptance completes. cleared when the panel closes (onVisibilityChange
+    // below) or when "open" is clicked, so hiding resumes as normal
+    // (governed by `showAccepted`) the next time the panel is opened.
+    const recentlyAcceptedIds = new Set<string>();
+
     // cache the local node id (resolved async)
     let localNodeId = "";
     getStoredIdentity().then((id) => {
@@ -898,6 +907,10 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
                 );
                 if (inv) inv.status = "accepted";
               });
+              // keep this row visible (with an "open" button) even though
+              // `showAccepted` may be off — see recentlyAcceptedIds' doc
+              // comment above.
+              recentlyAcceptedIds.add(inviteId);
               layout(currentWidth, currentHeight);
             };
 
@@ -1087,6 +1100,46 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
             );
           });
           rowContainer.addChild(reAddBtn);
+
+          // open button — lets the user actually navigate to the just-
+          // joined canvas while its row is still forced-visible (see
+          // recentlyAcceptedIds above), instead of having to hunt for its
+          // narthex canvas-card. real hash navigation, same mechanism
+          // clicking a canvas-card itself uses (SkeinRouter.onHashChange()
+          // in boot.ts).
+          const openW = 52;
+          const openH = 20;
+          const openBtn = new Container();
+          openBtn.eventMode = "static";
+          openBtn.cursor = "pointer";
+          openBtn.hitArea = new Rectangle(0, 0, openW, openH);
+          openBtn.x = reAddBtn.x - openW - 6;
+          openBtn.y = ROW_HEIGHT - openH - 4;
+
+          const openBg = new Graphics();
+          openBg.eventMode = "none";
+          openBg.roundRect(0, 0, openW, openH, 4);
+          openBg.fill({ color: 0x111118 });
+          openBg.stroke({ color: MUTED_TEXT, width: 1.5 });
+          openBtn.addChild(openBg);
+
+          const openLabel = new Text({
+            text: "open",
+            style: { fontFamily: FONT, fontSize: 9, fill: TEXT_COLOR },
+            resolution: RESOLUTION,
+          });
+          openLabel.eventMode = "none";
+          openLabel.anchor.set(0.5);
+          openLabel.x = openW / 2;
+          openLabel.y = openH / 2;
+          openBtn.addChild(openLabel);
+
+          openBtn.on("pointertap", (e) => {
+            e.stopPropagation();
+            recentlyAcceptedIds.delete(invite.id);
+            window.location.hash = invite.canvasDocId;
+          });
+          rowContainer.addChild(openBtn);
         } else if (invite.status === "declined") {
           const statusIcon = new Text({
             text: "\u00d7",
@@ -1824,29 +1877,51 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
       // tab bar
       drawTabBar(y, pendingCount);
 
-      // position "clear all" and "show resolved" on the tab bar line
+      // position "clear all" and "show resolved"/"show accepted" — on the
+      // tab bar line when there's room, or wrapped to their own row below
+      // it when the container is too narrow to fit both the tab labels
+      // and these buttons without overlapping (a real reported bug: on a
+      // narrow messagez panel, these could be squeezed off the visible
+      // area entirely instead of just wrapping).
       const tabBtnY = y + (TAB_HEIGHT - (TAB_FONT_SIZE - 1)) / 2;
       const currentTabItems = viewMode === "inbox" ? invites.length : shares.length;
+      const btnGap = 12;
 
       clearAllText.visible = currentTabItems > 0;
-      clearAllText.x = w - PADDING_X - clearAllText.width;
-      clearAllText.y = tabBtnY;
-
       toggleResolvedText.text = showResolved ? "hide resolved" : "show resolved";
       toggleResolvedText.visible = viewMode === "outbox" && shares.length > 0;
-      toggleResolvedText.x = clearAllText.visible
-        ? clearAllText.x - toggleResolvedText.width - 12
-        : w - PADDING_X - toggleResolvedText.width;
-      toggleResolvedText.y = tabBtnY;
-
       toggleAcceptedText.text = showAccepted ? "hide accepted" : "show accepted";
       toggleAcceptedText.visible = viewMode === "inbox" && invites.length > 0;
-      toggleAcceptedText.x = clearAllText.visible
-        ? clearAllText.x - toggleAcceptedText.width - 12
-        : w - PADDING_X - toggleAcceptedText.width;
-      toggleAcceptedText.y = tabBtnY;
 
-      y += TAB_HEIGHT + 4;
+      // only one of these two is ever visible at once (inbox vs outbox
+      // view) — whichever it is sits immediately left of "clear all".
+      const toggleText = viewMode === "outbox" ? toggleResolvedText : toggleAcceptedText;
+
+      let buttonsRowWidth = 0;
+      if (clearAllText.visible) buttonsRowWidth += clearAllText.width;
+      if (toggleText.visible) {
+        buttonsRowWidth += toggleText.width + (clearAllText.visible ? btnGap : 0);
+      }
+
+      const tabLabelsRightEdge = tabOutboxText.x + tabOutboxText.width;
+      const fitsOnTabRow =
+        buttonsRowWidth === 0 || w - tabLabelsRightEdge - btnGap - PADDING_X >= buttonsRowWidth;
+      const buttonsRowY = fitsOnTabRow ? tabBtnY : tabBtnY + TAB_HEIGHT;
+
+      clearAllText.x = w - PADDING_X - clearAllText.width;
+      clearAllText.y = buttonsRowY;
+
+      toggleResolvedText.x = clearAllText.visible
+        ? clearAllText.x - toggleResolvedText.width - btnGap
+        : w - PADDING_X - toggleResolvedText.width;
+      toggleResolvedText.y = buttonsRowY;
+
+      toggleAcceptedText.x = clearAllText.visible
+        ? clearAllText.x - toggleAcceptedText.width - btnGap
+        : w - PADDING_X - toggleAcceptedText.width;
+      toggleAcceptedText.y = buttonsRowY;
+
+      y += TAB_HEIGHT + (fitsOnTabRow ? 0 : TAB_HEIGHT) + 4;
 
       // hide all view containers
       inboxListContainer.visible = false;
@@ -1871,10 +1946,13 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         inboxListContainer.y = inboxAreaY;
         inboxListContainer.hitArea = new Rectangle(0, 0, contentW, inboxAreaHeight);
 
-        // filter invites based on toggle
-        const visibleInvites = showAccepted
-          ? invites
-          : invites.filter((inv: CanvasInvite) => inv.status === "pending");
+        // filter invites based on toggle — a just-accepted invite (this
+        // panel-open session) stays visible regardless of `showAccepted`,
+        // see recentlyAcceptedIds' doc comment.
+        const visibleInvites = invites.filter(
+          (inv: CanvasInvite) =>
+            showAccepted || inv.status === "pending" || recentlyAcceptedIds.has(inv.id)
+        );
 
         // filter deletions based on toggle
         const visibleDeletions = deletions.filter(
@@ -2165,6 +2243,16 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
     const controller: WidgetController & { testHooks: MessagezTestHooks } = {
       container,
       testHooks,
+
+      onVisibilityChange(visible: boolean) {
+        // panel closed (toggled off, or dismissed) — resume normal
+        // showAccepted-governed hiding for any invites accepted while it
+        // was open, rather than leaving them force-visible forever.
+        if (!visible && recentlyAcceptedIds.size > 0) {
+          recentlyAcceptedIds.clear();
+          layout(currentWidth, currentHeight);
+        }
+      },
 
       destroy() {
         unsub();

@@ -234,6 +234,10 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
     return {
       container,
 
+      onReposition() {
+        activeOverlay?.reposition();
+      },
+
       destroy() {
         if (activeOverlay) {
           activeOverlay.remove();

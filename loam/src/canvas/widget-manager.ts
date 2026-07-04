@@ -96,6 +96,13 @@ export class WidgetManager {
   /** callback to navigate home (narthex) — used as the first breadcrumb */
   private onNavigateHome: (() => void) | null = null;
 
+  /** listeners notified on every tick of a live drag (own or batch) — see
+   *  `onLiveMove()`. lets external UI anchored to a widget's screen
+   *  position (the property tray, DOM text-input overlays) follow the
+   *  frame live instead of only updating once the drag commits to the
+   *  store (which only happens on release). */
+  private liveMoveListeners: Array<() => void> = [];
+
   constructor(
     store: CanvasStore,
     registry: WidgetRegistry,
@@ -690,6 +697,15 @@ export class WidgetManager {
       onDragDelta: (dx: number, dy: number) => {
         this.handleBatchDragDelta(widgetId, dx, dy);
         this.checkDropTargetHover(widgetId);
+        // the dragged widget's own frame already moved (widget-frame.ts's
+        // updateDrag()) — notify anything anchored to its live position.
+        const live = this.liveWidgets.get(widgetId);
+        try {
+          live?.ctrl.onReposition?.();
+        } catch (err) {
+          console.warn(`widget ${widgetId} threw during onReposition callback:`, err);
+        }
+        this.notifyLiveMove();
       },
       onDragEnd: () => {
         this.tryDropOnTarget(widgetId);
@@ -753,7 +769,33 @@ export class WidgetManager {
       const live = this.liveWidgets.get(id);
       if (live) {
         live.frame.setPosition(startPos.x + dx, startPos.y + dy);
+        try {
+          live.ctrl.onReposition?.();
+        } catch (err) {
+          console.warn(`widget ${id} threw during onReposition callback:`, err);
+        }
       }
+    }
+  }
+
+  /**
+   * subscribe to be notified on every tick of a live drag (own or
+   * batch-dragged). returns an unsubscribe function. used by init.ts to
+   * keep the property tray glued to the selected widget's live position
+   * during a drag, instead of only repositioning once the drag ends and
+   * commits to the store (see property-tray.ts's `repositionIfNeeded()`,
+   * which is store-change-driven and therefore otherwise silent mid-drag).
+   */
+  onLiveMove(handler: () => void): () => void {
+    this.liveMoveListeners.push(handler);
+    return () => {
+      this.liveMoveListeners = this.liveMoveListeners.filter((h) => h !== handler);
+    };
+  }
+
+  private notifyLiveMove(): void {
+    for (const handler of this.liveMoveListeners) {
+      handler();
     }
   }
 

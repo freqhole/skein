@@ -333,6 +333,9 @@ export const labelWidget: WidgetFactory<typeof labelSchema> = {
 
     return {
       container,
+      onReposition() {
+        activeOverlay?.reposition();
+      },
       destroy() {
         if (activeOverlay) {
           activeOverlay.remove();

@@ -783,8 +783,14 @@ export class Toolbar {
 
   // -- layout ----------------------------------------------------------------
 
-  /** position all visible buttons horizontally and redraw the toolbar background. */
-  private layout(): void {
+  /**
+   * position all visible buttons horizontally and redraw the toolbar
+   * background. reads `app.screen.width` fresh each call, so it's also the
+   * right thing to call after a window resize — see `init.ts`'s debounced
+   * `resize` listener, which calls this via `refreshRoleGating()`'s public
+   * sibling below.
+   */
+  layout(): void {
     const BTN_SIZE = 28; // circle button diameter
     const gap = 6;
     const pad = { h: 8, v: 4 };
@@ -1040,9 +1046,12 @@ export class Toolbar {
     }
     this.deleteBtn.visible = !isViewer && this.inputRouter.selectedWidgetIds.size > 0;
 
-    if (this.shareBtn) {
-      this.shareBtn.visible = this.store.isLocalAdmin();
-    }
+    // the share button itself is visible for everyone (viewers included) —
+    // non-admins get a read-only dialog (see boot.ts's onShare handler and
+    // showShareDialog()'s `readOnly` option) showing who it's shared with
+    // and pending invites, with no share-string/URL/invite-friend controls.
+    // previously hidden entirely for non-admins, which also hid "who is
+    // this shared with" from everyone but the owner (a real reported bug).
   }
 
   /** re-apply role gating — call after `store.setLocalNodeId()` runs, since
