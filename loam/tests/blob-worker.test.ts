@@ -69,3 +69,25 @@ test("streaming upload session: chunked blake3 + OPFS write matches the one-shot
   // and the bytes must have landed under the blake3 content address
   expect(result.opfsByteLength).toBe(2_500_000);
 });
+
+// stage-0 opfs-store spike (docs/opfs-store-implementation-plan.md phase C):
+// midden's out-of-crate iroh-blobs store actor persisting to real OPFS via
+// sync access handles. the selftest runs inside the blob worker (dedicated
+// worker context) and exercises the REAL iroh-blobs api surface:
+// add_bytes -> get_bytes -> status -> export_bao -> import_bao_bytes into a
+// second store -> get_bytes. any mismatch throws.
+test("opfs store spike: full import/export round trip through the real iroh-blobs api", async ({
+  canvasPage,
+}) => {
+  test.setTimeout(90_000);
+  const { page } = await canvasPage();
+
+  const summary = await page.evaluate(async () => {
+    const helpers = (window as any).__skeinHelpers;
+    const worker = await helpers.getBlobWorker();
+    return worker.opfsStoreSelftest() as Promise<string>;
+  });
+
+  expect(summary).toContain("opfs store selftest OK");
+  expect(summary).toContain("1500000 bytes");
+});

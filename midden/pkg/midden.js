@@ -5,6 +5,6 @@ import { __wbg_set_wasm } from "./midden_bg.js";
 __wbg_set_wasm(wasm);
 wasm.__wbindgen_start();
 export {
-    BiStream, Blake3Hasher, HelloImageResult, ImportSession, IntoUnderlyingByteSource, IntoUnderlyingSink, IntoUnderlyingSource, MiddenNode, hash_blake3, start
+    BiStream, Blake3Hasher, HelloImageResult, ImportSession, IntoUnderlyingByteSource, IntoUnderlyingSink, IntoUnderlyingSource, MiddenNode, hash_blake3, opfs_store_selftest, start
 } from "./midden_bg.js";
 export { wasm as __wasm }

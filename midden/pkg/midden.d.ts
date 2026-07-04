@@ -426,4 +426,11 @@ export class MiddenNode {
  */
 export function hash_blake3(data: Uint8Array): string;
 
+/**
+ * stage-0 opfs store spike selftest — runs the full import/export round
+ * trip against real OPFS through the real iroh-blobs api. worker context
+ * required (sync access handles). see src/opfs_store.rs.
+ */
+export function opfs_store_selftest(): Promise<string>;
+
 export function start(): void;

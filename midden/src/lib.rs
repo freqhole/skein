@@ -9,6 +9,7 @@
 
 use bao_tree::ChunkRanges;
 use indexmap::IndexMap;
+mod opfs_store;
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::ProtocolHandler;
@@ -330,6 +331,14 @@ fn start() {
 #[wasm_bindgen]
 pub fn hash_blake3(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
+}
+
+/// stage-0 opfs store spike selftest — runs the full import/export round
+/// trip against real OPFS through the real iroh-blobs api. worker context
+/// required (sync access handles). see src/opfs_store.rs.
+#[wasm_bindgen]
+pub async fn opfs_store_selftest() -> Result<String, JsError> {
+    opfs_store::selftest().await.map_err(|e| JsError::new(&e))
 }
 
 /// incremental blake3 hasher for streaming uploads — feed fixed-size chunks

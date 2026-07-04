@@ -409,6 +409,19 @@ async function uploadAbort(id: number): Promise<void> {
   await dir?.removeEntry(session.tmpName).catch(() => {});
 }
 
+/**
+ * stage-0 opfs-store spike selftest — runs midden's out-of-crate iroh-blobs
+ * store round trip against real OPFS. must run here (dedicated worker):
+ * sync access handles don't exist on the main thread. throws on failure.
+ */
+async function opfsStoreSelftest(): Promise<string> {
+  const fn = (middenWasm as any).opfs_store_selftest;
+  if (typeof fn !== "function") {
+    throw new Error("opfs_store_selftest missing from midden wasm build");
+  }
+  return fn();
+}
+
 const api = {
   hashBlake3,
   hashSha256,
@@ -423,6 +436,7 @@ const api = {
   uploadPush,
   uploadFinish,
   uploadAbort,
+  opfsStoreSelftest,
 };
 
 export type BlobWorkerApi = typeof api;
