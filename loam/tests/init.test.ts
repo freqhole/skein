@@ -148,6 +148,7 @@ test("registry contains the expected widget types", async ({ canvasPage }) => {
   expect(types).toContain("markdown");
   expect(types).toContain("doodle");
   expect(types).toContain("audio-recording");
+  expect(types).toContain("voice-recording");
   expect(types).toContain("file");
   expect(types).toContain("peedeeeff");
   expect(types).toContain("bin");
@@ -156,7 +157,7 @@ test("registry contains the expected widget types", async ({ canvasPage }) => {
   expect(types).toContain("canvas-card");
   expect(types).toContain("canvas-wizard");
   expect(types).toContain("canvas-link-picker");
-  expect(types).toHaveLength(14);
+  expect(types).toHaveLength(15);
 });
 
 test("canvas persists widgets across sessions via IndexedDB", async ({ browser }) => {
