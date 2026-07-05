@@ -4,6 +4,7 @@ import { createTestRegistry } from "../../widgets/index";
 import { createNarthexRegistry } from "../../widgets/narthex/index";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
 import type { CanvasDocument, InvitableRole } from "../canvas/canvas-doc";
+import { registerPeerName } from "../canvas/peer-names";
 import { CanvasStore } from "../canvas/canvas-store";
 import type { ConnectionStateSource } from "../canvas/connection-status";
 import { initCanvas, type SkeinCanvas } from "../canvas/init";
@@ -1275,6 +1276,15 @@ class SkeinRouter {
           let shareActive = true;
           let isRebuilding = false;
           let shareOptions = buildShareOptions();
+          // the dialog destructures onClose AT CALL TIME, so it must be set
+          // BEFORE showShareDialog — assigning it after (as this code once
+          // did) left the FIRST dialog instance with no close handler:
+          // closing it never tore down the store subscriptions, and the next
+          // canvas-store change (e.g. selecting a widget) "randomly"
+          // reopened the dialog via rebuild(). the arrow indirection is safe:
+          // teardownSubscriptions is declared below but only ever called
+          // after it exists (on user close).
+          shareOptions.onClose = () => teardownSubscriptions();
           let shareHandle = showShareDialog(shareOptions);
 
           let rebuildQueued = false;
@@ -2232,6 +2242,19 @@ class SkeinRouter {
         // sync avatar image into the toolbar button
         const avatarUrl = this.socialDoc?.current.profile?.avatarDataUrl ?? null;
         canvas.toolbar.setAvatarUrl(avatarUrl || null);
+        // feed the session peer-name registry (used by widgets to display
+        // human names for node ids, e.g. the file tray's who-has-it rows)
+        const state = this.socialDoc?.current;
+        if (state?.profile?.username && this.localNodeId) {
+          registerPeerName(this.localNodeId, state.profile.username);
+        }
+        for (const friend of state?.friends ?? []) {
+          for (const n of friend.nodeIds ?? []) {
+            if (!n.nodeId) continue;
+            const name = friend.alias || n.username || friend.username || "";
+            registerPeerName(n.nodeId, name);
+          }
+        }
       };
       const unsub = this.socialDoc.on("change", updateSocial);
       this.badgeUnsubs.push(unsub);

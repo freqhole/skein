@@ -200,6 +200,13 @@ export function toWireAdminRequest(request: HubAdminRequest): unknown {
 }
 
 /** parse the CBOR-decoded wire value for an `AdminResponse` back into our TS shape. */
+/** cbor decodes rust u64 as BigInt (values ≤ 2^53 included, depending on
+ *  encoder) — coerce to number at the wire boundary so ui math/formatting
+ *  never mixes BigInt with number (a TypeError). sizes here fit in 2^53. */
+function toNum(v: unknown): number {
+  return typeof v === "bigint" ? Number(v) : (v as number);
+}
+
 export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
   if (wire === "NotAdmin") {
     return { kind: "notAdmin" };
@@ -227,7 +234,7 @@ export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
         friends: v.friends.map((f) => ({
           nodeId: f.node_id,
           status: f.status,
-          updatedAt: f.updated_at,
+          updatedAt: toNum(f.updated_at),
           username: f.username,
           bio: f.bio,
           avatarDataUrl: f.avatar_data_url,
@@ -270,7 +277,7 @@ export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
           requesterNodeId: k.requester_node_id,
           requesterUsername: k.requester_username,
           message: k.message,
-          knockedAt: k.knocked_at,
+          knockedAt: toNum(k.knocked_at),
         })),
       };
     }
@@ -286,12 +293,12 @@ export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
       return {
         kind: "diskUsage",
         usage: {
-          totalBlobBytes: v.total_blob_bytes,
-          blobCount: v.blob_count,
-          diskAvailableBytes: v.disk_available_bytes ?? null,
-          diskTotalBytes: v.disk_total_bytes ?? null,
-          softDeletedBlobBytes: v.soft_deleted_blob_bytes,
-          softDeletedBlobCount: v.soft_deleted_blob_count,
+          totalBlobBytes: toNum(v.total_blob_bytes),
+          blobCount: toNum(v.blob_count),
+          diskAvailableBytes: v.disk_available_bytes === null ? null : toNum(v.disk_available_bytes),
+          diskTotalBytes: v.disk_total_bytes === null ? null : toNum(v.disk_total_bytes),
+          softDeletedBlobBytes: toNum(v.soft_deleted_blob_bytes),
+          softDeletedBlobCount: toNum(v.soft_deleted_blob_count),
         },
       };
     }
@@ -302,11 +309,11 @@ export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
       };
       return {
         kind: "canvasUsage",
-        total: v.total,
+        total: toNum(v.total),
         canvases: v.canvases.map((c) => ({
           canvasDocId: c.canvas_doc_id,
-          blobCount: c.blob_count,
-          totalBytes: c.total_bytes,
+          blobCount: toNum(c.blob_count),
+          totalBytes: toNum(c.total_bytes),
         })),
       };
     }
@@ -324,12 +331,12 @@ export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
       };
       return {
         kind: "blobUsage",
-        total: v.total,
+        total: toNum(v.total),
         blobs: v.blobs.map((b) => ({
           blake3: b.blake3,
           filename: b.filename,
           mime: b.mime,
-          size: b.size,
+          size: toNum(b.size),
           external: b.external,
           softDeleted: b.soft_deleted,
         })),
@@ -337,7 +344,7 @@ export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
     }
     if ("BlobsMutation" in obj) {
       const v = obj.BlobsMutation as { affected: number; failed: string[] };
-      return { kind: "blobsMutation", affected: v.affected, failed: v.failed };
+      return { kind: "blobsMutation", affected: toNum(v.affected), failed: v.failed };
     }
     if ("SoftDeleted" in obj) {
       const v = obj.SoftDeleted as {
@@ -353,20 +360,20 @@ export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
       };
       return {
         kind: "softDeleted",
-        total: v.total,
+        total: toNum(v.total),
         blobs: v.blobs.map((b) => ({
           blake3: b.blake3,
           filename: b.filename,
           mime: b.mime,
-          size: b.size,
-          softDeletedAt: b.soft_deleted_at,
+          size: toNum(b.size),
+          softDeletedAt: toNum(b.soft_deleted_at),
           softDeletedBy: b.soft_deleted_by,
         })),
       };
     }
     if ("CanvasUnsynced" in obj) {
       const v = obj.CanvasUnsynced as { canvas_doc_id: string; swept: number };
-      return { kind: "canvasUnsynced", canvasDocId: v.canvas_doc_id, swept: v.swept };
+      return { kind: "canvasUnsynced", canvasDocId: v.canvas_doc_id, swept: toNum(v.swept) };
     }
   }
   throw new Error(`unrecognized AdminResponse wire shape: ${JSON.stringify(wire)}`);

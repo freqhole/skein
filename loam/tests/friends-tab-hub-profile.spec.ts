@@ -286,6 +286,64 @@ test.describe("friends-tab hub-profile-panel wiring @hub", () => {
 
     expect(state?.status).toBe("ready");
 
+    // -- scroll regression guard (user-reported: panel never scrolled) --
+    // a fresh hub renders a SHORT panel (nothing to scroll), so first seed
+    // enough friendz rows that the content genuinely overflows the panel
+    // viewport, then drive a real mouse wheel over it.
+    for (let i = 0; i < 14; i++) {
+      await hub.friendAllow(
+        `${i.toString(16).padStart(2, "0")}${"ab".repeat(31)}`.slice(0, 64)
+      );
+    }
+    await hooks.refreshHubProfilePanel();
+    await expect
+      .poll(
+        async () =>
+          (
+            await page.evaluate(() =>
+              (window as any).__skeinTest.social.friendsTab.getHubProfileScrollState()
+            )
+          )?.totalHeight ?? 0,
+        { timeout: 10_000 }
+      )
+      .toBeGreaterThan(0);
+
+    const scrollBefore = await page.evaluate(() =>
+      (window as any).__skeinTest.social.friendsTab.getHubProfileScrollState()
+    );
+    expect(scrollBefore).not.toBeNull();
+    // ScrollBox reports -0 at rest — compare numerically, not Object.is
+    expect(Math.abs(scrollBefore.scrollY)).toBe(0);
+    expect(scrollBefore.totalHeight).toBeGreaterThan(scrollBefore.areaHeight);
+
+    const panelPos = await page.evaluate(() =>
+      (window as any).__skeinTest.social.friendsTab.getHubProfilePanelGlobalPos()
+    );
+    expect(panelPos).not.toBeNull();
+    // the canvas viewport must NOT pan while the panel consumes the wheel
+    const worldBefore = await page.evaluate(() => {
+      const w = (window as any).__skein.world;
+      return { x: w.x, y: w.y };
+    });
+    await page.mouse.move(panelPos.x, panelPos.y);
+    await page.mouse.wheel(0, 240);
+    await expect
+      .poll(
+        async () =>
+          (
+            await page.evaluate(() =>
+              (window as any).__skeinTest.social.friendsTab.getHubProfileScrollState()
+            )
+          )?.scrollY ?? 0,
+        { timeout: 5_000 }
+      )
+      .toBeGreaterThan(0);
+    const worldAfter = await page.evaluate(() => {
+      const w = (window as any).__skein.world;
+      return { x: w.x, y: w.y };
+    });
+    expect(worldAfter).toEqual(worldBefore);
+
     await hooks.closeHubProfilePanel();
     expect(await hooks.isHubProfilePanelOpen()).toBe(false);
     expect(await hooks.getViewMode()).toBe("detail");

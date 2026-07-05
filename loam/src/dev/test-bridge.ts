@@ -269,6 +269,8 @@ export interface FriendsTabTestHooks {
   /** global position of a canvas row's "un-sync" button by canvas doc id,
    *  or null if that row isn't currently rendered. */
   getHubProfileUnsyncButtonGlobalPos(canvasDocId: string): { x: number; y: number } | null;
+  getHubProfileScrollState(): { scrollY: number; totalHeight: number; areaHeight: number } | null;
+  getHubProfilePanelGlobalPos(): { x: number; y: number } | null;
 }
 
 /**

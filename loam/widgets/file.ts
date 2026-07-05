@@ -27,6 +27,7 @@ import {
 } from "../src/widgets/file-utils";
 import { createInlinePlayer, type InlinePlayerHandle } from "../src/widgets/inline-media";
 import { createMediaOverlay, type MediaOverlayHandle } from "../src/widgets/media-overlay";
+import { peerNameFor } from "../src/canvas/peer-names";
 import type {
   CompactInfo,
   WidgetController,
@@ -2434,14 +2435,14 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     return {
       container,
-      // property-tray extras: "free up space" (browser only — tauri blob
+      // property-tray extras: "purge local copy" (browser only — tauri blob
       // storage is the durable native store) + who-has-this-file info rows
       widgetActions: isTauriMode()
         ? []
         : [
             {
-              id: "free-up-space",
-              label: "free up space",
+              id: "purge-local-copy",
+              label: "purge local copy",
               onClick: () => {
                 void handleFreeUpSpace();
               },
@@ -2451,24 +2452,21 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         const state = ctx.doc.current;
         if (!state.blobId) return [];
         const holders = (state.snatchedBy ?? []).map(String);
-        const hubs = holders.filter((id) => ctx.canvasStore?.isHubNode(id) ?? false);
-        const rows: { label: string; value: string }[] = [
-          { label: "hub synced", value: hubs.length > 0 ? "yes" : "no" },
-        ];
         if (holders.length === 0) {
-          rows.push({ label: "have it", value: "nobody yet" });
-        } else {
+          return [{ label: "have it", value: "nobody yet" }];
+        }
+        // one row per holder, by username where known (session peer-name
+        // registry, fed from the social doc) — node ids only as fallback.
+        // hubs are labeled; any number of hubs may have synced it.
+        const rows: { label: string; value: string }[] = [];
+        for (const id of holders) {
+          const isHub = ctx.canvasStore?.isHubNode(id) ?? false;
+          const you = id === localNodeIdCached;
+          const name = peerNameFor(id) ?? `${id.slice(0, 12)}...`;
           rows.push({
-            label: "have it",
-            value: `${holders.length} peer${holders.length === 1 ? "" : "s"}${
-              hubs.length ? ` (${hubs.length} hub)` : ""
-            }`,
+            label: isHub ? "hub" : "peer",
+            value: `${name}${you ? " (you)" : ""}`,
           });
-          for (const id of holders) {
-            const isHub = ctx.canvasStore?.isHubNode(id) ?? false;
-            const you = id === localNodeIdCached ? " (you)" : "";
-            rows.push({ label: isHub ? "hub" : "peer", value: `${id.slice(0, 16)}...${you}` });
-          }
         }
         return rows;
       },

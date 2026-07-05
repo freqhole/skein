@@ -345,6 +345,36 @@ describe("hubAdminDiskUsage", () => {
       usage: { diskAvailableBytes: null, diskTotalBytes: null },
     });
   });
+
+  it("coerces BigInt u64 fields to numbers (cbor decodes rust u64 as BigInt)", async () => {
+    // regression: BigInt sizes reaching formatFileSize threw
+    // "Cannot mix BigInt and other types"
+    const fake = createFakeNode({
+      DiskUsage: {
+        total_blob_bytes: 262_144_000n,
+        blob_count: 7n,
+        disk_available_bytes: 500_000_000_000n,
+        disk_total_bytes: 1_000_000_000_000n,
+        soft_deleted_blob_bytes: 0n,
+        soft_deleted_blob_count: 0n,
+      },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminDiskUsage(PEER_NODE_ID);
+
+    expect(response).toEqual({
+      kind: "diskUsage",
+      usage: {
+        totalBlobBytes: 262_144_000,
+        blobCount: 7,
+        diskAvailableBytes: 500_000_000_000,
+        diskTotalBytes: 1_000_000_000_000,
+        softDeletedBlobBytes: 0,
+        softDeletedBlobCount: 0,
+      },
+    });
+  });
 });
 
 describe("hubAdminCanvasUsage", () => {

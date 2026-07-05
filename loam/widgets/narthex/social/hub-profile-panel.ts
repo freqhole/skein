@@ -17,6 +17,7 @@
 // ---------------------------------------------------------------------------
 
 import { Assets, Container, Graphics, Rectangle, Sprite, Text } from "pixi.js";
+import { ScrollBox } from "@pixi/ui";
 import { log } from "../../../src/utils/log";
 import { formatFileSize } from "../../../src/widgets/file-utils";
 import {
@@ -47,7 +48,6 @@ import {
   ROW_ALT_BG,
   ROW_AVATAR_SIZE,
   ROW_PADDING_X,
-  SCROLL_SPEED,
   TEXT_COLOR,
   TEXT_SIZE,
 } from "./constants";
@@ -137,6 +137,11 @@ export interface HubProfilePanelHandle {
   getCanvasNextButtonGlobalPos(): { x: number; y: number } | null;
   // -- un-sync --
   getUnsyncButtonGlobalPos(canvasDocId: string): { x: number; y: number } | null;
+  /** dev/test-only: current scroll offset + content/viewport heights — lets
+   *  e2e drive a real mouse wheel over the panel and assert scrolling works. */
+  getScrollState(): { scrollY: number; totalHeight: number; areaHeight: number };
+  /** dev/test-only: global center position of the panel's visible area. */
+  getPanelGlobalPos(): { x: number; y: number };
   /**
    * dev/test-only: global (screen-space) center position of the "allow"
    * input field, or null if the panel isn't currently in its "ready" state
@@ -181,7 +186,6 @@ export function mountHubProfilePanel(
   let state: HubProfilePanelState = { status: "loading" };
   let destroyed = false;
   let currentWidth = 0;
-  let scrollY = 0;
   let totalHeight = 0;
   let areaHeight = 0;
 
@@ -241,34 +245,88 @@ export function mountHubProfilePanel(
     return { x: pos.x + c.width / 2, y: pos.y + c.height / 2 };
   }
 
-  // -- scaffolding: scrollable, masked content area --------------------------
+  // -- scaffolding: @pixi/ui ScrollBox --------------------------------------
+  //
+  // the panel went through THREE hand-rolled scroll attempts (pixi wheel
+  // events on the container, an explicit hitArea, a native capture-phase
+  // listener) and none of them scrolled reliably in production — pixi wheel
+  // dispatch depends on hit-testing an interactive object under the pointer,
+  // and the canvas viewport's own native wheel handler pans the world for
+  // anything that falls through. ScrollBox solves the whole class of
+  // problems: it listens for wheel on `document` in the CAPTURE phase (runs
+  // before pixi's dispatcher and the viewport's listener), gates on its own
+  // `isOver` state (tracked via its full-size background hit area), masks
+  // its content, and gives drag-to-scroll for free.
+  //
+  // the thin canvas-level capture listener below exists ONLY to set the
+  // `_skeinWidgetScroll` flag so viewport.ts skips panning while the pointer
+  // is over the overflowing panel — the actual scrolling is ScrollBox's.
 
-  const root = new Container();
-  root.eventMode = "static";
-  container.addChild(root);
+  // ordering matters, twice over:
+  //
+  // 1. the viewport's pan handler lives on the canvas ELEMENT — the wheel
+  //    event's TARGET. at the target node capture-flag doesn't jump the
+  //    queue (registration order rules), and the viewport registered at
+  //    app boot, long before this panel mounts — so a flag-setter on the
+  //    canvas element always ran too late and the world panned anyway.
+  //    `document` is a genuine ancestor: its capture phase runs before ANY
+  //    target listener, no ordering games.
+  // 2. ScrollBox gates its own document-capture wheel handler on `isOver`,
+  //    which pixi only flips on a `pointerover` crossing — when the pointer
+  //    is ALREADY over the panel as it mounts (it always is: the user just
+  //    clicked "manage hub" right there), the panel can stay isOver=false
+  //    until the pointer leaves and re-enters (tab-away/refocus also
+  //    re-arms it, which is how this bug hid). registering THIS listener
+  //    BEFORE constructing the ScrollBox means it runs first within the
+  //    document capture phase and primes `isOver` from real bounds before
+  //    ScrollBox's handler checks it.
+  let scrollBoxRef: ScrollBox | null = null;
+  const onNativeWheel = (e: WheelEvent) => {
+    if (destroyed || !scrollBoxRef) return;
+    for (let node: Container | null = scrollBoxRef; node; node = node.parent) {
+      if (!node.visible) return;
+    }
+    // pixi is configured with autoDensity, so global stage coords are CSS
+    // pixels — clientX/Y relative to the canvas rect maps 1:1
+    const rect = canvasElement.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+    const g = scrollBoxRef.getGlobalPosition();
+    const inside = px >= g.x && px <= g.x + currentWidth && py >= g.y && py <= g.y + areaHeight;
+    // prime/correct ScrollBox's isOver (its handler runs right after this
+    // one in the same capture phase), and flag the event so viewport.ts's
+    // pan handler leaves it alone. the flag is set for ANY wheel over the
+    // visible panel — even when the content is short enough not to scroll,
+    // the canvas world must not pan underneath the panel.
+    (scrollBoxRef as unknown as { isOver: boolean }).isOver = inside;
+    if (inside) {
+      (e as { _skeinWidgetScroll?: boolean } & WheelEvent)._skeinWidgetScroll = true;
+    }
+  };
+  document.addEventListener("wheel", onNativeWheel, { capture: true, passive: true });
+
+  const scrollBox = new ScrollBox({
+    width: 10,
+    height: 10,
+    background: BG,
+    globalScroll: false,
+    disableEasing: true,
+  });
+  scrollBoxRef = scrollBox;
+  container.addChild(scrollBox);
 
   const inner = new Container();
   inner.eventMode = "static";
-  root.addChild(inner);
-
-  const mask = new Graphics();
-  root.addChild(mask);
-  root.mask = mask;
-
-  root.on("wheel", (e: WheelEvent) => {
-    const canScroll = totalHeight > areaHeight;
-    if (!canScroll) return;
-    e.stopPropagation();
-    if ((e as any).nativeEvent) (e as any).nativeEvent._skeinWidgetScroll = true;
-    scrollY += e.deltaY > 0 ? SCROLL_SPEED : -SCROLL_SPEED;
-    clampScroll();
-    inner.y = -scrollY;
-  });
-
-  function clampScroll(): void {
-    const max = Math.max(0, totalHeight - areaHeight);
-    scrollY = Math.max(0, Math.min(scrollY, max));
-  }
+  // explicit sizing rect: gives `inner` real, deterministic bounds so
+  // ScrollBox's List can measure it (a bounds-less container triggers its
+  // "ScrollBox item should have size" warning and measures 0), and doubles
+  // as the full-content hit surface for isOver/drag over text and gaps.
+  // redrawn to currentWidth × contentHeight in finishLayout.
+  const innerSizingRect = new Graphics();
+  innerSizingRect.rect(0, 0, 1, 1);
+  innerSizingRect.fill({ color: 0x000000, alpha: 0.0001 });
+  inner.addChild(innerSizingRect);
+  scrollBox.addItem(inner);
 
   // -- data fetch --------------------------------------------------------
 
@@ -896,34 +954,17 @@ export function mountHubProfilePanel(
       allowInputHandle.destroy();
       allowInputHandle = null;
     }
-    while (inner.children.length > 0) {
-      inner.removeChildAt(0).destroy({ children: true });
+    // clear everything EXCEPT the sizing rect (child 0) — it must survive
+    // rebuilds so ScrollBox always has a measurable, hit-testable item
+    while (inner.children.length > 1) {
+      inner.removeChildAt(1).destroy({ children: true });
     }
 
     let dy = 0;
 
-    // header
-    const title = new Text({
-      text: "hub friendz",
-      style: { fontFamily: FONT, fontSize: 14, fontWeight: "bold", fill: TEXT_COLOR },
-      resolution: RESOLUTION,
-    });
-    title.eventMode = "none";
-    title.x = PADDING_X;
-    title.y = dy;
-    inner.addChild(title);
-    dy += title.height + 2;
-
-    const subtitle = new Text({
-      text: truncate(hubNodeId, 40),
-      style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: MUTED_TEXT },
-      resolution: RESOLUTION,
-    });
-    subtitle.eventMode = "none";
-    subtitle.x = PADDING_X;
-    subtitle.y = dy;
-    inner.addChild(subtitle);
-    dy += subtitle.height + SECTION_GAP;
+    // no header: the "hub friendz" title + hub node id line were dropped to
+    // reclaim vertical space — the friend detail view the user came from
+    // already identifies the hub, and the node id is copyable there.
 
     if (state.status === "loading") {
       const loadingText = new Text({
@@ -1227,19 +1268,20 @@ export function mountHubProfilePanel(
         }
 
         // -- status + admin badge --
-        const isAccepted = friend.status === "accepted" || friend.status === "allowed";
+        // neutral secondary color (was green) and nudged up so it doesn't
+        // crowd the right-aligned action buttons below
         const statusText = new Text({
           text: friend.isAdmin ? `${friend.status} \u00b7 admin` : friend.status,
           style: {
             fontFamily: FONT,
             fontSize: LABEL_SIZE,
-            fill: isAccepted ? ONLINE_COLOR : MUTED_TEXT,
+            fill: MUTED_TEXT,
           },
           resolution: RESOLUTION,
         });
         statusText.eventMode = "none";
         statusText.x = textX;
-        statusText.y = 46;
+        statusText.y = 42;
         row.addChild(statusText);
 
         // -- action buttons: admin toggle, block/unblock, remove — right-aligned --
@@ -1936,8 +1978,14 @@ export function mountHubProfilePanel(
 
   function finishLayout(contentHeight: number): void {
     totalHeight = contentHeight;
-    clampScroll();
-    inner.y = -scrollY;
+    // redraw the sizing rect to span the full content: deterministic bounds
+    // for ScrollBox's List measurement AND the hit surface for isOver/drag
+    // over text (eventMode "none") and empty gaps
+    innerSizingRect.clear();
+    innerSizingRect.rect(0, 0, Math.max(1, currentWidth), Math.max(1, contentHeight));
+    innerSizingRect.fill({ color: 0x000000, alpha: 0.0001 });
+    // ScrollBox caches item measurements — force a re-measure + re-clamp
+    scrollBox.resize(true);
   }
 
   // -- public interface -----------------------------------------------------
@@ -1945,11 +1993,7 @@ export function mountHubProfilePanel(
   function layout(width: number, height: number): void {
     currentWidth = width;
     areaHeight = height;
-
-    mask.clear();
-    mask.rect(0, 0, width, height);
-    mask.fill({ color: BG, alpha: 0.001 });
-
+    scrollBox.setSize(width, height);
     rebuild();
   }
 
@@ -1993,6 +2037,7 @@ export function mountHubProfilePanel(
 
   function destroy(): void {
     destroyed = true;
+    document.removeEventListener("wheel", onNativeWheel, { capture: true } as EventListenerOptions);
     if (confirmHardDeleteAllTimer !== null) {
       clearTimeout(confirmHardDeleteAllTimer);
     }
@@ -2003,7 +2048,8 @@ export function mountHubProfilePanel(
       allowInputHandle.destroy();
       allowInputHandle = null;
     }
-    root.destroy({ children: true });
+    // removes ScrollBox's document-level capture wheel listener too
+    scrollBox.destroy({ children: true });
   }
 
   refresh().catch((err) => {
@@ -2045,6 +2091,14 @@ export function mountHubProfilePanel(
     getUnsyncButtonGlobalPos(canvasDocId: string): { x: number; y: number } | null {
       const btn = unsyncButtonRefs.get(canvasDocId);
       return btn ? globalCenter(btn) : null;
+    },
+    getScrollState(): { scrollY: number; totalHeight: number; areaHeight: number } {
+      // ScrollBox's raw value is negated (0 at top, negative scrolled down)
+      return { scrollY: -scrollBox.scrollY, totalHeight, areaHeight };
+    },
+    getPanelGlobalPos(): { x: number; y: number } {
+      const p = scrollBox.getGlobalPosition();
+      return { x: p.x + currentWidth / 2, y: p.y + areaHeight / 2 };
     },
     getAllowInputGlobalPos,
     getAllowButtonGlobalPos,
