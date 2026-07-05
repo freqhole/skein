@@ -6,6 +6,58 @@ import {
   volumeToRawOpenness,
   smoothLerp,
 } from "./voice-recording";
+import { computeRmsEnvelope, ENVELOPE_HZ, clampThickness } from "./voice-recording-mouth";
+
+// ---------------------------------------------------------------------------
+// lip thickness
+// ---------------------------------------------------------------------------
+
+describe("clampThickness", () => {
+  it("clamps to the 1..10 range", () => {
+    expect(clampThickness(0)).toBe(1);
+    expect(clampThickness(5)).toBe(5);
+    expect(clampThickness(11)).toBe(10);
+  });
+
+  it("falls back to the default for non-finite input", () => {
+    expect(clampThickness(NaN)).toBe(5);
+    expect(clampThickness(Infinity)).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// playback envelope (drives lip-sync by currentTime — the webkit-safe path)
+// ---------------------------------------------------------------------------
+
+describe("computeRmsEnvelope", () => {
+  it("produces one rms value per 1/hz seconds of audio", () => {
+    const sampleRate = 3000;
+    const seconds = 2;
+    const samples = new Float32Array(sampleRate * seconds);
+    const env = computeRmsEnvelope(samples, sampleRate, ENVELOPE_HZ);
+    expect(env.length).toBe(seconds * ENVELOPE_HZ);
+  });
+
+  it("silence maps to 0 and a constant tone to its amplitude", () => {
+    const sampleRate = 300;
+    // first half silence, second half constant 0.5 amplitude
+    const samples = new Float32Array(sampleRate);
+    samples.fill(0.5, sampleRate / 2);
+    const env = computeRmsEnvelope(samples, sampleRate, 2);
+    expect(env.length).toBe(2);
+    expect(env[0]).toBe(0);
+    expect(env[1]).toBeCloseTo(0.5, 5);
+  });
+
+  it("handles a trailing partial window without NaN", () => {
+    const samples = new Float32Array(101);
+    samples.fill(0.25);
+    const env = computeRmsEnvelope(samples, 100, 1);
+    expect(env.length).toBe(2);
+    expect(env[1]).toBeCloseTo(0.25, 5);
+    expect(env.every((v) => Number.isFinite(v))).toBe(true);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // schema

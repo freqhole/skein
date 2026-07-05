@@ -55,7 +55,12 @@ import {
   type AudioBlobRef,
   type ResolvedAudioBytes,
 } from "./audio-recording";
-import { MouthRenderer, volumeToRawOpenness } from "./voice-recording-mouth";
+import {
+  MouthRenderer,
+  volumeToRawOpenness,
+  computeRmsEnvelope,
+  ENVELOPE_HZ,
+} from "./voice-recording-mouth";
 
 // re-export pure helpers so tests can import from a single module
 export { darkenHex, volumeToRawOpenness, smoothLerp } from "./voice-recording-mouth";
@@ -89,6 +94,8 @@ export const voiceRecordingSchema = z.object({
   deviceLabel: z.string().default(""),
   /** lip fill color — doc-synced so all peers see the chosen shade */
   lipsColor: z.number().default(0xc2455a),
+  /** lip thickness, 1 (thin) .. 10 (plump). scales the lip band height. */
+  lipThickness: z.number().default(5),
 });
 
 export type VoiceRecordingState = z.infer<typeof voiceRecordingSchema>;
@@ -192,8 +199,12 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     // -- transient playback state --
     let audioEl: HTMLAudioElement | null = null;
     // separate AudioContext for playback so the mic context can be closed after recording
-    let playbackAudioCtx: AudioContext | null = null;
-    let playbackAnalyser: AnalyserNode | null = null;
+    // precomputed playback rms envelope (ENVELOPE_HZ samples per second of
+    // audio) + the url it was computed for, for cache invalidation, and the
+    // raw bytes it decodes from
+    let playbackEnvelope: Float32Array | null = null;
+    let playbackEnvelopeUrl: string | null = null;
+    let playbackBytes: Blob | null = null;
     let playbackUrl: string | null = null;
     let fetchProgressText = "downloading…";
     let fetchErrorMessage = "";
@@ -249,7 +260,13 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     mouthContainer.eventMode = "static";
     container.addChild(mouthContainer);
 
-    const mouth = new MouthRenderer(mouthContainer, cw, ch, ctx.doc.current.lipsColor);
+    const mouth = new MouthRenderer(
+      mouthContainer,
+      cw,
+      ch,
+      ctx.doc.current.lipsColor,
+      ctx.doc.current.lipThickness
+    );
 
     // pill button (hidden after first recording)
     const btnGfx = new Graphics();
@@ -494,21 +511,20 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     };
 
     // -- playback mouth animation --
-    // reads RMS from the MediaElementAudioSource→AnalyserNode chain, same smoothing.
+    // driven by a PRECOMPUTED rms envelope indexed by audioEl.currentTime,
+    // not a live MediaElementAudioSourceNode→AnalyserNode tap. webkit (the
+    // tauri wkwebview) does not reliably route media-element output through
+    // the webaudio graph: audio keeps playing natively while the analyser
+    // reads flat zeros — the confirmed cause of "mouth talks in the browser
+    // but not in the tauri app". the envelope approach has no interception,
+    // no autoplay-policy suspension, and is deterministic across engines.
     const startPlayAnim = (): void => {
-      if (!playbackAnalyser) return;
-      const bufLen = playbackAnalyser.frequencyBinCount;
-      const dataArr = new Uint8Array(bufLen);
       const tick = (): void => {
         if (recState !== "playing") return;
         playRafId = requestAnimationFrame(tick);
-        playbackAnalyser!.getByteTimeDomainData(dataArr);
-        let sum = 0;
-        for (let i = 0; i < bufLen; i++) {
-          const v = (dataArr[i] - 128) / 128;
-          sum += v * v;
-        }
-        const rms = Math.sqrt(sum / bufLen);
+        if (!audioEl || !playbackEnvelope) return;
+        const idx = Math.floor(audioEl.currentTime * ENVELOPE_HZ);
+        const rms = playbackEnvelope[Math.min(idx, playbackEnvelope.length - 1)] ?? 0;
         const target = volumeToRawOpenness(rms);
         smoothOpenness += (target - smoothOpenness) * (target > smoothOpenness ? 0.6 : 0.15);
         mouth.setOpenness(smoothOpenness);
@@ -716,8 +732,36 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       }
 
       const blob = new Blob([resolved.buffer], { type: mime || "audio/webm" });
+      // keep a copy of the raw bytes for the playback envelope decode —
+      // decodeAudioData detaches the buffer it's given, so slice per use
+      playbackBytes = blob;
       playbackUrl = URL.createObjectURL(blob);
       return playbackUrl;
+    };
+
+    /** decode the recording once and precompute the rms envelope the
+     *  playback mouth animation indexes by currentTime. non-fatal on
+     *  failure — audio still plays, the mouth just stays closed. */
+    const ensurePlaybackEnvelope = async (url: string): Promise<void> => {
+      if (playbackEnvelope && playbackEnvelopeUrl === url) return;
+      if (!playbackBytes) return;
+      try {
+        const bytes = await playbackBytes.arrayBuffer();
+        // OfflineAudioContext: decode without a live audio graph (no
+        // autoplay-policy suspension, nothing routed anywhere)
+        const decodeCtx = new OfflineAudioContext(1, 1, 44100);
+        const decoded = await decodeCtx.decodeAudioData(bytes);
+        playbackEnvelope = computeRmsEnvelope(
+          decoded.getChannelData(0),
+          decoded.sampleRate,
+          ENVELOPE_HZ
+        );
+        playbackEnvelopeUrl = url;
+      } catch (err) {
+        console.warn("[voice-widget] envelope decode failed (mouth will stay closed):", err);
+        playbackEnvelope = null;
+        playbackEnvelopeUrl = null;
+      }
     };
 
     const startPlayback = async (): Promise<void> => {
@@ -740,11 +784,9 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         return;
       }
 
-      // create audio element + playback AudioContext once per widget lifetime.
-      // reusing the same element avoids the "MediaElementAudioSourceNode can
-      // only be created once per element" constraint.
-      // reusing the same element avoids the "MediaElementAudioSourceNode can
-      // only be created once per element" constraint.
+      // create the audio element once per widget lifetime. playback is
+      // plain native <audio> — deliberately NOT routed through webaudio
+      // (see startPlayAnim's comment on the webkit/tauri analyser bug).
       if (!audioEl) {
         audioEl = document.createElement("audio");
         audioEl.onended = () => {
@@ -756,13 +798,10 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           ctx.setHeaderActions?.(makeHeaderActions());
           scheduleIdleTwitch();
         };
-        playbackAudioCtx = new AudioContext();
-        playbackAnalyser = playbackAudioCtx.createAnalyser();
-        playbackAnalyser.fftSize = 256;
-        const source = playbackAudioCtx.createMediaElementSource(audioEl);
-        source.connect(playbackAnalyser);
-        playbackAnalyser.connect(playbackAudioCtx.destination);
       }
+
+      await ensurePlaybackEnvelope(url);
+      if (destroyed) return;
 
       if (audioEl.src !== url) audioEl.src = url;
 
@@ -805,9 +844,9 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         audioEl.src = "";
         audioEl = null;
       }
-      void playbackAudioCtx?.close();
-      playbackAudioCtx = null;
-      playbackAnalyser = null;
+      playbackEnvelope = null;
+      playbackEnvelopeUrl = null;
+      playbackBytes = null;
       if (playbackUrl) {
         URL.revokeObjectURL(playbackUrl);
         playbackUrl = null;
@@ -861,10 +900,11 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
 
     // -- doc subscription --
     const unsub = ctx.doc.on("change", () => {
-      const { blobId, lipsColor } = ctx.doc.current;
+      const { blobId, lipsColor, lipThickness } = ctx.doc.current;
 
-      // live lip color sync — peers see color changes immediately
+      // live lip color/thickness sync — peers see changes immediately
       mouth.setLipsColor(lipsColor);
+      mouth.setLipThickness(lipThickness);
 
       if ((recState === "idle" || recState === "error") && blobId) {
         recState = "ready";
@@ -907,6 +947,14 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       widgetActions,
       editableProps: [
         { key: "lipsColor", label: "lips color", type: "color" as const, default: 0xc2455a },
+        {
+          key: "lipThickness",
+          label: "lip thickness",
+          type: "number" as const,
+          default: 5,
+          min: 1,
+          max: 10,
+        },
         { key: "bgColor", label: "background", type: "color" as const, default: 0x1e1e2e },
         { key: "borderColor", label: "border", type: "color" as const, default: -1 },
         { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
@@ -926,7 +974,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         mediaRecorder?.stop();
         mediaStream?.getTracks().forEach((t) => t.stop());
         void audioCtx?.close();
-        void playbackAudioCtx?.close();
         if (audioEl) {
           audioEl.pause();
           audioEl.src = "";
