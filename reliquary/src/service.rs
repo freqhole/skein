@@ -447,6 +447,7 @@ impl Service {
                     username: self.local_username.clone(),
                     bio: String::new(),
                     avatar_data_url: String::new(),
+                    accent_color: None,
                 };
                 if let Err(e) = self.friendz_handler.send_message(from, &reply).await {
                     tracing::warn!(error = %e, peer = %from, "failed to send profile response");

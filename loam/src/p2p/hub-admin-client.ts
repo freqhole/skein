@@ -96,6 +96,14 @@ export interface HubAdminCanvasUsageSummary {
   totalBytes: number;
 }
 
+/** hub profile data from `AdminResponse::HubProfile`. */
+export interface HubAdminHubProfile {
+  username: string;
+  bio: string;
+  accentColor: number;
+  avatarDataUrl: string;
+}
+
 /** a single blob row from `AdminResponse::BlobUsage`. */
 export interface HubAdminBlobUsageSummary {
   blake3: string;
@@ -135,7 +143,11 @@ export type HubAdminRequest =
   | { kind: "restoreBlobs"; blake3s: string[] }
   | { kind: "listSoftDeleted"; offset: number; limit: number }
   | { kind: "hardDeleteBlobs"; blake3s: string[]; all: boolean }
-  | { kind: "unsyncCanvas"; canvasDocId: string };
+  | { kind: "unsyncCanvas"; canvasDocId: string }
+  | { kind: "getHubProfile" }
+  | { kind: "setHubProfile"; username: string | null; bio: string | null; accentColor: number | null }
+  | { kind: "setHubAvatar"; imageBase64: string }
+  | { kind: "canvasBlobs"; canvasDocId: string; offset: number; limit: number };
 
 /**
  * response payloads for `iroh/skein-hub-admin/1`, mirroring
@@ -155,7 +167,9 @@ export type HubAdminResponse =
   | { kind: "blobUsage"; blobs: HubAdminBlobUsageSummary[]; total: number }
   | { kind: "blobsMutation"; affected: number; failed: string[] }
   | { kind: "softDeleted"; blobs: HubAdminSoftDeletedBlob[]; total: number }
-  | { kind: "canvasUnsynced"; canvasDocId: string; swept: number };
+  | { kind: "canvasUnsynced"; canvasDocId: string; swept: number }
+  | { kind: "hubProfile"; profile: HubAdminHubProfile }
+  | { kind: "canvasBlobs"; canvasDocId: string; blobs: HubAdminBlobUsageSummary[]; total: number };
 
 /**
  * build the CBOR-ready wire value for an `HubAdminRequest`, matching
@@ -196,6 +210,14 @@ export function toWireAdminRequest(request: HubAdminRequest): unknown {
       return { HardDeleteBlobs: { blake3s: request.blake3s, all: request.all } };
     case "unsyncCanvas":
       return { UnsyncCanvas: { canvas_doc_id: request.canvasDocId } };
+    case "getHubProfile":
+      return "GetHubProfile";
+    case "setHubProfile":
+      return { SetHubProfile: { username: request.username, bio: request.bio, accent_color: request.accentColor } };
+    case "setHubAvatar":
+      return { SetHubAvatar: { image_base64: request.imageBase64 } };
+    case "canvasBlobs":
+      return { CanvasBlobs: { canvas_doc_id: request.canvasDocId, offset: request.offset, limit: request.limit } };
   }
 }
 
@@ -375,6 +397,38 @@ export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
       const v = obj.CanvasUnsynced as { canvas_doc_id: string; swept: number };
       return { kind: "canvasUnsynced", canvasDocId: v.canvas_doc_id, swept: toNum(v.swept) };
     }
+    if ("HubProfile" in obj) {
+      const v = obj.HubProfile as { username: string; bio: string; accent_color: number; avatar_data_url: string };
+      return {
+        kind: "hubProfile",
+        profile: {
+          username: v.username,
+          bio: v.bio,
+          accentColor: toNum(v.accent_color),
+          avatarDataUrl: v.avatar_data_url,
+        },
+      };
+    }
+    if ("CanvasBlobs" in obj) {
+      const v = obj.CanvasBlobs as {
+        canvas_doc_id: string;
+        blobs: Array<{ blake3: string; filename: string | null; mime: string | null; size: number; external: boolean; soft_deleted: boolean }>;
+        total: number;
+      };
+      return {
+        kind: "canvasBlobs",
+        canvasDocId: v.canvas_doc_id,
+        total: toNum(v.total),
+        blobs: v.blobs.map((b) => ({
+          blake3: b.blake3,
+          filename: b.filename,
+          mime: b.mime,
+          size: toNum(b.size),
+          external: b.external,
+          softDeleted: b.soft_deleted,
+        })),
+      };
+    }
   }
   throw new Error(`unrecognized AdminResponse wire shape: ${JSON.stringify(wire)}`);
 }
@@ -509,6 +563,28 @@ export interface HubAdminClient {
    * soft-deleted blobs.
    */
   hubAdminUnsyncCanvas(peerNodeId: string, canvasDocId: string): Promise<HubAdminResponse>;
+  /** fetch the hub's own profile (username, bio, accent_color, avatar). */
+  hubAdminGetProfile(peerNodeId: string): Promise<HubAdminResponse>;
+  /**
+   * update the hub's own profile fields. pass null for any field to leave
+   * it unchanged hub-side.
+   */
+  hubAdminSetProfile(
+    peerNodeId: string,
+    opts: { username?: string | null; bio?: string | null; accentColor?: number | null }
+  ): Promise<HubAdminResponse>;
+  /**
+   * upload a new avatar for the hub. `imageBase64` is a plain base64-encoded
+   * image (no data-url prefix). the hub re-encodes it to 128px webp.
+   * decoded size is capped at 512KB hub-side — callers should pre-resize.
+   */
+  hubAdminSetAvatar(peerNodeId: string, imageBase64: string): Promise<HubAdminResponse>;
+  /**
+   * list blobs belonging to a specific canvas doc.
+   * results are paginated; offset/limit are clamped hub-side (max 200, 0 -> 50).
+   * blobs may overlap with other canvases by design.
+   */
+  hubAdminCanvasBlobs(peerNodeId: string, canvasDocId: string, offset?: number, limit?: number): Promise<HubAdminResponse>;
 }
 
 /** build a `HubAdminClient` bound to the given transport. */
@@ -564,6 +640,23 @@ export function createHubAdminClient(transport: HubAdminTransport): HubAdminClie
     },
     hubAdminUnsyncCanvas(peerNodeId, canvasDocId) {
       return sendAdminRequest(transport, peerNodeId, { kind: "unsyncCanvas", canvasDocId });
+    },
+    hubAdminGetProfile(peerNodeId) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "getHubProfile" });
+    },
+    hubAdminSetProfile(peerNodeId, opts) {
+      return sendAdminRequest(transport, peerNodeId, {
+        kind: "setHubProfile",
+        username: opts.username ?? null,
+        bio: opts.bio ?? null,
+        accentColor: opts.accentColor ?? null,
+      });
+    },
+    hubAdminSetAvatar(peerNodeId, imageBase64) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "setHubAvatar", imageBase64 });
+    },
+    hubAdminCanvasBlobs(peerNodeId, canvasDocId, offset = 0, limit = 50) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "canvasBlobs", canvasDocId, offset, limit });
     },
   };
 }

@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::adminz;
 use crate::blobz;
 use crate::friendz;
+use crate::hub::HubProfile;
 use crate::hub_repo::HubRepo;
 use crate::userz;
 
@@ -120,6 +121,11 @@ pub struct BlobUsageSummary {
     pub mime: Option<String>,
     pub size: u64,
     pub external: bool,
+    /// true if the blob is currently soft-deleted. always false in
+    /// `AdminResponse::BlobUsage` (which only lists live blobs); may be
+    /// true in `AdminResponse::CanvasBlobs` where the canvas manifest is
+    /// shown regardless of soft-deleted status.
+    pub soft_deleted: bool,
 }
 
 /// a single soft-deleted blob, as reported by `AdminRequest::ListSoftDeleted`.
@@ -191,6 +197,33 @@ pub enum AdminRequest {
     /// locally (soft-delete from hub storage), and sweep blobs that were
     /// only referenced by this canvas.
     UnsyncCanvas { canvas_doc_id: String },
+    /// read the hub's current live profile (username, bio, accent_color,
+    /// avatar_data_url). reads from the in-memory RwLock, so the value is
+    /// always current even if SetHubProfile was called seconds ago.
+    GetHubProfile,
+    /// update one or more hub profile fields in-place. fields set to None
+    /// are left unchanged. persists to userz and updates the in-memory lock.
+    /// rejects empty username and enforces length caps (username ≤ 64,
+    /// bio ≤ 512 chars).
+    SetHubProfile {
+        username: Option<String>,
+        bio: Option<String>,
+        accent_color: Option<i64>,
+    },
+    /// replace the hub's avatar from a base64-encoded image. decodes the
+    /// bytes, rejects if > 512 KB, resizes to 128px webp, stores in blobz,
+    /// updates userz and the in-memory lock. responds with the full updated
+    /// HubProfile so the caller can refresh its display in one round-trip.
+    SetHubAvatar { image_base64: String },
+    /// list blobs referenced by a specific canvas's file widgets, paginated.
+    /// includes blobs that are soft-deleted (they appear with soft_deleted=true)
+    /// and blobs that have never been snatched (size=0, filename from widget doc).
+    /// deduped by blake3, sorted by size desc, paginated with clamp_limit.
+    CanvasBlobs {
+        canvas_doc_id: String,
+        offset: u64,
+        limit: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +299,20 @@ pub enum AdminResponse {
         /// referenced by this canvas and have now been marked for reclaim).
         swept: u64,
     },
+    /// response to `AdminRequest::GetHubProfile`, `AdminRequest::SetHubProfile`,
+    /// and `AdminRequest::SetHubAvatar`.
+    HubProfile {
+        username: String,
+        bio: String,
+        accent_color: i64,
+        avatar_data_url: String,
+    },
+    /// response to `AdminRequest::CanvasBlobs`.
+    CanvasBlobs {
+        canvas_doc_id: String,
+        blobs: Vec<BlobUsageSummary>,
+        total: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +356,14 @@ struct Inner {
     /// `hub_repo.soft_remove_canvas_id` (which persists the removal). keeping
     /// both in sync mirrors the canvas-deleted flow in `hub/canvas.rs`.
     canvas_doc_ids: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// live hub profile state, shared with `HubPeerService`. admin writes
+    /// (SetHubProfile / SetHubAvatar) update this so outgoing profile
+    /// responses always reflect the latest values without a restart.
+    hub_profile: Arc<tokio::sync::RwLock<HubProfile>>,
+    /// fires after SetHubProfile or SetHubAvatar succeeds. the hub's
+    /// broadcast loop (hub/mod.rs) waits on this and pushes a
+    /// ProfileResponse to every online peer.
+    profile_changed: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for HubAdminHandler {
@@ -326,6 +381,8 @@ impl HubAdminHandler {
         hub_repo: HubRepo,
         hub_node_id: String,
         canvas_doc_ids: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+        hub_profile: Arc<tokio::sync::RwLock<HubProfile>>,
+        profile_changed: Arc<tokio::sync::Notify>,
     ) -> Self {
         let blob_dir = blobz.blob_dir().to_path_buf();
         Self {
@@ -338,6 +395,8 @@ impl HubAdminHandler {
                 blob_dir,
                 hub_node_id,
                 canvas_doc_ids,
+                hub_profile,
+                profile_changed,
             }),
         }
     }
@@ -653,6 +712,7 @@ async fn handle_request(
                             mime: b.mime,
                             size: b.size as u64,
                             external: b.external,
+                            soft_deleted: false,
                         })
                         .collect(),
                     total,
@@ -725,6 +785,187 @@ async fn handle_request(
         }
         AdminRequest::UnsyncCanvas { canvas_doc_id } => {
             handle_unsync_canvas(handler, peer_id_str, &canvas_doc_id).await
+        }
+        AdminRequest::GetHubProfile => {
+            let p = handler.inner.hub_profile.read().await;
+            AdminResponse::HubProfile {
+                username: p.username.clone(),
+                bio: p.bio.clone(),
+                accent_color: p.accent_color,
+                avatar_data_url: p.avatar_data_url.clone(),
+            }
+        }
+        AdminRequest::SetHubProfile {
+            username,
+            bio,
+            accent_color,
+        } => {
+            // validate
+            if let Some(u) = &username {
+                if u.trim().is_empty() {
+                    return AdminResponse::Error {
+                        message: "username cannot be empty".to_string(),
+                    };
+                }
+                if u.len() > 64 {
+                    return AdminResponse::Error {
+                        message: "username exceeds 64 characters".to_string(),
+                    };
+                }
+            }
+            if let Some(b) = &bio {
+                if b.len() > 512 {
+                    return AdminResponse::Error {
+                        message: "bio exceeds 512 characters".to_string(),
+                    };
+                }
+            }
+            // read current values for fields not being updated
+            let (cur_username, cur_bio, cur_accent, cur_avatar) = {
+                let p = handler.inner.hub_profile.read().await;
+                (
+                    p.username.clone(),
+                    p.bio.clone(),
+                    p.accent_color,
+                    p.avatar_data_url.clone(),
+                )
+            };
+            let new_username = username.as_deref().unwrap_or(&cur_username);
+            let new_bio = bio.as_deref().unwrap_or(&cur_bio);
+            let new_accent = accent_color.unwrap_or(cur_accent);
+            // persist to userz
+            if let Err(e) = handler
+                .inner
+                .userz
+                .upsert_self_full(
+                    &handler.inner.hub_node_id,
+                    Some(new_username),
+                    None,
+                    Some(new_bio),
+                    None,
+                    Some(new_accent),
+                )
+                .await
+            {
+                return AdminResponse::Error {
+                    message: format!("userz update failed: {e}"),
+                };
+            }
+            // update the in-memory lock
+            {
+                let mut p = handler.inner.hub_profile.write().await;
+                p.username = new_username.to_string();
+                p.bio = new_bio.to_string();
+                p.accent_color = new_accent;
+            }
+            // notify the broadcast loop to push the updated profile to online peers
+            handler.inner.profile_changed.notify_one();
+            AdminResponse::HubProfile {
+                username: new_username.to_string(),
+                bio: new_bio.to_string(),
+                accent_color: new_accent,
+                avatar_data_url: cur_avatar,
+            }
+        }
+        AdminRequest::SetHubAvatar { image_base64 } => {
+            const MAX_AVATAR_BYTES: usize = 512 * 1024;
+            use base64::Engine;
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(&image_base64) {
+                Ok(b) => b,
+                Err(_) => {
+                    return AdminResponse::Error {
+                        message: "invalid base64 encoding".to_string(),
+                    }
+                }
+            };
+            if bytes.len() > MAX_AVATAR_BYTES {
+                return AdminResponse::Error {
+                    message: "image exceeds 512 KB limit".to_string(),
+                };
+            }
+            let webp = match crate::hub::avatar::resize_to_square_webp(&bytes, 128) {
+                Ok(w) => w,
+                Err(e) => {
+                    return AdminResponse::Error {
+                        message: format!("image processing failed: {e}"),
+                    }
+                }
+            };
+            let blake3_hash = blake3::hash(&webp).to_hex().to_string();
+            let blob_ref = match handler
+                .inner
+                .blobz
+                .insert(
+                    blake3_hash,
+                    Some("hub-avatar.webp".to_string()),
+                    Some("image/webp".to_string()),
+                    &webp,
+                )
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    return AdminResponse::Error {
+                        message: format!("blobz insert failed: {e}"),
+                    }
+                }
+            };
+            if let Err(e) = handler
+                .inner
+                .userz
+                .upsert_self_full(
+                    &handler.inner.hub_node_id,
+                    None,
+                    None,
+                    None,
+                    Some(&blob_ref.blake3),
+                    None,
+                )
+                .await
+            {
+                return AdminResponse::Error {
+                    message: format!("userz avatar update failed: {e}"),
+                };
+            }
+            let data_url = crate::hub::avatar::encode_data_url("image/webp", &webp);
+            // update the in-memory lock
+            let (username, bio, accent_color) = {
+                let mut p = handler.inner.hub_profile.write().await;
+                p.avatar_data_url = data_url.clone();
+                (p.username.clone(), p.bio.clone(), p.accent_color)
+            };
+            // notify the broadcast loop to push the updated profile to online peers
+            handler.inner.profile_changed.notify_one();
+            AdminResponse::HubProfile {
+                username,
+                bio,
+                accent_color,
+                avatar_data_url: data_url,
+            }
+        }
+        AdminRequest::CanvasBlobs {
+            canvas_doc_id,
+            offset,
+            limit,
+        } => {
+            let limit = clamp_limit(limit);
+            let blobs = canvas_blobs_for(
+                &handler.inner.hub_repo,
+                &handler.inner.blobz,
+                &canvas_doc_id,
+            )
+            .await;
+            let total = blobs.len() as u64;
+            let page: Vec<BlobUsageSummary> = blobs
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect();
+            AdminResponse::CanvasBlobs {
+                canvas_doc_id,
+                blobs: page,
+                total,
+            }
         }
     }
 }
@@ -1098,6 +1339,114 @@ async fn canvas_usage(hub_repo: &HubRepo, blobz: &blobz::Store) -> Vec<CanvasUsa
     summaries
 }
 
+/// walk a single canvas doc for its file widgets, resolve each widget's
+/// blob reference, and return a deduped (by blake3), sorted (size desc) list
+/// of BlobUsageSummary rows for the CanvasBlobs request.
+///
+/// includes blobs that are:
+/// - live in blobz (normal case)
+/// - soft-deleted (`soft_deleted = true`)
+/// - never snatched (`size = 0`, filename taken from the widget doc)
+async fn canvas_blobs_for(
+    hub_repo: &HubRepo,
+    blobz: &blobz::Store,
+    canvas_doc_id: &str,
+) -> Vec<BlobUsageSummary> {
+    use crate::snatch::{read_canvas_for_file_widgets, read_widget_state};
+    use std::collections::HashMap;
+
+    let handle = match hub_repo.find(canvas_doc_id).await {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+
+    let doc_id_owned = canvas_doc_id.to_string();
+    let placeholder_refs = tokio::task::spawn_blocking(move || {
+        let (refs, _peers) = read_canvas_for_file_widgets(&handle, &doc_id_owned, "");
+        refs
+    })
+    .await
+    .unwrap_or_default();
+
+    // dedupe by blake3: accumulate into a map, keeping the most informative
+    // entry (prefer a blobz-resolved row over a widget-only stub).
+    let mut by_blake3: HashMap<String, BlobUsageSummary> = HashMap::new();
+
+    for placeholder in &placeholder_refs {
+        let whandle = match hub_repo.find(&placeholder.widget_doc_id).await {
+            Some(h) => h,
+            None => continue,
+        };
+        let cid = canvas_doc_id.to_string();
+        let wid = placeholder.widget_doc_id.clone();
+        let wref = tokio::task::spawn_blocking(move || read_widget_state(&whandle, &cid, &wid))
+            .await
+            .ok()
+            .flatten();
+        let Some(wref) = wref else { continue };
+        if wref.blake3.is_empty() {
+            continue;
+        }
+
+        // skip if we already have a blobz-resolved entry for this blake3.
+        if by_blake3.contains_key(&wref.blake3) {
+            continue;
+        }
+
+        let blob_any = blobz.get_any(&wref.blake3).await.ok().flatten();
+        let (size, filename, mime, external, soft_deleted) = if let Some(b) = blob_any {
+            let is_soft_deleted = blobz.get(&wref.blake3).await.ok().flatten().is_none();
+            (
+                b.size as u64,
+                b.filename.or_else(|| {
+                    if wref.filename.is_empty() {
+                        None
+                    } else {
+                        Some(wref.filename.clone())
+                    }
+                }),
+                b.mime,
+                b.external,
+                is_soft_deleted,
+            )
+        } else {
+            // never snatched — use widget doc metadata, size 0
+            (
+                0,
+                if wref.filename.is_empty() {
+                    None
+                } else {
+                    Some(wref.filename.clone())
+                },
+                if wref.mime.is_empty() {
+                    None
+                } else {
+                    Some(wref.mime.clone())
+                },
+                false,
+                false,
+            )
+        };
+
+        by_blake3.insert(
+            wref.blake3.clone(),
+            BlobUsageSummary {
+                blake3: wref.blake3,
+                filename,
+                mime,
+                size,
+                external,
+                soft_deleted,
+            },
+        );
+    }
+
+    let mut result: Vec<BlobUsageSummary> = by_blake3.into_values().collect();
+    // sort largest-first; unsnatched (size 0) blobs sort to the end.
+    result.sort_by(|a, b| b.size.cmp(&a.size).then(a.blake3.cmp(&b.blake3)));
+    result
+}
+
 async fn send_response(
     send: &mut iroh::endpoint::SendStream,
     resp: &AdminResponse,
@@ -1129,6 +1478,7 @@ mod tests {
         blobz::Store,
         HubRepo,
         tempfile::TempDir,
+        Arc<tokio::sync::Notify>,
     ) {
         let pool = db::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
@@ -1142,6 +1492,8 @@ mod tests {
         let canvas_doc_ids = Arc::new(tokio::sync::Mutex::new(
             std::collections::HashSet::<String>::new(),
         ));
+        let hub_profile = default_test_hub_profile();
+        let profile_changed = Arc::new(tokio::sync::Notify::new());
         (
             HubAdminHandler::new(
                 adminz_store.clone(),
@@ -1151,6 +1503,8 @@ mod tests {
                 hub_repo.clone(),
                 "hub-node".to_string(),
                 canvas_doc_ids,
+                hub_profile,
+                Arc::clone(&profile_changed),
             ),
             adminz_store,
             friendz_store,
@@ -1158,7 +1512,18 @@ mod tests {
             blobz_store,
             hub_repo,
             tmp,
+            profile_changed,
         )
+    }
+
+    /// default hub profile for tests.
+    fn default_test_hub_profile() -> Arc<tokio::sync::RwLock<HubProfile>> {
+        Arc::new(tokio::sync::RwLock::new(HubProfile {
+            username: "test-hub".to_string(),
+            bio: "a test hub".to_string(),
+            accent_color: 0,
+            avatar_data_url: String::new(),
+        }))
     }
 
     #[test]
@@ -1182,7 +1547,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_admin_is_rejected_for_all_operations() {
-        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp, _) = make_handler().await;
         let stranger = "stranger-node";
 
         let allow = handle_request(
@@ -1211,7 +1576,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_can_allow_list_and_remove() {
-        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1269,7 +1634,7 @@ mod tests {
     /// since no unit test in this crate spins up a real iroh connection).
     #[tokio::test]
     async fn admin_remove_cancels_an_active_connection() {
-        let (handler, adminz_store, friendz_store, userz_dir, _blobz, hub_repo, _tmp) =
+        let (handler, adminz_store, friendz_store, userz_dir, _blobz, hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         let target_peer = "target-peer";
@@ -1317,7 +1682,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_allow_does_not_demote_an_already_accepted_friend() {
-        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp) =
+        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1350,7 +1715,7 @@ mod tests {
     /// the wire response looks right.
     #[tokio::test]
     async fn non_admin_requests_have_no_side_effects_on_friendz_table() {
-        let (handler, _adminz, friendz_store, userz_dir, _blobz, _hub_repo, _tmp) =
+        let (handler, _adminz, friendz_store, userz_dir, _blobz, _hub_repo, _tmp, _) =
             make_handler().await;
         let stranger = "stranger-node";
 
@@ -1405,7 +1770,7 @@ mod tests {
     /// variants), so it must never affect the caller's own admin rights.
     #[tokio::test]
     async fn admin_remove_never_touches_the_adminz_table() {
-        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp) =
+        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1440,7 +1805,7 @@ mod tests {
     /// it's an intentional "delete is idempotent" convention, not a bug.
     #[tokio::test]
     async fn admin_remove_of_nonexistent_friend_reports_removed_not_error() {
-        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1461,7 +1826,7 @@ mod tests {
     /// mutating request variants.
     #[tokio::test]
     async fn allow_and_remove_reject_whitespace_only_node_id() {
-        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1491,7 +1856,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_can_block_and_then_unblock_via_allow() {
-        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp) =
+        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1539,7 +1904,7 @@ mod tests {
 
     #[tokio::test]
     async fn block_rejects_empty_node_id_and_non_admin_callers() {
-        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp) =
+        let (handler, adminz_store, friendz_store, userz_dir, _blobz, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1577,7 +1942,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_can_promote_and_demote_a_second_admin() {
-        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1621,7 +1986,7 @@ mod tests {
 
     #[tokio::test]
     async fn promote_and_demote_admin_reject_non_admin_callers() {
-        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp, _) = make_handler().await;
         let stranger = "stranger-node";
 
         let promote = handle_request(
@@ -1649,7 +2014,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_includes_username_bio_avatar_and_admin_status() {
-        let (handler, adminz_store, friendz_store, userz_dir, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, friendz_store, userz_dir, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1800,6 +2165,8 @@ mod tests {
             hub_repo,
             "hub-node".to_string(),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            default_test_hub_profile(),
+            Arc::new(tokio::sync::Notify::new()),
         );
 
         let admin_node = "admin-node";
@@ -1888,6 +2255,8 @@ mod tests {
             hub_repo,
             "hub-node".to_string(),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            default_test_hub_profile(),
+            Arc::new(tokio::sync::Notify::new()),
         );
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1939,6 +2308,8 @@ mod tests {
             hub_repo,
             "hub-node".to_string(),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            default_test_hub_profile(),
+            Arc::new(tokio::sync::Notify::new()),
         );
 
         let stranger = "stranger-node";
@@ -1953,7 +2324,7 @@ mod tests {
 
     #[tokio::test]
     async fn disk_usage_sums_blobz_sizes_and_counts_rows() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -1997,7 +2368,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_admin_cannot_request_disk_usage() {
-        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp, _) = make_handler().await;
         let resp = handle_request(&handler, "stranger", AdminRequest::DiskUsage).await;
         assert!(matches!(resp, AdminResponse::NotAdmin));
     }
@@ -2006,7 +2377,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_usage_returns_all_blob_rows() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2053,7 +2424,7 @@ mod tests {
 
     #[tokio::test]
     async fn soft_delete_stamps_caller_as_actor_and_hides_blob() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2089,7 +2460,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_blobs_makes_blob_visible_again() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2124,7 +2495,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_soft_deleted_returns_soft_deleted_blobs() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2161,7 +2532,7 @@ mod tests {
 
     #[tokio::test]
     async fn hard_delete_blobs_removes_managed_file_and_row() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2201,7 +2572,7 @@ mod tests {
 
     #[tokio::test]
     async fn hard_delete_all_purges_every_soft_deleted_row() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2238,7 +2609,7 @@ mod tests {
 
     #[tokio::test]
     async fn disk_usage_includes_soft_deleted_fields() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2276,7 +2647,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_admin_cannot_soft_delete_restore_or_hard_delete_blobs() {
-        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp, _) = make_handler().await;
         let stranger = "stranger-node";
 
         let sd = handle_request(
@@ -2326,7 +2697,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_usage_pagination_returns_correct_page_and_total() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2395,7 +2766,7 @@ mod tests {
 
     #[tokio::test]
     async fn soft_deleted_pagination_returns_correct_page_and_total() {
-        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp) =
+        let (handler, adminz_store, _friendz, _userz, blobz_store, _hub_repo, _tmp, _) =
             make_handler().await;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2491,6 +2862,8 @@ mod tests {
             hub_repo,
             "hub-node".to_string(),
             Arc::clone(&canvas_doc_ids),
+            default_test_hub_profile(),
+            Arc::new(tokio::sync::Notify::new()),
         );
 
         let resp = handle_request(
@@ -2566,6 +2939,8 @@ mod tests {
             hub_repo,
             "hub-node".to_string(),
             canvas_doc_ids,
+            default_test_hub_profile(),
+            Arc::new(tokio::sync::Notify::new()),
         );
 
         let resp = handle_request(
@@ -2584,12 +2959,624 @@ mod tests {
 
     #[tokio::test]
     async fn non_admin_cannot_unsync_canvas() {
-        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp) = make_handler().await;
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp, _) = make_handler().await;
         let resp = handle_request(
             &handler,
             "stranger",
             AdminRequest::UnsyncCanvas {
                 canvas_doc_id: "any-canvas".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(resp, AdminResponse::NotAdmin));
+    }
+
+    // -- GetHubProfile / SetHubProfile / SetHubAvatar --------------------
+
+    #[tokio::test]
+    async fn get_hub_profile_returns_current_values() {
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp, _) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let resp = handle_request(&handler, admin_node, AdminRequest::GetHubProfile).await;
+        match resp {
+            AdminResponse::HubProfile {
+                username,
+                bio,
+                accent_color,
+                ..
+            } => {
+                assert_eq!(username, "test-hub");
+                assert_eq!(bio, "a test hub");
+                assert_eq!(accent_color, 0);
+            }
+            other => panic!("expected HubProfile, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_get_hub_profile() {
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp, _) = make_handler().await;
+        let resp = handle_request(&handler, "stranger", AdminRequest::GetHubProfile).await;
+        assert!(matches!(resp, AdminResponse::NotAdmin));
+    }
+
+    #[tokio::test]
+    async fn set_hub_profile_round_trip_persists_to_userz_and_lock() {
+        let (handler, adminz_store, _friendz, userz_dir, _blobz, _hub_repo, _tmp, _) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        // first upsert_self so the hub node row exists for the FK
+        userz_dir
+            .upsert_self("hub-node", Some("test-hub"), Some("a test hub"), None)
+            .await
+            .unwrap();
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::SetHubProfile {
+                username: Some("new-hub-name".to_string()),
+                bio: Some("updated bio".to_string()),
+                accent_color: Some(42),
+            },
+        )
+        .await;
+        match &resp {
+            AdminResponse::HubProfile {
+                username,
+                bio,
+                accent_color,
+                ..
+            } => {
+                assert_eq!(username, "new-hub-name");
+                assert_eq!(bio, "updated bio");
+                assert_eq!(*accent_color, 42);
+            }
+            other => panic!("expected HubProfile, got {other:?}"),
+        }
+
+        // verify persisted to userz
+        let self_row = userz_dir.get_self().await.unwrap();
+        assert!(self_row.is_some(), "self row must exist after upsert");
+        let row = self_row.unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("new-hub-name"));
+        assert_eq!(row.bio.as_deref(), Some("updated bio"));
+        assert_eq!(row.accent_color, 42);
+
+        // verify visible in a subsequent GetHubProfile
+        let get_resp = handle_request(&handler, admin_node, AdminRequest::GetHubProfile).await;
+        match get_resp {
+            AdminResponse::HubProfile {
+                username,
+                bio,
+                accent_color,
+                ..
+            } => {
+                assert_eq!(username, "new-hub-name");
+                assert_eq!(bio, "updated bio");
+                assert_eq!(accent_color, 42);
+            }
+            other => panic!("expected HubProfile on second get, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_hub_profile_rejects_empty_username() {
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp, _) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::SetHubProfile {
+                username: Some("   ".to_string()),
+                bio: None,
+                accent_color: None,
+            },
+        )
+        .await;
+        assert!(matches!(resp, AdminResponse::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn set_hub_profile_rejects_overlong_username_and_bio() {
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp, _) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let long_name = "x".repeat(65);
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::SetHubProfile {
+                username: Some(long_name),
+                bio: None,
+                accent_color: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(resp, AdminResponse::Error { .. }),
+            "65-char username must fail"
+        );
+
+        let long_bio = "b".repeat(513);
+        let resp2 = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::SetHubProfile {
+                username: None,
+                bio: Some(long_bio),
+                accent_color: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(resp2, AdminResponse::Error { .. }),
+            "513-char bio must fail"
+        );
+    }
+
+    /// SetHubProfile fires the profile_changed notify on a successful update
+    /// so the broadcast task in hub/mod.rs can push the change to online peers.
+    /// SetHubProfile with invalid input must NOT fire it (no spurious broadcast).
+    #[tokio::test]
+    async fn set_hub_profile_fires_notify_on_success() {
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp, notify) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        // invalid request: empty username — notify must NOT fire
+        handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::SetHubProfile {
+                username: Some("   ".to_string()),
+                bio: None,
+                accent_color: None,
+            },
+        )
+        .await;
+        let no_fire =
+            tokio::time::timeout(std::time::Duration::from_millis(10), notify.notified()).await;
+        assert!(
+            no_fire.is_err(),
+            "notify must not fire for a rejected request"
+        );
+
+        // valid request: notify must fire
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::SetHubProfile {
+                username: Some("new-hub-name".to_string()),
+                bio: Some("updated bio".to_string()),
+                accent_color: None,
+            },
+        )
+        .await;
+        assert!(matches!(resp, AdminResponse::HubProfile { .. }));
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
+            .await
+            .expect("notify must fire after a successful SetHubProfile");
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_set_hub_profile() {
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp, _) = make_handler().await;
+        let resp = handle_request(
+            &handler,
+            "stranger",
+            AdminRequest::SetHubProfile {
+                username: Some("evil".to_string()),
+                bio: None,
+                accent_color: None,
+            },
+        )
+        .await;
+        assert!(matches!(resp, AdminResponse::NotAdmin));
+    }
+
+    #[tokio::test]
+    async fn set_hub_avatar_accepts_valid_png_and_updates_lock() {
+        let (handler, adminz_store, _friendz, userz_dir, blobz_store, _hub_repo, _tmp, _) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        // seed hub node row
+        userz_dir
+            .upsert_self("hub-node", Some("test-hub"), Some("bio"), None)
+            .await
+            .unwrap();
+
+        // generate a minimal valid png in-memory (same helper as avatar.rs tests)
+        let png = {
+            let img = image::RgbImage::from_fn(8, 8, |x, y| {
+                image::Rgb([(x * 32) as u8, (y * 32) as u8, 0])
+            });
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .unwrap();
+            buf.into_inner()
+        };
+
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::SetHubAvatar { image_base64: b64 },
+        )
+        .await;
+        match &resp {
+            AdminResponse::HubProfile {
+                avatar_data_url, ..
+            } => {
+                assert!(
+                    avatar_data_url.starts_with("data:image/webp;base64,"),
+                    "response must contain a webp data url"
+                );
+            }
+            other => panic!("expected HubProfile, got {other:?}"),
+        }
+
+        // verify blobz has a blob now
+        let blobs = blobz_store
+            .list_paginated_with_count(10, 0)
+            .await
+            .unwrap()
+            .0;
+        assert!(!blobs.is_empty(), "avatar blob must be stored in blobz");
+
+        // verify lock was updated
+        let get_resp = handle_request(&handler, admin_node, AdminRequest::GetHubProfile).await;
+        match get_resp {
+            AdminResponse::HubProfile {
+                avatar_data_url, ..
+            } => {
+                assert!(avatar_data_url.starts_with("data:image/webp;base64,"));
+            }
+            other => panic!("expected HubProfile, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_hub_avatar_rejects_oversized_image() {
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp, _) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        // build a base64 payload that decodes to > 512 KB
+        use base64::Engine;
+        let big = vec![0u8; 513 * 1024];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&big);
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::SetHubAvatar { image_base64: b64 },
+        )
+        .await;
+        assert!(
+            matches!(resp, AdminResponse::Error { .. }),
+            "oversized avatar must be rejected with Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_set_hub_avatar() {
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp, _) = make_handler().await;
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"data");
+        let resp = handle_request(
+            &handler,
+            "stranger",
+            AdminRequest::SetHubAvatar { image_base64: b64 },
+        )
+        .await;
+        assert!(matches!(resp, AdminResponse::NotAdmin));
+    }
+
+    // -- CanvasBlobs -------------------------------------------------------
+
+    #[tokio::test]
+    async fn canvas_blobs_returns_empty_for_unknown_canvas() {
+        let (handler, adminz_store, _friendz, _userz, _blobz, _hub_repo, _tmp, _) =
+            make_handler().await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let resp = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::CanvasBlobs {
+                canvas_doc_id: "no-such-canvas".to_string(),
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::CanvasBlobs { blobs, total, .. } => {
+                assert_eq!(total, 0);
+                assert!(blobs.is_empty());
+            }
+            other => panic!("expected CanvasBlobs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn canvas_blobs_includes_soft_deleted_flag() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = db::open_in_memory().await;
+        let blobz_store = blobz::Store::new(pool.clone(), tmp.path());
+
+        // insert a blob that we'll soft-delete
+        let b = blobz_store
+            .insert(
+                "h-cb-sd".into(),
+                Some("soft.txt".into()),
+                Some("text/plain".into()),
+                b"soft content",
+            )
+            .await
+            .unwrap();
+        blobz_store
+            .soft_delete(&[b.blake3.clone()], "admin")
+            .await
+            .unwrap();
+
+        // insert a live blob
+        let live = blobz_store
+            .insert(
+                "h-cb-live".into(),
+                Some("live.txt".into()),
+                Some("text/plain".into()),
+                b"live content",
+            )
+            .await
+            .unwrap();
+
+        // build a canvas doc with two file widgets referencing these blobs
+        let db_path = tmp.path().join("hub-docs.db");
+        let storage = crate::hub_repo::HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new");
+
+        let mut canvas_doc = automerge::Automerge::new();
+        let canvas_doc_id = "canvas-blob-test";
+        let widget_doc_id_soft = "widget-soft-deleted";
+        let widget_doc_id_live = "widget-live";
+
+        canvas_doc
+            .transact::<_, _, automerge::AutomergeError>(|tx| {
+                use automerge::transaction::Transactable;
+                tx.put(automerge::ROOT, "title", "test canvas")?;
+                let widgets = tx.put_object(automerge::ROOT, "widgets", automerge::ObjType::Map)?;
+                let w1 = tx.put_object(&widgets, "w1", automerge::ObjType::Map)?;
+                tx.put(&w1, "type", "file")?;
+                tx.put(&w1, "docId", widget_doc_id_soft)?;
+                let w2 = tx.put_object(&widgets, "w2", automerge::ObjType::Map)?;
+                tx.put(&w2, "type", "file")?;
+                tx.put(&w2, "docId", widget_doc_id_live)?;
+                Ok(())
+            })
+            .unwrap();
+        storage.save_doc(canvas_doc_id, &canvas_doc.save()).await;
+
+        // build widget state docs
+        for (wid, blake3, filename) in [
+            (widget_doc_id_soft, b.blake3.as_str(), "soft.txt"),
+            (widget_doc_id_live, live.blake3.as_str(), "live.txt"),
+        ] {
+            let mut wdoc = automerge::Automerge::new();
+            wdoc.transact::<_, _, automerge::AutomergeError>(|tx| {
+                use automerge::transaction::Transactable;
+                tx.put(automerge::ROOT, "blobId", blake3)?;
+                tx.put(automerge::ROOT, "blake3", blake3)?;
+                tx.put(automerge::ROOT, "filename", filename)?;
+                tx.put(automerge::ROOT, "mime", "text/plain")?;
+                tx.put(automerge::ROOT, "size", 12u64)?;
+                Ok(())
+            })
+            .unwrap();
+            storage.save_doc(wid, &wdoc.save()).await;
+        }
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new");
+        let adminz_store = crate::adminz::Store::new(pool.clone());
+        adminz_store.allow("admin").await.unwrap();
+        let handler = HubAdminHandler::new(
+            adminz_store,
+            friendz::Store::new(pool.clone()),
+            userz::Directory::new(pool),
+            blobz_store,
+            hub_repo,
+            "hub-node".to_string(),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            default_test_hub_profile(),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+
+        let resp = handle_request(
+            &handler,
+            "admin",
+            AdminRequest::CanvasBlobs {
+                canvas_doc_id: canvas_doc_id.to_string(),
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::CanvasBlobs { blobs, total, .. } => {
+                assert_eq!(total, 2, "both blobs (live + soft-deleted) should appear");
+                let soft = blobs.iter().find(|b2| b2.blake3 == b.blake3);
+                let live_b = blobs.iter().find(|b2| b2.blake3 == live.blake3);
+                assert!(soft.is_some(), "soft-deleted blob must be in the response");
+                assert!(
+                    soft.unwrap().soft_deleted,
+                    "soft_deleted flag must be true for the soft-deleted blob"
+                );
+                assert!(live_b.is_some(), "live blob must be in the response");
+                assert!(
+                    !live_b.unwrap().soft_deleted,
+                    "live blob must have soft_deleted=false"
+                );
+            }
+            other => panic!("expected CanvasBlobs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn canvas_blobs_pagination_works() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = db::open_in_memory().await;
+        let blobz_store = blobz::Store::new(pool.clone(), tmp.path());
+
+        // insert three blobs with different sizes so we can verify sort order
+        let blobs_in: Vec<(&str, &str, &[u8])> = vec![
+            ("h-pg-1", "small.txt", b"s"),
+            ("h-pg-2", "medium.txt", b"mmm"),
+            ("h-pg-3", "large.txt", b"lllll"),
+        ];
+        let mut inserted = Vec::new();
+        for (iroh, name, data) in &blobs_in {
+            let b = blobz_store
+                .insert(iroh.to_string(), Some(name.to_string()), None, data)
+                .await
+                .unwrap();
+            inserted.push(b);
+        }
+
+        let db_path = tmp.path().join("hub-docs.db");
+        let storage = crate::hub_repo::HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new");
+
+        let canvas_doc_id = "canvas-pg";
+        let mut canvas_doc = automerge::Automerge::new();
+        canvas_doc
+            .transact::<_, _, automerge::AutomergeError>(|tx| {
+                use automerge::transaction::Transactable;
+                tx.put(automerge::ROOT, "title", "pg canvas")?;
+                let widgets = tx.put_object(automerge::ROOT, "widgets", automerge::ObjType::Map)?;
+                for (i, b) in inserted.iter().enumerate() {
+                    let wkey = format!("w{i}");
+                    let wdoc_id = format!("widget-pg-{i}");
+                    let w = tx.put_object(&widgets, wkey, automerge::ObjType::Map)?;
+                    tx.put(&w, "type", "file")?;
+                    tx.put(&w, "docId", wdoc_id)?;
+                    let _ = b;
+                }
+                Ok(())
+            })
+            .unwrap();
+        storage.save_doc(canvas_doc_id, &canvas_doc.save()).await;
+
+        for (i, b) in inserted.iter().enumerate() {
+            let wdoc_id = format!("widget-pg-{i}");
+            let mut wdoc = automerge::Automerge::new();
+            wdoc.transact::<_, _, automerge::AutomergeError>(|tx| {
+                use automerge::transaction::Transactable;
+                tx.put(automerge::ROOT, "blobId", b.blake3.as_str())?;
+                tx.put(automerge::ROOT, "blake3", b.blake3.as_str())?;
+                tx.put(
+                    automerge::ROOT,
+                    "filename",
+                    b.filename.as_deref().unwrap_or(""),
+                )?;
+                tx.put(automerge::ROOT, "size", b.size as u64)?;
+                Ok(())
+            })
+            .unwrap();
+            storage.save_doc(&wdoc_id, &wdoc.save()).await;
+        }
+
+        let hub_repo = HubRepo::new("hub-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new");
+        let adminz_store = crate::adminz::Store::new(pool.clone());
+        adminz_store.allow("admin").await.unwrap();
+        let handler = HubAdminHandler::new(
+            adminz_store,
+            friendz::Store::new(pool.clone()),
+            userz::Directory::new(pool),
+            blobz_store,
+            hub_repo,
+            "hub-node".to_string(),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            default_test_hub_profile(),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+
+        // full listing: 3 blobs, sorted size desc
+        let resp = handle_request(
+            &handler,
+            "admin",
+            AdminRequest::CanvasBlobs {
+                canvas_doc_id: canvas_doc_id.to_string(),
+                offset: 0,
+                limit: 50,
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::CanvasBlobs { blobs, total, .. } => {
+                assert_eq!(total, 3);
+                assert_eq!(blobs.len(), 3);
+                // largest first
+                assert!(blobs[0].size >= blobs[1].size);
+                assert!(blobs[1].size >= blobs[2].size);
+            }
+            other => panic!("expected CanvasBlobs, got {other:?}"),
+        }
+
+        // paginate: offset=1, limit=1 → second blob only
+        let resp2 = handle_request(
+            &handler,
+            "admin",
+            AdminRequest::CanvasBlobs {
+                canvas_doc_id: canvas_doc_id.to_string(),
+                offset: 1,
+                limit: 1,
+            },
+        )
+        .await;
+        match resp2 {
+            AdminResponse::CanvasBlobs { blobs, total, .. } => {
+                assert_eq!(total, 3, "total is always the deduplicated count");
+                assert_eq!(blobs.len(), 1, "limit=1 must return exactly 1 blob");
+            }
+            other => panic!("expected CanvasBlobs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_list_canvas_blobs() {
+        let (handler, _adminz, _friendz, _userz, _blobz, _hub_repo, _tmp, _) = make_handler().await;
+        let resp = handle_request(
+            &handler,
+            "stranger",
+            AdminRequest::CanvasBlobs {
+                canvas_doc_id: "any".to_string(),
+                offset: 0,
+                limit: 10,
             },
         )
         .await;

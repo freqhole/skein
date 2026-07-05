@@ -2464,6 +2464,13 @@ export function createFriendsTab(ctx: TabContext): TabController {
         hubProfileHandle?.getUnsyncButtonGlobalPos(canvasDocId) ?? null,
       getHubProfileScrollState: () => hubProfileHandle?.getScrollState() ?? null,
       getHubProfilePanelGlobalPos: () => hubProfileHandle?.getPanelGlobalPos() ?? null,
+      getHubProfileSectionCollapsed: (sectionId: string) =>
+        hubProfileHandle?.getSectionCollapsed(sectionId) ?? false,
+      toggleHubProfileSection: (sectionId: string) =>
+        hubProfileHandle?.toggleSection(sectionId),
+      getHubProfileProfileState: () => hubProfileHandle?.getHubProfileState() ?? null,
+      getHubProfileCanvasBlobsState: (canvasDocId: string) =>
+        hubProfileHandle?.getCanvasBlobsState(canvasDocId) ?? null,
     },
   });
 

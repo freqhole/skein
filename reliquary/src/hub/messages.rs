@@ -76,17 +76,27 @@ impl HubPeerService {
         match message {
             FriendzMessage::ProfileRequest => {
                 // hub peer shares its profile with anyone — no visibility check
+                let (hub_username, hub_bio, hub_avatar_data_url, hub_accent_color) = {
+                    let p = self.hub_profile.read().await;
+                    (
+                        p.username.clone(),
+                        p.bio.clone(),
+                        p.avatar_data_url.clone(),
+                        p.accent_color,
+                    )
+                };
                 tracing::info!(
                     peer = %from_node_id,
-                    username = %self.profile_username,
-                    bio_len = self.profile_bio.len(),
-                    avatar_len = self.profile_avatar_data_url.len(),
+                    username = %hub_username,
+                    bio_len = hub_bio.len(),
+                    avatar_len = hub_avatar_data_url.len(),
                     "responding to profile request"
                 );
                 let response = FriendzMessage::ProfileResponse {
-                    username: self.profile_username.clone(),
-                    bio: self.profile_bio.clone(),
-                    avatar_data_url: self.profile_avatar_data_url.clone(),
+                    username: hub_username,
+                    bio: hub_bio,
+                    avatar_data_url: hub_avatar_data_url,
+                    accent_color: Some(hub_accent_color),
                 };
                 if let Err(e) = self.friendz.send_message(from_node_id, &response).await {
                     tracing::warn!(
@@ -100,6 +110,7 @@ impl HubPeerService {
                 username,
                 bio,
                 avatar_data_url,
+                ..
             } => {
                 // update the remote peer's profile in userz.
                 //
@@ -213,15 +224,24 @@ impl HubPeerService {
                 );
 
                 // send friend-accept back with the hub's username from config
+                let (hub_username, hub_bio, hub_avatar_data_url, hub_accent_color) = {
+                    let p = self.hub_profile.read().await;
+                    (
+                        p.username.clone(),
+                        p.bio.clone(),
+                        p.avatar_data_url.clone(),
+                        p.accent_color,
+                    )
+                };
                 tracing::info!(
                     peer = %from_node_id,
-                    hub_username = %self.profile_username,
+                    hub_username = %hub_username,
                     hub_node_id = %self.node_id_str,
                     "sending friend-accept"
                 );
                 let accept = FriendzMessage::FriendAccept {
                     from_node_id: self.node_id_str.clone(),
-                    from_username: self.profile_username.clone(),
+                    from_username: hub_username.clone(),
                     // this router is a hub's friendz handler — always flag
                     // ourselves as a hub node (see docs/hub-and-profile-plan.md
                     // section 3.2; the tauri-desktop-peer router in service.rs
@@ -244,9 +264,10 @@ impl HubPeerService {
                 // proactively send our profile so the peer has our display name,
                 // bio, and avatar immediately (without waiting for a profile-request)
                 let profile_resp = FriendzMessage::ProfileResponse {
-                    username: self.profile_username.clone(),
-                    bio: self.profile_bio.clone(),
-                    avatar_data_url: self.profile_avatar_data_url.clone(),
+                    username: hub_username,
+                    bio: hub_bio,
+                    avatar_data_url: hub_avatar_data_url,
+                    accent_color: Some(hub_accent_color),
                 };
                 match self.friendz.send_message(from_node_id, &profile_resp).await {
                     Ok(()) => {

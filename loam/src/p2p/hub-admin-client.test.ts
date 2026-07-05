@@ -595,3 +595,156 @@ describe("hubAdminHardDeleteBlobs", () => {
     expect(response).toEqual({ kind: "blobsMutation", affected: 5, failed: [] });
   });
 });
+
+// ---------------------------------------------------------------------------
+// hub profile wire shapes
+// ---------------------------------------------------------------------------
+
+describe("hubAdminGetProfile", () => {
+  it("sends unit-variant GetHubProfile request and parses HubProfile response", async () => {
+    const fake = createFakeNode({
+      HubProfile: { username: "myhub", bio: "a relay hub", accent_color: 0x6366f1, avatar_data_url: "data:image/webp;base64,abc" },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminGetProfile(PEER_NODE_ID);
+
+    expect(fake.getWrittenRequest()).toEqual("GetHubProfile");
+    expect(response).toEqual({
+      kind: "hubProfile",
+      profile: { username: "myhub", bio: "a relay hub", accentColor: 0x6366f1, avatarDataUrl: "data:image/webp;base64,abc" },
+    });
+  });
+
+  it("handles an empty profile (fresh hub with no profile set)", async () => {
+    const fake = createFakeNode({
+      HubProfile: { username: "", bio: "", accent_color: 0, avatar_data_url: "" },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminGetProfile(PEER_NODE_ID);
+
+    expect(response).toEqual({
+      kind: "hubProfile",
+      profile: { username: "", bio: "", accentColor: 0, avatarDataUrl: "" },
+    });
+  });
+});
+
+describe("hubAdminSetProfile", () => {
+  it("sends SetHubProfile struct request and parses HubProfile response", async () => {
+    const fake = createFakeNode({
+      HubProfile: { username: "updated-hub", bio: "new bio", accent_color: 0xd946ef, avatar_data_url: "" },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminSetProfile(PEER_NODE_ID, {
+      username: "updated-hub",
+      bio: "new bio",
+      accentColor: 0xd946ef,
+    });
+
+    expect(fake.getWrittenRequest()).toEqual({
+      SetHubProfile: { username: "updated-hub", bio: "new bio", accent_color: 0xd946ef },
+    });
+    expect(response).toEqual({
+      kind: "hubProfile",
+      profile: { username: "updated-hub", bio: "new bio", accentColor: 0xd946ef, avatarDataUrl: "" },
+    });
+  });
+
+  it("sends null fields when opts are omitted — hub-side leaves those fields unchanged", async () => {
+    const fake = createFakeNode({
+      HubProfile: { username: "unchanged", bio: "", accent_color: 0, avatar_data_url: "" },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    await client.hubAdminSetProfile(PEER_NODE_ID, {});
+
+    expect(fake.getWrittenRequest()).toEqual({
+      SetHubProfile: { username: null, bio: null, accent_color: null },
+    });
+  });
+});
+
+describe("hubAdminSetAvatar", () => {
+  it("sends SetHubAvatar struct request and parses HubProfile response", async () => {
+    const fake = createFakeNode({
+      HubProfile: { username: "hub", bio: "", accent_color: 0, avatar_data_url: "data:image/webp;base64,xyz" },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminSetAvatar(PEER_NODE_ID, "base64data==");
+
+    expect(fake.getWrittenRequest()).toEqual({ SetHubAvatar: { image_base64: "base64data==" } });
+    expect(response).toEqual({
+      kind: "hubProfile",
+      profile: { username: "hub", bio: "", accentColor: 0, avatarDataUrl: "data:image/webp;base64,xyz" },
+    });
+  });
+});
+
+describe("hubAdminCanvasBlobs", () => {
+  it("sends CanvasBlobs struct request and parses CanvasBlobs response", async () => {
+    const fake = createFakeNode({
+      CanvasBlobs: {
+        canvas_doc_id: "canvas-abc",
+        blobs: [
+          { blake3: "aa", filename: "img.png", mime: "image/png", size: 2048, external: false, soft_deleted: false },
+        ],
+        total: 1,
+      },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminCanvasBlobs(PEER_NODE_ID, "canvas-abc");
+
+    expect(fake.getWrittenRequest()).toEqual({ CanvasBlobs: { canvas_doc_id: "canvas-abc", offset: 0, limit: 50 } });
+    expect(response).toEqual({
+      kind: "canvasBlobs",
+      canvasDocId: "canvas-abc",
+      total: 1,
+      blobs: [{ blake3: "aa", filename: "img.png", mime: "image/png", size: 2048, external: false, softDeleted: false }],
+    });
+  });
+
+  it("passes pagination params as canvas_doc_id / offset / limit", async () => {
+    const fake = createFakeNode({ CanvasBlobs: { canvas_doc_id: "canvas-xyz", blobs: [], total: 42 } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    await client.hubAdminCanvasBlobs(PEER_NODE_ID, "canvas-xyz", 10, 5);
+
+    expect(fake.getWrittenRequest()).toEqual({ CanvasBlobs: { canvas_doc_id: "canvas-xyz", offset: 10, limit: 5 } });
+  });
+
+  it("coerces BigInt size and total fields to numbers (cbor decodes rust u64 as BigInt)", async () => {
+    const fake = createFakeNode({
+      CanvasBlobs: {
+        canvas_doc_id: "canvas-bigint",
+        blobs: [
+          { blake3: "bb", filename: null, mime: null, size: 1_073_741_824n, external: false, soft_deleted: false },
+        ],
+        total: 1n,
+      },
+    });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminCanvasBlobs(PEER_NODE_ID, "canvas-bigint");
+
+    expect(response).toEqual({
+      kind: "canvasBlobs",
+      canvasDocId: "canvas-bigint",
+      total: 1,
+      blobs: [{ blake3: "bb", filename: null, mime: null, size: 1_073_741_824, external: false, softDeleted: false }],
+    });
+  });
+
+  it("returns empty blob list when the canvas has no blobs", async () => {
+    const fake = createFakeNode({ CanvasBlobs: { canvas_doc_id: "canvas-empty", blobs: [], total: 0 } });
+    const client = createHubAdminClient(transportFor(fake.node));
+
+    const response = await client.hubAdminCanvasBlobs(PEER_NODE_ID, "canvas-empty");
+
+    expect(response).toEqual({ kind: "canvasBlobs", canvasDocId: "canvas-empty", total: 0, blobs: [] });
+  });
+});

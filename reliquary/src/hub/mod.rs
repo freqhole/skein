@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::blobz;
@@ -66,6 +66,23 @@ pub enum HubError {
 }
 
 // ---------------------------------------------------------------------------
+// live profile state
+// ---------------------------------------------------------------------------
+
+/// the hub's own profile — username, bio, accent colour, and pre-built avatar
+/// data URL. wrapped in `Arc<RwLock<_>>` so both the friendz message handler
+/// (frequent reads: one read per incoming ProfileRequest) and the admin
+/// protocol (rare writes: SetHubProfile / SetHubAvatar) can access it without
+/// copying the three large strings for every message send.
+#[derive(Debug, Clone)]
+pub struct HubProfile {
+    pub username: String,
+    pub bio: String,
+    pub accent_color: i64,
+    pub avatar_data_url: String,
+}
+
+// ---------------------------------------------------------------------------
 // config
 // ---------------------------------------------------------------------------
 
@@ -101,16 +118,16 @@ pub struct HubPeerService {
     pub(crate) hub_repo: HubRepo,
     pub(crate) friendz: FriendzHandler,
     friendz_events: tokio::sync::mpsc::UnboundedReceiver<FriendzEvent>,
-    /// the hub peer's iroh node ID as a string
+    /// the hub's own node ID as a string
     pub(crate) node_id_str: String,
-    /// cached profile: username (from config, persisted in userz on boot)
-    pub(crate) profile_username: String,
-    /// cached profile: bio (from config, persisted in userz on boot)
-    pub(crate) profile_bio: String,
-    /// cached profile: avatar webp data URL (generated from `config.avatar_path`).
-    /// the underlying webp bytes are also stored in `blobz` and referenced
-    /// from `userz.avatar_blake3`.
-    pub(crate) profile_avatar_data_url: String,
+    /// live profile (username, bio, accent_color, avatar_data_url). shared
+    /// with HubAdminHandler via Arc<RwLock<_>> so admin writes are immediately
+    /// visible to outgoing ProfileResponse messages without a restart.
+    pub(crate) hub_profile: Arc<RwLock<HubProfile>>,
+    /// notified by HubAdminHandler whenever SetHubProfile or SetHubAvatar
+    /// succeeds. the broadcast task in `run()` waits here and pushes a
+    /// ProfileResponse to every currently-online peer.
+    pub(crate) profile_changed: Arc<tokio::sync::Notify>,
     /// canvas doc IDs the hub is participating in (for gossip and relay)
     pub(crate) canvas_doc_ids: Arc<Mutex<HashSet<String>>>,
     /// peer blob inventory — maps peer node ID → set of blake3 hashes they have.
@@ -180,6 +197,19 @@ impl HubPeerService {
             "hub peer profile persisted"
         );
 
+        // shared live profile state — admin writes update this directly
+        // so outgoing profile responses always use the current values.
+        let hub_profile = Arc::new(RwLock::new(HubProfile {
+            username: config.username.clone(),
+            bio: config.bio.clone(),
+            accent_color: 0,
+            avatar_data_url: profile_avatar_data_url.clone(),
+        }));
+
+        // notified when admin changes the hub's own profile so the broadcast
+        // task in run() can push a fresh ProfileResponse to online peers.
+        let profile_changed = Arc::new(tokio::sync::Notify::new());
+
         // wire automerge sync over iroh
         let iroh_repo = IrohRepo::new(endpoint.clone(), hub_repo.clone(), friendz_store.clone());
 
@@ -216,7 +246,9 @@ impl HubPeerService {
                     "loaded persisted canvas doc IDs from storage"
                 );
             }
-            Arc::new(Mutex::new(persisted.into_iter().collect::<HashSet<String>>()))
+            Arc::new(Mutex::new(
+                persisted.into_iter().collect::<HashSet<String>>(),
+            ))
         };
 
         // remote hub administration: lets a privileged remote peer manage
@@ -233,6 +265,8 @@ impl HubPeerService {
             hub_repo.clone(),
             node_id_str.clone(),
             Arc::clone(&canvas_doc_ids),
+            Arc::clone(&hub_profile),
+            Arc::clone(&profile_changed),
         );
 
         let router = iroh::protocol::Router::builder(endpoint.clone())
@@ -277,9 +311,8 @@ impl HubPeerService {
             friendz,
             friendz_events,
             node_id_str,
-            profile_username: config.username,
-            profile_bio: config.bio,
-            profile_avatar_data_url,
+            hub_profile,
+            profile_changed,
             canvas_doc_ids,
             peer_blob_inventory,
             snatcher,
@@ -377,6 +410,51 @@ impl HubPeerService {
         let sync_health_hub_repo = self.hub_repo.clone();
         let sync_health_canvas_ids = self.canvas_doc_ids.clone();
         let sync_health_cancel = cancel.clone();
+
+        // push a fresh ProfileResponse to every online peer after an admin
+        // SetHubProfile or SetHubAvatar call. debounces 500ms so a burst of
+        // username + bio + avatar changes sends one message, not three.
+        let profile_changed = Arc::clone(&self.profile_changed);
+        let friendz_for_profile = self.friendz.clone();
+        let hub_profile_for_broadcast = Arc::clone(&self.hub_profile);
+        let broadcast_cancel = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                // wait for a profile change notification or cancellation
+                tokio::select! {
+                    _ = broadcast_cancel.cancelled() => break,
+                    _ = profile_changed.notified() => {}
+                }
+                // debounce: absorb rapid successive changes
+                tokio::select! {
+                    _ = broadcast_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+                let msg = {
+                    let p = hub_profile_for_broadcast.read().await;
+                    FriendzMessage::ProfileResponse {
+                        username: p.username.clone(),
+                        bio: p.bio.clone(),
+                        avatar_data_url: p.avatar_data_url.clone(),
+                        accent_color: Some(p.accent_color),
+                    }
+                };
+                let peers = friendz_for_profile.get_online_peers().await;
+                tracing::debug!(
+                    peer_count = peers.len(),
+                    "broadcasting updated hub profile to online peers"
+                );
+                for peer_id in peers {
+                    if let Err(e) = friendz_for_profile.send_message(&peer_id, &msg).await {
+                        tracing::debug!(
+                            peer = %peer_id,
+                            error = %e,
+                            "profile broadcast: send failed"
+                        );
+                    }
+                }
+            }
+        });
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.tick().await; // skip first immediate tick

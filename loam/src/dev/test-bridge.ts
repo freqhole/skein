@@ -17,6 +17,7 @@ import {
 import type { SocialDoc } from "../../widgets/narthex/social/types";
 import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { HubProfilePanelState } from "../../widgets/narthex/social/hub-profile-panel";
+import type { HubAdminHubProfile, HubAdminBlobUsageSummary } from "../p2p/hub-admin-client";
 import type { ProfileCanvasBinTestHooks } from "../../widgets/narthex/social/canvas-bin";
 import type { ProfileCanvasEntry, ProfileStore } from "../canvas/profile-doc";
 import type { FriendInfo } from "../canvas/share-dialog";
@@ -271,6 +272,14 @@ export interface FriendsTabTestHooks {
   getHubProfileUnsyncButtonGlobalPos(canvasDocId: string): { x: number; y: number } | null;
   getHubProfileScrollState(): { scrollY: number; totalHeight: number; areaHeight: number } | null;
   getHubProfilePanelGlobalPos(): { x: number; y: number } | null;
+  /** whether a named section in the hub-profile-panel is currently collapsed. */
+  getHubProfileSectionCollapsed(sectionId: string): boolean;
+  /** toggle a named section in the hub-profile-panel. */
+  toggleHubProfileSection(sectionId: string): void;
+  /** the hub's own profile after the hub-profile section loads, or null. */
+  getHubProfileProfileState(): HubAdminHubProfile | null;
+  /** per-canvas blob data after the nested blob rows have loaded, or null. */
+  getHubProfileCanvasBlobsState(canvasDocId: string): { rows: HubAdminBlobUsageSummary[]; total: number; page: number } | null;
 }
 
 /**

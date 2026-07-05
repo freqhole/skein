@@ -219,6 +219,7 @@ mod tests {
                 username: "alice".to_string(),
                 bio: "hello world".to_string(),
                 avatar_data_url: "data:image/png;base64,abc".to_string(),
+                accent_color: None,
             },
             FriendzMessage::FriendRequest {
                 from_node_id: "node-xyz".to_string(),
@@ -250,6 +251,7 @@ mod tests {
                 username,
                 bio,
                 avatar_data_url,
+                ..
             } => {
                 assert_eq!(username, "alice");
                 assert_eq!(bio, "hello world");
@@ -289,6 +291,7 @@ mod tests {
             username: huge_string,
             bio: String::new(),
             avatar_data_url: String::new(),
+            accent_color: None,
         };
 
         let result = encode_message(&msg);

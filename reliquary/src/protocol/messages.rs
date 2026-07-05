@@ -118,6 +118,12 @@ pub enum FriendzMessage {
         bio: String,
         #[serde(rename = "avatarDataUrl")]
         avatar_data_url: String,
+        /// optional accent color (hub_admin SetHubProfile / GetHubProfile).
+        /// omitted on the wire when not set so old clients that don't know
+        /// the field are unaffected.
+        #[serde(rename = "accentColor")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        accent_color: Option<i64>,
     },
 
     /// send a friend request to a peer.
@@ -477,6 +483,7 @@ mod tests {
             username: "alice".to_string(),
             bio: "hello world".to_string(),
             avatar_data_url: "data:image/png;base64,abc".to_string(),
+            accent_color: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();

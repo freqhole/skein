@@ -684,6 +684,61 @@ export async function initFriendzWiring(
   const unsubSocial = sDoc.on("change", onSocialChange);
   unsubs.push(unsubSocial);
 
+  // push a gossip digest to online friends whenever our own profile fields
+  // change (username, bio, avatarDataUrl, accentColor). the digest carries
+  // the current profile-doc pointer + updatedAt; receivers apply newer-wins
+  // merging and pull the full profile doc if the pointer is fresher than
+  // what they already hold. debounced 2s so a username+bio+avatar burst
+  // sends one digest instead of three.
+  {
+    const profileSnapshot = () => {
+      const p = sDoc.current.profile;
+      return JSON.stringify({
+        username: p?.username,
+        bio: p?.bio,
+        avatarDataUrl: p?.avatarDataUrl,
+        accentColor: p?.accentColor,
+      });
+    };
+    let lastSnap = profileSnapshot();
+    let profilePushTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const onProfileChange = (_state: SocialState) => {
+      const snap = profileSnapshot();
+      if (snap === lastSnap) return;
+      lastSnap = snap;
+
+      if (profilePushTimer !== null) clearTimeout(profilePushTimer);
+      profilePushTimer = setTimeout(() => {
+        profilePushTimer = null;
+        const friends = sDoc.current.friends ?? [];
+        for (const friend of friends as any[]) {
+          for (const n of friend.nodeIds ?? []) {
+            if (!n.nodeId || n.nodeId === localNodeId) continue;
+            if (!protocol.isOnline(n.nodeId)) continue;
+            computeAndSendGossipDigest(n.nodeId).catch((err) => {
+              log.debug(
+                TAG,
+                "profile push: gossip digest failed for:",
+                n.nodeId.slice(0, 16) + "...",
+                err
+              );
+            });
+          }
+        }
+      }, 2000);
+    };
+
+    const unsubProfilePush = sDoc.on("change", onProfileChange);
+    unsubs.push(() => {
+      if (profilePushTimer !== null) {
+        clearTimeout(profilePushTimer);
+        profilePushTimer = null;
+      }
+      unsubProfilePush();
+    });
+  }
+
   // watch for messagez doc changes
   if (messagezHandle) {
     const onMessagezChange = () => {
