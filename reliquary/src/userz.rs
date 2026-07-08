@@ -150,20 +150,29 @@ impl Directory {
     }
 
     /// set the local user's free-form alias for a peer (or for self).
-    /// the row must already exist (caller should `touch` first).
-    ///
-    /// stopgap: `PeerDirectory::upsert_profile`'s `None` always means "leave
-    /// unchanged" (a coalesce-based partial upsert) - there is no way to
-    /// explicitly clear a field back to `NULL` through the trait, which this
-    /// method needs (clearing a custom alias). raw sql against haruspex's own
-    /// `peerz` table until a real trait method exists (see
-    /// CUTOVER_BACKLOG.md).
+    /// the row must already exist (caller should `touch` first). `None`
+    /// clears the alias back to unset.
     pub async fn set_alias(&self, node_id: &str, alias: Option<&str>) -> Result<(), UserError> {
-        sqlx::query("UPDATE peerz SET alias = ?1 WHERE node_id = ?2")
-            .bind(alias)
-            .bind(node_id)
-            .execute(&self.haruspex_pool)
-            .await?;
+        match alias {
+            Some(alias) => {
+                let now = now_secs();
+                self.peers()
+                    .upsert_profile(PeerProfile {
+                        node_id: node_id.to_string(),
+                        display_name: None,
+                        alias: Some(alias.to_string()),
+                        bio: None,
+                        avatar_blake3: None,
+                        accent_color: None,
+                        is_self: false,
+                        is_hub: false,
+                        first_seen: now,
+                        last_seen: now,
+                    })
+                    .await?;
+            }
+            None => self.peers().clear_alias(node_id).await?,
+        }
         Ok(())
     }
 

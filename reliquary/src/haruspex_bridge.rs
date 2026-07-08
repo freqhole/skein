@@ -94,10 +94,9 @@ async fn backfill_friendz(
             .as_deref()
             .and_then(FriendDirection::parse)
             .unwrap_or(FriendDirection::Inbound);
-        let node_id = row.friend_node_id;
         store
             .upsert_edge(FriendEdge {
-                node_id: node_id.clone(),
+                node_id: row.friend_node_id,
                 status,
                 direction,
                 alias: row.alias,
@@ -106,20 +105,6 @@ async fn backfill_friendz(
                 updated_at: row.updated_at,
             })
             .await?;
-        // workaround for a bug in haruspex's `SqliteFriendStore::upsert_edge`:
-        // its insert statement binds `updated_at` into both the `created_at`
-        // and `updated_at` column slots, silently discarding whatever
-        // `created_at` the caller passed in on a fresh insert (see
-        // CUTOVER_BACKLOG.md). historical rows almost always have a
-        // `created_at` earlier than their `updated_at`, so it's worth a
-        // follow-up correction rather than losing that history.
-        if row.created_at != row.updated_at {
-            sqlx::query("UPDATE friendz SET created_at = ?1 WHERE node_id = ?2")
-                .bind(row.created_at)
-                .bind(&node_id)
-                .execute(haruspex_pool)
-                .await?;
-        }
     }
     Ok(())
 }
