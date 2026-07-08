@@ -5559,6 +5559,7 @@ name = "reliquary"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "automerge",
  "base64 0.22.1",
  "blake3",

@@ -23,8 +23,9 @@ use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{Hash, HashAndFormat};
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::protocol::blob_proxy::{PeerMessage, SKEIN_ALPN};
+use crate::protocol::blob_proxy::SKEIN_ALPN;
 use freqhole_reliquary::blobz::{BlobStore, NewBlobMeta};
+use freqhole_reliquary::ensure::PeerMessage;
 
 /// timeout for a single ensure_blob probe to a peer (seconds).
 const PROBE_TIMEOUT_SECS: u64 = 15;

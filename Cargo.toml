@@ -60,6 +60,7 @@ time = { version = "0.3", features = [
 ] }
 tempfile = "3"
 indexmap = "2"
+async-trait = "0.1"
 
 # release profile optimizations for smaller binaries
 [profile.release]

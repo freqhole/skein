@@ -4,7 +4,7 @@
 //!
 //! - `iroh/automerge-repo/1` — automerge sync via [`IrohRepo`] + [`hub_repo::HubRepo`]
 //! - `skein-friendz/1`       — presence/heartbeat/message dispatch via [`FriendzHandler`]
-//! - `skein/1`               — blob proxy (ensure-by-blake3) via [`BlobProxyHandler`]
+//! - `skein/1`               — blob proxy (ensure-by-blake3) via [`freqhole_reliquary::ensure::EnsureBlobHandler`]
 //! - `iroh-blobs/4`          — iroh-blobs [`BlobsProtocol`] for verified transfer
 //!
 //! phase-1 scope intentionally excludes canvas invite flows, gossip digests,
@@ -20,14 +20,14 @@ use iroh::Endpoint;
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::store::fs::{options::Options, FsStore};
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
-use iroh_blobs::{Hash, BlobsProtocol};
+use iroh_blobs::{BlobsProtocol, Hash};
 use sqlx::SqlitePool;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 use crate::friendz;
 use crate::hub_repo::HubRepo;
-use crate::protocol::blob_proxy::{BlobProxyHandler, SKEIN_ALPN};
+use crate::protocol::blob_proxy::SKEIN_ALPN;
 use crate::protocol::handler::{FriendzEvent, FriendzHandler};
 use crate::protocol::messages::{FriendzMessage, FRIENDZ_ALPN};
 use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
@@ -84,7 +84,7 @@ pub struct ServiceConfig {
 // ---------------------------------------------------------------------------
 // FsStore singleton
 //
-// BlobProxyHandler requires `&'static FsStore`. in a long-running reliquary
+// EnsureBlobHandler requires `&'static FsStore`. in a long-running reliquary
 // process there's only ever one store, so a process-wide OnceCell is fine.
 // ---------------------------------------------------------------------------
 
@@ -104,7 +104,10 @@ pub fn snatcher_in_flight() -> Arc<std::sync::Mutex<HashSet<Hash>>> {
         .clone()
 }
 
-async fn fs_store(data_dir: &Path, blobz: Arc<dyn BlobStore>) -> Result<&'static FsStore, ServiceError> {
+async fn fs_store(
+    data_dir: &Path,
+    blobz: Arc<dyn BlobStore>,
+) -> Result<&'static FsStore, ServiceError> {
     FS_STORE
         .get_or_try_init(|| async {
             let path = data_dir.join("iroh-blobs");
@@ -273,7 +276,8 @@ impl Service {
             .upsert_self(&node_id_str, Some(&config.username), None, None)
             .await?;
 
-        let blobz: Arc<dyn BlobStore> = Arc::new(SqliteBlobStore::new(pool.clone(), &config.data_dir));
+        let blobz: Arc<dyn BlobStore> =
+            Arc::new(SqliteBlobStore::new(pool.clone(), &config.data_dir));
         let friendz_store = friendz::Store::new(pool.clone());
 
         // automerge sync — hub_repo owns its own sqlite db for now
@@ -304,7 +308,8 @@ impl Service {
             store,
             Some(crate::blob_acl::build_gated_blobs_events(blob_acl_gate)),
         );
-        let blob_proxy = BlobProxyHandler::new(store, blobz.clone(), friendz_store.clone());
+        let blob_proxy =
+            crate::protocol::blob_proxy::new_handler(store, blobz.clone(), friendz_store.clone());
 
         // router
         let router = Router::builder(endpoint.clone())

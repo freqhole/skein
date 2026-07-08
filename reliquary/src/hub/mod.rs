@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::friendz;
 use crate::hub_repo::HubRepo;
-use crate::protocol::blob_proxy::{BlobProxyHandler, SKEIN_ALPN};
+use crate::protocol::blob_proxy::SKEIN_ALPN;
 use crate::protocol::handler::{FriendzEvent, FriendzHandler};
 use crate::protocol::messages::{FriendzMessage, FRIENDZ_ALPN};
 use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
@@ -232,7 +232,11 @@ impl HubPeerService {
             fs_store,
             Some(crate::blob_acl::build_gated_blobs_events(blob_acl_gate)),
         );
-        let blob_proxy = BlobProxyHandler::new(fs_store, blobz.clone(), friendz_store.clone());
+        let blob_proxy = crate::protocol::blob_proxy::new_handler(
+            fs_store,
+            blobz.clone(),
+            friendz_store.clone(),
+        );
 
         // resume tracking canvases from previous runs (moved before hub_admin
         // so the admin handler can receive a clone of the live set).

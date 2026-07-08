@@ -28,7 +28,7 @@
 //! encoded via `ciborium` (the same encoding `hub_repo` uses for automerge
 //! sync messages), no length prefix — the sender signals end-of-request by
 //! calling `finish()` on the send stream, the same convention `skein/1`'s
-//! `blob_proxy` handler uses. structure and style follow `blob_proxy.rs`.
+//! `ensure_blob` handler uses (see `freqhole_reliquary::ensure`).
 
 use std::sync::Arc;
 

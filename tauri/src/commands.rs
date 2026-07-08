@@ -1169,9 +1169,9 @@ async fn prewarm_fs_store(state: &AppState, blob: &BlobRecord) {
 /// that arrived through other paths (e.g. snatched from another peer).
 ///
 /// returns `{ available: true }` on success or `{ available: false, reason }`
-/// when the blob is unknown / missing on disk / fails to import. mirrors
-/// reliquary's [`reliquary::protocol::blob_proxy::BlobProxyHandler::ensure`]
-/// shape.
+/// when the blob is unknown / missing on disk / fails to import. mirrors the
+/// same lookup-and-stage shape as `freqhole_reliquary::ensure::EnsureBlobHandler`'s
+/// own request handling.
 async fn blob_iroh_ensure(
     args: BlobGetArgs,
     state: &AppState,
