@@ -455,11 +455,12 @@ mod tests {
         .await;
 
         let pool = crate::db::open_in_memory().await;
-        crate::userz::Directory::new(pool.clone())
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        crate::userz::Directory::new(haruspex_pool.clone())
             .touch("alice")
             .await
             .expect("touch userz row");
-        let friendz_store = friendz::Store::new(pool);
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
         friendz_store
             .upsert("alice", friendz::FriendStatus::Accepted, None)
             .await
@@ -484,7 +485,8 @@ mod tests {
         .await;
 
         let pool = crate::db::open_in_memory().await;
-        let friendz_store = friendz::Store::new(pool);
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
         // mallory has no friendz row at all, and is not in canvas-1's acl.
 
         let gate = BlobAclGate::for_hub(friendz_store, hub_repo);
@@ -507,11 +509,12 @@ mod tests {
         .await;
 
         let pool = crate::db::open_in_memory().await;
-        crate::userz::Directory::new(pool.clone())
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        crate::userz::Directory::new(haruspex_pool.clone())
             .touch("bob")
             .await
             .expect("touch userz row");
-        let friendz_store = friendz::Store::new(pool);
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
         // bob IS a hub friend...
         friendz_store
             .upsert("bob", friendz::FriendStatus::Accepted, None)
@@ -540,11 +543,12 @@ mod tests {
         .await;
 
         let pool = crate::db::open_in_memory().await;
-        crate::userz::Directory::new(pool.clone())
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        crate::userz::Directory::new(haruspex_pool.clone())
             .touch("alice")
             .await
             .expect("touch userz row");
-        let friendz_store = friendz::Store::new(pool);
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
         friendz_store
             .upsert("alice", friendz::FriendStatus::Accepted, None)
             .await
@@ -560,11 +564,12 @@ mod tests {
     #[tokio::test]
     async fn friend_only_gate_allows_any_hub_friend_regardless_of_hash() {
         let pool = crate::db::open_in_memory().await;
-        crate::userz::Directory::new(pool.clone())
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        crate::userz::Directory::new(haruspex_pool.clone())
             .touch("alice")
             .await
             .expect("touch userz row");
-        let friendz_store = friendz::Store::new(pool);
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
         friendz_store
             .upsert("alice", friendz::FriendStatus::Accepted, None)
             .await
@@ -577,7 +582,8 @@ mod tests {
     #[tokio::test]
     async fn friend_only_gate_denies_a_non_friend() {
         let pool = crate::db::open_in_memory().await;
-        let friendz_store = friendz::Store::new(pool);
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
 
         let gate = BlobAclGate::friend_only(friendz_store);
         assert!(!gate.peer_can_fetch("mallory", "anything-at-all").await);

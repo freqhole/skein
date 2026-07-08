@@ -53,6 +53,9 @@ pub enum ServiceError {
     #[error("blobz error: {0}")]
     Blobz(#[from] freqhole_reliquary::blobz::BlobStoreError),
 
+    #[error("haruspex bridge: {0}")]
+    HaruspexBridge(String),
+
     #[error("fs store: {0}")]
     FsStore(String),
 
@@ -179,14 +182,17 @@ impl Service {
         let node_id_str = node_id.to_string();
 
         // record ourselves in userz
-        let userz = userz::Directory::new(pool.clone());
+        let haruspex_pool = crate::haruspex_bridge::open(&config.data_dir, &pool)
+            .await
+            .map_err(|e| ServiceError::HaruspexBridge(format!("{e}")))?;
+        let userz = userz::Directory::new(haruspex_pool.clone());
         userz
             .upsert_self(&node_id_str, Some(&config.username), None, None)
             .await?;
 
         let blobz: Arc<dyn BlobStore> =
             Arc::new(SqliteBlobStore::new(pool.clone(), &config.data_dir));
-        let friendz_store = friendz::Store::new(pool.clone());
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
 
         // automerge sync — hub_repo owns its own sqlite db for now
         let hub_repo = HubRepo::new(node_id_str.clone(), &config.data_dir.join("skein-docs.db"))
@@ -523,10 +529,13 @@ pub async fn start_hub(
 
     let node_id_str = endpoint.id().to_string();
 
-    let userz = userz::Directory::new(pool.clone());
+    let haruspex_pool = crate::haruspex_bridge::open(&config.data_dir, &pool)
+        .await
+        .map_err(|e| ServiceError::HaruspexBridge(format!("{e}")))?;
+    let userz = userz::Directory::new(haruspex_pool.clone());
     let blobz: Arc<dyn BlobStore> = Arc::new(SqliteBlobStore::new(pool.clone(), &config.data_dir));
-    let friendz_store = friendz::Store::new(pool.clone());
-    let adminz_store = crate::adminz::Store::new(pool.clone());
+    let friendz_store = friendz::Store::new(haruspex_pool, pool.clone());
+    let adminz_store = crate::adminz::Store::new(pool);
 
     // automerge sync — hub_repo owns its own sqlite db for the doc graph
     let hub_repo = HubRepo::new(node_id_str.clone(), &config.data_dir.join("skein-docs.db"))

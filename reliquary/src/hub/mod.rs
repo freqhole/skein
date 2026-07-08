@@ -294,7 +294,10 @@ impl HubPeerService {
         // calls notify_one on it. the downloader and in-flight set are both
         // shared with the storage node's own gc-protect callback, so a blob
         // mid-download is never swept before it's ingested into blobz.
-        let downloader = storage.downloader.clone();
+        let downloader = storage
+            .downloader()
+            .expect("storage node's endpoint is already attached by the time the hub starts")
+            .clone();
         let peer_blob_inventory = Arc::new(Mutex::new(HashMap::new()));
         let snatch_trigger_legacy = Arc::new(tokio::sync::Notify::new());
         let snatcher = Arc::new(crate::snatch::BlobSnatcher::new(

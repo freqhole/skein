@@ -244,8 +244,9 @@ async fn friend(data_dir: PathBuf, cmd: FriendCommand) -> anyhow::Result<()> {
     // rejecting me" confusion.
     eprintln!("data_dir = {}", data_dir.display());
     let pool = db::open(&data_dir).await?;
-    let users = userz::Directory::new(pool.clone());
-    let store = friendz::Store::new(pool);
+    let haruspex_pool = reliquary::haruspex_bridge::open(&data_dir, &pool).await?;
+    let users = userz::Directory::new(haruspex_pool.clone());
+    let store = friendz::Store::new(haruspex_pool, pool);
 
     match cmd {
         FriendCommand::Allow { node_id } => {
@@ -262,7 +263,8 @@ async fn friend(data_dir: PathBuf, cmd: FriendCommand) -> anyhow::Result<()> {
                 println!("{node_id} is already an accepted friend; leaving as-is");
                 return Ok(());
             }
-            // ensure a userz row exists so the FK on friendz.friend_node_id holds.
+            // record a peer row for this node id up front, same as any
+            // other peer we've encountered.
             users.touch(node_id).await?;
             let friend = store
                 .upsert(node_id, friendz::FriendStatus::Allowed, None)

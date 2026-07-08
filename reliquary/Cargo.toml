@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 freqhole-reliquary = { package = "reliquary", path = "../../reliquary/rust" }
+haruspex = { path = "../../haruspex/rust", features = ["iroh"] }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 tokio = { workspace = true }
@@ -54,3 +55,7 @@ webp = { version = "0.3", default-features = false, features = ["img"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = { workspace = true }
+# unifies with the [dependencies] haruspex entry above for test/bench builds
+# only, adding haruspex::testing (open_in_memory + per-store constructors)
+# without pulling it into the production lib build.
+haruspex = { path = "../../haruspex/rust", features = ["iroh", "test-utils"] }

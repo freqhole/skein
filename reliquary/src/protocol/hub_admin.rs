@@ -501,7 +501,7 @@ async fn handle_request(
                 };
             }
 
-            // ensure a userz row exists so the FK on friendz.friend_node_id holds.
+            // record a peer row for this node id, same as any other peer.
             if let Err(e) = handler.inner.userz.touch(node_id).await {
                 return AdminResponse::Error {
                     message: format!("userz touch failed: {e}"),
@@ -1486,9 +1486,10 @@ mod tests {
         Arc<tokio::sync::Notify>,
     ) {
         let pool = db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
-        let friendz_store = friendz::Store::new(pool.clone());
-        let userz_dir = userz::Directory::new(pool.clone());
+        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
+        let userz_dir = userz::Directory::new(haruspex_pool);
         let tmp = tempfile::tempdir().expect("tempdir");
         let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
         let hub_repo = HubRepo::new("hub-node".to_string(), &tmp.path().join("hub-docs.db"))
@@ -2160,9 +2161,10 @@ mod tests {
             .await
             .expect("HubRepo::new should succeed");
         let pool = db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
-        let friendz_store = friendz::Store::new(pool.clone());
-        let userz_dir = userz::Directory::new(pool.clone());
+        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
+        let userz_dir = userz::Directory::new(haruspex_pool);
         let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
         let handler = HubAdminHandler::new(
             adminz_store.clone(),
@@ -2251,9 +2253,10 @@ mod tests {
             .await
             .expect("HubRepo::new should succeed");
         let pool = db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
-        let friendz_store = friendz::Store::new(pool.clone());
-        let userz_dir = userz::Directory::new(pool.clone());
+        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
+        let userz_dir = userz::Directory::new(haruspex_pool);
         let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
         let handler = HubAdminHandler::new(
             adminz_store.clone(),
@@ -2305,9 +2308,10 @@ mod tests {
             .await
             .expect("HubRepo::new should succeed");
         let pool = db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
-        let friendz_store = friendz::Store::new(pool.clone());
-        let userz_dir = userz::Directory::new(pool.clone());
+        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
+        let userz_dir = userz::Directory::new(haruspex_pool);
         let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
         let handler = HubAdminHandler::new(
             adminz_store,
@@ -2866,9 +2870,10 @@ mod tests {
             .await
             .expect("HubRepo::new");
         let pool = db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
         let adminz_store = adminz::Store::new(pool.clone());
-        let friendz_store = friendz::Store::new(pool.clone());
-        let userz_dir = userz::Directory::new(pool.clone());
+        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
+        let userz_dir = userz::Directory::new(haruspex_pool);
         let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2956,10 +2961,11 @@ mod tests {
         let canvas_doc_ids = Arc::new(tokio::sync::Mutex::new(
             std::collections::HashSet::<String>::from(["canvas-to-unsync".to_string()]),
         ));
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
         let handler = HubAdminHandler::new(
             adminz_store,
-            friendz::Store::new(pool.clone()),
-            userz::Directory::new(pool),
+            friendz::Store::new(haruspex_pool.clone(), pool.clone()),
+            userz::Directory::new(haruspex_pool),
             blobz_store,
             tmp.path().join("blob-files"),
             hub_repo,
@@ -3428,10 +3434,11 @@ mod tests {
             .expect("HubRepo::new");
         let adminz_store = crate::adminz::Store::new(pool.clone());
         adminz_store.allow("admin").await.unwrap();
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
         let handler = HubAdminHandler::new(
             adminz_store,
-            friendz::Store::new(pool.clone()),
-            userz::Directory::new(pool),
+            friendz::Store::new(haruspex_pool.clone(), pool.clone()),
+            userz::Directory::new(haruspex_pool),
             blobz_store,
             tmp.path().join("blob-files"),
             hub_repo,
@@ -3548,10 +3555,11 @@ mod tests {
             .expect("HubRepo::new");
         let adminz_store = crate::adminz::Store::new(pool.clone());
         adminz_store.allow("admin").await.unwrap();
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
         let handler = HubAdminHandler::new(
             adminz_store,
-            friendz::Store::new(pool.clone()),
-            userz::Directory::new(pool),
+            friendz::Store::new(haruspex_pool.clone(), pool.clone()),
+            userz::Directory::new(haruspex_pool),
             blobz_store,
             tmp.path().join("blob-files"),
             hub_repo,

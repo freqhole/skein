@@ -3,15 +3,40 @@
 //! tracks peers we've encountered: node id, optional display name + avatar
 //! blob, first/last-seen timestamps. also marks the local node as `is_self`.
 //! no passwords, no sessions, no roles.
+//!
+//! storage is haruspex's own `PeerDirectory`/`SqlitePeerDirectory` (its
+//! `peerz` table, distinct from skein's original `userz` table). the one
+//! field haruspex's `PeerProfile` shape represents differently is
+//! `accent_color`: skein stores it as a `0xRRGGBB` integer, haruspex as an
+//! arbitrary `#rrggbb`-style hex string - converted at this module's
+//! boundary.
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use thiserror::Error;
 
+use haruspex::identity::PeerProfile;
+use haruspex::sqlite::SqlitePeerDirectory;
+use haruspex::stores::PeerDirectory as _;
+
 #[derive(Debug, Error)]
 pub enum UserError {
     #[error("sqlx error: {0}")]
     Sqlx(#[from] sqlx::Error),
+
+    #[error("haruspex store error: {0}")]
+    Store(#[from] haruspex::error::StoreError),
+}
+
+/// `0` means "no accent color set" - matches skein's original convention.
+pub(crate) fn accent_color_to_hex(color: i64) -> String {
+    format!("#{:06x}", color & 0xff_ffff)
+}
+
+fn hex_to_accent_color(hex: Option<String>) -> i64 {
+    hex.as_deref()
+        .and_then(|s| i64::from_str_radix(s.trim_start_matches('#'), 16).ok())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,12 +58,19 @@ pub struct PeerRecord {
 
 #[derive(Clone)]
 pub struct Directory {
-    pool: SqlitePool,
+    /// haruspex's own sqlite db (a sibling file to this crate's own,
+    /// opened via `haruspex_bridge::open`) - this directory carries no
+    /// skein-specific side data of its own, so it needs nothing else.
+    haruspex_pool: SqlitePool,
 }
 
 impl Directory {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(haruspex_pool: SqlitePool) -> Self {
+        Self { haruspex_pool }
+    }
+
+    fn peers(&self) -> SqlitePeerDirectory {
+        SqlitePeerDirectory::new(self.haruspex_pool.clone())
     }
 
     /// upsert the local node. called once on hub startup.
@@ -68,46 +100,26 @@ impl Directory {
         accent_color: Option<i64>,
     ) -> Result<(), UserError> {
         let now = now_secs();
-        sqlx::query!(
-            r#"
-            INSERT INTO userz (node_id, display_name, alias, bio, avatar_blake3, accent_color, first_seen_at, last_seen_at, is_self)
-            VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, 0), ?7, ?7, 1)
-            ON CONFLICT(node_id) DO UPDATE SET
-                display_name  = COALESCE(excluded.display_name,  userz.display_name),
-                alias         = COALESCE(excluded.alias,         userz.alias),
-                bio           = COALESCE(excluded.bio,           userz.bio),
-                avatar_blake3 = COALESCE(excluded.avatar_blake3, userz.avatar_blake3),
-                accent_color  = COALESCE(?6, userz.accent_color),
-                last_seen_at  = excluded.last_seen_at,
-                is_self       = 1
-            "#,
-            node_id,
-            display_name,
-            alias,
-            bio,
-            avatar_blake3,
-            accent_color,
-            now,
-        )
-        .execute(&self.pool)
-        .await?;
+        let profile = PeerProfile {
+            node_id: node_id.to_string(),
+            display_name: display_name.map(str::to_string),
+            alias: alias.map(str::to_string),
+            bio: bio.map(str::to_string),
+            avatar_blake3: avatar_blake3.map(str::to_string),
+            accent_color: accent_color.map(accent_color_to_hex),
+            is_self: true,
+            is_hub: false,
+            first_seen: now,
+            last_seen: now,
+        };
+        self.peers().upsert_profile(profile).await?;
         Ok(())
     }
 
     /// update `last_seen_at` for a peer (and insert a minimal row if new).
     pub async fn touch(&self, node_id: &str) -> Result<(), UserError> {
         let now = now_secs();
-        sqlx::query!(
-            r#"
-            INSERT INTO userz (node_id, first_seen_at, last_seen_at, is_self)
-            VALUES (?1, ?2, ?2, 0)
-            ON CONFLICT(node_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
-            "#,
-            node_id,
-            now,
-        )
-        .execute(&self.pool)
-        .await?;
+        self.peers().touch(node_id, now).await?;
         Ok(())
     }
 
@@ -121,37 +133,37 @@ impl Directory {
         avatar_blake3: Option<&str>,
     ) -> Result<(), UserError> {
         let now = now_secs();
-        sqlx::query!(
-            r#"
-            INSERT INTO userz (node_id, display_name, bio, avatar_blake3, first_seen_at, last_seen_at, is_self)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0)
-            ON CONFLICT(node_id) DO UPDATE SET
-                display_name  = COALESCE(excluded.display_name,  userz.display_name),
-                bio           = COALESCE(excluded.bio,           userz.bio),
-                avatar_blake3 = COALESCE(excluded.avatar_blake3, userz.avatar_blake3),
-                last_seen_at  = excluded.last_seen_at
-            "#,
-            node_id,
-            display_name,
-            bio,
-            avatar_blake3,
-            now,
-        )
-        .execute(&self.pool)
-        .await?;
+        let profile = PeerProfile {
+            node_id: node_id.to_string(),
+            display_name: display_name.map(str::to_string),
+            alias: None,
+            bio: bio.map(str::to_string),
+            avatar_blake3: avatar_blake3.map(str::to_string),
+            accent_color: None,
+            is_self: false,
+            is_hub: false,
+            first_seen: now,
+            last_seen: now,
+        };
+        self.peers().upsert_profile(profile).await?;
         Ok(())
     }
 
     /// set the local user's free-form alias for a peer (or for self).
     /// the row must already exist (caller should `touch` first).
+    ///
+    /// stopgap: `PeerDirectory::upsert_profile`'s `None` always means "leave
+    /// unchanged" (a coalesce-based partial upsert) - there is no way to
+    /// explicitly clear a field back to `NULL` through the trait, which this
+    /// method needs (clearing a custom alias). raw sql against haruspex's own
+    /// `peerz` table until a real trait method exists (see
+    /// CUTOVER_BACKLOG.md).
     pub async fn set_alias(&self, node_id: &str, alias: Option<&str>) -> Result<(), UserError> {
-        sqlx::query!(
-            "UPDATE userz SET alias = ?1 WHERE node_id = ?2",
-            alias,
-            node_id
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE peerz SET alias = ?1 WHERE node_id = ?2")
+            .bind(alias)
+            .bind(node_id)
+            .execute(&self.haruspex_pool)
+            .await?;
         Ok(())
     }
 
@@ -163,79 +175,35 @@ impl Directory {
     /// be called before any other profile data has arrived for the peer.
     pub async fn mark_as_hub(&self, node_id: &str) -> Result<(), UserError> {
         let now = now_secs();
-        sqlx::query!(
-            r#"
-            INSERT INTO userz (node_id, first_seen_at, last_seen_at, is_self, is_hub)
-            VALUES (?1, ?2, ?2, 0, 1)
-            ON CONFLICT(node_id) DO UPDATE SET is_hub = 1
-            "#,
-            node_id,
-            now,
-        )
-        .execute(&self.pool)
-        .await?;
+        self.peers().mark_as_hub(node_id, now).await?;
         Ok(())
     }
 
     pub async fn get(&self, node_id: &str) -> Result<Option<PeerRecord>, UserError> {
-        let row = sqlx::query_as!(
-            PeerRow,
-            r#"
-            SELECT node_id as "node_id!", display_name, alias, bio, avatar_blake3,
-                   accent_color as "accent_color!", first_seen_at as "first_seen_at!",
-                   last_seen_at as "last_seen_at!", is_self as "is_self!", is_hub as "is_hub!"
-            FROM userz WHERE node_id = ?1
-            "#,
-            node_id,
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(Into::into))
+        let profile = self.peers().get_profile(node_id).await?;
+        Ok(profile.map(PeerRecord::from_profile))
     }
 
     /// fetch the local self row (the one with is_self = 1), if any.
     pub async fn get_self(&self) -> Result<Option<PeerRecord>, UserError> {
-        let row = sqlx::query_as!(
-            PeerRow,
-            r#"
-            SELECT node_id as "node_id!", display_name, alias, bio, avatar_blake3,
-                   accent_color as "accent_color!", first_seen_at as "first_seen_at!",
-                   last_seen_at as "last_seen_at!", is_self as "is_self!", is_hub as "is_hub!"
-            FROM userz WHERE is_self = 1 LIMIT 1
-            "#,
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(Into::into))
+        let profile = self.peers().get_self().await?;
+        Ok(profile.map(PeerRecord::from_profile))
     }
 }
 
-struct PeerRow {
-    node_id: String,
-    display_name: Option<String>,
-    alias: Option<String>,
-    bio: Option<String>,
-    avatar_blake3: Option<String>,
-    accent_color: i64,
-    first_seen_at: i64,
-    last_seen_at: i64,
-    is_self: i64,
-    is_hub: i64,
-}
-
-impl From<PeerRow> for PeerRecord {
-    fn from(r: PeerRow) -> Self {
+impl PeerRecord {
+    fn from_profile(p: PeerProfile) -> Self {
         Self {
-            node_id: r.node_id,
-            display_name: r.display_name,
-            alias: r.alias,
-            bio: r.bio,
-            avatar_blake3: r.avatar_blake3,
-            accent_color: r.accent_color,
-            first_seen_at: r.first_seen_at,
-            last_seen_at: r.last_seen_at,
-            is_self: r.is_self != 0,
-            is_hub: r.is_hub != 0,
+            node_id: p.node_id,
+            display_name: p.display_name,
+            alias: p.alias,
+            bio: p.bio,
+            avatar_blake3: p.avatar_blake3,
+            accent_color: hex_to_accent_color(p.accent_color),
+            first_seen_at: p.first_seen,
+            last_seen_at: p.last_seen,
+            is_self: p.is_self,
+            is_hub: p.is_hub,
         }
     }
 }
@@ -250,10 +218,9 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
 
     async fn make_dir() -> Directory {
-        Directory::new(db::open_in_memory().await)
+        Directory::new(haruspex::testing::open_in_memory().await)
     }
 
     #[tokio::test]

@@ -79,14 +79,15 @@ async fn build_state() -> anyhow::Result<AppState> {
     tokio::fs::create_dir_all(&data_dir).await?;
 
     let pool = db::open(&data_dir).await?;
+    let haruspex_pool = reliquary::haruspex_bridge::open(&data_dir, &pool).await?;
     let username = std::env::var("SKEIN_USERNAME").unwrap_or_else(|_| "skein".to_string());
     let blobz_store: std::sync::Arc<dyn freqhole_reliquary::blobz::BlobStore> =
         std::sync::Arc::new(freqhole_reliquary::blobz::SqliteBlobStore::new(
             pool.clone(),
             &data_dir,
         ));
-    let friendz_store = friendz::Store::new(pool.clone());
-    let userz_dir = userz::Directory::new(pool.clone());
+    let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
+    let userz_dir = userz::Directory::new(haruspex_pool);
     let app_config_path = data_dir.join(APP_CONFIG_FILENAME);
 
     // boot the iroh-blobs FsStore that backs verified blob streaming. peers

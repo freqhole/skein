@@ -93,7 +93,14 @@ mod tests {
         // expect every migrated table to be queryable.
         // table name is interpolated at runtime, so this can't be a query_as!
         // macro call (the macro requires a literal SQL string).
-        for table in ["blobz", "userz", "friendz", "docz", "doc_deltaz"] {
+        for table in [
+            "blobz",
+            "userz",
+            "friendz",
+            "friend_docz",
+            "docz",
+            "doc_deltaz",
+        ] {
             let q = format!("SELECT COUNT(*) FROM {table}");
             let (c,): (i64,) = sqlx::query_as(&q)
                 .fetch_one(&pool)

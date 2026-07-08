@@ -161,10 +161,9 @@ impl HubPeerService {
                     "received friend request"
                 );
 
-                // ensure a userz row exists before writing to friendz —
-                // friendz.friend_node_id has a FK referencing userz(node_id),
-                // so the insert will fail if the peer has never been seen before
-                // (e.g. when the FriendRequest message races ahead of PeerOnline).
+                // record a peer row before writing to friendz — this keeps a
+                // profile entry available for the peer even if the
+                // `FriendRequest` message races ahead of `PeerOnline`.
                 if let Err(e) = self
                     .userz
                     .upsert_profile(from_node_id, Some(&from_username), None, None)

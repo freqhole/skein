@@ -3,15 +3,33 @@
 //! one row per friend node id. status is a small enum. we keep the narthex
 //! doc id (the canvas they share with us) alongside the edge so the hub can
 //! resolve which doc to sync when a friend connects.
+//!
+//! storage for the shared fields (status/direction/alias/group_name/
+//! timestamps) is haruspex's own `FriendStore`/`SqliteFriendStore` - the
+//! narthex doc id has no equivalent field on haruspex's `FriendEdge` (an
+//! app-specific concept, not part of the core friend-relationship shape),
+//! so it lives in a small side table (`friend_docz`) this module manages
+//! directly.
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use thiserror::Error;
 
+use haruspex::sqlite::SqliteFriendStore;
+use haruspex::stores::friend_store::{
+    FriendDirection as HxDirection, FriendEdge as HxFriendEdge, FriendStatus as HxFriendStatus,
+};
+use haruspex::stores::FriendStore as _;
+
 #[derive(Debug, Error)]
 pub enum FriendError {
     #[error("sqlx error: {0}")]
     Sqlx(#[from] sqlx::Error),
+
+    #[error("haruspex store error: {0}")]
+    Store(#[from] haruspex::error::StoreError),
 
     #[error("unknown status value: {0}")]
     UnknownStatus(String),
@@ -53,6 +71,24 @@ impl FriendStatus {
             other => Err(FriendError::UnknownStatus(other.to_string())),
         }
     }
+
+    fn to_haruspex(self) -> HxFriendStatus {
+        match self {
+            Self::Allowed => HxFriendStatus::Allowed,
+            Self::Pending => HxFriendStatus::Pending,
+            Self::Accepted => HxFriendStatus::Accepted,
+            Self::Blocked => HxFriendStatus::Blocked,
+        }
+    }
+
+    fn from_haruspex(status: HxFriendStatus) -> Self {
+        match status {
+            HxFriendStatus::Allowed => Self::Allowed,
+            HxFriendStatus::Pending => Self::Pending,
+            HxFriendStatus::Accepted => Self::Accepted,
+            HxFriendStatus::Blocked => Self::Blocked,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +113,20 @@ impl Direction {
             _ => None,
         }
     }
+
+    fn to_haruspex(self) -> HxDirection {
+        match self {
+            Self::Inbound => HxDirection::Inbound,
+            Self::Outbound => HxDirection::Outbound,
+        }
+    }
+
+    fn from_haruspex(direction: HxDirection) -> Self {
+        match direction {
+            HxDirection::Inbound => Self::Inbound,
+            HxDirection::Outbound => Self::Outbound,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,14 +141,41 @@ pub struct Friend {
     pub updated_at: i64,
 }
 
+impl Friend {
+    fn from_edge(edge: HxFriendEdge, narthex_doc_id: Option<String>) -> Self {
+        Self {
+            friend_node_id: edge.node_id,
+            status: FriendStatus::from_haruspex(edge.status),
+            direction: Some(Direction::from_haruspex(edge.direction)),
+            alias: edge.alias,
+            group_name: edge.group_name,
+            narthex_doc_id,
+            created_at: edge.created_at,
+            updated_at: edge.updated_at,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Store {
-    pool: SqlitePool,
+    /// haruspex's own sqlite db (a sibling file to this crate's own,
+    /// opened via `haruspex_bridge::open`) - every method below except the
+    /// narthex-doc-id side table goes through this pool.
+    haruspex_pool: SqlitePool,
+    /// this crate's own sqlite db, used only for `friend_docz`.
+    skein_pool: SqlitePool,
 }
 
 impl Store {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(haruspex_pool: SqlitePool, skein_pool: SqlitePool) -> Self {
+        Self {
+            haruspex_pool,
+            skein_pool,
+        }
+    }
+
+    fn edges(&self) -> SqliteFriendStore {
+        SqliteFriendStore::new(self.haruspex_pool.clone())
     }
 
     pub async fn upsert(
@@ -113,6 +190,9 @@ impl Store {
 
     /// upsert with all optional fields. None values use COALESCE-style merge:
     /// existing row values are preserved when the parameter is None.
+    /// haruspex's `upsert_edge` overwrites unconditionally, so the coalesce
+    /// is done here by reading the existing edge first - the same pattern
+    /// haruspex's own `hub_admin::friend_allow`/`friend_block` use.
     pub async fn upsert_full(
         &self,
         friend_node_id: &str,
@@ -123,30 +203,29 @@ impl Store {
         narthex_doc_id: Option<&str>,
     ) -> Result<Friend, FriendError> {
         let now = now_secs();
-        let status_str = status.as_str();
-        let direction_str = direction.map(|d| d.as_str());
-        sqlx::query!(
-            r#"
-            INSERT INTO friendz (friend_node_id, status, direction, alias, group_name, narthex_doc_id, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-            ON CONFLICT(friend_node_id) DO UPDATE SET
-                status         = excluded.status,
-                direction      = COALESCE(excluded.direction,      friendz.direction),
-                alias          = COALESCE(excluded.alias,          friendz.alias),
-                group_name     = COALESCE(excluded.group_name,     friendz.group_name),
-                narthex_doc_id = COALESCE(excluded.narthex_doc_id, friendz.narthex_doc_id),
-                updated_at     = excluded.updated_at
-            "#,
-            friend_node_id,
-            status_str,
-            direction_str,
-            alias,
-            group_name,
-            narthex_doc_id,
-            now,
-        )
-        .execute(&self.pool)
-        .await?;
+        let existing = self.edges().get_edge(friend_node_id).await?;
+
+        let edge = HxFriendEdge {
+            node_id: friend_node_id.to_string(),
+            status: status.to_haruspex(),
+            direction: direction
+                .map(Direction::to_haruspex)
+                .or_else(|| existing.as_ref().map(|e| e.direction))
+                .unwrap_or(HxDirection::Inbound),
+            alias: alias
+                .map(str::to_string)
+                .or_else(|| existing.as_ref().and_then(|e| e.alias.clone())),
+            group_name: group_name
+                .map(str::to_string)
+                .or_else(|| existing.as_ref().and_then(|e| e.group_name.clone())),
+            created_at: existing.as_ref().map(|e| e.created_at).unwrap_or(now),
+            updated_at: now,
+        };
+        self.edges().upsert_edge(edge).await?;
+
+        if let Some(doc_id) = narthex_doc_id {
+            self.set_narthex_doc_id(friend_node_id, doc_id).await?;
+        }
 
         self.get(friend_node_id)
             .await?
@@ -154,42 +233,19 @@ impl Store {
     }
 
     pub async fn get(&self, friend_node_id: &str) -> Result<Option<Friend>, FriendError> {
-        let row = sqlx::query_as!(
-            FriendRow,
-            r#"
-            SELECT friend_node_id as "friend_node_id!", status as "status!", direction, alias,
-                   group_name, narthex_doc_id, created_at as "created_at!", updated_at as "updated_at!"
-            FROM friendz WHERE friend_node_id = ?1
-            "#,
-            friend_node_id,
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(TryInto::try_into).transpose()
+        let Some(edge) = self.edges().get_edge(friend_node_id).await? else {
+            return Ok(None);
+        };
+        let narthex_doc_id = self.narthex_doc_id(friend_node_id).await?;
+        Ok(Some(Friend::from_edge(edge, narthex_doc_id)))
     }
 
     pub async fn list(&self, only_accepted: bool) -> Result<Vec<Friend>, FriendError> {
-        let rows: Vec<FriendRow> = if only_accepted {
-            sqlx::query_as!(
-                FriendRow,
-                r#"SELECT friend_node_id as "friend_node_id!", status as "status!", direction, alias,
-                          group_name, narthex_doc_id, created_at as "created_at!", updated_at as "updated_at!"
-                   FROM friendz WHERE status = 'accepted' ORDER BY created_at ASC"#,
-            )
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as!(
-                FriendRow,
-                r#"SELECT friend_node_id as "friend_node_id!", status as "status!", direction, alias,
-                          group_name, narthex_doc_id, created_at as "created_at!", updated_at as "updated_at!"
-                   FROM friendz ORDER BY created_at ASC"#,
-            )
-            .fetch_all(&self.pool)
-            .await?
-        };
-        rows.into_iter().map(TryInto::try_into).collect()
+        let status = only_accepted.then_some(HxFriendStatus::Accepted);
+        let edges = self.edges().list_edges(status).await?;
+        let mut friends = self.attach_doc_ids(edges).await?;
+        friends.sort_by_key(|f| f.created_at);
+        Ok(friends)
     }
 
     /// list all friendz rows where status='pending' filtered by direction.
@@ -198,42 +254,20 @@ impl Store {
         &self,
         direction: Option<Direction>,
     ) -> Result<Vec<Friend>, FriendError> {
-        let rows: Vec<FriendRow> = match direction {
-            Some(d) => {
-                let d = d.as_str();
-                sqlx::query_as!(
-                    FriendRow,
-                    r#"SELECT friend_node_id as "friend_node_id!", status as "status!", direction, alias,
-                              group_name, narthex_doc_id, created_at as "created_at!", updated_at as "updated_at!"
-                       FROM friendz WHERE status = 'pending' AND direction = ?1
-                       ORDER BY created_at ASC"#,
-                    d,
-                )
-                .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query_as!(
-                    FriendRow,
-                    r#"SELECT friend_node_id as "friend_node_id!", status as "status!", direction, alias,
-                              group_name, narthex_doc_id, created_at as "created_at!", updated_at as "updated_at!"
-                       FROM friendz WHERE status = 'pending'
-                       ORDER BY created_at ASC"#,
-                )
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
-        rows.into_iter().map(TryInto::try_into).collect()
+        let edges = self
+            .edges()
+            .list_edges(Some(HxFriendStatus::Pending))
+            .await?;
+        let mut friends = self.attach_doc_ids(edges).await?;
+        if let Some(direction) = direction {
+            friends.retain(|f| f.direction == Some(direction));
+        }
+        friends.sort_by_key(|f| f.created_at);
+        Ok(friends)
     }
 
     pub async fn delete(&self, friend_node_id: &str) -> Result<(), FriendError> {
-        sqlx::query!(
-            "DELETE FROM friendz WHERE friend_node_id = ?1",
-            friend_node_id
-        )
-        .execute(&self.pool)
-        .await?;
+        self.edges().remove_edge(friend_node_id).await?;
         Ok(())
     }
 
@@ -263,34 +297,46 @@ impl Store {
             }
         }
     }
-}
 
-#[derive(Debug)]
-struct FriendRow {
-    friend_node_id: String,
-    status: String,
-    direction: Option<String>,
-    alias: Option<String>,
-    group_name: Option<String>,
-    narthex_doc_id: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-}
+    /// haruspex's `FriendEdge` has no equivalent field for the narthex doc
+    /// id (an app-specific concept), so it's tracked in its own side table.
+    async fn narthex_doc_id(&self, node_id: &str) -> Result<Option<String>, FriendError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT narthex_doc_id FROM friend_docz WHERE node_id = ?1")
+                .bind(node_id)
+                .fetch_optional(&self.skein_pool)
+                .await?;
+        Ok(row.map(|(doc_id,)| doc_id))
+    }
 
-impl TryFrom<FriendRow> for Friend {
-    type Error = FriendError;
+    async fn set_narthex_doc_id(&self, node_id: &str, doc_id: &str) -> Result<(), FriendError> {
+        sqlx::query(
+            r#"
+            INSERT INTO friend_docz (node_id, narthex_doc_id)
+            VALUES (?1, ?2)
+            ON CONFLICT(node_id) DO UPDATE SET narthex_doc_id = excluded.narthex_doc_id
+            "#,
+        )
+        .bind(node_id)
+        .bind(doc_id)
+        .execute(&self.skein_pool)
+        .await?;
+        Ok(())
+    }
 
-    fn try_from(r: FriendRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            friend_node_id: r.friend_node_id,
-            status: FriendStatus::parse(&r.status)?,
-            direction: r.direction.as_deref().and_then(Direction::parse),
-            alias: r.alias,
-            group_name: r.group_name,
-            narthex_doc_id: r.narthex_doc_id,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-        })
+    async fn attach_doc_ids(&self, edges: Vec<HxFriendEdge>) -> Result<Vec<Friend>, FriendError> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT node_id, narthex_doc_id FROM friend_docz")
+                .fetch_all(&self.skein_pool)
+                .await?;
+        let mut doc_ids: HashMap<String, String> = rows.into_iter().collect();
+        Ok(edges
+            .into_iter()
+            .map(|edge| {
+                let doc_id = doc_ids.remove(&edge.node_id);
+                Friend::from_edge(edge, doc_id)
+            })
+            .collect())
     }
 }
 
@@ -306,13 +352,16 @@ mod tests {
     use super::*;
     use crate::{db, userz};
 
-    /// build a fresh in-memory pool with a peer row already touched, so the
-    /// FK from friendz.friend_node_id -> userz.node_id is satisfied.
+    /// build a fresh pair of in-memory pools (skein's own + haruspex's own)
+    /// with a peer row already touched. no longer required for an FK
+    /// (haruspex's friendz schema has none), kept so friend rows in tests
+    /// have a matching peer row like real usage.
     async fn make_store_with_peer(node_id: &str) -> Store {
-        let pool = db::open_in_memory().await;
-        let users = userz::Directory::new(pool.clone());
+        let skein_pool = db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let users = userz::Directory::new(haruspex_pool.clone());
         users.touch(node_id).await.unwrap();
-        Store::new(pool)
+        Store::new(haruspex_pool, skein_pool)
     }
 
     #[test]
@@ -371,19 +420,21 @@ mod tests {
 
     #[tokio::test]
     async fn get_returns_none_for_unknown_friend() {
-        let pool = db::open_in_memory().await;
-        let store = Store::new(pool);
+        let store = Store::new(
+            haruspex::testing::open_in_memory().await,
+            db::open_in_memory().await,
+        );
         assert!(store.get("nope").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn list_filters_by_only_accepted() {
-        let pool = db::open_in_memory().await;
-        let users = userz::Directory::new(pool.clone());
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let users = userz::Directory::new(haruspex_pool.clone());
         for n in ["a", "b", "c"] {
             users.touch(n).await.unwrap();
         }
-        let store = Store::new(pool);
+        let store = Store::new(haruspex_pool, db::open_in_memory().await);
 
         store
             .upsert("a", FriendStatus::Accepted, None)
@@ -422,14 +473,18 @@ mod tests {
         store.delete("never-existed").await.unwrap();
     }
 
+    /// haruspex's friendz schema carries no FK to peerz (unlike skein's
+    /// original schema's FK to userz) - a friend edge can be recorded before
+    /// any profile/presence data has arrived for the peer. a deliberate,
+    /// documented behavior change (see CUTOVER_BACKLOG.md).
     #[tokio::test]
-    async fn upsert_without_userz_row_violates_fk() {
-        // friendz.friend_node_id REFERENCES userz(node_id) — inserting
-        // without a peer row first should fail with a sqlx error.
-        let pool = db::open_in_memory().await;
-        let store = Store::new(pool);
+    async fn upsert_without_a_peer_row_no_longer_requires_one() {
+        let store = Store::new(
+            haruspex::testing::open_in_memory().await,
+            db::open_in_memory().await,
+        );
         let res = store.upsert("orphan", FriendStatus::Allowed, None).await;
-        assert!(matches!(res, Err(FriendError::Sqlx(_))));
+        assert!(res.is_ok());
     }
 
     /// a `Blocked` peer that gets re-`Allowed` (e.g. an operator changes
@@ -480,10 +535,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_upsert_same_node_id_resolves_to_single_row() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let pool = crate::db::open(tmp.path()).await.expect("open db");
-        let users = userz::Directory::new(pool.clone());
+        let skein_pool = crate::db::open(tmp.path()).await.expect("open db");
+        // a real file-backed pool (multiple connections) for haruspex's own
+        // db too, since this test needs the same race actually exercised
+        // against it, not against a single-connection in-memory pool.
+        let haruspex_pool = haruspex::sqlite::open(tmp.path())
+            .await
+            .expect("open haruspex db");
+        let users = userz::Directory::new(haruspex_pool.clone());
         users.touch("racing-peer").await.unwrap();
-        let store = Store::new(pool);
+        let store = Store::new(haruspex_pool, skein_pool);
 
         let mut handles = Vec::new();
         for _ in 0..8 {

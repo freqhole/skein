@@ -242,10 +242,11 @@ mod tests {
     /// the e2e layer, e.g. `loam/tests/reliquary-hub.spec.ts`), so this is
     /// deliberately unit-level rather than an end-to-end network test.
     async fn make_repo() -> friendz::Store {
-        let pool = db::open_in_memory().await;
-        let friendz_store = friendz::Store::new(pool.clone());
-        let users = userz::Directory::new(pool);
-        // friendz.friend_node_id has an FK on userz.node_id — touch first.
+        let skein_pool = db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let friendz_store = friendz::Store::new(haruspex_pool.clone(), skein_pool);
+        let users = userz::Directory::new(haruspex_pool);
+        // seed a peer row for each friend up front, matching real usage.
         for peer in ["friend-accepted", "friend-allowed", "friend-blocked"] {
             users.touch(peer).await.unwrap();
         }

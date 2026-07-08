@@ -208,9 +208,11 @@ mod tests {
     #[tokio::test]
     async fn admin_status_and_friend_status_are_independent() {
         let pool = db::open_in_memory().await;
-        let admin_store = Store::new(pool.clone());
-        let friend_store = crate::friendz::Store::new(pool.clone());
-        let users = crate::userz::Directory::new(pool);
+        let admin_store = Store::new(pool);
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let friend_store =
+            crate::friendz::Store::new(haruspex_pool.clone(), db::open_in_memory().await);
+        let users = crate::userz::Directory::new(haruspex_pool);
 
         users.touch("both-roles").await.unwrap();
         admin_store.allow("both-roles").await.unwrap();
