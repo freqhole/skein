@@ -4,20 +4,20 @@
 //! also exposed as a library so the skein tauri app can optionally run a hub
 //! in-process and share its iroh identity.
 //!
-//! all modules are grimoire-free as of phase-2: stores (`blobz`, `userz`,
-//! `friendz`) provide direct sqlx access; the hub layer (`hub`, `hub_repo`,
-//! `snatch`) talks to those stores plus iroh-blobs `FsStore` directly.
+//! all modules are grimoire-free: stores (`userz`, `friendz`) provide direct
+//! sqlx access; the hub layer (`hub`, `hub_repo`, `snatch`) talks to those
+//! stores plus iroh-blobs `FsStore` and the `freqhole_reliquary` blob store
+//! directly.
 
 pub mod adminz;
 pub mod blob_acl;
-pub mod blobz;
 pub mod db;
 pub mod documents;
 pub mod friendz;
 pub mod groupz;
 pub mod hub;
 pub mod hub_repo;
-pub mod identity;
+
 pub mod maintenance;
 pub mod protocol;
 pub mod service;

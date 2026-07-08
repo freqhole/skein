@@ -16,7 +16,9 @@ use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use iroh::Endpoint;
-use reliquary::{blobz, friendz, identity, service, userz};
+use freqhole_reliquary::blobz::{BlobRecord, BlobStore, NewBlobMeta};
+use freqhole_reliquary::identity;
+use reliquary::{friendz, service, userz};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
@@ -99,7 +101,7 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub username: String,
 
-    pub blobz: blobz::Store,
+    pub blobz: Arc<dyn BlobStore>,
     pub friendz_store: friendz::Store,
     pub userz: userz::Directory,
 
@@ -248,7 +250,7 @@ pub(crate) enum DispatchError {
     #[error("hub: {0}")]
     Hub(String),
     #[error("blob: {0}")]
-    Blob(#[from] blobz::BlobError),
+    Blob(#[from] freqhole_reliquary::blobz::BlobStoreError),
     #[error("friend: {0}")]
     Friend(#[from] friendz::FriendError),
     #[error("user: {0}")]
@@ -292,7 +294,8 @@ async fn current_node_id(state: &AppState) -> String {
 /// from a peer, or the user clicking "generate identity" in the profile
 /// widget) — never merely because the process started.
 pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkState> {
-    let secret = identity::load_or_generate_keypair(&state.data_dir)?;
+    let secret =
+        identity::load_or_generate_keypair(&state.data_dir, identity::DEFAULT_KEYPAIR_FILENAME)?;
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret)
         .bind()
@@ -318,7 +321,7 @@ pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkStat
     // best-effort: errors are logged and ignored — the lazy
     // `blob_iroh_ensure` path still works as a fallback.
     match state.blobz.list(i64::MAX, 0).await {
-        Ok(blobs) => {
+        Ok((blobs, _total)) => {
             tracing::info!(count = blobs.len(), "pre-warming iroh-blobs FsStore");
             for blob in blobs {
                 prewarm_fs_store(state, &blob).await;
@@ -578,15 +581,15 @@ struct BlobDto {
     iroh_hash: String,
     filename: Option<String>,
     mime: Option<String>,
-    size: i64,
+    size: u64,
     created_at: i64,
 }
 
-impl From<blobz::BlobRef> for BlobDto {
-    fn from(b: blobz::BlobRef) -> Self {
+impl From<BlobRecord> for BlobDto {
+    fn from(b: BlobRecord) -> Self {
         Self {
             blake3: b.blake3,
-            iroh_hash: b.iroh_hash,
+            iroh_hash: b.iroh_hash.unwrap_or_default(),
             filename: b.filename,
             mime: b.mime,
             size: b.size,
@@ -1084,7 +1087,7 @@ struct BlobListArgs {
 }
 
 async fn blob_list(args: BlobListArgs, state: &AppState) -> Result<Value, DispatchError> {
-    let blobs = state
+    let (blobs, _total) = state
         .blobz
         .list(args.limit.unwrap_or(200), args.offset.unwrap_or(0))
         .await?;
@@ -1134,7 +1137,7 @@ async fn blob_get_path(args: BlobGetArgs, state: &AppState) -> Result<Value, Dis
 /// handler — easily blowing past the browser's 30 s strategy-1 timeout
 /// for video files. errors are logged and swallowed: the lazy
 /// `blob_iroh_ensure` path will still work as a fallback.
-async fn prewarm_fs_store(state: &AppState, blob: &blobz::BlobRef) {
+async fn prewarm_fs_store(state: &AppState, blob: &BlobRecord) {
     let path = state.blobz.path_for(blob);
     if !path.exists() {
         tracing::warn!(blake3 = %blob.blake3, "prewarm: blob file missing on disk");
@@ -1201,10 +1204,6 @@ async fn blob_iroh_ensure(
 
 #[derive(Debug, Deserialize)]
 struct BlobInsertArgs {
-    /// optional iroh hash (if the blob is also being shared via iroh-blobs).
-    /// for purely local blobs, callers can omit and the rust side mirrors
-    /// the blake3.
-    iroh_hash: Option<String>,
     filename: Option<String>,
     mime: Option<String>,
     /// base64-encoded bytes.
@@ -1221,11 +1220,16 @@ async fn blob_insert(
             source: serde::de::Error::custom(format!("base64 decode: {e}")),
         }
     })?;
-    let blake3_hex = blake3::hash(&bytes).to_hex().to_string();
-    let iroh_hash = args.iroh_hash.unwrap_or_else(|| blake3_hex.clone());
     let blob = state
         .blobz
-        .insert(iroh_hash, args.filename, args.mime, &bytes)
+        .insert(
+            &bytes,
+            NewBlobMeta {
+                filename: args.filename,
+                mime: args.mime,
+                ..Default::default()
+            },
+        )
         .await?;
     prewarm_fs_store(state, &blob).await;
     Ok(serde_json::to_value(BlobDto::from(blob)).expect("blob insert serialize"))
@@ -1254,7 +1258,7 @@ struct BlobInsertFromPathArgs {
 /// app on large files. widgets already handle "blob only reachable via
 /// tauri dispatch" gracefully (see `getBlobData()`'s tauri fallback), so a
 /// large file simply staying rust-only is fine.
-const MIRROR_DATA_MAX_BYTES: i64 = 25 * 1024 * 1024;
+const MIRROR_DATA_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
 async fn blob_insert_from_path(
     args: BlobInsertFromPathArgs,
@@ -1280,12 +1284,12 @@ async fn blob_insert_from_path(
     });
 
     // streams the file through blake3 in fixed-size chunks (see
-    // `blobz::Store::register_path`'s doc comment) — never loads the whole
-    // file into memory, and registers it as an "external" reference (the
-    // file stays exactly where the user's native file picker found it,
-    // rather than also being copied into reliquary's blob-files dir) so a
-    // multi-gigabyte upload costs one streaming read pass, not a read +
-    // a full-file copy + a full-file base64 round-trip.
+    // `register_external_path`'s doc comment in `freqhole_reliquary::blobz`)
+    // — never loads the whole file into memory, and registers it as an
+    // "external" reference (the file stays exactly where the user's native
+    // file picker found it, rather than also being copied into reliquary's
+    // blob-files dir) so a multi-gigabyte upload costs one streaming read
+    // pass, not a read + a full-file copy + a full-file base64 round-trip.
     let upload_id = args.upload_id.clone();
     let progress_cb = upload_id.as_ref().map(|id| {
         let app = app.clone();
@@ -1314,10 +1318,19 @@ async fn blob_insert_from_path(
 
     let blob = state
         .blobz
-        .register_path(&path, filename, args.mime, on_progress, Some(&cancel_flag))
+        .register_external_path(
+            &path,
+            NewBlobMeta {
+                filename,
+                mime: args.mime,
+                ..Default::default()
+            },
+            on_progress,
+            Some(&cancel_flag),
+        )
         .await
         .map_err(|e| {
-            if matches!(e, blobz::BlobError::Cancelled) {
+            if matches!(e, freqhole_reliquary::blobz::BlobStoreError::Cancelled) {
                 DispatchError::Stream("upload cancelled".to_string())
             } else {
                 DispatchError::Blob(e)
@@ -1331,9 +1344,10 @@ async fn blob_insert_from_path(
     // genuinely-empty (0-byte) file.
     let data = if blob.size <= MIRROR_DATA_MAX_BYTES {
         let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            DispatchError::Blob(blobz::BlobError::Io(std::io::Error::new(
-                e.kind(),
-                format!("read {}: {}", path.display(), e),
+            DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(format!(
+                "read {}: {}",
+                path.display(),
+                e
             )))
         })?;
         Value::String(B64.encode(&bytes))
@@ -1563,7 +1577,14 @@ async fn blob_iroh_download(
         .map_err(|e| DispatchError::Stream(format!("export to blobz path: {e}")))?;
     let blob = state
         .blobz
-        .register_ingested(args.blake3.clone(), args.filename, args.mime)
+        .register_ingested(
+            &args.blake3,
+            NewBlobMeta {
+                filename: args.filename,
+                mime: args.mime,
+                ..Default::default()
+            },
+        )
         .await?;
 
     tracing::info!(
@@ -1863,10 +1884,9 @@ async fn blob_thumbnail(
 
     let result = crate::thumbnail::generate_thumbnail(&path, mime, size)
         .await
-        .map_err(|e| DispatchError::Blob(blobz::BlobError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))))?;
+        .map_err(|e| {
+            DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+        })?;
 
     Ok(result)
 }
@@ -1902,9 +1922,8 @@ async fn pdf_render_pages(
 
     let pdf_bytes =
         tokio::fs::read(state.blobz.path_for(&source_blob)).await.map_err(|e| {
-            DispatchError::Blob(blobz::BlobError::Io(std::io::Error::new(
-                e.kind(),
-                format!("read pdf bytes: {e}"),
+            DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(format!(
+                "read pdf bytes: {e}"
             )))
         })?;
 
@@ -1927,10 +1946,16 @@ async fn pdf_render_pages(
         let page_number = (idx + 1) as i64;
         let filename = Some(format!("{stem}_page_{page_number:03}.png"));
         let mime = Some("image/png".to_string());
-        let blake3_hex = blake3::hash(&png_bytes).to_hex().to_string();
         let blob = state
             .blobz
-            .insert(blake3_hex.clone(), filename.clone(), mime.clone(), &png_bytes)
+            .insert(
+                &png_bytes,
+                NewBlobMeta {
+                    filename,
+                    mime,
+                    ..Default::default()
+                },
+            )
             .await?;
         prewarm_fs_store(state, &blob).await;
 

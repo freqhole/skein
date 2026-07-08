@@ -37,11 +37,11 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use serde::{Deserialize, Serialize};
 
 use crate::adminz;
-use crate::blobz;
 use crate::friendz;
 use crate::hub::HubProfile;
 use crate::hub_repo::HubRepo;
 use crate::userz;
+use freqhole_reliquary::blobz::{BlobStore, NewBlobMeta};
 
 /// ALPN protocol identifier for remote hub administration.
 pub const HUB_ADMIN_ALPN: &[u8] = b"iroh/skein-hub-admin/1";
@@ -333,7 +333,7 @@ struct Inner {
     /// read here only to build a `FriendSummary.avatar_data_url` for
     /// `AdminRequest::List` — see that struct's doc comment for why this
     /// is computed server-side rather than left to a separate blob fetch.
-    blobz: blobz::Store,
+    blobz: Arc<dyn BlobStore>,
     /// used to cancel a peer's already-accepted `iroh/automerge-repo/1`
     /// connection immediately after a `Remove` request deletes their
     /// `friendz` row (see `HubRepo::cancel_peer`'s doc comment for the full
@@ -345,8 +345,10 @@ struct Inner {
     /// cancellation, unlike the CLI's `friend remove` (see `main.rs`).
     hub_repo: HubRepo,
     /// absolute path to the blob-files directory — used by `DiskUsage` to
-    /// stat the filesystem. derived from `blobz.blob_dir()` at construction
-    /// time so no extra field is needed on the public `new()` signature.
+    /// stat the filesystem. not derivable from the `BlobStore` trait (the
+    /// concrete store's on-disk layout is deliberately not part of the
+    /// trait contract), so the caller passes it in directly at construction
+    /// time.
     blob_dir: std::path::PathBuf,
     /// the hub's own node id string, used by `UnsyncCanvas` to remove the
     /// hub's entry from the canvas doc's `peers` and `acl` maps.
@@ -377,14 +379,14 @@ impl HubAdminHandler {
         adminz: adminz::Store,
         friendz: friendz::Store,
         userz: userz::Directory,
-        blobz: blobz::Store,
+        blobz: Arc<dyn BlobStore>,
+        blob_dir: std::path::PathBuf,
         hub_repo: HubRepo,
         hub_node_id: String,
         canvas_doc_ids: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
         hub_profile: Arc<tokio::sync::RwLock<HubProfile>>,
         profile_changed: Arc<tokio::sync::Notify>,
     ) -> Self {
-        let blob_dir = blobz.blob_dir().to_path_buf();
         Self {
             inner: Arc::new(Inner {
                 adminz,
@@ -648,7 +650,7 @@ async fn handle_request(
             knocks: list_pending_knocks(&handler.inner.hub_repo).await,
         },
         AdminRequest::DiskUsage => {
-            let (total_blob_bytes, blob_count) = match handler.inner.blobz.total_usage().await {
+            let usage = match handler.inner.blobz.total_usage().await {
                 Ok(v) => v,
                 Err(e) => {
                     return AdminResponse::Error {
@@ -656,25 +658,24 @@ async fn handle_request(
                     }
                 }
             };
-            let (soft_deleted_blob_bytes, soft_deleted_blob_count) =
-                match handler.inner.blobz.soft_deleted_usage().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return AdminResponse::Error {
-                            message: format!("blobz soft-deleted query failed: {e}"),
-                        }
+            let soft_deleted_usage = match handler.inner.blobz.soft_deleted_usage().await {
+                Ok(v) => v,
+                Err(e) => {
+                    return AdminResponse::Error {
+                        message: format!("blobz soft-deleted query failed: {e}"),
                     }
-                };
+                }
+            };
             let (disk_available_bytes, disk_total_bytes) = match disk_space(&handler.inner.blob_dir)
             {
                 Some((avail, total)) => (Some(avail), Some(total)),
                 None => (None, None),
             };
             AdminResponse::DiskUsage {
-                total_blob_bytes,
-                blob_count,
-                soft_deleted_blob_bytes,
-                soft_deleted_blob_count,
+                total_blob_bytes: usage.total_bytes,
+                blob_count: usage.count,
+                soft_deleted_blob_bytes: soft_deleted_usage.total_bytes,
+                soft_deleted_blob_count: soft_deleted_usage.count,
                 disk_available_bytes,
                 disk_total_bytes,
             }
@@ -697,12 +698,7 @@ async fn handle_request(
         }
         AdminRequest::BlobUsage { offset, limit } => {
             let limit = clamp_limit(limit);
-            match handler
-                .inner
-                .blobz
-                .list_paginated_with_count(limit, offset as i64)
-                .await
-            {
+            match handler.inner.blobz.list(limit, offset as i64).await {
                 Ok((blobs, total)) => AdminResponse::BlobUsage {
                     blobs: blobs
                         .into_iter()
@@ -710,7 +706,7 @@ async fn handle_request(
                             blake3: b.blake3,
                             filename: b.filename,
                             mime: b.mime,
-                            size: b.size as u64,
+                            size: b.size,
                             external: b.external,
                             soft_deleted: false,
                         })
@@ -725,7 +721,10 @@ async fn handle_request(
         AdminRequest::SoftDeleteBlobs { blake3s } => {
             // stamp the authenticated caller as the actor.
             match handler.inner.blobz.soft_delete(&blake3s, peer_id_str).await {
-                Ok((affected, failed)) => AdminResponse::BlobsMutation { affected, failed },
+                Ok(outcome) => AdminResponse::BlobsMutation {
+                    affected: outcome.affected,
+                    failed: outcome.failed,
+                },
                 Err(e) => AdminResponse::Error {
                     message: format!("soft_delete failed: {e}"),
                 },
@@ -733,7 +732,10 @@ async fn handle_request(
         }
         AdminRequest::RestoreBlobs { blake3s } => {
             match handler.inner.blobz.restore(&blake3s).await {
-                Ok((affected, failed)) => AdminResponse::BlobsMutation { affected, failed },
+                Ok(outcome) => AdminResponse::BlobsMutation {
+                    affected: outcome.affected,
+                    failed: outcome.failed,
+                },
                 Err(e) => AdminResponse::Error {
                     message: format!("restore failed: {e}"),
                 },
@@ -744,7 +746,7 @@ async fn handle_request(
             match handler
                 .inner
                 .blobz
-                .list_soft_deleted_with_count(limit, offset as i64)
+                .list_soft_deleted(limit, offset as i64)
                 .await
             {
                 Ok((blobs, total)) => AdminResponse::SoftDeleted {
@@ -755,8 +757,8 @@ async fn handle_request(
                             filename: b.filename,
                             mime: b.mime,
                             size: b.size,
-                            soft_deleted_at: b.soft_deleted_at,
-                            soft_deleted_by: b.soft_deleted_by,
+                            soft_deleted_at: b.soft_deleted_at.unwrap_or(0),
+                            soft_deleted_by: b.soft_deleted_by.unwrap_or_default(),
                         })
                         .collect(),
                     total,
@@ -774,9 +776,9 @@ async fn handle_request(
             // already performs for managed (non-external) blobs, which is the
             // part that matters now that TryReference means blobz owns the only copy.
             match handler.inner.blobz.hard_delete_soft_deleted(hashes).await {
-                Ok((deleted, failed)) => AdminResponse::BlobsMutation {
-                    affected: deleted,
-                    failed,
+                Ok(outcome) => AdminResponse::BlobsMutation {
+                    affected: outcome.affected,
+                    failed: outcome.failed,
                 },
                 Err(e) => AdminResponse::Error {
                     message: format!("hard_delete_soft_deleted failed: {e}"),
@@ -896,10 +898,8 @@ async fn handle_request(
                 .inner
                 .blobz
                 .insert(
-                    blake3_hash,
-                    Some("hub-avatar.webp".to_string()),
-                    Some("image/webp".to_string()),
                     &webp,
+                    NewBlobMeta { filename: Some("hub-avatar.webp".to_string()), mime: Some("image/webp".to_string()), ..Default::default() },
                 )
                 .await
             {
@@ -1123,7 +1123,7 @@ fn remove_self_from_canvas_doc(
 /// this is best-effort presentation data, not something worth failing an
 /// entire `List` request over) if the blob row is missing, has no mime, or
 /// the bytes can't be read.
-async fn build_avatar_data_url(blobz: &blobz::Store, blake3: &str) -> Option<String> {
+async fn build_avatar_data_url(blobz: &Arc<dyn BlobStore>, blake3: &str) -> Option<String> {
     let blob = blobz.get(blake3).await.ok()??;
     let mime = blob.mime.clone()?;
     let bytes = blobz.read_bytes(blake3).await.ok()??;
@@ -1268,7 +1268,7 @@ fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
 ///
 /// blobs shared across canvases count independently in each canvas entry —
 /// see `CanvasUsageSummary`'s doc comment.
-async fn canvas_usage(hub_repo: &HubRepo, blobz: &blobz::Store) -> Vec<CanvasUsageSummary> {
+async fn canvas_usage(hub_repo: &HubRepo, blobz: &Arc<dyn BlobStore>) -> Vec<CanvasUsageSummary> {
     use crate::snatch::{classify_doc, read_canvas_for_file_widgets, read_widget_state, DocKind};
 
     let doc_ids = hub_repo.all_doc_ids().await;
@@ -1325,7 +1325,7 @@ async fn canvas_usage(hub_repo: &HubRepo, blobz: &blobz::Store) -> Vec<CanvasUsa
             // only count blobs already in the local store
             if let Ok(Some(blob)) = blobz.get(&wref.blake3).await {
                 blob_count += 1;
-                total_bytes += blob.size as u64;
+                total_bytes += blob.size;
             }
         }
 
@@ -1349,7 +1349,7 @@ async fn canvas_usage(hub_repo: &HubRepo, blobz: &blobz::Store) -> Vec<CanvasUsa
 /// - never snatched (`size = 0`, filename taken from the widget doc)
 async fn canvas_blobs_for(
     hub_repo: &HubRepo,
-    blobz: &blobz::Store,
+    blobz: &Arc<dyn BlobStore>,
     canvas_doc_id: &str,
 ) -> Vec<BlobUsageSummary> {
     use crate::snatch::{read_canvas_for_file_widgets, read_widget_state};
@@ -1397,7 +1397,7 @@ async fn canvas_blobs_for(
         let (size, filename, mime, external, soft_deleted) = if let Some(b) = blob_any {
             let is_soft_deleted = blobz.get(&wref.blake3).await.ok().flatten().is_none();
             (
-                b.size as u64,
+                b.size,
                 b.filename.or_else(|| {
                     if wref.filename.is_empty() {
                         None
@@ -1466,6 +1466,7 @@ async fn send_response(
 mod tests {
     use super::*;
     use crate::db;
+    use freqhole_reliquary::blobz::SqliteBlobStore;
 
     /// the returned `TempDir` backs `HubRepo`'s sqlite file and must be kept
     /// alive by the caller for as long as the returned handler/hub_repo are
@@ -1475,7 +1476,7 @@ mod tests {
         adminz::Store,
         friendz::Store,
         userz::Directory,
-        blobz::Store,
+        Arc<dyn BlobStore>,
         HubRepo,
         tempfile::TempDir,
         Arc<tokio::sync::Notify>,
@@ -1485,7 +1486,7 @@ mod tests {
         let friendz_store = friendz::Store::new(pool.clone());
         let userz_dir = userz::Directory::new(pool.clone());
         let tmp = tempfile::tempdir().expect("tempdir");
-        let blobz_store = blobz::Store::new(pool, tmp.path());
+        let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
         let hub_repo = HubRepo::new("hub-node".to_string(), &tmp.path().join("hub-docs.db"))
             .await
             .expect("HubRepo::new should succeed");
@@ -1500,6 +1501,7 @@ mod tests {
                 friendz_store.clone(),
                 userz_dir.clone(),
                 blobz_store.clone(),
+                tmp.path().join("blob-files"),
                 hub_repo.clone(),
                 "hub-node".to_string(),
                 canvas_doc_ids,
@@ -2028,11 +2030,9 @@ mod tests {
         let avatar_bytes = b"fake-png-bytes";
         let avatar_blob = blobz_store
             .insert(
-                "alice-avatar-iroh-hash".to_string(),
-                None,
-                Some("image/png".to_string()),
-                avatar_bytes,
-            )
+            avatar_bytes,
+            NewBlobMeta { mime: Some("image/png".to_string()), ..Default::default() },
+        )
             .await
             .unwrap();
         userz_dir
@@ -2156,12 +2156,13 @@ mod tests {
         let adminz_store = adminz::Store::new(pool.clone());
         let friendz_store = friendz::Store::new(pool.clone());
         let userz_dir = userz::Directory::new(pool.clone());
-        let blobz_store = blobz::Store::new(pool, tmp.path());
+        let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
         let handler = HubAdminHandler::new(
             adminz_store.clone(),
             friendz_store,
             userz_dir,
             blobz_store,
+            tmp.path().join("blob-files"),
             hub_repo,
             "hub-node".to_string(),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -2246,12 +2247,13 @@ mod tests {
         let adminz_store = adminz::Store::new(pool.clone());
         let friendz_store = friendz::Store::new(pool.clone());
         let userz_dir = userz::Directory::new(pool.clone());
-        let blobz_store = blobz::Store::new(pool, tmp.path());
+        let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
         let handler = HubAdminHandler::new(
             adminz_store.clone(),
             friendz_store,
             userz_dir,
             blobz_store,
+            tmp.path().join("blob-files"),
             hub_repo,
             "hub-node".to_string(),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -2299,12 +2301,13 @@ mod tests {
         let adminz_store = adminz::Store::new(pool.clone());
         let friendz_store = friendz::Store::new(pool.clone());
         let userz_dir = userz::Directory::new(pool.clone());
-        let blobz_store = blobz::Store::new(pool, tmp.path());
+        let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
         let handler = HubAdminHandler::new(
             adminz_store,
             friendz_store,
             userz_dir,
             blobz_store,
+            tmp.path().join("blob-files"),
             hub_repo,
             "hub-node".to_string(),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -2344,11 +2347,17 @@ mod tests {
         }
 
         blobz_store
-            .insert("h1".into(), None, None, b"hello")
+            .insert(
+            b"hello",
+            NewBlobMeta::default(),
+        )
             .await
             .unwrap();
         blobz_store
-            .insert("h2".into(), None, None, b"world!!")
+            .insert(
+            b"world!!",
+            NewBlobMeta::default(),
+        )
             .await
             .unwrap();
 
@@ -2384,15 +2393,16 @@ mod tests {
 
         blobz_store
             .insert(
-                "h1".into(),
-                Some("a.txt".into()),
-                Some("text/plain".into()),
-                b"aaa",
-            )
+            b"aaa",
+            NewBlobMeta { filename: Some("a.txt".into()), mime: Some("text/plain".into()), ..Default::default() },
+        )
             .await
             .unwrap();
         blobz_store
-            .insert("h2".into(), None, None, b"bbbbb")
+            .insert(
+            b"bbbbb",
+            NewBlobMeta::default(),
+        )
             .await
             .unwrap();
 
@@ -2430,7 +2440,10 @@ mod tests {
         adminz_store.allow(admin_node).await.unwrap();
 
         let blob = blobz_store
-            .insert("h-sd-admin".into(), None, None, b"soft del via admin")
+            .insert(
+            b"soft del via admin",
+            NewBlobMeta::default(),
+        )
             .await
             .unwrap();
 
@@ -2453,9 +2466,9 @@ mod tests {
         // blob is hidden from normal get
         assert!(blobz_store.get(&blob.blake3).await.unwrap().is_none());
         // but the actor is the admin's node id
-        let sd = blobz_store.list_soft_deleted().await.unwrap();
+        let (sd, _) = blobz_store.list_soft_deleted(i64::MAX, 0).await.unwrap();
         assert_eq!(sd.len(), 1);
-        assert_eq!(sd[0].soft_deleted_by, admin_node);
+        assert_eq!(sd[0].soft_deleted_by.as_deref(), Some(admin_node));
     }
 
     #[tokio::test]
@@ -2466,7 +2479,10 @@ mod tests {
         adminz_store.allow(admin_node).await.unwrap();
 
         let blob = blobz_store
-            .insert("h-res-admin".into(), None, None, b"restore me")
+            .insert(
+            b"restore me",
+            NewBlobMeta::default(),
+        )
             .await
             .unwrap();
         blobz_store
@@ -2501,7 +2517,10 @@ mod tests {
         adminz_store.allow(admin_node).await.unwrap();
 
         let blob = blobz_store
-            .insert("h-lsd".into(), Some("f.txt".into()), None, b"list me")
+            .insert(
+            b"list me",
+            NewBlobMeta { filename: Some("f.txt".into()), ..Default::default() },
+        )
             .await
             .unwrap();
         blobz_store
@@ -2538,7 +2557,10 @@ mod tests {
         adminz_store.allow(admin_node).await.unwrap();
 
         let blob = blobz_store
-            .insert("h-hd-admin".into(), None, None, b"hard del via admin")
+            .insert(
+            b"hard del via admin",
+            NewBlobMeta::default(),
+        )
             .await
             .unwrap();
         let path = blobz_store.path_for(&blob);
@@ -2579,7 +2601,10 @@ mod tests {
 
         for i in 0u8..3 {
             let b = blobz_store
-                .insert(format!("h-all-{i}"), None, None, &[i; 4])
+                .insert(
+                &[i; 4],
+                NewBlobMeta::default(),
+            )
                 .await
                 .unwrap();
             blobz_store
@@ -2604,7 +2629,12 @@ mod tests {
             }
             other => panic!("expected BlobsMutation, got {other:?}"),
         }
-        assert!(blobz_store.list_soft_deleted().await.unwrap().is_empty());
+        assert!(blobz_store
+            .list_soft_deleted(i64::MAX, 0)
+            .await
+            .unwrap()
+            .0
+            .is_empty());
     }
 
     #[tokio::test]
@@ -2615,11 +2645,17 @@ mod tests {
         adminz_store.allow(admin_node).await.unwrap();
 
         let live = blobz_store
-            .insert("h-du-live".into(), None, None, b"alive")
+            .insert(
+            b"alive",
+            NewBlobMeta::default(),
+        )
             .await
             .unwrap();
         let sd = blobz_store
-            .insert("h-du-sd".into(), None, None, b"soft deleted")
+            .insert(
+            b"soft deleted",
+            NewBlobMeta::default(),
+        )
             .await
             .unwrap();
         blobz_store
@@ -2704,7 +2740,10 @@ mod tests {
 
         for i in 0u8..5 {
             blobz_store
-                .insert(format!("h-page-{i}"), None, None, &[i; 4])
+                .insert(
+                &[i; 4],
+                NewBlobMeta::default(),
+            )
                 .await
                 .unwrap();
         }
@@ -2773,7 +2812,10 @@ mod tests {
 
         for i in 0u8..4 {
             let b = blobz_store
-                .insert(format!("h-sd-page-{i}"), None, None, &[i; 3])
+                .insert(
+                &[i; 3],
+                NewBlobMeta::default(),
+            )
                 .await
                 .unwrap();
             blobz_store
@@ -2846,7 +2888,7 @@ mod tests {
         let adminz_store = adminz::Store::new(pool.clone());
         let friendz_store = friendz::Store::new(pool.clone());
         let userz_dir = userz::Directory::new(pool.clone());
-        let blobz_store = blobz::Store::new(pool, tmp.path());
+        let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
 
@@ -2859,6 +2901,7 @@ mod tests {
             friendz_store,
             userz_dir,
             blobz_store,
+            tmp.path().join("blob-files"),
             hub_repo,
             "hub-node".to_string(),
             Arc::clone(&canvas_doc_ids),
@@ -2897,11 +2940,14 @@ mod tests {
     async fn unsync_canvas_sweeps_only_canvas_unique_blobs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pool = db::open_in_memory().await;
-        let blobz_store = blobz::Store::new(pool.clone(), tmp.path());
+        let blobz_store = Arc::new(SqliteBlobStore::new(pool.clone(), tmp.path())) as Arc<dyn BlobStore>;
 
         // insert a blob and soft-delete it to simulate an orphan
         let b = blobz_store
-            .insert("h-unsync-sweep".into(), None, None, b"sweepme")
+            .insert(
+            b"sweepme",
+            NewBlobMeta::default(),
+        )
             .await
             .unwrap();
         // leave the blob live (not soft-deleted) — sweep_canvas_blobs will
@@ -2936,6 +2982,7 @@ mod tests {
             friendz::Store::new(pool.clone()),
             userz::Directory::new(pool),
             blobz_store,
+            tmp.path().join("blob-files"),
             hub_repo,
             "hub-node".to_string(),
             canvas_doc_ids,
@@ -3233,11 +3280,7 @@ mod tests {
         }
 
         // verify blobz has a blob now
-        let blobs = blobz_store
-            .list_paginated_with_count(10, 0)
-            .await
-            .unwrap()
-            .0;
+        let blobs = blobz_store.list(10, 0).await.unwrap().0;
         assert!(!blobs.is_empty(), "avatar blob must be stored in blobz");
 
         // verify lock was updated
@@ -3322,16 +3365,14 @@ mod tests {
     async fn canvas_blobs_includes_soft_deleted_flag() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pool = db::open_in_memory().await;
-        let blobz_store = blobz::Store::new(pool.clone(), tmp.path());
+        let blobz_store = Arc::new(SqliteBlobStore::new(pool.clone(), tmp.path())) as Arc<dyn BlobStore>;
 
         // insert a blob that we'll soft-delete
         let b = blobz_store
             .insert(
-                "h-cb-sd".into(),
-                Some("soft.txt".into()),
-                Some("text/plain".into()),
-                b"soft content",
-            )
+            b"soft content",
+            NewBlobMeta { filename: Some("soft.txt".into()), mime: Some("text/plain".into()), ..Default::default() },
+        )
             .await
             .unwrap();
         blobz_store
@@ -3342,11 +3383,9 @@ mod tests {
         // insert a live blob
         let live = blobz_store
             .insert(
-                "h-cb-live".into(),
-                Some("live.txt".into()),
-                Some("text/plain".into()),
-                b"live content",
-            )
+            b"live content",
+            NewBlobMeta { filename: Some("live.txt".into()), mime: Some("text/plain".into()), ..Default::default() },
+        )
             .await
             .unwrap();
 
@@ -3406,6 +3445,7 @@ mod tests {
             friendz::Store::new(pool.clone()),
             userz::Directory::new(pool),
             blobz_store,
+            tmp.path().join("blob-files"),
             hub_repo,
             "hub-node".to_string(),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -3447,7 +3487,7 @@ mod tests {
     async fn canvas_blobs_pagination_works() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pool = db::open_in_memory().await;
-        let blobz_store = blobz::Store::new(pool.clone(), tmp.path());
+        let blobz_store = Arc::new(SqliteBlobStore::new(pool.clone(), tmp.path())) as Arc<dyn BlobStore>;
 
         // insert three blobs with different sizes so we can verify sort order
         let blobs_in: Vec<(&str, &str, &[u8])> = vec![
@@ -3458,7 +3498,10 @@ mod tests {
         let mut inserted = Vec::new();
         for (iroh, name, data) in &blobs_in {
             let b = blobz_store
-                .insert(iroh.to_string(), Some(name.to_string()), None, data)
+                .insert(
+                data,
+                NewBlobMeta { filename: Some(name.to_string()), ..Default::default() },
+            )
                 .await
                 .unwrap();
             inserted.push(b);
@@ -3518,6 +3561,7 @@ mod tests {
             friendz::Store::new(pool.clone()),
             userz::Directory::new(pool),
             blobz_store,
+            tmp.path().join("blob-files"),
             hub_repo,
             "hub-node".to_string(),
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),

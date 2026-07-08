@@ -5534,6 +5534,31 @@ name = "reliquary"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "futures",
+ "getrandom 0.2.17",
+ "image",
+ "iroh",
+ "iroh-blobs",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "webp",
+]
+
+[[package]]
+name = "reliquary"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
  "automerge",
  "base64 0.22.1",
  "blake3",
@@ -5547,6 +5572,7 @@ dependencies = [
  "iroh",
  "iroh-blobs",
  "libc",
+ "reliquary 0.1.0",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -6385,7 +6411,8 @@ dependencies = [
  "iroh",
  "iroh-blobs",
  "n0-future",
- "reliquary",
+ "reliquary 0.1.0",
+ "reliquary 0.1.1",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

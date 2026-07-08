@@ -25,7 +25,6 @@ use sqlx::SqlitePool;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
-use crate::blobz;
 use crate::friendz;
 use crate::hub_repo::HubRepo;
 use crate::protocol::blob_proxy::{BlobProxyHandler, SKEIN_ALPN};
@@ -33,6 +32,7 @@ use crate::protocol::handler::{FriendzEvent, FriendzHandler};
 use crate::protocol::messages::{FriendzMessage, FRIENDZ_ALPN};
 use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
 use crate::userz;
+use freqhole_reliquary::blobz::{BlobStore, SqliteBlobStore};
 
 // ---------------------------------------------------------------------------
 // errors
@@ -53,7 +53,7 @@ pub enum ServiceError {
     Friendz(#[from] friendz::FriendError),
 
     #[error("blobz error: {0}")]
-    Blobz(#[from] blobz::BlobError),
+    Blobz(#[from] freqhole_reliquary::blobz::BlobStoreError),
 
     #[error("fs store: {0}")]
     FsStore(String),
@@ -104,7 +104,7 @@ pub fn snatcher_in_flight() -> Arc<std::sync::Mutex<HashSet<Hash>>> {
         .clone()
 }
 
-async fn fs_store(data_dir: &Path, blobz: blobz::Store) -> Result<&'static FsStore, ServiceError> {
+async fn fs_store(data_dir: &Path, blobz: Arc<dyn BlobStore>) -> Result<&'static FsStore, ServiceError> {
     FS_STORE
         .get_or_try_init(|| async {
             let path = data_dir.join("iroh-blobs");
@@ -208,7 +208,7 @@ pub struct ServiceHandle {
     endpoint: Endpoint,
     friendz_handler: FriendzHandler,
     iroh_repo: IrohRepo,
-    blobz: blobz::Store,
+    blobz: Arc<dyn BlobStore>,
     friendz_store: friendz::Store,
     userz: userz::Directory,
     node_id_str: String,
@@ -224,7 +224,7 @@ impl ServiceHandle {
     pub fn iroh_repo(&self) -> &IrohRepo {
         &self.iroh_repo
     }
-    pub fn blobz(&self) -> &blobz::Store {
+    pub fn blobz(&self) -> &Arc<dyn BlobStore> {
         &self.blobz
     }
     pub fn friendz_store(&self) -> &friendz::Store {
@@ -247,7 +247,7 @@ pub struct Service {
     friendz_handler: FriendzHandler,
     friendz_events: tokio::sync::mpsc::UnboundedReceiver<FriendzEvent>,
     iroh_repo: IrohRepo,
-    blobz: blobz::Store,
+    blobz: Arc<dyn BlobStore>,
     friendz_store: friendz::Store,
     userz: userz::Directory,
     #[allow(dead_code)]
@@ -273,7 +273,7 @@ impl Service {
             .upsert_self(&node_id_str, Some(&config.username), None, None)
             .await?;
 
-        let blobz = blobz::Store::new(pool.clone(), &config.data_dir);
+        let blobz: Arc<dyn BlobStore> = Arc::new(SqliteBlobStore::new(pool.clone(), &config.data_dir));
         let friendz_store = friendz::Store::new(pool.clone());
 
         // automerge sync — hub_repo owns its own sqlite db for now
@@ -568,7 +568,7 @@ impl Service {
         &self.iroh_repo
     }
 
-    pub fn blobz(&self) -> &blobz::Store {
+    pub fn blobz(&self) -> &Arc<dyn BlobStore> {
         &self.blobz
     }
 
@@ -608,7 +608,7 @@ pub async fn start_hub(
     let node_id_str = endpoint.id().to_string();
 
     let userz = userz::Directory::new(pool.clone());
-    let blobz = blobz::Store::new(pool.clone(), &config.data_dir);
+    let blobz: Arc<dyn BlobStore> = Arc::new(SqliteBlobStore::new(pool.clone(), &config.data_dir));
     let friendz_store = friendz::Store::new(pool.clone());
     let adminz_store = crate::adminz::Store::new(pool.clone());
 

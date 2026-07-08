@@ -21,7 +21,6 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::blobz;
 use crate::friendz;
 use crate::hub_repo::HubRepo;
 use crate::protocol::blob_proxy::{BlobProxyHandler, SKEIN_ALPN};
@@ -29,6 +28,7 @@ use crate::protocol::handler::{FriendzEvent, FriendzHandler};
 use crate::protocol::messages::{FriendzMessage, FRIENDZ_ALPN};
 use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
 use crate::userz;
+use freqhole_reliquary::blobz::{BlobStore, NewBlobMeta};
 
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::store::fs::FsStore;
@@ -41,7 +41,7 @@ use iroh_blobs::BlobsProtocol;
 #[derive(Debug, thiserror::Error)]
 pub enum HubError {
     #[error("identity error: {0}")]
-    Identity(#[from] crate::identity::IdentityError),
+    Identity(#[from] freqhole_reliquary::identity::IdentityError),
 
     #[error("storage error: {0}")]
     Storage(#[from] sqlx::Error),
@@ -56,7 +56,7 @@ pub enum HubError {
     Avatar(String),
 
     #[error("blobz error: {0}")]
-    Blobz(#[from] crate::blobz::BlobError),
+    Blobz(#[from] freqhole_reliquary::blobz::BlobStoreError),
 
     #[error("userz error: {0}")]
     Userz(#[from] crate::userz::UserError),
@@ -147,7 +147,7 @@ pub struct HubPeerService {
     // skein store handles
     pub(crate) userz: userz::Directory,
     pub(crate) friendz_store: friendz::Store,
-    pub(crate) blobz: blobz::Store,
+    pub(crate) blobz: Arc<dyn BlobStore>,
     /// kept on the service for future accessor use (e.g. a `ServiceHandle`-
     /// style admin surface); the running `iroh/skein-hub-admin/1` handler
     /// already holds its own clone, constructed in `start` below.
@@ -170,7 +170,7 @@ impl HubPeerService {
         fs_store: &'static FsStore,
         userz: userz::Directory,
         friendz_store: friendz::Store,
-        blobz: blobz::Store,
+        blobz: Arc<dyn BlobStore>,
         adminz_store: crate::adminz::Store,
         config: HubPeerConfig,
     ) -> Result<Self, HubError> {
@@ -262,6 +262,10 @@ impl HubPeerService {
             friendz_store.clone(),
             userz.clone(),
             blobz.clone(),
+            // absolute path to the blob-files directory, used only for
+            // filesystem disk-usage stats (not part of the BlobStore trait
+            // — see freqhole_reliquary::blobz's module doc comment).
+            config.data_dir.join("blob-files"),
             hub_repo.clone(),
             node_id_str.clone(),
             Arc::clone(&canvas_doc_ids),
@@ -567,7 +571,7 @@ impl HubPeerService {
 async fn process_hub_avatar(
     avatar_path: Option<&str>,
     data_dir: &std::path::Path,
-    blobz: &blobz::Store,
+    blobz: &Arc<dyn BlobStore>,
 ) -> Result<(String, Option<String>), HubError> {
     let path = match avatar_path {
         Some(p) if !p.is_empty() => p,
@@ -618,10 +622,12 @@ async fn process_hub_avatar(
         Some(_) => Some(blake3_hash.clone()),
         None => match blobz
             .insert(
-                blake3_hash.clone(), // iroh_hash: same as blake3 for locally-ingested blobs
-                Some("hub-avatar.webp".to_string()),
-                Some("image/webp".to_string()),
                 &webp,
+                NewBlobMeta {
+                    filename: Some("hub-avatar.webp".to_string()),
+                    mime: Some("image/webp".to_string()),
+                    ..Default::default()
+                },
             )
             .await
         {

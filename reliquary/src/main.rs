@@ -3,8 +3,10 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use freqhole_reliquary::blobz::{BlobStore, SqliteBlobStore};
+use freqhole_reliquary::identity;
 use iroh::SecretKey;
-use reliquary::{adminz, db, friendz, identity, userz};
+use reliquary::{adminz, db, friendz, userz};
 
 #[derive(Parser, Debug)]
 #[command(name = "reliquary", version, about = "skein hub peer")]
@@ -164,14 +166,14 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Init => {
-            let secret = identity::generate_keypair(&data_dir)?;
+            let secret = identity::generate_keypair(&data_dir, identity::DEFAULT_KEYPAIR_FILENAME)?;
             let node_id = secret.public();
             println!("node_id = {node_id}");
             println!("data_dir = {}", data_dir.display());
             Ok(())
         }
         Command::NodeId => {
-            let secret = identity::load_keypair(&data_dir)?;
+            let secret = identity::load_keypair(&data_dir, identity::DEFAULT_KEYPAIR_FILENAME)?;
             println!("{}", secret.public());
             eprintln!("data_dir = {}", data_dir.display());
             Ok(())
@@ -363,7 +365,8 @@ async fn maintenance(data_dir: PathBuf, cmd: MaintenanceCommand) -> anyhow::Resu
     let docs_db_path = data_dir.join("skein-docs.db");
     let storage = reliquary::hub_repo::HubDocStorage::new(&docs_db_path).await?;
     let pool = db::open(&data_dir).await?;
-    let blobz_store = reliquary::blobz::Store::new(pool, &data_dir);
+    let blobz_store: std::sync::Arc<dyn BlobStore> =
+        std::sync::Arc::new(SqliteBlobStore::new(pool, &data_dir));
 
     match cmd {
         MaintenanceCommand::List { limit, offset } => {
@@ -439,11 +442,14 @@ async fn maintenance(data_dir: PathBuf, cmd: MaintenanceCommand) -> anyhow::Resu
 }
 
 fn load_or_generate(data_dir: &std::path::Path) -> anyhow::Result<SecretKey> {
-    match identity::load_keypair(data_dir) {
+    match identity::load_keypair(data_dir, identity::DEFAULT_KEYPAIR_FILENAME) {
         Ok(secret) => Ok(secret),
         Err(identity::IdentityError::NotFound { .. }) => {
             tracing::info!("no keypair found; generating a new one");
-            Ok(identity::generate_keypair(data_dir)?)
+            Ok(identity::generate_keypair(
+                data_dir,
+                identity::DEFAULT_KEYPAIR_FILENAME,
+            )?)
         }
         Err(e) => Err(e.into()),
     }

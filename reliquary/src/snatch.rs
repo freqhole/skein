@@ -23,8 +23,8 @@ use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{Hash, HashAndFormat};
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::blobz;
 use crate::protocol::blob_proxy::{PeerMessage, SKEIN_ALPN};
+use freqhole_reliquary::blobz::{BlobStore, NewBlobMeta};
 
 /// timeout for a single ensure_blob probe to a peer (seconds).
 const PROBE_TIMEOUT_SECS: u64 = 15;
@@ -98,7 +98,7 @@ pub struct BlobSnatcher {
     fs_store: &'static FsStore,
     /// blob metadata + filesystem store (the skein equivalent of grimoire's
     /// `media_blobz` + `blob_data`).
-    blobz: blobz::Store,
+    blobz: Arc<dyn BlobStore>,
     /// hashes currently being downloaded. kept in sync with the iroh-blobs
     /// gc protect callback so an in-progress download is never swept before
     /// it has been ingested into blobz.
@@ -116,7 +116,7 @@ impl BlobSnatcher {
         scan_trigger: Arc<tokio::sync::Notify>,
         peer_blob_inventory: Arc<Mutex<HashMap<String, HashSet<String>>>>,
         fs_store: &'static FsStore,
-        blobz: blobz::Store,
+        blobz: Arc<dyn BlobStore>,
         in_flight: Arc<std::sync::Mutex<HashSet<Hash>>>,
     ) -> Self {
         Self {
@@ -904,7 +904,14 @@ impl BlobSnatcher {
 
         let stored = self
             .blobz
-            .register_ingested(blob_ref.blake3.clone(), filename, mime)
+            .register_ingested(
+                &blob_ref.blake3,
+                NewBlobMeta {
+                    filename,
+                    mime,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(|e| SnatchError::Ingest(format!("{e}")))?;
 

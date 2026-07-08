@@ -30,8 +30,8 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh_blobs::store::fs::FsStore;
 use serde::{Deserialize, Serialize};
 
-use crate::blobz;
 use crate::friendz;
+use freqhole_reliquary::blobz::BlobStore;
 
 /// ALPN protocol identifier for skein blob-proxy connections.
 pub const SKEIN_ALPN: &[u8] = b"skein/1";
@@ -74,7 +74,7 @@ pub struct BlobProxyHandler {
 
 struct Inner {
     store: &'static FsStore,
-    blobz: blobz::Store,
+    blobz: Arc<dyn BlobStore>,
     friendz: friendz::Store,
 }
 
@@ -85,7 +85,7 @@ impl std::fmt::Debug for BlobProxyHandler {
 }
 
 impl BlobProxyHandler {
-    pub fn new(store: &'static FsStore, blobz: blobz::Store, friendz: friendz::Store) -> Self {
+    pub fn new(store: &'static FsStore, blobz: Arc<dyn BlobStore>, friendz: friendz::Store) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,

@@ -148,7 +148,7 @@ export async function startReliquaryHub(options?: {
   if (!existsSync(RELIQUARY_BIN)) {
     throw new Error(
       `reliquary binary not found at ${RELIQUARY_BIN} — build it first with ` +
-        `"cargo build -p reliquary" from the skein workspace root (or set RELIQUARY_BIN).`
+        `"cargo build -p reliquary@0.1.1" from the skein workspace root (or set RELIQUARY_BIN).`
     );
   }
 

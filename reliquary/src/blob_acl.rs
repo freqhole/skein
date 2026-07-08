@@ -37,9 +37,10 @@
 //!   gate, but still closes the "any stranger can fetch anything" hole for
 //!   that path too, for the same low cost.
 //!
-//! reliquary has no persisted blake3->canvas mapping anywhere (`blobz::Store`
-//! is flat/content-addressed — see its module doc comment — with no canvas
-//! linkage column), so canvas membership is resolved live, by walking the
+//! reliquary has no persisted blake3->canvas mapping anywhere (the blob
+//! store is flat/content-addressed — see `SqliteBlobStore`'s module doc
+//! comment — with no canvas linkage column), so canvas membership is
+//! resolved live, by walking the
 //! same doc shapes `snatch::BlobSnatcher` already reads to *fetch* missing
 //! blobs, reused here read-only to *gate* blobs the hub already has.
 

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use reliquary::{blobz, db, friendz, identity, userz};
+use reliquary::{db, friendz, userz};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::Listener;
 use tauri::Manager;
@@ -80,7 +80,11 @@ async fn build_state() -> anyhow::Result<AppState> {
 
     let pool = db::open(&data_dir).await?;
     let username = std::env::var("SKEIN_USERNAME").unwrap_or_else(|_| "skein".to_string());
-    let blobz_store = blobz::Store::new(pool.clone(), &data_dir);
+    let blobz_store: std::sync::Arc<dyn freqhole_reliquary::blobz::BlobStore> =
+        std::sync::Arc::new(freqhole_reliquary::blobz::SqliteBlobStore::new(
+            pool.clone(),
+            &data_dir,
+        ));
     let friendz_store = friendz::Store::new(pool.clone());
     let userz_dir = userz::Directory::new(pool.clone());
     let app_config_path = data_dir.join(APP_CONFIG_FILENAME);
@@ -196,7 +200,12 @@ async fn build_state() -> anyhow::Result<AppState> {
         blobs_in_flight,
     };
 
-    if identity::keypair_path(&app_state.data_dir).exists() {
+    if freqhole_reliquary::identity::keypair_path(
+        &app_state.data_dir,
+        freqhole_reliquary::identity::DEFAULT_KEYPAIR_FILENAME,
+    )
+    .exists()
+    {
         let net = commands::build_network_state(&app_state).await?;
         tracing::info!(node_id = %net.node_id, "restored existing identity on boot");
         *app_state.network.lock().await = Some(net);

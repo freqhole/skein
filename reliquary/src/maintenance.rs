@@ -12,9 +12,10 @@
 //! cross-canvas blob-reference sweep in [`purge`] — is unit-testable
 //! without needing a full CLI invocation or a live `HubRepo`/iroh endpoint.
 
-use crate::blobz;
 use crate::hub_repo::HubDocStorage;
+use freqhole_reliquary::blobz::BlobStore;
 use std::collections::HashSet;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -22,7 +23,7 @@ pub enum MaintenanceError {
     #[error("canvas {0} is not soft-deleted — refusing to purge an actively-tracked canvas")]
     NotRemoved(String),
     #[error("blobz error: {0}")]
-    Blobz(#[from] crate::blobz::BlobError),
+    Blobz(#[from] freqhole_reliquary::blobz::BlobStoreError),
 }
 
 /// a soft-deleted canvas, with its title resolved (best-effort) for display
@@ -100,7 +101,7 @@ pub async fn restore(storage: &HubDocStorage, canvas_doc_id: &str) -> bool {
 /// returns the number of blobs soft-deleted.
 pub async fn sweep_canvas_blobs(
     storage: &HubDocStorage,
-    blobz: &blobz::Store,
+    blobz: &Arc<dyn BlobStore>,
     canvas_doc_id: &str,
     actor: &str,
 ) -> Result<u64, MaintenanceError> {
@@ -141,20 +142,20 @@ pub async fn sweep_canvas_blobs(
         return Ok(0);
     }
 
-    let (affected, failed) = blobz
+    let outcome = blobz
         .soft_delete(&to_delete, actor)
         .await
         .map_err(MaintenanceError::Blobz)?;
 
-    if !failed.is_empty() {
+    if !outcome.failed.is_empty() {
         tracing::debug!(
             canvas_doc_id,
-            failed_count = failed.len(),
+            failed_count = outcome.failed.len(),
             "sweep_canvas_blobs: some blobs were already soft-deleted or missing"
         );
     }
 
-    Ok(affected)
+    Ok(outcome.affected)
 }
 
 /// permanently purge a soft-deleted canvas: its own automerge doc, its
@@ -167,7 +168,7 @@ pub async fn sweep_canvas_blobs(
 /// silent `false`).
 pub async fn purge(
     storage: &HubDocStorage,
-    blobz: &blobz::Store,
+    blobz: &Arc<dyn BlobStore>,
     canvas_doc_id: &str,
 ) -> Result<PurgeReport, MaintenanceError> {
     let removed_ids = storage.load_removed_canvas_ids(i64::MAX, 0).await;
@@ -208,14 +209,19 @@ pub async fn purge(
     }
 
     // 4. delete blobs this canvas referenced, unless some other still-known
-    //    canvas also references them.
+    //    canvas also references them. the store has no direct hard-delete —
+    //    a blob must be soft-deleted first, so this stamps the maintenance
+    //    sweep itself as the actor before reclaiming the row and file.
+    const PURGE_ACTOR: &str = "system:maintenance-purge";
     let mut blobs_deleted = Vec::new();
     let mut blobs_kept = Vec::new();
     for hash in &this_canvas_blake3s {
         if still_referenced.contains(hash) {
             blobs_kept.push(hash.clone());
         } else {
-            let _ = blobz.delete(hash).await;
+            let hash_slice = std::slice::from_ref(hash);
+            let _ = blobz.soft_delete(hash_slice, PURGE_ACTOR).await;
+            let _ = blobz.hard_delete_soft_deleted(Some(hash_slice)).await;
             blobs_deleted.push(hash.clone());
         }
     }
@@ -305,12 +311,14 @@ async fn blake3_for_widget_doc(storage: &HubDocStorage, widget_doc_id: &str) -> 
 mod tests {
     use super::*;
 
-    async fn make_storage() -> (HubDocStorage, blobz::Store, tempfile::TempDir) {
+    async fn make_storage() -> (HubDocStorage, Arc<dyn BlobStore>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let docs_db = tmp.path().join("hub-docs.db");
         let storage = HubDocStorage::new(&docs_db).await.expect("storage");
         let pool = crate::db::open_in_memory().await;
-        let blob_store = blobz::Store::new(pool, tmp.path());
+        let blob_store: Arc<dyn BlobStore> = Arc::new(
+            freqhole_reliquary::blobz::SqliteBlobStore::new(pool, tmp.path()),
+        );
         (storage, blob_store, tmp)
     }
 
@@ -418,10 +426,11 @@ mod tests {
         let bytes = b"orphan blob content";
         let blob = blobz_store
             .insert(
-                "iroh-hash-1".to_string(),
-                Some("f.txt".to_string()),
-                None,
                 bytes,
+                freqhole_reliquary::blobz::NewBlobMeta {
+                    filename: Some("f.txt".to_string()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("insert blob");
@@ -448,10 +457,11 @@ mod tests {
 
         let blob = blobz_store
             .insert(
-                "iroh-hash-2".to_string(),
-                Some("f.txt".to_string()),
-                None,
                 b"shared content",
+                freqhole_reliquary::blobz::NewBlobMeta {
+                    filename: Some("f.txt".to_string()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("insert blob");
@@ -496,20 +506,22 @@ mod tests {
         // shared blob — also referenced by c2
         let shared = blobz_store
             .insert(
-                "iroh-shared".into(),
-                Some("shared.bin".into()),
-                None,
                 b"shared",
+                freqhole_reliquary::blobz::NewBlobMeta {
+                    filename: Some("shared.bin".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
         // orphan blob — only referenced by c1
         let orphan = blobz_store
             .insert(
-                "iroh-orphan".into(),
-                Some("orphan.bin".into()),
-                None,
                 b"orphan",
+                freqhole_reliquary::blobz::NewBlobMeta {
+                    filename: Some("orphan.bin".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -552,10 +564,14 @@ mod tests {
         assert!(blobz_store.get_any(&orphan.blake3).await.unwrap().is_some());
 
         // actor is stamped correctly
-        let sd = blobz_store.list_soft_deleted().await.unwrap();
+        let (sd, sd_total) = blobz_store.list_soft_deleted(i64::MAX, 0).await.unwrap();
+        assert_eq!(sd_total, 1);
         assert_eq!(sd.len(), 1);
         assert_eq!(sd[0].blake3, orphan.blake3);
-        assert_eq!(sd[0].soft_deleted_by, "system:canvas-deleted");
+        assert_eq!(
+            sd[0].soft_deleted_by.as_deref(),
+            Some("system:canvas-deleted")
+        );
     }
 
     #[tokio::test]
@@ -563,7 +579,10 @@ mod tests {
         let (storage, blobz_store, _tmp) = make_storage().await;
 
         let shared = blobz_store
-            .insert("iroh-sh2".into(), None, None, b"shared2")
+            .insert(
+                b"shared2",
+                freqhole_reliquary::blobz::NewBlobMeta::default(),
+            )
             .await
             .unwrap();
 

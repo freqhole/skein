@@ -733,10 +733,12 @@ impl HubPeerService {
             Ok(None) => match self
                 .blobz
                 .insert(
-                    blake3_hash.clone(),
-                    Some("peer-avatar.webp".to_string()),
-                    Some("image/webp".to_string()),
                     &webp,
+                    freqhole_reliquary::blobz::NewBlobMeta {
+                        filename: Some("peer-avatar.webp".to_string()),
+                        mime: Some("image/webp".to_string()),
+                        ..Default::default()
+                    },
                 )
                 .await
             {

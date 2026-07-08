@@ -20,8 +20,12 @@ DEV_DB := $(CURDIR)/reliquary/dev-data/skein-hub.db
 
 # (re)creates the sqlite dev db reliquary's sqlx macros need, by running a
 # side-effect-free reliquary CLI subcommand (applies migrations, nothing else).
+#
+# `-p reliquary@0.1.1` (not bare `-p reliquary`) because the freqhole/reliquary
+# path dependency (aliased `freqhole-reliquary` in Cargo.toml, still package-
+# named "reliquary" upstream) makes the bare name ambiguous in this workspace.
 dev-data: ## (re)create the sqlx compile-time-check dev db
-	cargo run -p reliquary -- --data-dir reliquary/dev-data friend list
+	cargo run -p reliquary@0.1.1 -- --data-dir reliquary/dev-data friend list
 
 # reliquary applies sqlx migrations (reliquary/migrationz/) automatically on
 # every startup via sqlx::migrate! (see reliquary/src/db.rs), so "running
@@ -30,7 +34,7 @@ dev-data: ## (re)create the sqlx compile-time-check dev db
 # so a new migration lands everywhere without waiting for the next
 # tauri-dev/hub-dev boot.
 db-migrate: dev-data ## apply sqlx migrations to the dev dbs (dev-data + hub-dev-data)
-	cargo run -p reliquary -- --data-dir reliquary/hub-dev-data friend list
+	cargo run -p reliquary@0.1.1 -- --data-dir reliquary/hub-dev-data friend list
 
 tauri-dev: dev-data ## run the tauri desktop app in dev mode
 	cd tauri && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri dev
@@ -53,7 +57,7 @@ tauri-build: dev-data ## build the tauri desktop app
 # port. RUST_LOG matches the level loam/tests/helpers/reliquary-hub.ts
 # already uses for a real hub process.
 hub-dev: dev-data ## run a real reliquary hub (own data dir, safe alongside tauri-dev)
-	RUST_LOG=reliquary=debug cargo run -p reliquary -- --data-dir reliquary/hub-dev-data serve
+	RUST_LOG=reliquary=debug cargo run -p reliquary@0.1.1 -- --data-dir reliquary/hub-dev-data serve
 
 # both target the dev hub's own data dir (reliquary/hub-dev-data, see
 # hub-dev above) so they affect a hub already running via `make hub-dev`.
@@ -63,10 +67,10 @@ hub-friend-allow: ## allow a peer as a friend on the dev hub (NODE_ID=<hex node 
 	@node_id="$(NODE_ID)"; \
 	if [ -z "$$node_id" ]; then read -p "node id to allow as friend: " node_id; fi; \
 	if [ -z "$$node_id" ]; then echo "no node id given, aborting"; exit 1; fi; \
-	cargo run -p reliquary -- --data-dir reliquary/hub-dev-data friend allow "$$node_id"
+	cargo run -p reliquary@0.1.1 -- --data-dir reliquary/hub-dev-data friend allow "$$node_id"
 
 hub-admin-allow: ## grant a peer hub-admin rights on the dev hub (NODE_ID=<hex node id>, or prompts)
 	@node_id="$(NODE_ID)"; \
 	if [ -z "$$node_id" ]; then read -p "node id to grant admin: " node_id; fi; \
 	if [ -z "$$node_id" ]; then echo "no node id given, aborting"; exit 1; fi; \
-	cargo run -p reliquary -- --data-dir reliquary/hub-dev-data admin allow "$$node_id"
+	cargo run -p reliquary@0.1.1 -- --data-dir reliquary/hub-dev-data admin allow "$$node_id"
