@@ -13,7 +13,7 @@
 // store, endpoint, and protocols must share one wasm instance.
 
 import * as Comlink from "comlink";
-import { CancelToken, MiddenNode } from "midden";
+import { CancelToken, MiddenNode, MiddenNodeOptions } from "@freqhole/midden";
 
 let node: MiddenNode | null = null;
 
@@ -93,6 +93,11 @@ const OPFS_STORE_DIR = "midden-blob-store";
 /** web lock name guarding single-tab ownership of the OPFS store. */
 const STORE_LOCK_NAME = "skein-midden-blob-store";
 
+/** skein's own protocol ALPNs, registered alongside the package's default
+ *  set: blob proxying/small stream requests, and the friends protocol. */
+const SKEIN_ALPN = "skein/1";
+const SKEIN_FRIENDZ_ALPN = "skein-friendz/1";
+
 /** resolves when we know whether this worker owns the store lock. the lock
  *  (when granted) is held for the worker's lifetime via a never-resolving
  *  promise — worker termination releases it automatically. */
@@ -141,9 +146,12 @@ async function init(
   }
   const storeDir = ownsStore ? OPFS_STORE_DIR : undefined;
 
-  node = secretKey
-    ? await MiddenNode.create_from_key(secretKey, storeDir)
-    : await MiddenNode.create(storeDir);
+  const options = new MiddenNodeOptions();
+  options.secret_key = secretKey ?? undefined;
+  options.opfs_store_dir = storeDir;
+  options.extra_alpns = [SKEIN_ALPN, SKEIN_FRIENDZ_ALPN];
+
+  node = await MiddenNode.create_with_options(options);
   const sk = node.secret_key();
   return { nodeId: node.node_id(), secretKey: Comlink.transfer(sk, [sk.buffer as ArrayBuffer]) };
 }

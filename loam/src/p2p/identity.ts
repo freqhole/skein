@@ -11,7 +11,7 @@
 
 import { deleteMetaRecord, getMetaRecord, setMetaRecord } from "../storage/meta-db";
 import { checkTauriIdentityStatus, isTauriMode, TauriStreamNode } from "./tauri-transport";
-import { MiddenNode } from "midden";
+import { MiddenNode } from "@freqhole/midden";
 import { WorkerMiddenNode } from "../workers/midden-worker-client";
 import { log } from "../utils/log";
 

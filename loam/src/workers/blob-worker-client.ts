@@ -10,7 +10,7 @@
 
 import * as Comlink from "comlink";
 import type { BlobWorkerApi } from "./blob-worker";
-import * as middenWasm from "midden";
+import * as middenWasm from "@freqhole/midden";
 
 let workerProxy: Comlink.Remote<BlobWorkerApi> | null = null;
 let workerInstance: Worker | null = null;

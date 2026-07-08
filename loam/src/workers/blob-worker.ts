@@ -10,7 +10,7 @@
 // worker at all (rust handles hashing).
 
 import * as Comlink from "comlink";
-import * as middenWasm from "midden";
+import * as middenWasm from "@freqhole/midden";
 
 const OPFS_DIR = "skein-blobs";
 

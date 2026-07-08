@@ -12,9 +12,9 @@ const deployBase = process.env.VITE_SKEIN_BASE;
 
 export default defineConfig({
   // wasm plugin is needed (automerge uses WASM internally).
-  // only midden (iroh P2P transport) is stubbed in tauri builds.
+  // only @freqhole/midden (iroh P2P transport) is stubbed in tauri builds.
   plugins: [wasm()],
-  // worker bundles need the same plugin — blob-worker imports midden (WASM) for blake3.
+  // worker bundles need the same plugin — blob-worker imports @freqhole/midden (WASM) for blake3.
   worker: {
     format: "es",
     plugins: () => [wasm()],
@@ -34,19 +34,19 @@ export default defineConfig({
     },
     sourcemap: true,
   },
-  // in tauri builds, alias midden to a stub (P2P transport is handled by the rust backend)
+  // in tauri builds, alias @freqhole/midden to a stub (P2P transport is handled by the rust backend)
   ...(isTauriBuild
     ? {
         resolve: {
           alias: {
-            midden: path.resolve(dirname, "src/stubs/midden-stub.ts"),
+            "@freqhole/midden": path.resolve(dirname, "src/stubs/midden-stub.ts"),
           },
         },
       }
     : {}),
-  // exclude midden from esbuild pre-bundling — it contains a .wasm file that
-  // esbuild can't handle; vite-plugin-wasm takes care of it instead.
+  // exclude @freqhole/midden from esbuild pre-bundling — it contains a .wasm
+  // file that esbuild can't handle; vite-plugin-wasm takes care of it instead.
   optimizeDeps: {
-    exclude: ["midden"],
+    exclude: ["@freqhole/midden"],
   },
 });

@@ -8,7 +8,7 @@ const isTauriBuild = !!process.env.VITE_TAURI;
 
 export default defineConfig({
   plugins: [wasm()],
-  // worker bundles need wasm too — the blob worker pulls in midden (wasm) for blake3.
+  // worker bundles need wasm too — the blob worker pulls in @freqhole/midden (wasm) for blake3.
   worker: {
     format: "es",
     plugins: () => [wasm()],
@@ -23,29 +23,32 @@ export default defineConfig({
       fileName: "skein",
     },
     rollupOptions: {
-      external: isTauriBuild ? ["pixi.js", "@pixi/ui", "midden"] : ["pixi.js", "@pixi/ui"],
+      external: isTauriBuild
+        ? ["pixi.js", "@pixi/ui", "@freqhole/midden"]
+        : ["pixi.js", "@pixi/ui"],
     },
     sourcemap: true,
   },
-  // when building for Tauri, alias midden to a stub that throws on use
+  // when building for Tauri, alias @freqhole/midden to a stub that throws on use
   ...(isTauriBuild
     ? {
         resolve: {
           alias: {
-            midden: path.resolve(__dirname, "src/stubs/midden-stub.ts"),
+            "@freqhole/midden": path.resolve(__dirname, "src/stubs/midden-stub.ts"),
           },
         },
       }
     : {}),
   // dev server serves test-harness.html for playwright tests.
-  // allow serving the midden package which lives at ../midden/pkg (outside project root).
+  // allow serving the @freqhole/midden package, which lives at ../../midden/pkg
+  // (a sibling repo of skein, two levels above loam).
   server: {
     port: 5897,
     fs: {
-      allow: [".."],
+      allow: ["..", "../../midden"],
     },
     // cross-origin isolation headers — required for the blob worker's WASM
-    // (midden) init to complete reliably. without these, the worker's
+    // (@freqhole/midden) init to complete reliably. without these, the worker's
     // midden init can hang indefinitely in some browsers (see
     // docs/skein-runtime-plan.md: "blob worker in tests").
     headers: {
@@ -53,10 +56,10 @@ export default defineConfig({
       "Cross-Origin-Embedder-Policy": "require-corp",
     },
   },
-  // exclude midden from esbuild pre-bundling — it contains a .wasm file that
-  // esbuild can't handle; vite-plugin-wasm takes care of it instead.
+  // exclude @freqhole/midden from esbuild pre-bundling — it contains a .wasm
+  // file that esbuild can't handle; vite-plugin-wasm takes care of it instead.
   optimizeDeps: {
-    exclude: ["midden"],
+    exclude: ["@freqhole/midden"],
   },
   test: {
     globals: true,
