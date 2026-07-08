@@ -90,115 +90,35 @@ async fn build_state() -> anyhow::Result<AppState> {
     let userz_dir = userz::Directory::new(haruspex_pool);
     let app_config_path = data_dir.join(APP_CONFIG_FILENAME);
 
-    // boot the iroh-blobs FsStore that backs verified blob streaming. peers
-    // (browser midden) hit us on `iroh-blobs/4` and pull bytes directly out
-    // of this store; the `blob_iroh_ensure` dispatch action pre-loads the
-    // requested blob from `blobz` so the FsStore has the bytes when the
-    // peer asks for them. leaked to satisfy `BlobsProtocol`'s `&'static`
-    // requirement -- there's only ever one of these per process. this is
-    // independent of the iroh endpoint/identity, so it's always built.
-    let fs_store_dir = data_dir.join("iroh-blobs");
-    tokio::fs::create_dir_all(&fs_store_dir).await?;
-
-    // in-flight download set: hashes currently being fetched by
-    // blob_iroh_download. shared between AppState (for command access) and
-    // the gc protect callback below, so the gc never sweeps a blob that is
-    // mid-download.
-    let blobs_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<iroh_blobs::Hash>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-
-    // gc-protected hash cache: refreshed every 10 min by a background task.
-    // None = never refreshed → abort gc cycle to avoid sweeping blind.
-    let protected: Arc<std::sync::RwLock<Option<std::collections::HashSet<iroh_blobs::Hash>>>> =
-        Arc::new(std::sync::RwLock::new(None));
-    {
-        let protected_bg = Arc::clone(&protected);
-        let blobz_bg = blobz_store.clone();
-        tokio::spawn(async move {
-            loop {
-                match blobz_bg.list_all_iroh_hashes().await {
-                    Ok(hex_hashes) => {
-                        let mut set = std::collections::HashSet::new();
-                        for hex in &hex_hashes {
-                            if let Ok(h) = hex.parse::<iroh_blobs::Hash>() {
-                                set.insert(h);
-                            }
-                        }
-                        if let Ok(mut guard) = protected_bg.write() {
-                            *guard = Some(set);
-                        }
-                        tracing::debug!(
-                            count = hex_hashes.len(),
-                            "gc protect: refreshed protected hashes from blobz"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "gc protect: failed to refresh protected hashes from blobz"
-                        );
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
-            }
-        });
-    }
-
-    let protect_cb: iroh_blobs::store::ProtectCb = {
-        let inf = Arc::clone(&blobs_in_flight);
-        Arc::new(move |live: &mut std::collections::HashSet<iroh_blobs::Hash>| {
-            let p = Arc::clone(&protected);
-            let inf2 = Arc::clone(&inf);
-            Box::pin(async move {
-                match p.read() {
-                    Ok(guard) => match guard.as_ref() {
-                        None => {
-                            tracing::debug!(
-                                "gc protect: protected set not yet initialized, aborting cycle"
-                            );
-                            return iroh_blobs::store::ProtectOutcome::Abort;
-                        }
-                        Some(set) => {
-                            live.extend(set.iter().cloned());
-                        }
-                    },
-                    Err(_) => return iroh_blobs::store::ProtectOutcome::Abort,
-                }
-                // also protect blobs mid-download
-                if let Ok(inf_guard) = inf2.lock() {
-                    live.extend(inf_guard.iter().cloned());
-                }
-                iroh_blobs::store::ProtectOutcome::Continue
-            })
-        })
-    };
-
-    let mut fs_opts = iroh_blobs::store::fs::options::Options::new(&fs_store_dir);
-    fs_opts.gc = Some(iroh_blobs::store::GcConfig {
-        interval: std::time::Duration::from_secs(3600),
-        add_protected: Some(protect_cb),
-    });
-    let fs_store: &'static iroh_blobs::store::fs::FsStore = Box::leak(Box::new(
-        iroh_blobs::store::fs::FsStore::load_with_opts(
-            fs_store_dir.join("blobs.db"),
-            fs_opts,
+    // the iroh-blobs FsStore + gc-protect + downloader bundle. boots fully
+    // offline -- no iroh endpoint/identity needed yet -- so it's ready the
+    // moment the process starts, independent of whether the user already
+    // has an identity on disk. a downloader attaches moments later in this
+    // same function for a returning user, or whenever the frontend first
+    // needs the network for a first-time user (see
+    // `commands::ensure_network`); either way it's the same `StorageNode`,
+    // never a second one.
+    let storage = Arc::new(
+        freqhole_reliquary::node::StorageNode::init_local(
+            &data_dir,
+            blobz_store,
+            freqhole_reliquary::node::StorageNodeOptions::default(),
         )
         .await?,
-    ));
+    );
 
     let app_state = AppState {
         network: Arc::new(Mutex::new(None)),
         pool,
         data_dir,
         username,
-        blobz: blobz_store,
+        storage,
+        downloader_cell: Arc::new(std::sync::RwLock::new(None)),
         friendz_store,
         userz: userz_dir,
         process_started_at: Instant::now(),
         app_config_path,
         hub: Arc::new(Mutex::new(None)),
-        fs_store,
-        blobs_in_flight,
     };
 
     if freqhole_reliquary::identity::keypair_path(

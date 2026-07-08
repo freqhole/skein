@@ -1,27 +1,18 @@
 //! blob-fetch ACL gate for the `iroh-blobs/*` verified-transfer ALPN.
 //!
-//! before this module existed, `iroh_blobs::BlobsProtocol::new(store, events)`
-//! was constructed with `events: None` at both call sites in this crate
-//! (`hub::HubPeerService::start` and `service::Service::start`) — meaning
-//! every blob in the local `FsStore` was served to any peer that could open
-//! a QUIC connection and knew (or was given) a blake3 hash. no friendz
-//! check, no canvas check, nothing. `skein/1`'s `ensure_blob` handshake
-//! (`protocol::blob_proxy.rs`) only decides whether the hub *imports* a
-//! blob into its iroh-blobs store by reference — the actual bytes flow over
-//! `iroh-blobs/*`, which is what this module gates.
+//! `skein/1`'s `ensure_blob` handshake (`protocol::blob_proxy.rs`) only
+//! decides whether the hub *imports* a blob into its iroh-blobs store by
+//! reference - the actual bytes flow over `iroh-blobs/*`, which is what
+//! this module gates: a peer must (a) be a hub friend and (b) have a
+//! `.acl` entry on at least one canvas that references the requested blob.
 //!
-//! `BlobsProtocol::new`'s second argument is an
-//! `Option<iroh_blobs::provider::events::EventSender>` — an upstream,
-//! documented extension point (see the `iroh-blobs` crate's own
-//! `examples/limit.rs`) that lets a caller intercept
-//! `ClientConnected`/`GetRequestReceived`/`GetManyRequestReceived` events and
-//! accept or reject them *before* any bytes are served. `midden` (the
-//! browser/wasm side of this stack) already uses the same mechanism as a
-//! hardcoded-allow-list stopgap (`build_gated_blobs_events` in
-//! `midden/src/lib.rs`) — this module is the native-hub equivalent, wired to
-//! real data instead of a manually-populated allow-list:
-//! `friendz::Store::is_friend()` plus the requested blob's owning canvas(es)
-//! `.acl` map.
+//! [`BlobAclGate`] implements [`freqhole_reliquary::gate::AccessGate`],
+//! which supplies the generic `iroh_blobs` event-interception mechanics
+//! (`ClientConnected`/`GetRequestReceived`/`GetManyRequestReceived`) via
+//! [`freqhole_reliquary::gate::build_gated_blobs_events`] - this module
+//! contributes only the app-specific access decision: friendz status plus
+//! canvas `.acl` membership, resolved live by walking the same doc shapes
+//! `snatch`'s doc-scanning logic already reads.
 //!
 //! two gating modes:
 //! - [`BlobAclGate::for_hub`]: full canvas-ACL gating, used by
@@ -40,21 +31,19 @@
 //! reliquary has no persisted blake3->canvas mapping anywhere (the blob
 //! store is flat/content-addressed — see `SqliteBlobStore`'s module doc
 //! comment — with no canvas linkage column), so canvas membership is
-//! resolved live, by walking the
-//! same doc shapes `snatch::BlobSnatcher` already reads to *fetch* missing
-//! blobs, reused here read-only to *gate* blobs the hub already has.
+//! resolved live, by walking the same doc shapes `snatch`'s doc-scanning
+//! logic already reads to *find* missing blobs, reused here read-only to
+//! *gate* blobs the hub already has.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use iroh_blobs::provider::events::{
-    AbortReason, ConnectMode, EventMask, EventResult, EventSender, ProviderMessage, RequestMode,
-};
-use tokio::sync::Mutex;
+use async_trait::async_trait;
+use iroh_blobs::provider::events::EventSender;
 
 use crate::friendz;
 use crate::hub_repo::HubRepo;
 use crate::snatch::{classify_doc, read_canvas_for_file_widgets, read_widget_state, DocKind};
+use freqhole_reliquary::gate::AccessGate;
 
 // ---------------------------------------------------------------------------
 // canvas membership resolution
@@ -159,7 +148,8 @@ impl CanvasResolver {
 // ---------------------------------------------------------------------------
 
 /// per-peer blob-fetch gate. construct via [`BlobAclGate::for_hub`] or
-/// [`BlobAclGate::friend_only`], then pass to [`build_gated_blobs_events`].
+/// [`BlobAclGate::friend_only`], then pass to
+/// [`freqhole_reliquary::gate::build_gated_blobs_events`].
 #[derive(Clone)]
 pub struct BlobAclGate {
     friendz: friendz::Store,
@@ -184,7 +174,10 @@ impl BlobAclGate {
             canvas: None,
         }
     }
+}
 
+#[async_trait]
+impl AccessGate for BlobAclGate {
     /// true if `peer_node_id` may fetch the blob identified by
     /// `blake3_hash`.
     ///
@@ -192,7 +185,7 @@ impl BlobAclGate {
     /// friend who hasn't been invited to (or removed from) the specific
     /// canvas that references this blob is still denied. see this module's
     /// doc comment for the full design rationale.
-    async fn peer_can_fetch(&self, peer_node_id: &str, blake3_hash: &str) -> bool {
+    async fn allow_blob(&self, peer_node_id: &str, blake3_hash: &str) -> bool {
         if !self.friendz.is_friend(peer_node_id).await {
             tracing::info!(peer = peer_node_id, "blob-acl: denied, not a hub friend");
             return false;
@@ -233,97 +226,12 @@ impl BlobAclGate {
 // ---------------------------------------------------------------------------
 
 /// build an `EventSender` that intercepts `iroh_blobs`' connect/get/get_many
-/// events and gates them against `gate`.
-///
-/// mirrors `midden::build_gated_blobs_events` (same upstream extension
-/// point, same event shapes) with two differences suited to a native tokio
-/// process rather than a single-threaded wasm runtime: `tokio::spawn` +
-/// `tokio::sync::Mutex` instead of `wasm_bindgen_futures::spawn_local` +
-/// `Rc<RefCell<_>>`, and real ACL resolution (friendz + canvas `.acl`)
-/// instead of a hardcoded allow-list.
-///
-/// a connection is never rejected outright at `ClientConnected` time — we
-/// only learn which hash is being requested once a get/get_many request
-/// comes in, so gating happens per-request, keyed by the requester's
-/// endpoint id (recorded from `ClientConnected` and looked up by
-/// connection id, same as iroh authenticates the remote endpoint id at the
-/// QUIC/TLS layer before any application data flows — a request whose
-/// connection id we can't resolve to an endpoint id is denied, fail closed).
+/// events and gates them against `gate`. thin wrapper over
+/// [`freqhole_reliquary::gate::build_gated_blobs_events`], which owns the
+/// generic interception-loop mechanics; this module only supplies the
+/// access decision via `BlobAclGate`'s [`AccessGate`] implementation above.
 pub fn build_gated_blobs_events(gate: BlobAclGate) -> EventSender {
-    let mask = EventMask {
-        connected: ConnectMode::Intercept,
-        get: RequestMode::Intercept,
-        get_many: RequestMode::Intercept,
-        ..EventMask::DEFAULT
-    };
-    let (tx, mut rx) = EventSender::channel(32, mask);
-    let connections: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                ProviderMessage::ClientConnected(msg) => {
-                    if let Some(endpoint_id) = msg.endpoint_id {
-                        connections
-                            .lock()
-                            .await
-                            .insert(msg.connection_id, endpoint_id.to_string());
-                    }
-                    // always accept the connection itself; gating happens
-                    // per-request below, once we know which hash is asked for.
-                    msg.tx.send(Ok(())).await.ok();
-                }
-                ProviderMessage::ConnectionClosed(msg) => {
-                    connections.lock().await.remove(&msg.connection_id);
-                }
-                ProviderMessage::GetRequestReceived(msg) => {
-                    let peer = connections.lock().await.get(&msg.connection_id).cloned();
-                    let hash = msg.request.hash;
-                    let allowed = match &peer {
-                        Some(peer) => gate.peer_can_fetch(peer, &hash.to_string()).await,
-                        None => false,
-                    };
-                    if !allowed {
-                        tracing::warn!(peer = ?peer, %hash, "blob-acl: denied get request");
-                    }
-                    let res: EventResult = if allowed {
-                        Ok(())
-                    } else {
-                        Err(AbortReason::Permission)
-                    };
-                    msg.tx.send(res).await.ok();
-                }
-                ProviderMessage::GetManyRequestReceived(msg) => {
-                    let peer = connections.lock().await.get(&msg.connection_id).cloned();
-                    let allowed = match &peer {
-                        Some(peer) => {
-                            let mut ok = true;
-                            for hash in &msg.request.hashes {
-                                if !gate.peer_can_fetch(peer, &hash.to_string()).await {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            ok
-                        }
-                        None => false,
-                    };
-                    if !allowed {
-                        tracing::warn!(peer = ?peer, "blob-acl: denied get_many request");
-                    }
-                    let res: EventResult = if allowed {
-                        Ok(())
-                    } else {
-                        Err(AbortReason::Permission)
-                    };
-                    msg.tx.send(res).await.ok();
-                }
-                _ => {}
-            }
-        }
-    });
-
-    tx
+    freqhole_reliquary::gate::build_gated_blobs_events(Arc::new(gate))
 }
 
 // ---------------------------------------------------------------------------
@@ -467,7 +375,7 @@ mod tests {
             .expect("upsert friend");
 
         let gate = BlobAclGate::for_hub(friendz_store, hub_repo);
-        assert!(gate.peer_can_fetch("alice", "abc123").await);
+        assert!(gate.allow_blob("alice", "abc123").await);
     }
 
     #[tokio::test]
@@ -490,7 +398,7 @@ mod tests {
         // mallory has no friendz row at all, and is not in canvas-1's acl.
 
         let gate = BlobAclGate::for_hub(friendz_store, hub_repo);
-        assert!(!gate.peer_can_fetch("mallory", "abc123").await);
+        assert!(!gate.allow_blob("mallory", "abc123").await);
     }
 
     #[tokio::test]
@@ -525,7 +433,7 @@ mod tests {
         // ...but is not on canvas-1's acl, so the fetch must still be denied.
         // this is the key distinction from the sync-ALPN gate (`sync::IrohRepo::accept`),
         // which only checks hub-level friendz status.
-        assert!(!gate.peer_can_fetch("bob", "abc123").await);
+        assert!(!gate.allow_blob("bob", "abc123").await);
     }
 
     #[tokio::test]
@@ -558,7 +466,7 @@ mod tests {
         // alice is a friend and a canvas-1 member, but this hash isn't
         // referenced by any canvas at all (e.g. an unrelated blob) — fail
         // closed rather than defaulting to "no known link means unrestricted".
-        assert!(!gate.peer_can_fetch("alice", "some-other-hash").await);
+        assert!(!gate.allow_blob("alice", "some-other-hash").await);
     }
 
     #[tokio::test]
@@ -576,7 +484,7 @@ mod tests {
             .expect("upsert friend");
 
         let gate = BlobAclGate::friend_only(friendz_store);
-        assert!(gate.peer_can_fetch("alice", "anything-at-all").await);
+        assert!(gate.allow_blob("alice", "anything-at-all").await);
     }
 
     #[tokio::test]
@@ -586,6 +494,6 @@ mod tests {
         let friendz_store = friendz::Store::new(haruspex_pool, pool);
 
         let gate = BlobAclGate::friend_only(friendz_store);
-        assert!(!gate.peer_can_fetch("mallory", "anything-at-all").await);
+        assert!(!gate.allow_blob("mallory", "anything-at-all").await);
     }
 }

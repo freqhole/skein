@@ -11,7 +11,7 @@
 mod canvas;
 mod messages;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,17 +127,16 @@ pub struct HubPeerService {
     pub(crate) profile_changed: Arc<tokio::sync::Notify>,
     /// canvas doc IDs the hub is participating in (for gossip and relay)
     pub(crate) canvas_doc_ids: Arc<Mutex<HashSet<String>>>,
-    /// peer blob inventory — maps peer node ID → set of blake3 hashes they have.
-    /// populated by BlobOffer responses. cleared when peer goes offline.
-    pub(crate) peer_blob_inventory: Arc<Mutex<HashMap<String, HashSet<String>>>>,
-    /// the change-driven blob snatcher — subscribes to hub_repo doc changes
-    /// and snatches blobs only for the docs that actually changed.
-    /// wrapped in [`Arc`] so it can be moved into the spawned run loop while
-    /// the hub keeps a handle for accessor / shutdown purposes.
-    pub(crate) snatcher: Arc<crate::snatch::BlobSnatcher>,
+    /// blob replication engine: scans automerge canvas/widget docs for
+    /// blob references the hub doesn't have locally and fetches them from
+    /// peers over the `skein/1` ALPN. wrapped in [`Arc`] so it can be moved
+    /// into the spawned run loop while the hub keeps a handle - e.g. to
+    /// feed it peer-offered blob inventory via `offer_peer_blobs` once a
+    /// `BlobOffer` message arrives.
+    pub(crate) engine: Arc<crate::snatch::HubSnatchEngine>,
     /// legacy "wake the snatcher now" trigger. preserved as a no-op so that
-    /// canvas/messages handlers from the prototype still compile; the new
-    /// change-driven snatcher subscribes to `hub_repo.subscribe_doc_changes`
+    /// canvas/messages handlers from the prototype still compile; the
+    /// change-driven engine subscribes to `hub_repo.subscribe_doc_changes`
     /// directly and ignores this notify.
     pub(crate) snatch_trigger: Arc<tokio::sync::Notify>,
 
@@ -296,23 +295,17 @@ impl HubPeerService {
         // mid-download is never swept before it's ingested into blobz.
         let downloader = storage
             .downloader()
-            .expect("storage node's endpoint is already attached by the time the hub starts")
-            .clone();
-        let peer_blob_inventory = Arc::new(Mutex::new(HashMap::new()));
+            .expect("storage node's endpoint is already attached by the time the hub starts");
         let snatch_trigger_legacy = Arc::new(tokio::sync::Notify::new());
-        let snatcher = Arc::new(crate::snatch::BlobSnatcher::new(
-            hub_repo.clone(),
-            endpoint.clone(),
-            downloader,
-            node_id_str.clone(),
-            // BlobSnatcher::new still accepts a scan trigger for the older
-            // `run_scan_loop` path; the new `run` (change-driven) path ignores
-            // it. nothing in this service notifies the snatcher's copy.
-            Arc::new(tokio::sync::Notify::new()),
-            peer_blob_inventory.clone(),
-            fs_store,
+        let engine = Arc::new(freqhole_reliquary::snatch::SnatchEngine::new(
             blobz.clone(),
+            Arc::new(std::sync::RwLock::new(Some(downloader))),
+            fs_store,
             storage.in_flight.clone(),
+            node_id_str.clone(),
+            crate::snatch::HubBlobRefSource::new(hub_repo.clone(), node_id_str.clone()),
+            crate::snatch::HubPeerProbeTransport::new(endpoint.clone()),
+            freqhole_reliquary::snatch::SnatchEngineOptions::default(),
         ));
 
         Ok(Self {
@@ -326,8 +319,7 @@ impl HubPeerService {
             hub_profile,
             profile_changed,
             canvas_doc_ids,
-            peer_blob_inventory,
-            snatcher,
+            engine,
             snatch_trigger: snatch_trigger_legacy,
             userz,
             friendz_store,
@@ -377,10 +369,10 @@ impl HubPeerService {
         // change-driven blob snatcher: does one boot-time catch-up scan,
         // then only acts on doc-change notifications. replaces the prototype's
         // "scan everything every time anything changes" debounce loop.
-        let snatcher = self.snatcher.clone();
+        let engine = self.engine.clone();
         let snatcher_cancel = cancel.clone();
         let snatcher_handle = tokio::spawn(async move {
-            snatcher.run(snatcher_cancel).await;
+            engine.run(snatcher_cancel).await;
         });
 
         // heartbeat loop — pulls friend node IDs from friendz store on each tick

@@ -1,44 +1,31 @@
-//! blob snatching — watches automerge docs for file widgets, fetches blobs from peers.
+//! blob replication for the hub: wires skein's canvas/widget automerge doc
+//! model onto [`freqhole_reliquary::snatch::SnatchEngine`], the generic
+//! engine that scans for blob references and fetches any missing blobs
+//! from peers.
 //!
-//! the snatcher scans ALL automerge documents in the hub repo for file widgets
-//! that reference blobs the hub doesn't have locally. docs without a `widgets`
-//! map are skipped cheaply. for each missing blob, it probes canvas peers via
-//! `ensure_blob_request` over the `skein/1` ALPN, downloads the blob via
-//! iroh-blobs verified transfer, and ingests it into skein's [`blobz::Store`]
-//! (blake3-keyed; sha256 is no longer computed).
+//! [`HubBlobRefSource`] scans automerge canvas docs for file widgets and
+//! their widget-state docs for blake3/snatchedBy fields - the engine calls
+//! it both for a full boot-time sweep and for single-doc rescans driven by
+//! `hub_repo`'s doc-change notifications. [`HubPeerProbeTransport`] asks a
+//! candidate peer whether it has a blob via `ensure_blob_request` over the
+//! `skein/1` ALPN, the same handshake `protocol::blob_proxy` uses for the
+//! ensure-request gate.
 //!
-//! scanning is triggered reactively via doc change notifications from hub_repo
-//! (debounced 3s). no periodic timer — the snatcher only runs when docs change.
+//! this module also hosts the doc-shape helpers (`classify_doc`,
+//! `read_canvas_for_file_widgets`, `read_widget_state`) that `blob_acl`'s
+//! canvas-membership resolver reuses read-only to gate blobs the hub
+//! already has.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-
-use futures::stream::{self, StreamExt};
+use async_trait::async_trait;
 use iroh::Endpoint;
-use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
-use iroh_blobs::api::downloader::Downloader;
-use iroh_blobs::store::fs::FsStore;
-use iroh_blobs::{Hash, HashAndFormat};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::broadcast;
 
+use crate::hub_repo::HubRepo;
 use crate::protocol::blob_proxy::SKEIN_ALPN;
-use freqhole_reliquary::blobz::{BlobStore, NewBlobMeta};
 use freqhole_reliquary::ensure::PeerMessage;
-use freqhole_reliquary::node::InFlightGuard;
-
-/// timeout for a single ensure_blob probe to a peer (seconds).
-const PROBE_TIMEOUT_SECS: u64 = 15;
-
-/// timeout for a blob download via iroh-blobs (seconds).
-const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
-
-/// max concurrent snatch operations (probe + download + ingest).
-const MAX_CONCURRENT_SNATCHES: usize = 20;
-
-/// max concurrent downloads from a single peer.
-const MAX_PER_PEER_DOWNLOADS: usize = 4;
+use freqhole_reliquary::snatch::{
+    BlobDescriptor, BlobRefSource, PeerProbeTransport, ProbeError, SnatchEngine,
+};
 
 // ---------------------------------------------------------------------------
 // blob reference — extracted from file widget state docs
@@ -66,494 +53,112 @@ pub struct BlobRef {
 }
 
 // ---------------------------------------------------------------------------
-// blob snatcher
+// blob-replication engine wiring
 // ---------------------------------------------------------------------------
 
-/// scans automerge docs for file widget blob references and fetches missing blobs.
-///
-/// instead of relying on a curated "tracked canvases" set, the snatcher scans
-/// ALL docs in the hub repo. docs without a `widgets` map are skipped cheaply.
-/// it also subscribes to doc change notifications for near-instant snatching
-/// when new file attachments arrive via automerge sync.
-///
-/// downloads are parallelized: up to `MAX_CONCURRENT_SNATCHES` (20) blobs at
-/// once, with a per-peer limit of `MAX_PER_PEER_DOWNLOADS` (4) to avoid
-/// hammering any single peer.
-pub struct BlobSnatcher {
-    /// hub repo for reading automerge docs.
-    repo: crate::hub_repo::HubRepo,
-    /// iroh endpoint for connecting to peers.
-    endpoint: Endpoint,
-    /// iroh-blobs downloader for verified transfers.
-    downloader: Downloader,
-    /// hub's own node ID string (to exclude from peer lists).
+/// concrete [`SnatchEngine`] instantiation for the hub: scans automerge
+/// canvas/widget docs for blob references ([`HubBlobRefSource`]) and probes
+/// peers over the `skein/1` ALPN ([`HubPeerProbeTransport`]).
+pub(crate) type HubSnatchEngine = SnatchEngine<HubBlobRefSource, HubPeerProbeTransport>;
+
+/// where the hub's blob references live: automerge canvas docs (file
+/// widgets) and their widget-state docs (the `blake3`/`snatchedBy` fields).
+pub(crate) struct HubBlobRefSource {
+    repo: HubRepo,
     local_node_id: String,
-    /// notify handle used to trigger an immediate scan from outside the loop.
-    scan_trigger: Arc<tokio::sync::Notify>,
-    /// per-peer download semaphores (limit concurrent downloads to a single peer).
-    peer_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
-    /// peer blob inventory — maps peer node ID → set of blake3 hashes they have.
-    /// populated by BlobOffer responses via the hub service. used as fallback
-    /// when snatchedBy is empty for a blob.
-    peer_blob_inventory: Arc<Mutex<HashMap<String, HashSet<String>>>>,
-    /// shared iroh-blobs FsStore for reading downloaded blob bytes.
-    fs_store: &'static FsStore,
-    /// blob metadata + filesystem store (the skein equivalent of grimoire's
-    /// `media_blobz` + `blob_data`).
-    blobz: Arc<dyn BlobStore>,
-    /// hashes currently being downloaded. kept in sync with the iroh-blobs
-    /// gc protect callback so an in-progress download is never swept before
-    /// it has been ingested into blobz.
-    in_flight: Arc<std::sync::Mutex<HashSet<Hash>>>,
 }
 
-impl BlobSnatcher {
-    /// create a new blob snatcher.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        repo: crate::hub_repo::HubRepo,
-        endpoint: Endpoint,
-        downloader: Downloader,
-        local_node_id: String,
-        scan_trigger: Arc<tokio::sync::Notify>,
-        peer_blob_inventory: Arc<Mutex<HashMap<String, HashSet<String>>>>,
-        fs_store: &'static FsStore,
-        blobz: Arc<dyn BlobStore>,
-        in_flight: Arc<std::sync::Mutex<HashSet<Hash>>>,
-    ) -> Self {
+impl HubBlobRefSource {
+    pub(crate) fn new(repo: HubRepo, local_node_id: String) -> Self {
         Self {
             repo,
-            endpoint,
-            downloader,
             local_node_id,
-            scan_trigger,
-            peer_semaphores: Arc::new(Mutex::new(HashMap::new())),
-            peer_blob_inventory,
-            fs_store,
-            blobz,
-            in_flight,
         }
     }
 
-    /// return a clone of the scan trigger handle so callers can wake the loop.
-    pub fn scan_trigger(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.scan_trigger)
-    }
+    /// resolve a canvas doc into descriptors for every file widget it
+    /// references, using the canvas's own peer list as the candidate-peer
+    /// pool for each widget's `snatchedBy` entries.
+    async fn extract_from_canvas(&self, canvas_doc_id: &str) -> Vec<BlobDescriptor> {
+        let Some(handle) = self.repo.find(canvas_doc_id).await else {
+            return Vec::new();
+        };
 
-    /// get or create a per-peer download semaphore (capped at MAX_PER_PEER_DOWNLOADS).
-    async fn peer_semaphore(&self, peer_id: &str) -> Arc<Semaphore> {
-        let mut map = self.peer_semaphores.lock().await;
-        map.entry(peer_id.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(MAX_PER_PEER_DOWNLOADS)))
-            .clone()
-    }
+        let local_node_id = self.local_node_id.clone();
+        let canvas_id_owned = canvas_doc_id.to_string();
+        let (placeholder_refs, peers) = tokio::task::spawn_blocking(move || {
+            read_canvas_for_file_widgets(&handle, &canvas_id_owned, &local_node_id)
+        })
+        .await
+        .unwrap_or_default();
 
-    /// run the scan loop until the token is cancelled.
-    ///
-    /// only wakes when doc changes trigger a scan (via `scan_trigger.notified()`).
-    /// no periodic timer — if you need a full rescan, use the CLI command or
-    /// trigger it manually via the notify handle.
-    pub async fn run_scan_loop(&self, cancel: tokio_util::sync::CancellationToken) {
-        tracing::info!("blob snatcher scan loop started (reactive only, no periodic timer)");
-
-        loop {
-            // wait for a doc-change trigger or cancellation — no timer
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!("blob snatcher scan loop shutting down");
-                    break;
-                }
-                _ = self.scan_trigger.notified() => {
-                    tracing::info!("doc-change blob snatch scan triggered");
-                }
-            }
-
-            // run the scan itself with cancel awareness — if ctrl+c fires
-            // mid-scan (e.g. during a 15s probe or 120s download), we bail
-            // immediately instead of blocking shutdown
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!("blob snatcher scan loop shutting down");
-                    break;
-                }
-                count = self.scan_and_snatch() => {
-                    if count > 0 {
-                        tracing::info!(snatched = count, "blob snatch cycle completed");
-                    }
-                }
-            }
-        }
-    }
-
-    /// scan all docs for missing blobs and snatch them concurrently.
-    ///
-    /// iterates every automerge doc in the hub repo, reads each to find file
-    /// widgets, reads each file widget's state doc to extract blob references,
-    /// checks grimoire for local availability, and snatches any missing blobs
-    /// from canvas peers.
-    ///
-    /// downloads run concurrently (up to MAX_CONCURRENT_SNATCHES) with
-    /// per-peer download limits (MAX_PER_PEER_DOWNLOADS).
-    ///
-    /// returns the number of blobs successfully snatched.
-    pub async fn scan_and_snatch(&self) -> usize {
-        let doc_ids = self.repo.all_doc_ids().await;
-
-        tracing::debug!(
-            doc_count = doc_ids.len(),
-            "blob snatcher: starting scan cycle (scanning all docs)"
-        );
-
-        if doc_ids.is_empty() {
-            return 0;
-        }
-
-        let mut all_refs = Vec::new();
-        let mut all_peers: Vec<String> = Vec::new();
-
-        for doc_id in &doc_ids {
-            let (refs, peers) = self.scan_canvas_resolved(doc_id).await;
-            all_refs.extend(refs);
-            for p in peers {
-                if !all_peers.contains(&p) {
-                    all_peers.push(p);
-                }
-            }
-        }
-
-        if all_refs.is_empty() {
-            return 0;
-        }
-
-        tracing::info!(
-            missing = all_refs.len(),
-            peers = all_peers.len(),
-            max_concurrent = MAX_CONCURRENT_SNATCHES,
-            per_peer_limit = MAX_PER_PEER_DOWNLOADS,
-            "found missing blobs, starting parallel snatch"
-        );
-
-        let snatched = AtomicUsize::new(0);
-
-        stream::iter(all_refs.iter())
-            .for_each_concurrent(Some(MAX_CONCURRENT_SNATCHES), |blob_ref| {
-                let snatched = &snatched;
-                let all_peers = &all_peers;
-                async move {
-                    match self.snatch_blob(blob_ref, all_peers).await {
-                        Ok(()) => {
-                            snatched.fetch_add(1, Ordering::Relaxed);
-                            tracing::info!(
-                                blake3 = trunc(&blob_ref.blake3),
-                                filename = %blob_ref.filename,
-                                "blob snatched successfully"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                blake3 = trunc(&blob_ref.blake3),
-                                filename = %blob_ref.filename,
-                                error = %e,
-                                "failed to snatch blob"
-                            );
-                        }
-                    }
-                }
-            })
-            .await;
-
-        snatched.load(Ordering::Relaxed)
-    }
-
-    /// scan a canvas and resolve file widget state docs into full BlobRefs.
-    ///
-    /// handles the two-level doc read:
-    /// 1. read canvas doc -> find file widgets -> get their docIds
-    /// 2. for each docId, find/read the widget state doc -> extract blob refs
-    /// 3. filter out blobs we already have in grimoire
-    async fn scan_canvas_resolved(&self, canvas_doc_id: &str) -> (Vec<BlobRef>, Vec<String>) {
-        let (placeholder_refs, peers) = self.scan_canvas_for_widgets(canvas_doc_id).await;
-
-        if placeholder_refs.is_empty() {
-            return (Vec::new(), peers);
-        }
-
-        let mut resolved_refs = Vec::new();
-
+        let mut descriptors = Vec::new();
         for placeholder in &placeholder_refs {
-            let widget_doc_id_str = &placeholder.widget_doc_id;
-
-            // find the widget state doc in the repo
-            let whandle = match self.repo.find(widget_doc_id_str).await {
-                Some(h) => h,
-                None => {
-                    tracing::info!(
-                        widget_doc_id = widget_doc_id_str,
-                        "widget state doc not found in hub repo"
-                    );
-                    continue;
-                }
+            let Some(whandle) = self.repo.find(&placeholder.widget_doc_id).await else {
+                continue;
             };
-
-            // read the widget state doc (blocking — with_document is sync)
             let canvas_id = canvas_doc_id.to_string();
-            let wdoc_id = widget_doc_id_str.clone();
-            let ref_result = tokio::task::spawn_blocking(move || {
+            let wdoc_id = placeholder.widget_doc_id.clone();
+            let blob_ref = tokio::task::spawn_blocking(move || {
                 read_widget_state(&whandle, &canvas_id, &wdoc_id)
             })
-            .await;
+            .await
+            .ok()
+            .flatten();
 
-            match ref_result {
-                Ok(Some(blob_ref)) => {
-                    // skip if blake3 is empty (can't snatch without it)
-                    if blob_ref.blake3.is_empty() {
-                        tracing::info!(
-                            widget_doc_id = widget_doc_id_str,
-                            "widget has no blake3 hash, skipping"
-                        );
-                        continue;
-                    }
-
-                    // check if we already have this blob locally
-                    let already_have = self.check_blob_exists(&blob_ref).await;
-
-                    if !already_have {
-                        tracing::info!(
-                            blake3 = trunc(&blob_ref.blake3),
-                            filename = %blob_ref.filename,
-                            "found missing blob in file widget"
-                        );
-                        resolved_refs.push(blob_ref);
-                    }
-                }
-                Ok(None) => {
-                    // widget has no blob reference yet (empty/new widget)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        widget_doc_id = widget_doc_id_str,
-                        error = %e,
-                        "spawn_blocking failed for widget state read"
-                    );
+            if let Some(blob_ref) = blob_ref {
+                if !blob_ref.blake3.is_empty() {
+                    descriptors.push(to_descriptor(blob_ref, &peers, &self.local_node_id));
                 }
             }
         }
-
-        (resolved_refs, peers)
+        descriptors
     }
 
-    // -------------------------------------------------------------------
-    // change-driven snatching
-    //
-    // instead of waking on a coarse scan trigger and walking every doc,
-    // the change-driven path subscribes to `hub_repo.subscribe_doc_changes`
-    // and only acts on the doc that actually changed:
-    //
-    // - canvas doc changed -> scan only that canvas
-    // - widget state doc changed -> snatch just that widget's blob, using
-    //   peers gathered from any canvases that reference it
-    // - other doc kinds -> ignored
-    //
-    // this keeps the hub from re-scanning unrelated canvases on every
-    // sync event (the original prototype's behavior). steady-state cost
-    // is dominated by the actual download, not the scan.
-    // -------------------------------------------------------------------
-
-    /// run the change-driven snatch loop until `cancel` fires.
-    ///
-    /// on boot, performs one full `scan_and_snatch` so we catch up on any
-    /// canvases that arrived in previous sessions and never had their blobs
-    /// snatched. after that, only doc-change notifications drive work.
-    pub async fn run(&self, cancel: tokio_util::sync::CancellationToken) {
-        tracing::info!("blob snatcher: change-driven loop starting");
-
-        // boot-time catch-up — covers persisted canvases whose blobs are
-        // still missing (e.g. the hub was killed mid-sync last run).
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            count = self.scan_and_snatch() => {
-                if count > 0 {
-                    tracing::info!(snatched = count, "boot-time snatch caught up missing blobs");
-                }
-            }
-        }
-
-        let mut rx = self.repo.subscribe_doc_changes();
-
-        loop {
-            let doc_id = tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!("blob snatcher shutting down");
-                    return;
-                }
-                result = rx.recv() => match result {
-                    Ok(id) => id,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "doc-change channel lagged; running full scan");
-                        tokio::select! {
-                            _ = cancel.cancelled() => return,
-                            _ = self.scan_and_snatch() => {}
-                        }
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::info!("doc-change channel closed");
-                        return;
-                    }
-                }
-            };
-
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                count = self.handle_doc_change(&doc_id) => {
-                    if count > 0 {
-                        tracing::info!(
-                            doc_id = %doc_id,
-                            snatched = count,
-                            "snatched blobs after doc change"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// react to a single doc-change event.
-    ///
-    /// classifies the doc by its top-level shape:
-    /// - has a `widgets` map -> treat as canvas, scan + snatch missing
-    /// - has a `blake3` field -> treat as widget state, snatch the one blob
-    /// - otherwise ignore
-    ///
-    /// returns the number of blobs successfully snatched.
-    pub async fn handle_doc_change(&self, doc_id: &str) -> usize {
-        let handle = match self.repo.find(doc_id).await {
-            Some(h) => h,
-            None => {
-                tracing::trace!(doc_id, "doc-change for unknown doc, ignoring");
-                return 0;
-            }
+    /// resolve a widget-state doc into a single descriptor, gathering
+    /// candidate peers from every canvas that references it (a widget doc
+    /// change carries no canvas context of its own).
+    async fn extract_from_widget_state(&self, widget_doc_id: &str) -> Vec<BlobDescriptor> {
+        let Some(handle) = self.repo.find(widget_doc_id).await else {
+            return Vec::new();
         };
-
-        // classify the doc shape on the blocking pool
-        let kind = {
-            let h = handle.clone();
-            tokio::task::spawn_blocking(move || classify_doc(&h))
-                .await
-                .unwrap_or(DocKind::Unknown)
-        };
-
-        match kind {
-            DocKind::Canvas => {
-                let (refs, peers) = self.scan_canvas_resolved(doc_id).await;
-                self.snatch_refs(refs, peers).await
-            }
-            DocKind::WidgetState => self.snatch_widget_state(doc_id).await,
-            DocKind::Unknown => {
-                tracing::trace!(doc_id, "doc-change for unrecognized doc shape, ignoring");
-                0
-            }
-        }
-    }
-
-    /// snatch a list of blob refs concurrently using the supplied peer set.
-    /// shared by canvas-doc dispatch and full-scan paths.
-    async fn snatch_refs(&self, refs: Vec<BlobRef>, peers: Vec<String>) -> usize {
-        if refs.is_empty() {
-            return 0;
-        }
-        let snatched = AtomicUsize::new(0);
-        stream::iter(refs.iter())
-            .for_each_concurrent(Some(MAX_CONCURRENT_SNATCHES), |blob_ref| {
-                let snatched = &snatched;
-                let peers = &peers;
-                async move {
-                    match self.snatch_blob(blob_ref, peers).await {
-                        Ok(()) => {
-                            snatched.fetch_add(1, Ordering::Relaxed);
-                            tracing::info!(
-                                blake3 = trunc(&blob_ref.blake3),
-                                filename = %blob_ref.filename,
-                                "blob snatched successfully"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                blake3 = trunc(&blob_ref.blake3),
-                                error = %e,
-                                "snatch attempt failed"
-                            );
-                        }
-                    }
-                }
-            })
-            .await;
-        snatched.load(Ordering::Relaxed)
-    }
-
-    /// handle a doc-change event for a widget-state doc.
-    ///
-    /// reads the widget's blob ref, then aggregates peers from any known
-    /// canvases that reference this widget so [`Self::snatch_blob`] has
-    /// real candidates to probe.
-    async fn snatch_widget_state(&self, widget_doc_id: &str) -> usize {
-        let handle = match self.repo.find(widget_doc_id).await {
-            Some(h) => h,
-            None => return 0,
-        };
-        let canvas_id_placeholder = String::new();
+        let placeholder_canvas_id = String::new();
         let wid = widget_doc_id.to_string();
         let blob_ref = match tokio::task::spawn_blocking(move || {
-            read_widget_state(&handle, &canvas_id_placeholder, &wid)
+            read_widget_state(&handle, &placeholder_canvas_id, &wid)
         })
         .await
         {
             Ok(Some(b)) if !b.blake3.is_empty() => b,
-            _ => return 0,
+            _ => return Vec::new(),
         };
 
-        // already have it?
-        if self.check_blob_exists(&blob_ref).await {
-            return 0;
-        }
-
-        // gather peers from canvases that reference this widget doc
-        let peers = self.peers_for_widget(widget_doc_id).await;
-        if peers.is_empty() {
-            tracing::debug!(
-                widget_doc_id,
-                "widget changed but no canvas peers known yet; will try again on next change"
-            );
-            return 0;
-        }
-
-        match self.snatch_blob(&blob_ref, &peers).await {
-            Ok(()) => 1,
-            Err(e) => {
-                tracing::debug!(
-                    widget_doc_id,
-                    blake3 = trunc(&blob_ref.blake3),
-                    error = %e,
-                    "widget snatch failed"
-                );
-                0
-            }
-        }
+        let peers = self.peers_referencing_widget(widget_doc_id).await;
+        vec![to_descriptor(blob_ref, &peers, &self.local_node_id)]
     }
 
-    /// walk known canvases to find ones that reference `widget_doc_id`,
-    /// returning the union of their peer lists.
-    async fn peers_for_widget(&self, widget_doc_id: &str) -> Vec<String> {
+    /// walk every doc the hub holds to find canvases that reference
+    /// `widget_doc_id`, returning the union of their peer lists.
+    async fn peers_referencing_widget(&self, widget_doc_id: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for canvas_id in self.repo.all_doc_ids().await {
-            let (placeholder_refs, peers) = self.scan_canvas_for_widgets(&canvas_id).await;
-            let referenced = placeholder_refs
+        for canvas_doc_id in self.repo.all_doc_ids().await {
+            let Some(handle) = self.repo.find(&canvas_doc_id).await else {
+                continue;
+            };
+            let local_node_id = self.local_node_id.clone();
+            let canvas_id_owned = canvas_doc_id.clone();
+            let (placeholder_refs, peers) = tokio::task::spawn_blocking(move || {
+                read_canvas_for_file_widgets(&handle, &canvas_id_owned, &local_node_id)
+            })
+            .await
+            .unwrap_or_default();
+            if placeholder_refs
                 .iter()
-                .any(|r| r.widget_doc_id == widget_doc_id);
-            if referenced {
-                for p in peers {
-                    if !out.contains(&p) {
-                        out.push(p);
+                .any(|r| r.widget_doc_id == widget_doc_id)
+            {
+                for peer in peers {
+                    if !out.contains(&peer) {
+                        out.push(peer);
                     }
                 }
             }
@@ -561,138 +166,23 @@ impl BlobSnatcher {
         out
     }
 
-    /// read a canvas doc to find file widget docIds and peer node IDs.
-    ///
-    /// returns placeholder BlobRefs (only widget_doc_id populated) plus
-    /// the list of peer node IDs from the canvas.
-    async fn scan_canvas_for_widgets(&self, canvas_doc_id: &str) -> (Vec<BlobRef>, Vec<String>) {
-        // find the canvas doc in the repo
-        let handle = match self.repo.find(canvas_doc_id).await {
-            Some(h) => h,
-            None => {
-                tracing::info!(doc_id = canvas_doc_id, "canvas doc not found in hub repo");
-                return (Vec::new(), Vec::new());
-            }
+    /// mark the local node as having snatched a widget's blob, so future
+    /// scans (by this node or any peer reading the same doc) see it in
+    /// `snatchedBy` without re-probing. notifies `hub_repo`'s doc-change
+    /// channel on a real write so any sync-push logic subscribed to it
+    /// picks up the change immediately, the same way any other mutation
+    /// made outside `handle_sync_message` must.
+    async fn mark_snatched(&self, widget_doc_id: &str, local_node_id: &str) {
+        let Some(handle) = self.repo.find(widget_doc_id).await else {
+            tracing::warn!(widget_doc_id, "cannot mark snatched: widget doc not found");
+            return;
         };
 
-        // read the canvas doc to find file widgets and peers (sync)
-        let local_node_id = self.local_node_id.clone();
-        let canvas_doc_id_owned = canvas_doc_id.to_string();
-
-        let result = tokio::task::spawn_blocking(move || {
-            read_canvas_for_file_widgets(&handle, &canvas_doc_id_owned, &local_node_id)
-        })
-        .await;
-
-        match result {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(doc_id = canvas_doc_id, error = %e, "spawn_blocking failed");
-                (Vec::new(), Vec::new())
-            }
-        }
-    }
-
-    /// snatch a single blob: probe peers, download, ingest into the local store.
-    async fn snatch_blob(&self, blob_ref: &BlobRef, peers: &[String]) -> Result<(), SnatchError> {
-        if blob_ref.blake3.is_empty() {
-            return Err(SnatchError::NoBlake3);
-        }
-
-        // double-check local availability (may have been snatched by another cycle)
-        if self.check_blob_exists(blob_ref).await {
-            tracing::debug!(
-                blake3 = trunc(&blob_ref.blake3),
-                "blob appeared locally, skipping"
-            );
-            return Ok(());
-        }
-
-        // determine which peers to probe:
-        // 1. prefer snatchedBy (peers that confirmed they have this blob)
-        // 2. fall back to peer blob inventory (from BlobOffer gossip responses)
-        // 3. if neither has info, skip (hub should not blindly probe all peers)
-        let target_peers: Vec<String> = if !blob_ref.snatched_by.is_empty() {
-            // filter snatchedBy to peers that are also in the canvas peer list
-            blob_ref
-                .snatched_by
-                .iter()
-                .filter(|node_id| peers.contains(node_id) && node_id.as_str() != self.local_node_id)
-                .cloned()
-                .collect()
-        } else {
-            // no snatchedBy — check peer blob inventory from BlobOffer responses
-            let inventory = self.peer_blob_inventory.lock().await;
-            let mut from_inventory: Vec<String> = Vec::new();
-            for (peer_id, hashes) in inventory.iter() {
-                if hashes.contains(&blob_ref.blake3)
-                    && peer_id != &self.local_node_id
-                    && peers.contains(peer_id)
-                {
-                    from_inventory.push(peer_id.clone());
-                }
-            }
-            if from_inventory.is_empty() {
-                tracing::debug!(
-                    blake3 = trunc(&blob_ref.blake3),
-                    filename = %blob_ref.filename,
-                    "no snatchedBy entries and no peer inventory matches, skipping"
-                );
-                return Err(SnatchError::NoPeers);
-            }
-            tracing::info!(
-                blake3 = trunc(&blob_ref.blake3),
-                peers_from_inventory = from_inventory.len(),
-                "using peer blob inventory (no snatchedBy)"
-            );
-            from_inventory
-        };
-
-        if target_peers.is_empty() {
-            tracing::debug!(
-                blake3 = trunc(&blob_ref.blake3),
-                snatched_by_count = blob_ref.snatched_by.len(),
-                "target peers empty after filtering, skipping"
-            );
-            return Err(SnatchError::NoPeers);
-        }
-
-        // probe targeted peers to find one that has the blob
-        let provider = self.probe_peers(&blob_ref.blake3, &target_peers).await?;
-
-        tracing::info!(
-            blake3 = trunc(&blob_ref.blake3),
-            provider = trunc(&provider),
-            "downloading blob from peer"
-        );
-
-        // download via iroh-blobs verified transfer, stream to canonical blobz path
-        self.download_blob(&blob_ref.blake3, &provider).await?;
-
-        // register metadata in blobz
-        self.ingest_blob(blob_ref).await?;
-
-        // mark ourselves in the widget state doc's snatchedBy list
-        self.mark_snatched(&blob_ref.widget_doc_id).await;
-
-        Ok(())
-    }
-
-    /// write the hub's node ID into a widget state doc's snatchedBy list.
-    async fn mark_snatched(&self, widget_doc_id: &str) {
-        let handle = match self.repo.find(widget_doc_id).await {
-            Some(h) => h,
-            None => {
-                tracing::warn!(widget_doc_id, "cannot mark snatched: widget doc not found");
-                return;
-            }
-        };
-
-        let local_id = self.local_node_id.clone();
+        let local_id = local_node_id.to_string();
         let wdoc_id = widget_doc_id.to_string();
 
-        let result = tokio::task::spawn_blocking(move || {
-            handle.with_document_mut(|doc| {
+        let wrote = tokio::task::spawn_blocking(move || {
+            handle.with_document_mut(|doc| -> bool {
                 use automerge::ReadDoc;
 
                 // get or create snatchedBy list
@@ -707,7 +197,7 @@ impl BlobSnatcher {
                             Ok(result) => result.result,
                             Err(e) => {
                                 tracing::warn!(error = ?e, "failed to create snatchedBy list");
-                                return;
+                                return false;
                             }
                         }
                     }
@@ -719,7 +209,7 @@ impl BlobSnatcher {
                     if let Ok(Some((v, _))) = doc.get(&list_id, i) {
                         if v.to_str() == Some(&local_id) {
                             tracing::debug!(widget_doc_id = %wdoc_id, "already in snatchedBy");
-                            return;
+                            return false;
                         }
                     }
                 }
@@ -736,195 +226,107 @@ impl BlobSnatcher {
                             node_id = trunc(&local_id),
                             "added self to snatchedBy"
                         );
+                        true
                     }
                     Err(e) => {
                         tracing::warn!(error = ?e, "failed to add node ID to snatchedBy");
+                        false
                     }
                 }
-            });
-        })
-        .await;
-
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "spawn_blocking failed for mark_snatched");
-        }
-    }
-
-    /// probe peers in parallel to find one that has the blob.
-    ///
-    /// sends `ensure_blob_request` to each peer over `freqhole/1`.
-    /// returns the node ID of the first peer that responds `available: true`.
-    async fn probe_peers(
-        &self,
-        blake3_hash: &str,
-        peers: &[String],
-    ) -> Result<String, SnatchError> {
-        if peers.is_empty() {
-            return Err(SnatchError::NoPeers);
-        }
-
-        tracing::info!(
-            hash = trunc(blake3_hash),
-            peer_count = peers.len(),
-            "probing peers for blob"
-        );
-
-        // probe all peers in parallel, take first success
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
-
-        let mut handles = Vec::new();
-        for peer_id in peers {
-            let endpoint = self.endpoint.clone();
-            let blake3 = blake3_hash.to_string();
-            let peer = peer_id.clone();
-            let tx = tx.clone();
-
-            let handle = tokio::spawn(async move {
-                match probe_single_peer(&endpoint, &peer, &blake3).await {
-                    Ok(true) => {
-                        let _ = tx.send(peer).await;
-                    }
-                    Ok(false) => {
-                        tracing::info!(peer = trunc(&peer), "peer doesn't have blob");
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            peer = trunc(&peer),
-                            error = %e,
-                            "probe failed"
-                        );
-                    }
-                }
-            });
-            handles.push(handle);
-        }
-
-        // drop our sender so rx closes when all probes finish
-        drop(tx);
-
-        // wait for first available response or all probes to finish
-        let result = tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), rx.recv()).await;
-
-        // cancel remaining probes
-        for h in handles {
-            h.abort();
-        }
-
-        match result {
-            Ok(Some(peer)) => Ok(peer),
-            Ok(None) => Err(SnatchError::NoPeerHasBlob),
-            Err(_) => Err(SnatchError::ProbeTimeout),
-        }
-    }
-
-    /// download a blob via iroh-blobs verified transfer and stream it to the
-    /// canonical blobz content-addressed path. no full in-memory buffer.
-    async fn download_blob(
-        &self,
-        blake3_hash: &str,
-        provider_node_id: &str,
-    ) -> Result<(), SnatchError> {
-        let hash: Hash = blake3_hash
-            .parse()
-            .map_err(|e| SnatchError::InvalidHash(format!("{e}")))?;
-
-        let node_id: iroh::PublicKey = provider_node_id
-            .parse()
-            .map_err(|e| SnatchError::InvalidNodeId(format!("{e}")))?;
-
-        let hash_and_format = HashAndFormat::raw(hash);
-
-        // register this hash as in-flight so the gc protect callback keeps it
-        // alive until ingest_blob writes it into blobz. the guard removes it
-        // on all exit paths (ok, error, or cancellation).
-        let _in_flight_guard = InFlightGuard::new(Arc::clone(&self.in_flight), hash);
-
-        // acquire per-peer download semaphore (limits to MAX_PER_PEER_DOWNLOADS per peer)
-        let sem = self.peer_semaphore(provider_node_id).await;
-        let _permit = sem
-            .acquire()
-            .await
-            .map_err(|_| SnatchError::DownloadFailed("peer semaphore closed".into()))?;
-
-        // start the download; use an inactivity timeout (resets on each progress event)
-        // so large/slow transfers aren't killed by a wall-clock limit
-        let progress = self.downloader.download(hash_and_format, [node_id]);
-        consume_download_progress(progress, blake3_hash).await?;
-
-        tracing::debug!(
-            blake3 = trunc(blake3_hash),
-            "download stream completed, exporting to blobz canonical path"
-        );
-
-        // stream-export from the FsStore straight to blobz's canonical path —
-        // no Vec<u8> allocation regardless of blob size
-        let target = self
-            .blobz
-            .prepare_canonical_path(blake3_hash)
-            .await
-            .map_err(|e| SnatchError::DownloadFailed(format!("prepare blobz path: {e}")))?;
-        // TryReference renames the Owned .data file to the blobz canonical path
-        // (same filesystem => no copy; EXDEV falls back to copy). the fs store
-        // then tracks it as External and keeps serving it for P2P. the .obao4
-        // outboard (~0.1% of size) stays in the fs store.
-        self.fs_store
-            .blobs()
-            .export_with_opts(ExportOptions {
-                hash,
-                mode: ExportMode::TryReference,
-                target: target.clone(),
             })
-            .await
-            .map_err(|e| SnatchError::DownloadFailed(format!("export to blobz path: {e}")))?;
+        })
+        .await
+        .unwrap_or(false);
 
-        tracing::debug!(
-            blake3 = trunc(blake3_hash),
-            path = %target.display(),
-            "blob exported to canonical blobz path"
-        );
+        if wrote {
+            self.repo.notify_doc_changed(widget_doc_id);
+        }
+    }
+}
 
-        Ok(())
+/// combine a raw widget-doc [`BlobRef`] with its canvas peer list into a
+/// generic [`BlobDescriptor`]: candidate peers are whichever `snatchedBy`
+/// entries are also members of the canvas peer list (excluding ourselves) -
+/// peers who confirmed they have the blob and are actually reachable
+/// through this canvas. an empty result here is not a dead end: the engine
+/// falls back to its own peer-blob-inventory (fed by `offer_peer_blobs`)
+/// when a descriptor arrives with no candidate peers of its own.
+fn to_descriptor(
+    blob_ref: BlobRef,
+    canvas_peers: &[String],
+    local_node_id: &str,
+) -> BlobDescriptor {
+    let candidate_peers = blob_ref
+        .snatched_by
+        .iter()
+        .filter(|node_id| canvas_peers.contains(node_id) && node_id.as_str() != local_node_id)
+        .cloned()
+        .collect();
+    BlobDescriptor {
+        blake3: blob_ref.blake3,
+        filename: blob_ref.filename,
+        mime: blob_ref.mime,
+        size: blob_ref.size,
+        candidate_peers,
+        source_ref: blob_ref.widget_doc_id,
+    }
+}
+
+#[async_trait]
+impl BlobRefSource for HubBlobRefSource {
+    async fn all_doc_ids(&self) -> Vec<String> {
+        self.repo.all_doc_ids().await
     }
 
-    /// register blob metadata into the skein blobz store.
-    ///
-    /// the bytes must already be on disk at the canonical content-addressed
-    /// path (written by `download_blob` via `prepare_canonical_path` +
-    /// `fs_store.blobs().export`). `register_ingested` reads size from fs
-    /// metadata and inserts the DB row; no re-hashing or full buffer needed.
-    async fn ingest_blob(&self, blob_ref: &BlobRef) -> Result<(), SnatchError> {
-        let filename = if blob_ref.filename.is_empty() {
-            None
-        } else {
-            Some(blob_ref.filename.clone())
-        };
-        let mime = if blob_ref.mime.is_empty() {
-            Some("application/octet-stream".to_string())
-        } else {
-            Some(blob_ref.mime.clone())
-        };
+    fn subscribe_changes(&self) -> broadcast::Receiver<String> {
+        self.repo.subscribe_doc_changes()
+    }
 
-        let stored = self
-            .blobz
-            .register_ingested(
-                &blob_ref.blake3,
-                NewBlobMeta {
-                    filename,
-                    mime,
-                    ..Default::default()
-                },
-            )
+    async fn extract_from_doc(&self, doc_id: &str) -> Vec<BlobDescriptor> {
+        let Some(handle) = self.repo.find(doc_id).await else {
+            return Vec::new();
+        };
+        let kind = {
+            let h = handle.clone();
+            tokio::task::spawn_blocking(move || classify_doc(&h))
+                .await
+                .unwrap_or(DocKind::Unknown)
+        };
+        match kind {
+            DocKind::Canvas => self.extract_from_canvas(doc_id).await,
+            DocKind::WidgetState => self.extract_from_widget_state(doc_id).await,
+            DocKind::Unknown => Vec::new(),
+        }
+    }
+
+    async fn on_snatched(&self, descriptor: &BlobDescriptor, local_node_id: &str) {
+        self.mark_snatched(&descriptor.source_ref, local_node_id)
+            .await;
+    }
+}
+
+/// probes a peer for blob availability over the `skein/1` ALPN
+/// (`ensure_blob_request`/`ensure_blob_response`), the same handshake
+/// `protocol::blob_proxy` uses for the ensure-request gate.
+pub(crate) struct HubPeerProbeTransport {
+    endpoint: Endpoint,
+}
+
+impl HubPeerProbeTransport {
+    pub(crate) fn new(endpoint: Endpoint) -> Self {
+        Self { endpoint }
+    }
+}
+
+#[async_trait]
+impl PeerProbeTransport for HubPeerProbeTransport {
+    async fn probe(&self, peer_node_id: &str, blake3: &str) -> Result<bool, ProbeError> {
+        probe_single_peer(&self.endpoint, peer_node_id, blake3)
             .await
-            .map_err(|e| SnatchError::Ingest(format!("{e}")))?;
-
-        tracing::info!(
-            blake3 = trunc(&stored.blake3),
-            filename = ?stored.filename,
-            size = stored.size,
-            "blob ingested into blobz"
-        );
-
-        Ok(())
+            .map_err(|e| match e {
+                SnatchError::Connection(msg) => ProbeError::Connection(msg),
+                other => ProbeError::Protocol(other.to_string()),
+            })
     }
 }
 
@@ -985,25 +387,8 @@ fn trunc(s: &str) -> &str {
     }
 }
 
-/// check whether a blob already exists locally (by blake3).
-///
-/// sha256 lookups are gone in phase-2 (see design decisions): blake3 is
-/// canonical, and `blob_ref.blob_id` may be a sha256 from older clients
-/// but we no longer index by it.
-///
-/// uses get_any so that soft-deleted blobs are treated as existing — this
-/// prevents the snatcher from re-downloading a blob that an admin soft-deleted,
-/// which would immediately resurrect it.
-impl BlobSnatcher {
-    async fn check_blob_exists(&self, blob_ref: &BlobRef) -> bool {
-        if blob_ref.blake3.is_empty() {
-            return false;
-        }
-        matches!(self.blobz.get_any(&blob_ref.blake3).await, Ok(Some(_)))
-    }
-}
-
 /// send `ensure_blob_request` to a single peer over the `skein/1` ALPN.
+
 ///
 /// returns `true` if the peer has the blob and it's now available for download.
 async fn probe_single_peer(
@@ -1067,84 +452,6 @@ async fn probe_single_peer(
             "unexpected response type".to_string(),
         )),
     }
-}
-
-/// consume the iroh-blobs download progress stream, returning an error if
-/// the download fails.
-async fn consume_download_progress(
-    progress: iroh_blobs::api::downloader::DownloadProgress,
-    blake3_label: &str,
-) -> Result<(), SnatchError> {
-    use futures::StreamExt;
-    use iroh_blobs::api::downloader::DownloadProgressItem;
-
-    let mut stream = progress
-        .stream()
-        .await
-        .map_err(|e| SnatchError::DownloadFailed(format!("stream: {e}")))?;
-
-    let mut had_error = false;
-    let mut last_error: Option<String> = None;
-    let mut event_count: u32 = 0;
-
-    // inactivity timeout: resets on each progress event so large/slow blobs
-    // aren't killed mid-transfer. DOWNLOAD_TIMEOUT_SECS is the maximum gap
-    // between events, not a wall-clock budget for the whole transfer.
-    loop {
-        let maybe_event =
-            tokio::time::timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS), stream.next())
-                .await
-                .map_err(|_| SnatchError::DownloadTimeout)?;
-        let event = match maybe_event {
-            Some(e) => e,
-            None => break,
-        };
-        event_count += 1;
-        match &event {
-            DownloadProgressItem::Error(e) => {
-                had_error = true;
-                last_error = Some(format!("{e:?}"));
-                tracing::warn!(
-                    blake3 = trunc(blake3_label),
-                    error = ?e,
-                    event_index = event_count,
-                    "download progress: error event"
-                );
-            }
-            DownloadProgressItem::DownloadError => {
-                had_error = true;
-                last_error = Some("download error".to_string());
-                tracing::warn!(
-                    blake3 = trunc(blake3_label),
-                    event_index = event_count,
-                    "download progress: download error event"
-                );
-            }
-            other => {
-                tracing::debug!(
-                    blake3 = trunc(blake3_label),
-                    event = ?other,
-                    event_index = event_count,
-                    "download progress event"
-                );
-            }
-        }
-    }
-
-    tracing::debug!(
-        blake3 = trunc(blake3_label),
-        event_count,
-        had_error,
-        "download progress stream finished"
-    );
-
-    if had_error {
-        return Err(SnatchError::DownloadFailed(
-            last_error.unwrap_or_else(|| "unknown error".to_string()),
-        ));
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

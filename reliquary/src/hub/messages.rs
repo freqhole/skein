@@ -4,8 +4,6 @@
 //! dispatches to the appropriate handler. friend request/accept logic,
 //! profile exchange, and routing to canvas/gossip handlers all live here.
 
-use std::collections::HashSet;
-
 use crate::protocol::handler::FriendzEvent;
 use crate::protocol::messages::FriendzMessage;
 
@@ -45,12 +43,6 @@ impl HubPeerService {
             }
             FriendzEvent::PeerOffline { node_id } => {
                 tracing::info!(peer = %node_id, "peer went offline");
-
-                // clear peer blob inventory when peer goes offline
-                let mut inventory = self.peer_blob_inventory.lock().await;
-                if inventory.remove(&node_id).is_some() {
-                    tracing::debug!(peer = %node_id, "cleared peer blob inventory");
-                }
             }
             FriendzEvent::MessageReceived {
                 from_node_id,
@@ -621,18 +613,7 @@ impl HubPeerService {
                     "received blob offer, updating peer inventory"
                 );
 
-                // store in peer blob inventory
-                let mut inventory = self.peer_blob_inventory.lock().await;
-                let entry = inventory
-                    .entry(from_node_id.to_string())
-                    .or_insert_with(HashSet::new);
-                for hash in available {
-                    entry.insert(hash);
-                }
-
-                // trigger a snatch scan since we now have new information about
-                // where blobs might be available
-                self.snatch_trigger.notify_one();
+                self.engine.offer_peer_blobs(from_node_id, available);
             }
             FriendzMessage::CanvasKnock {
                 knock_id,

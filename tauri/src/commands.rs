@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use iroh::Endpoint;
-use freqhole_reliquary::blobz::{BlobRecord, BlobStore, NewBlobMeta};
+use freqhole_reliquary::blobz::{BlobRecord, NewBlobMeta};
 use freqhole_reliquary::identity;
 use reliquary::{friendz, service, userz};
 use serde::{Deserialize, Serialize};
@@ -101,7 +101,18 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub username: String,
 
-    pub blobz: Arc<dyn BlobStore>,
+    /// the iroh-blobs `FsStore` + gc-protect + downloader bundle. boots
+    /// fully offline via `StorageNode::init_local` (see `lib.rs`'s
+    /// `build_state`); a downloader is bound once a live endpoint exists
+    /// (see `attach_network_endpoint`) and cleared if the endpoint is ever
+    /// torn down, without needing a new `StorageNode`.
+    pub storage: Arc<freqhole_reliquary::node::StorageNode>,
+    /// mirrors `storage`'s own downloader across every attach/rebind, so
+    /// anything holding this cell (a future snatch engine, e.g.) always
+    /// agrees with the storage node about the current downloader. kept in
+    /// sync exclusively through `attach_network_endpoint`.
+    pub downloader_cell:
+        Arc<std::sync::RwLock<Option<iroh_blobs::api::downloader::Downloader>>>,
     pub friendz_store: friendz::Store,
     pub userz: userz::Directory,
 
@@ -109,15 +120,6 @@ pub struct AppState {
     pub app_config_path: PathBuf,
 
     pub hub: Arc<Mutex<Option<HubState>>>,
-    /// iroh-blobs FsStore — leaked at boot so `BlobsProtocol` (registered on
-    /// `iroh-blobs/4` by [`crate::streams::StreamRegistry::start_with_blobs`])
-    /// can hold a `'static` reference. used by the `blob_iroh_ensure`
-    /// dispatch action to import blob bytes from `blobz` on demand.
-    pub fs_store: &'static iroh_blobs::store::fs::FsStore,
-    /// hashes currently being downloaded via `blob_iroh_download`. included
-    /// in the gc protect callback so the gc never sweeps a blob mid-download
-    /// before it has been ingested into blobz.
-    pub blobs_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<iroh_blobs::Hash>>>,
 }
 
 /// the "network is up" half of `AppState`: the bound iroh endpoint, our own
@@ -293,6 +295,19 @@ async fn current_node_id(state: &AppState) -> String {
 /// network (sharing/joining a canvas, starting the hub, fetching a blob
 /// from a peer, or the user clicking "generate identity" in the profile
 /// widget) — never merely because the process started.
+/// bind (or rebind) the storage node's downloader to `endpoint`, and keep
+/// `AppState::downloader_cell` in sync with it. every code path that ends up
+/// with a live endpoint funnels through `build_network_state` (the boot-time
+/// identity restore in `lib.rs` and `ensure_network`'s lazy first-use build
+/// both call it), so this is the single place that ever attaches an
+/// endpoint to the storage node.
+fn attach_network_endpoint(state: &AppState, endpoint: &Endpoint) {
+    state.storage.attach_endpoint(endpoint);
+    if let Ok(mut cell) = state.downloader_cell.write() {
+        *cell = state.storage.downloader();
+    }
+}
+
 pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkState> {
     let secret =
         identity::load_or_generate_keypair(&state.data_dir, identity::DEFAULT_KEYPAIR_FILENAME)?;
@@ -302,6 +317,8 @@ pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkStat
         .await?;
     let node_id = endpoint.id().to_string();
 
+    attach_network_endpoint(state, &endpoint);
+
     state
         .userz
         .upsert_self(&node_id, Some(&state.username), None, None)
@@ -309,7 +326,7 @@ pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkStat
 
     let streams = crate::streams::StreamRegistry::start_with_blobs(
         endpoint.clone(),
-        state.fs_store,
+        state.storage.fs_store,
         state.friendz_store.clone(),
     )
     .await?;
@@ -320,7 +337,7 @@ pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkStat
     // large files that easily exceeds the browser's snatch timeout.
     // best-effort: errors are logged and ignored — the lazy
     // `blob_iroh_ensure` path still works as a fallback.
-    match state.blobz.list(i64::MAX, 0).await {
+    match state.storage.blobz.list(i64::MAX, 0).await {
         Ok((blobs, _total)) => {
             tracing::info!(count = blobs.len(), "pre-warming iroh-blobs FsStore");
             for blob in blobs {
@@ -1088,6 +1105,7 @@ struct BlobListArgs {
 
 async fn blob_list(args: BlobListArgs, state: &AppState) -> Result<Value, DispatchError> {
     let (blobs, _total) = state
+        .storage
         .blobz
         .list(args.limit.unwrap_or(200), args.offset.unwrap_or(0))
         .await?;
@@ -1101,10 +1119,11 @@ struct BlobGetArgs {
 }
 
 async fn blob_get(args: BlobGetArgs, state: &AppState) -> Result<Value, DispatchError> {
-    let Some(meta) = state.blobz.get(&args.blake3).await? else {
+    let Some(meta) = state.storage.blobz.get(&args.blake3).await? else {
         return Err(DispatchError::NotFound);
     };
     let bytes = state
+        .storage
         .blobz
         .read_bytes(&args.blake3)
         .await?
@@ -1119,10 +1138,10 @@ async fn blob_get(args: BlobGetArgs, state: &AppState) -> Result<Value, Dispatch
 /// can hand it to tauri's asset:// protocol for native streaming. avoids
 /// base64-roundtripping the entire file for `<video>` / `<audio>` previews.
 async fn blob_get_path(args: BlobGetArgs, state: &AppState) -> Result<Value, DispatchError> {
-    let Some(meta) = state.blobz.get(&args.blake3).await? else {
+    let Some(meta) = state.storage.blobz.get(&args.blake3).await? else {
         return Err(DispatchError::NotFound);
     };
-    let path = state.blobz.path_for(&meta);
+    let path = state.storage.blobz.path_for(&meta);
     Ok(json!({
         "path": path.to_string_lossy(),
         "mime": meta.mime,
@@ -1138,12 +1157,12 @@ async fn blob_get_path(args: BlobGetArgs, state: &AppState) -> Result<Value, Dis
 /// for video files. errors are logged and swallowed: the lazy
 /// `blob_iroh_ensure` path will still work as a fallback.
 async fn prewarm_fs_store(state: &AppState, blob: &BlobRecord) {
-    let path = state.blobz.path_for(blob);
+    let path = state.storage.blobz.path_for(blob);
     if !path.exists() {
         tracing::warn!(blake3 = %blob.blake3, "prewarm: blob file missing on disk");
         return;
     }
-    match state.fs_store.blobs().add_path(path).await {
+    match state.storage.fs_store.blobs().add_path(path).await {
         Ok(_tag) => {
             tracing::debug!(blake3 = %blob.blake3, "prewarm: imported into FsStore");
         }
@@ -1182,18 +1201,18 @@ async fn blob_iroh_ensure(
             "reason": format!("expected 64-char blake3 hex, got {}", args.blake3.len()),
         }));
     }
-    let meta = match state.blobz.get(&args.blake3).await? {
+    let meta = match state.storage.blobz.get(&args.blake3).await? {
         Some(m) => m,
         None => return Ok(json!({ "available": false, "reason": "unknown blake3" })),
     };
-    let path = state.blobz.path_for(&meta);
+    let path = state.storage.blobz.path_for(&meta);
     if !path.exists() {
         return Ok(json!({ "available": false, "reason": "blob file missing on disk" }));
     }
     // import by reference into the iroh-blobs store. iroh-blobs computes
     // blake3 internally and dedupes on hash, so re-imports are cheap (only
     // the outboard metadata is recomputed).
-    match state.fs_store.blobs().add_path(path).await {
+    match state.storage.fs_store.blobs().add_path(path).await {
         Ok(_tag) => Ok(json!({ "available": true })),
         Err(e) => Ok(json!({
             "available": false,
@@ -1221,6 +1240,7 @@ async fn blob_insert(
         }
     })?;
     let blob = state
+        .storage
         .blobz
         .insert(
             &bytes,
@@ -1317,6 +1337,7 @@ async fn blob_insert_from_path(
     };
 
     let blob = state
+        .storage
         .blobz
         .register_external_path(
             &path,
@@ -1414,7 +1435,7 @@ async fn blob_iroh_download(
     state: &AppState,
 ) -> Result<Value, DispatchError> {
     use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
-    use iroh_blobs::api::downloader::{DownloadProgressItem, Downloader};
+    use iroh_blobs::api::downloader::DownloadProgressItem;
     use iroh_blobs::{Hash, HashAndFormat};
     use n0_future::StreamExt;
 
@@ -1457,17 +1478,19 @@ async fn blob_iroh_download(
     // register the hash as in-flight so the gc protect callback keeps it alive
     // until we have finished ingesting it into blobz. guard removes on all exits.
     {
-        if let Ok(mut inf) = state.blobs_in_flight.lock() {
+        if let Ok(mut inf) = state.storage.in_flight.lock() {
             inf.insert(hash);
         }
     }
     let _in_flight_guard = BlobsInFlightGuard {
-        set: Arc::clone(&state.blobs_in_flight),
+        set: Arc::clone(&state.storage.in_flight),
         hash,
     };
 
-    let (endpoint, _, _) = ensure_network(state).await?;
-    let downloader = Downloader::new(state.fs_store, &endpoint);
+    let (_endpoint, _, _) = ensure_network(state).await?;
+    let downloader = state.storage.downloader().ok_or_else(|| {
+        DispatchError::Stream("no downloader attached: endpoint not ready".to_string())
+    })?;
     let progress = downloader.download(HashAndFormat::raw(hash), [node_id]);
     let mut stream = progress
         .stream()
@@ -1557,6 +1580,7 @@ async fn blob_iroh_download(
     // (previously this did get_bytes -> blobz.insert -> base64 over IPC:
     // three full in-memory copies of the payload.)
     let target = state
+        .storage
         .blobz
         .prepare_canonical_path(&args.blake3)
         .await
@@ -1566,6 +1590,7 @@ async fn blob_iroh_download(
     // then tracks it as External and keeps serving it for P2P. the .obao4
     // outboard (~0.1% of size) stays in the fs store.
     state
+        .storage
         .fs_store
         .blobs()
         .export_with_opts(ExportOptions {
@@ -1576,6 +1601,7 @@ async fn blob_iroh_download(
         .await
         .map_err(|e| DispatchError::Stream(format!("export to blobz path: {e}")))?;
     let blob = state
+        .storage
         .blobz
         .register_ingested(
             &args.blake3,
@@ -1787,7 +1813,7 @@ async fn hub_start_inner(state: &AppState) -> Result<Value, DispatchError> {
             bio: String::new(),
             avatar_path: None,
         },
-        state.fs_store,
+        state.storage.fs_store,
     )
     .await
     .map_err(|e| DispatchError::Hub(format!("service start: {e}")))?;
@@ -1875,12 +1901,13 @@ async fn blob_thumbnail(
     let size = args.size.unwrap_or(200);
 
     let blob = state
+        .storage
         .blobz
         .get(&args.blake3)
         .await?
         .ok_or(DispatchError::NotFound)?;
 
-    let path = state.blobz.path_for(&blob);
+    let path = state.storage.blobz.path_for(&blob);
     let mime = blob.mime.as_deref().unwrap_or("application/octet-stream");
 
     let result = crate::thumbnail::generate_thumbnail(&path, mime, size)
@@ -1910,6 +1937,7 @@ async fn pdf_render_pages(
     state: &AppState,
 ) -> Result<Value, DispatchError> {
     let source_blob = state
+        .storage
         .blobz
         .get(&args.blake3)
         .await?
@@ -1922,7 +1950,7 @@ async fn pdf_render_pages(
         })?;
 
     let pdf_bytes =
-        tokio::fs::read(state.blobz.path_for(&source_blob)).await.map_err(|e| {
+        tokio::fs::read(state.storage.blobz.path_for(&source_blob)).await.map_err(|e| {
             DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(format!(
                 "read pdf bytes: {e}"
             )))
@@ -1948,6 +1976,7 @@ async fn pdf_render_pages(
         let filename = Some(format!("{stem}_page_{page_number:03}.png"));
         let mime = Some("image/png".to_string());
         let blob = state
+            .storage
             .blobz
             .insert(
                 &png_bytes,
