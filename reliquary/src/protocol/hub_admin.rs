@@ -885,7 +885,7 @@ async fn handle_request(
                     message: "image exceeds 512 KB limit".to_string(),
                 };
             }
-            let webp = match crate::hub::avatar::resize_to_square_webp(&bytes, 128) {
+            let webp = match freqhole_reliquary::media::resize_to_square_webp(&bytes, 128) {
                 Ok(w) => w,
                 Err(e) => {
                     return AdminResponse::Error {
@@ -899,7 +899,11 @@ async fn handle_request(
                 .blobz
                 .insert(
                     &webp,
-                    NewBlobMeta { filename: Some("hub-avatar.webp".to_string()), mime: Some("image/webp".to_string()), ..Default::default() },
+                    NewBlobMeta {
+                        filename: Some("hub-avatar.webp".to_string()),
+                        mime: Some("image/webp".to_string()),
+                        ..Default::default()
+                    },
                 )
                 .await
             {
@@ -927,7 +931,7 @@ async fn handle_request(
                     message: format!("userz avatar update failed: {e}"),
                 };
             }
-            let data_url = crate::hub::avatar::encode_data_url("image/webp", &webp);
+            let data_url = freqhole_reliquary::media::encode_data_url("image/webp", &webp);
             // update the in-memory lock
             let (username, bio, accent_color) = {
                 let mut p = handler.inner.hub_profile.write().await;
@@ -1127,7 +1131,7 @@ async fn build_avatar_data_url(blobz: &Arc<dyn BlobStore>, blake3: &str) -> Opti
     let blob = blobz.get(blake3).await.ok()??;
     let mime = blob.mime.clone()?;
     let bytes = blobz.read_bytes(blake3).await.ok()??;
-    Some(crate::hub::avatar::encode_data_url(&mime, &bytes))
+    Some(freqhole_reliquary::media::encode_data_url(&mime, &bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -2030,9 +2034,12 @@ mod tests {
         let avatar_bytes = b"fake-png-bytes";
         let avatar_blob = blobz_store
             .insert(
-            avatar_bytes,
-            NewBlobMeta { mime: Some("image/png".to_string()), ..Default::default() },
-        )
+                avatar_bytes,
+                NewBlobMeta {
+                    mime: Some("image/png".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         userz_dir
@@ -2347,17 +2354,11 @@ mod tests {
         }
 
         blobz_store
-            .insert(
-            b"hello",
-            NewBlobMeta::default(),
-        )
+            .insert(b"hello", NewBlobMeta::default())
             .await
             .unwrap();
         blobz_store
-            .insert(
-            b"world!!",
-            NewBlobMeta::default(),
-        )
+            .insert(b"world!!", NewBlobMeta::default())
             .await
             .unwrap();
 
@@ -2393,16 +2394,17 @@ mod tests {
 
         blobz_store
             .insert(
-            b"aaa",
-            NewBlobMeta { filename: Some("a.txt".into()), mime: Some("text/plain".into()), ..Default::default() },
-        )
+                b"aaa",
+                NewBlobMeta {
+                    filename: Some("a.txt".into()),
+                    mime: Some("text/plain".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         blobz_store
-            .insert(
-            b"bbbbb",
-            NewBlobMeta::default(),
-        )
+            .insert(b"bbbbb", NewBlobMeta::default())
             .await
             .unwrap();
 
@@ -2440,10 +2442,7 @@ mod tests {
         adminz_store.allow(admin_node).await.unwrap();
 
         let blob = blobz_store
-            .insert(
-            b"soft del via admin",
-            NewBlobMeta::default(),
-        )
+            .insert(b"soft del via admin", NewBlobMeta::default())
             .await
             .unwrap();
 
@@ -2479,10 +2478,7 @@ mod tests {
         adminz_store.allow(admin_node).await.unwrap();
 
         let blob = blobz_store
-            .insert(
-            b"restore me",
-            NewBlobMeta::default(),
-        )
+            .insert(b"restore me", NewBlobMeta::default())
             .await
             .unwrap();
         blobz_store
@@ -2518,9 +2514,12 @@ mod tests {
 
         let blob = blobz_store
             .insert(
-            b"list me",
-            NewBlobMeta { filename: Some("f.txt".into()), ..Default::default() },
-        )
+                b"list me",
+                NewBlobMeta {
+                    filename: Some("f.txt".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         blobz_store
@@ -2557,10 +2556,7 @@ mod tests {
         adminz_store.allow(admin_node).await.unwrap();
 
         let blob = blobz_store
-            .insert(
-            b"hard del via admin",
-            NewBlobMeta::default(),
-        )
+            .insert(b"hard del via admin", NewBlobMeta::default())
             .await
             .unwrap();
         let path = blobz_store.path_for(&blob);
@@ -2601,10 +2597,7 @@ mod tests {
 
         for i in 0u8..3 {
             let b = blobz_store
-                .insert(
-                &[i; 4],
-                NewBlobMeta::default(),
-            )
+                .insert(&[i; 4], NewBlobMeta::default())
                 .await
                 .unwrap();
             blobz_store
@@ -2645,17 +2638,11 @@ mod tests {
         adminz_store.allow(admin_node).await.unwrap();
 
         let live = blobz_store
-            .insert(
-            b"alive",
-            NewBlobMeta::default(),
-        )
+            .insert(b"alive", NewBlobMeta::default())
             .await
             .unwrap();
         let sd = blobz_store
-            .insert(
-            b"soft deleted",
-            NewBlobMeta::default(),
-        )
+            .insert(b"soft deleted", NewBlobMeta::default())
             .await
             .unwrap();
         blobz_store
@@ -2740,10 +2727,7 @@ mod tests {
 
         for i in 0u8..5 {
             blobz_store
-                .insert(
-                &[i; 4],
-                NewBlobMeta::default(),
-            )
+                .insert(&[i; 4], NewBlobMeta::default())
                 .await
                 .unwrap();
         }
@@ -2812,10 +2796,7 @@ mod tests {
 
         for i in 0u8..4 {
             let b = blobz_store
-                .insert(
-                &[i; 3],
-                NewBlobMeta::default(),
-            )
+                .insert(&[i; 3], NewBlobMeta::default())
                 .await
                 .unwrap();
             blobz_store
@@ -2940,14 +2921,12 @@ mod tests {
     async fn unsync_canvas_sweeps_only_canvas_unique_blobs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pool = db::open_in_memory().await;
-        let blobz_store = Arc::new(SqliteBlobStore::new(pool.clone(), tmp.path())) as Arc<dyn BlobStore>;
+        let blobz_store =
+            Arc::new(SqliteBlobStore::new(pool.clone(), tmp.path())) as Arc<dyn BlobStore>;
 
         // insert a blob and soft-delete it to simulate an orphan
         let b = blobz_store
-            .insert(
-            b"sweepme",
-            NewBlobMeta::default(),
-        )
+            .insert(b"sweepme", NewBlobMeta::default())
             .await
             .unwrap();
         // leave the blob live (not soft-deleted) — sweep_canvas_blobs will
@@ -3365,14 +3344,19 @@ mod tests {
     async fn canvas_blobs_includes_soft_deleted_flag() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pool = db::open_in_memory().await;
-        let blobz_store = Arc::new(SqliteBlobStore::new(pool.clone(), tmp.path())) as Arc<dyn BlobStore>;
+        let blobz_store =
+            Arc::new(SqliteBlobStore::new(pool.clone(), tmp.path())) as Arc<dyn BlobStore>;
 
         // insert a blob that we'll soft-delete
         let b = blobz_store
             .insert(
-            b"soft content",
-            NewBlobMeta { filename: Some("soft.txt".into()), mime: Some("text/plain".into()), ..Default::default() },
-        )
+                b"soft content",
+                NewBlobMeta {
+                    filename: Some("soft.txt".into()),
+                    mime: Some("text/plain".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         blobz_store
@@ -3383,9 +3367,13 @@ mod tests {
         // insert a live blob
         let live = blobz_store
             .insert(
-            b"live content",
-            NewBlobMeta { filename: Some("live.txt".into()), mime: Some("text/plain".into()), ..Default::default() },
-        )
+                b"live content",
+                NewBlobMeta {
+                    filename: Some("live.txt".into()),
+                    mime: Some("text/plain".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
 
@@ -3487,7 +3475,8 @@ mod tests {
     async fn canvas_blobs_pagination_works() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pool = db::open_in_memory().await;
-        let blobz_store = Arc::new(SqliteBlobStore::new(pool.clone(), tmp.path())) as Arc<dyn BlobStore>;
+        let blobz_store =
+            Arc::new(SqliteBlobStore::new(pool.clone(), tmp.path())) as Arc<dyn BlobStore>;
 
         // insert three blobs with different sizes so we can verify sort order
         let blobs_in: Vec<(&str, &str, &[u8])> = vec![
@@ -3499,9 +3488,12 @@ mod tests {
         for (iroh, name, data) in &blobs_in {
             let b = blobz_store
                 .insert(
-                data,
-                NewBlobMeta { filename: Some(name.to_string()), ..Default::default() },
-            )
+                    data,
+                    NewBlobMeta {
+                        filename: Some(name.to_string()),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
             inserted.push(b);

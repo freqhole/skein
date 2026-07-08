@@ -2,7 +2,7 @@
 //!
 //! supports three source types:
 //! - image/*: decoded + resized in-process via the `image` crate (through
-//!   `reliquary::hub::avatar`), returned as webp.
+//!   `freqhole_reliquary::media`), returned as webp.
 //! - application/pdf: rasterizes the first page via `magick` (same subprocess
 //!   pattern as `pdf.rs`), returned as png.
 //! - video/*: extracts a frame at ~1% of the duration via ffprobe + ffmpeg,
@@ -51,7 +51,7 @@ pub async fn generate_thumbnail(
 
 async fn thumbnail_image(path: &Path, size: u32) -> Result<Value, ThumbnailError> {
     let bytes = tokio::fs::read(path).await?;
-    let webp = reliquary::hub::avatar::resize_to_square_webp(&bytes, size)
+    let webp = freqhole_reliquary::media::resize_to_square_webp(&bytes, size)
         .map_err(|e| ThumbnailError::Image(e.to_string()))?;
     let b64 = B64.encode(&webp);
     Ok(json!({ "data": b64, "mime": "image/webp" }))
@@ -220,7 +220,7 @@ fn uuid_like() -> String {
 mod tests {
     use super::*;
 
-    /// build a tiny in-memory PNG — same pattern as reliquary/src/hub/avatar.rs.
+    /// build a tiny in-memory PNG for use as thumbnail test fixture data.
     fn tiny_png() -> Vec<u8> {
         use image::ImageFormat;
         let img = image::RgbImage::from_fn(16, 16, |x, y| {

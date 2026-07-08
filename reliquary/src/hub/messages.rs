@@ -706,14 +706,14 @@ impl HubPeerService {
         peer_node_id: &str,
         data_url: &str,
     ) -> Option<String> {
-        use crate::hub::avatar;
+        use freqhole_reliquary::media;
 
-        let (_mime, raw_bytes) = avatar::decode_data_url(data_url)?;
+        let (_mime, raw_bytes) = media::decode_data_url(data_url)?;
         if raw_bytes.is_empty() {
             return None;
         }
 
-        let webp = match avatar::resize_to_square_webp(&raw_bytes, 128) {
+        let webp = match media::resize_to_square_webp(&raw_bytes, 128) {
             Ok(w) => w,
             Err(e) => {
                 tracing::warn!(

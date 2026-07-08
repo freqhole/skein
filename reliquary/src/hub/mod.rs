@@ -5,11 +5,9 @@
 //! blob snatcher into a single service.
 //!
 //! split into submodules:
-//! - [`avatar`]: image processing for profile thumbnails
 //! - `messages`: friendz message dispatch (friend requests, profile, heartbeat)
 //! - `canvas`: canvas invite, update, and gossip digest handling
 
-pub mod avatar;
 mod canvas;
 mod messages;
 
@@ -564,7 +562,7 @@ impl HubPeerService {
 
 /// process the configured avatar image:
 /// 1. read the file
-/// 2. resize to 128px webp via [`avatar::resize_to_square_webp`]
+/// 2. resize to 128px webp via [`freqhole_reliquary::media::resize_to_square_webp`]
 /// 3. insert into `blobz` (deduped by blake3)
 /// 4. return `(data_url, blake3)` so the caller can persist the reference
 ///    in `userz` and serve the data URL in `ProfileResponse` messages
@@ -596,7 +594,7 @@ async fn process_hub_avatar(
         }
     };
 
-    let webp = match avatar::resize_to_square_webp(&image_data, 128) {
+    let webp = match freqhole_reliquary::media::resize_to_square_webp(&image_data, 128) {
         Ok(w) => w,
         Err(e) => {
             tracing::warn!(
