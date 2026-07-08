@@ -1787,6 +1787,7 @@ async fn hub_start_inner(state: &AppState) -> Result<Value, DispatchError> {
             bio: String::new(),
             avatar_path: None,
         },
+        state.fs_store,
     )
     .await
     .map_err(|e| DispatchError::Hub(format!("service start: {e}")))?;

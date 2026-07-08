@@ -27,9 +27,8 @@ use crate::protocol::messages::{FriendzMessage, FRIENDZ_ALPN};
 use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
 use crate::userz;
 use freqhole_reliquary::blobz::{BlobStore, NewBlobMeta};
+use freqhole_reliquary::node::StorageNode;
 
-use iroh_blobs::api::downloader::Downloader;
-use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
 
 // ---------------------------------------------------------------------------
@@ -157,7 +156,7 @@ impl HubPeerService {
     /// start the hub peer service.
     ///
     /// the caller is responsible for constructing the iroh endpoint, the
-    /// iroh-blobs `FsStore`, and the skein `userz`/`friendz`/`blobz` stores
+    /// iroh-blobs storage node, and the skein `userz`/`friendz`/`blobz` stores
     /// — all of these may be shared with the embedding [`crate::service::Service`].
     /// after this returns, the service is ready to accept connections; call
     /// [`HubPeerService::run`] to drive the event loop.
@@ -165,15 +164,17 @@ impl HubPeerService {
     pub async fn start(
         endpoint: iroh::Endpoint,
         hub_repo: HubRepo,
-        fs_store: &'static FsStore,
+        storage: &'static StorageNode,
         userz: userz::Directory,
         friendz_store: friendz::Store,
-        blobz: Arc<dyn BlobStore>,
         adminz_store: crate::adminz::Store,
         config: HubPeerConfig,
     ) -> Result<Self, HubError> {
         let node_id_str = endpoint.id().to_string();
         tracing::info!(node_id = %node_id_str, "hub peer service starting");
+
+        let fs_store = storage.fs_store;
+        let blobz = storage.blobz.clone();
 
         // process avatar (if configured) and persist into blobz + userz.
         let (profile_avatar_data_url, avatar_blake3) =
@@ -290,8 +291,10 @@ impl HubPeerService {
         // it subscribes to hub_repo's doc_notify channel internally, so we
         // don't pass an external trigger — the legacy `snatch_trigger` field
         // below is kept only because canvas/messages prototype code still
-        // calls notify_one on it.
-        let downloader = Downloader::new(fs_store, &endpoint);
+        // calls notify_one on it. the downloader and in-flight set are both
+        // shared with the storage node's own gc-protect callback, so a blob
+        // mid-download is never swept before it's ingested into blobz.
+        let downloader = storage.downloader.clone();
         let peer_blob_inventory = Arc::new(Mutex::new(HashMap::new()));
         let snatch_trigger_legacy = Arc::new(tokio::sync::Notify::new());
         let snatcher = Arc::new(crate::snatch::BlobSnatcher::new(
@@ -306,7 +309,7 @@ impl HubPeerService {
             peer_blob_inventory.clone(),
             fs_store,
             blobz.clone(),
-            crate::service::snatcher_in_flight(),
+            storage.in_flight.clone(),
         ));
 
         Ok(Self {

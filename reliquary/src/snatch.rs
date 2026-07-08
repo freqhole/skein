@@ -26,6 +26,7 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::protocol::blob_proxy::SKEIN_ALPN;
 use freqhole_reliquary::blobz::{BlobStore, NewBlobMeta};
 use freqhole_reliquary::ensure::PeerMessage;
+use freqhole_reliquary::node::InFlightGuard;
 
 /// timeout for a single ensure_blob probe to a peer (seconds).
 const PROBE_TIMEOUT_SECS: u64 = 15;
@@ -924,36 +925,6 @@ impl BlobSnatcher {
         );
 
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// in-flight guard
-// ---------------------------------------------------------------------------
-
-/// raii guard that inserts a hash into the in-flight set on construction and
-/// removes it when dropped. ensures the gc protect callback never sweeps a
-/// blob that is mid-download, regardless of which exit path download_blob
-/// takes (success, error, or future cancellation).
-struct InFlightGuard {
-    set: Arc<std::sync::Mutex<HashSet<Hash>>>,
-    hash: Hash,
-}
-
-impl InFlightGuard {
-    fn new(set: Arc<std::sync::Mutex<HashSet<Hash>>>, hash: Hash) -> Self {
-        if let Ok(mut guard) = set.lock() {
-            guard.insert(hash);
-        }
-        Self { set, hash }
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = self.set.lock() {
-            guard.remove(&self.hash);
-        }
     }
 }
 
