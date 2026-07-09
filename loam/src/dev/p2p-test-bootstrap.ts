@@ -63,11 +63,10 @@ let sharedIrohAdapter: IrohNetworkAdapter | null = null;
  * skein-bridge.ts), then use `joinCanvas()` below to open the shared doc.
  */
 async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2PTestInitResult> {
-  // build the repo (broadcast + iroh) and canvas doc via the harness (see
-  // harness/skein-harness.ts — phase 2 step 4 of the SkeinHarness
-  // extraction) instead of hand-rolling ensureIdentity/IrohNetworkAdapter/
-  // Repo here. "both" mirrors what this file built by hand before: iroh for
-  // real cross-process peers, broadcast for same-browser-context tabs.
+  // build the repo (broadcast + iroh) and canvas doc via the harness
+  // instead of hand-rolling ensureIdentity/IrohNetworkAdapter/Repo here.
+  // "both" enables iroh for real cross-process peers and broadcast for
+  // same-browser-context tabs.
   const harness = await createSkeinHarness({
     network: "both",
     canvasDocId: options.canvasDocId ?? null,

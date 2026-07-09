@@ -11,10 +11,10 @@
 //
 // this file doesn't fully solve that (there are still two call sites —
 // boot.ts and profile-tab.ts — because `SkeinHarness` doesn't own the
-// social doc / identity yet, see the plan doc's phase 2 notes on why
-// `socialStore` is deliberately out of scope for the first harness pass).
-// once boot.ts is migrated to construct its social bridge from a harness,
-// this can collapse to a single `registerTestBridge(harness)` call.
+// social doc / identity yet, so `socialStore` is deliberately out of scope
+// for the harness). once boot.ts is migrated to construct its social bridge
+// from a harness, this can collapse to a single `registerTestBridge(harness)`
+// call.
 //
 // for now: this is the *only* file that reads/writes `window.__skeinTest`.
 // every other module calls `registerSocialBridge()` instead.

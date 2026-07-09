@@ -13,7 +13,7 @@
  *   after every IPC mutation) and refetches the full snapshot
  *
  * the diff engine handles all 17 mutation patterns used by the widget tabs
- * and friendz-wiring. see docs/peer-identity-unification-plan.md phase 4.
+ * and friendz-wiring.
  */
 
 import { invoke } from "@tauri-apps/api/core";

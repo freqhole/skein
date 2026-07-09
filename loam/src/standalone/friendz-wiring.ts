@@ -560,7 +560,7 @@ export async function initFriendzWiring(
     });
   });
 
-  // --- canvas update federation (phase 2): send side ---
+  // --- canvas update federation: send side ---
   // track which canvas docs we're already watching (by per-widget docId)
   const watchedCanvasWidgets = new Set<string>();
   // canvases with changes since last heartbeat flush

@@ -159,7 +159,7 @@ export interface SkeinP2PBridge {
    * stream via the underlying midden node (same `open_bi` mechanism
    * `importBlob`/`fetchBlob` use), writes a CBOR-encoded request terminated
    * by `finish()`, then reads the CBOR-encoded response back with
-   * `read_to_end()` — mirrors reliquary's `protocol::hub_admin` framing.
+   * `read_to_end()` (one request/response pair per stream, no length prefix).
    *
    * the caller is only treated as an admin if their own node id is already
    * in the hub's `hub_adminz` table (bootstrapped locally, e.g. via

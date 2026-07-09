@@ -832,10 +832,10 @@ class SkeinRouter {
     // the recoverable cases this no longer treats as terminal) must not
     // propagate as an uncaught rejection: `destroyCurrent()` below already
     // tore down whatever was previously mounted by the time `initCanvas()`
-    // could throw, so an uncaught failure here left the app with *nothing*
-    // mounted at all — a real, user-reported crash ("everything turns
-    // black"), 2026-07-03. caught below and recovered by falling back to
-    // the narthex, same as clicking the home button would.
+    // could throw, so an uncaught failure here leaves the app with *nothing*
+    // mounted at all — a real, user-reported crash ("everything turns black").
+    // caught below and recovered by falling back to the narthex, same as
+    // clicking the home button would.
     let failure: unknown = null;
 
     try {
@@ -922,10 +922,7 @@ class SkeinRouter {
 
             // get already-invited node IDs from messagez outbox.
             // excludes declined shares — a friend who declined should be
-            // re-invitable, not permanently stuck off the invite list (a
-            // real bug: previously this checked canvasDocId only, so a
-            // declined invite blocked re-inviting that friend forever, even
-            // though the "declined" section below shows them as declined).
+            // re-invitable, not permanently stuck off the invite list.
             // also excludes cancelled shares (see onCancelInvite below) — a
             // pending invite that the sharer themselves cancels must free
             // the friend back up for re-inviting, same as a decline.

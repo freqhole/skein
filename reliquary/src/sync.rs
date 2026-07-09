@@ -151,11 +151,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for LoggingIo<T> {
 /// peer's `friendz` row after their connection was already accepted needs a
 /// second mechanism to actually tear the live connection down: see
 /// `hub_repo::HubRepo::cancel_peer` and its doc comment for how that works
-/// and who's expected to call it. this used to be a documented-but-unfixed
-/// gap (see the old `revoking_friendz_status_does_not_tear_down_an_already_accepted_connection`
-/// test, replaced by
+/// and who's expected to call it. see the
 /// `sync::tests::revoking_friendz_status_now_cancels_an_already_accepted_connection`
-/// below, which proves the fix).
+/// test below which proves this behavior.
 #[derive(Clone)]
 pub struct IrohRepo {
     /// kept for future outbound dialing (hub-to-hub sync).

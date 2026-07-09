@@ -1577,8 +1577,6 @@ async fn blob_iroh_download(
     // IPC: stream-export the (verified, complete) blob from the FsStore
     // straight to blobz's canonical content-addressed path, then record
     // metadata trusting the hash the transfer already verified.
-    // (previously this did get_bytes -> blobz.insert -> base64 over IPC:
-    // three full in-memory copies of the payload.)
     let target = state
         .storage
         .blobz

@@ -464,8 +464,7 @@ export function hubAdminTransportFromAdapter(adapter: {
 /**
  * open a fresh `iroh/skein-hub-admin/1` stream to `peerNodeId`, write a
  * single CBOR-encoded request terminated by `finish()`, and read back a
- * single CBOR-encoded response with `read_to_end()` — mirrors reliquary's
- * `protocol::hub_admin` framing exactly (no length prefix, one
+ * single CBOR-encoded response with `read_to_end()` (no length prefix, one
  * request/response pair per stream).
  */
 async function sendAdminRequest(

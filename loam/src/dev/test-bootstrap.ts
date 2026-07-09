@@ -36,8 +36,7 @@ interface TestInitResult {
  * via page.evaluate(), and window.__skein for test assertions.
  */
 async function initSkeinForTest(options: TestInitOptions = {}): Promise<TestInitResult> {
-  // build the repo + canvas doc via the harness (see harness/skein-harness.ts —
-  // phase 2 step 1 of the SkeinHarness extraction) instead of hand-rolling a
+  // build the repo + canvas doc via the harness instead of hand-rolling a
   // BroadcastChannelNetworkAdapter + Repo here.
   const harness = await createSkeinHarness({ canvasDocId: options.canvasDocId ?? null });
 

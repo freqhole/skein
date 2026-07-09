@@ -1,12 +1,9 @@
 // ---------------------------------------------------------------------------
 // unit tests for file-utils.ts's tauri-mode branches.
 //
-// before this file, checkBlobLocality/snatchBlob/uploadFile had zero test
-// coverage of any kind (browser or tauri) — see
-// docs/widget-blob-acl-plan.md's phase 5 item 3. these tests target only
-// the isTauriMode() === true branches, mocking the tauri IPC boundary
-// (dispatch) and the blob-store/identity/blob-worker modules that would
-// otherwise touch real IndexedDB/OPFS/wasm.
+// these tests target the isTauriMode() === true branches, mocking the tauri
+// IPC boundary (dispatch) and the blob-store/identity/blob-worker modules
+// that would otherwise touch real IndexedDB/OPFS/wasm.
 // ---------------------------------------------------------------------------
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

@@ -1152,7 +1152,7 @@ export async function snatchBlobBatch(
     domain: coerceStr(b.domain),
   }));
 
-  // --- phase 1: skip already-local blobs ---
+  // --- skip already-local blobs ---
   const pending: number[] = [];
 
   for (let i = 0; i < coercedBlobs.length; i++) {

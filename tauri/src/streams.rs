@@ -137,11 +137,7 @@ impl StreamRegistry {
     /// gated by `blob_acl`'s friend-only mode (same as `reliquary::service::
     /// Service`, the other peer variant with no canvas tracking) — a peer
     /// must be a friend of this tauri instance's own identity to fetch any
-    /// blob. this used to be `events: None` (fully public: any peer that
-    /// could open a connection and knew a blake3 hash could fetch it,
-    /// zero access control) — that was the one remaining ungated blob path
-    /// in this codebase (reliquary's own hub/service peers were already
-    /// gated, see `blob_acl`'s module doc comment) and has been fixed.
+    /// blob.
     pub async fn start_with_blobs(
         endpoint: Endpoint,
         fs_store: &'static FsStore,
