@@ -10,7 +10,7 @@
 
 import * as Comlink from "comlink";
 import type { MiddenWorkerApi, StreamInfo } from "./midden-worker";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 
 const TAG = "midden.worker";
 

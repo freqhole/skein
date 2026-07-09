@@ -22,8 +22,8 @@ import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
 import { handleSkeinStream } from "../p2p/skein-handler";
 import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
-import { log } from "../utils/log";
-import { getBlobRecordByBlake3 } from "../storage/skein-blob-store";
+import { log } from "@freqhole/reliquary/utils";
+import { getBlobRecordByBlake3 } from "../storage/blob-store";
 
 export interface FriendzWiringDeps {
   repo: Repo;

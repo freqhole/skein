@@ -4,6 +4,7 @@ import type { SkeinCanvas } from "../canvas/init";
 import type { InvitableRole } from "../canvas/canvas-doc";
 import type { CanvasStore } from "../canvas/canvas-store";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
+import { restrictBlobToPeers } from "../p2p/iroh-network-adapter";
 import type { EndpointState, IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
 import {
   approveKnock,
@@ -21,7 +22,7 @@ import type { HubAdminHubProfile, HubAdminBlobUsageSummary } from "../p2p/hub-ad
 import type { ProfileCanvasBinTestHooks } from "../../widgets/narthex/social/canvas-bin";
 import type { ProfileCanvasEntry, ProfileStore } from "../canvas/profile-doc";
 import type { FriendInfo } from "../canvas/share-dialog";
-import { storeBlob, classifyDomain } from "../storage/skein-blob-store";
+import { storeBlob, classifyDomain } from "../storage/blob-store";
 import {
   type HubAdminRequest,
   type HubAdminResponse,
@@ -145,8 +146,8 @@ export interface SkeinP2PBridge {
    * restricts a blob (by blake3 hash) on THIS peer's
    * `iroh_blobs::BlobsProtocol` so only the given peer node ids may fetch
    * it. a hash never passed to this method is unrestricted (today's
-   * default, unchanged). delegates to `IrohNetworkAdapter.restrictBlobToPeers`
-   * — the same production entry point `CanvasBlobAclSync`
+   * default, unchanged). delegates to the same `restrictBlobToPeers()`
+   * helper (`p2p/iroh-network-adapter.ts`) that `CanvasBlobAclSync`
    * (`canvas/blob-acl-sync.ts`) uses to mirror a canvas's real `.acl` onto
    * this gate, so calling it directly here is a manual stand-in for that
    * real wiring, not a separate/fake code path.
@@ -565,17 +566,12 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
       const mime = options?.mime ?? "application/octet-stream";
       const filename = options?.filename ?? "test-blob";
       const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
-      await storeBlob(blake3, buffer, {
-        blob_id: blake3,
-        sha256: "",
-        blake3,
+      await storeBlob(buffer, {
         filename,
         mime,
-        size: data.byteLength,
-        domain: classifyDomain(mime),
         blob_type: "original",
         parent_blob_id: null,
-        metadata: {},
+        metadata: { domain: classifyDomain(mime) },
       });
 
       return blake3;
@@ -618,17 +614,12 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
       const mime = options?.mime ?? "application/octet-stream";
       const filename = options?.filename ?? "test-blob-streamed";
       const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
-      await storeBlob(blake3, buffer, {
-        blob_id: blake3,
-        sha256: "",
-        blake3,
+      await storeBlob(buffer, {
         filename,
         mime,
-        size: data.byteLength,
-        domain: classifyDomain(mime),
         blob_type: "original",
         parent_blob_id: null,
-        metadata: {},
+        metadata: { domain: classifyDomain(mime) },
       });
 
       return blake3;
@@ -726,11 +717,10 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
     },
 
     async restrictBlobToPeers(blake3Hash: string, peerNodeIds: string[]): Promise<void> {
-      // delegates to the real production entry point (IrohNetworkAdapter.
-      // restrictBlobToPeers, added alongside CanvasBlobAclSync) rather than
-      // reaching into the wasm node directly — this test hook and real
-      // canvas-ACL-driven callers now go through the exact same path.
-      return adapter.restrictBlobToPeers(blake3Hash, peerNodeIds);
+      // delegates to the same standalone restrictBlobToPeers() helper real
+      // canvas-acl-driven callers use (see canvas/blob-acl-sync.ts) — this
+      // test hook and production wiring go through the exact same path.
+      return restrictBlobToPeers(adapter, blake3Hash, peerNodeIds);
     },
 
   async hubAdminRequest(peerNodeId: string, request: AdminRequest): Promise<AdminResponse> {

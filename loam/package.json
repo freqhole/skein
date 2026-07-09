@@ -33,6 +33,7 @@
     "@pixi/ui": "^2.3.2",
     "comlink": "^4.4.2",
     "@freqhole/midden": "file:../../midden/pkg",
+    "@freqhole/reliquary": "file:../../reliquary/ts",
     "pixi.js": "^8.19.0",
     "zod": "^4.4.3"
   },

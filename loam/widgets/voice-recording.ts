@@ -32,8 +32,8 @@ import {
   getBlobRecord,
   storeBlob,
   storeBlobFromFile,
-} from "../src/storage/skein-blob-store";
-import { base64Encode } from "../src/workers/blob-worker-client";
+} from "../src/storage/blob-store";
+import { base64Encode } from "@freqhole/reliquary/worker";
 import {
   checkBlobLocality,
   getLocalNodeId,
@@ -639,17 +639,12 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           // best-effort mirror into OPFS/IndexedDB so local getBlobData() reads keep working
           const existingRecord = await getBlobRecord(response.blake3);
           if (!existingRecord) {
-            await storeBlob(response.blake3, buffer, {
-              blob_id: response.blake3,
-              sha256: "",
-              blake3: response.blake3,
+            await storeBlob(buffer, {
               filename: response.filename || filename,
               mime: resolvedMime,
-              size: response.size,
-              domain: classifyDomain(resolvedMime),
               blob_type: "original",
               parent_blob_id: null,
-              metadata: {},
+              metadata: { domain: classifyDomain(resolvedMime) },
             });
           }
           record = {
@@ -661,7 +656,14 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           };
         } else {
           const file = new File([recordedBlob], filename, { type: recMime });
-          record = await storeBlobFromFile(file, "audio");
+          const fileRecord = await storeBlobFromFile(file, { metadata: { domain: "audio" } });
+          record = {
+            blob_id: fileRecord.blob_id,
+            sha256: fileRecord.sha256 ?? "",
+            blake3: fileRecord.blake3 || fileRecord.blob_id,
+            size: fileRecord.size,
+            mime: fileRecord.mime,
+          };
         }
 
         // recorder has the blob locally — register it as a snatcher immediately

@@ -18,7 +18,7 @@ import type { Repo } from "@automerge/automerge-repo";
 import { BroadcastChannelNetworkAdapter } from "@automerge/automerge-repo-network-broadcastchannel";
 
 import { createSkeinHarness } from "../harness/skein-harness";
-import { AclFilteringNetworkAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
+import { createAclFilteringAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
 import type { RoleResolver } from "../p2p/acl-filtering-network-adapter";
 
 interface AclTestInitOptions {
@@ -42,7 +42,7 @@ async function initSkeinForTest(options: AclTestInitOptions = {}): Promise<AclTe
     return createRepoRoleResolver(repoBox.repo)(documentId, senderId);
   };
 
-  const aclAdapter = new AclFilteringNetworkAdapter(new BroadcastChannelNetworkAdapter(), roleResolver);
+  const aclAdapter = createAclFilteringAdapter(new BroadcastChannelNetworkAdapter(), roleResolver);
 
   const harness = await createSkeinHarness({
     networkAdapter: aclAdapter,

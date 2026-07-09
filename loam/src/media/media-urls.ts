@@ -3,7 +3,7 @@
  *
  * handles the platform differences that affect <audio> and <video> elements:
  *
- * - **browser mode**: creates blob: URLs from OPFS data via skein-blob-store.
+ * - **browser mode**: creates blob: URLs from OPFS data via the blob store.
  *   works everywhere because blob: is a standard web API.
  *
  * - **macOS Tauri**: uses asset:// protocol URLs via convertFileSrc().
@@ -20,9 +20,9 @@
  */
 
 import { dispatch as tauriDispatch, isTauriMode } from "../p2p/tauri-transport";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { resolveBlob, getBlobData } from "../storage/skein-blob-store";
+import { resolveBlob, getBlobData } from "../storage/blob-store";
 import { getFullBlobDataUrl } from "../widgets/file-utils";
 
 const TAG = "media-urls";

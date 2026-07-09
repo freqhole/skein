@@ -7,7 +7,7 @@ import { createSkeinHarness } from "../harness/skein-harness";
 import { PresenceManager } from "../canvas/presence-manager";
 import { Viewport } from "../canvas/viewport";
 import { createWidgetDoc } from "../widgets/widget-doc";
-import { getBlobWorker, processBlobBytes, streamFileToOpfs } from "../workers/blob-worker-client";
+import { getBlobWorker, processBlobBytes, streamFileToOpfs } from "@freqhole/reliquary/worker";
 
 /**
  * a simple zod schema used by playwright tests to exercise createWidgetDoc.

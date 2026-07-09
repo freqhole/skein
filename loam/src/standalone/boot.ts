@@ -35,8 +35,8 @@ import {
   getStoredIdentity,
   onIdentityChange,
 } from "../p2p/identity";
-import { IrohNetworkAdapter, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
-import { AclFilteringNetworkAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
+import { IrohNetworkAdapter, restrictBlobToPeers, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
+import { createAclFilteringAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
 import type { RoleResolver } from "../p2p/acl-filtering-network-adapter";
 import { createCanvasScopedSharePolicy } from "../p2p/canvas-scoped-share-policy";
 import { decodeShareString, encodeShareString } from "../p2p/share-string";
@@ -67,7 +67,20 @@ import {
   CANVAS_INFO_OVERLAY_H,
 } from "../canvas/widget-overlay";
 import type { WidgetDoc, WidgetMountContext } from "../widgets/widget-types";
-import { log } from "../utils/log";
+import { configureLogging, log, type LogLevel } from "@freqhole/reliquary/utils";
+
+// configure logging as early as possible - this module is the app's entry
+// point (see index.html), so every other module's log calls run after this.
+// localStorage overrides still take priority over these build-time defaults.
+configureLogging({
+  level:
+    (import.meta.env.VITE_LOG_LEVEL as LogLevel | undefined) ??
+    (import.meta.env.DEV ? "debug" : "warn"),
+  filter: (import.meta.env.VITE_LOG_FILTER as string | undefined)
+    ?.split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+});
 
 // indexeddb key for the well-known narthex document id
 const NARTHEX_DOC_KEY = "skein-narthex-doc-id";
@@ -227,7 +240,7 @@ class SkeinRouter {
       // createRepoRoleResolver()'s lookup falls through to the "member"
       // default (read/write, same as today's unfiltered behavior) for them,
       // so this is a no-op for non-canvas docs.
-      wrapNetworkAdapter: (iroh) => new AclFilteringNetworkAdapter(iroh, roleResolver),
+      wrapNetworkAdapter: (iroh) => createAclFilteringAdapter(iroh, roleResolver),
     });
     repoBox.repo = harness.repo;
 
@@ -848,7 +861,7 @@ class SkeinRouter {
         repo: this.repo,
         connectionStateSource: this.connectionStateSource,
         restrictBlobToPeers: (blake3Hash, peerNodeIds) =>
-          this.irohAdapter.restrictBlobToPeers(blake3Hash, peerNodeIds),
+          restrictBlobToPeers(this.irohAdapter, blake3Hash, peerNodeIds),
         onNavigateHome: () => {
           log.debug(TAG, "home button clicked, navigating to narthex");
           window.location.hash = "";

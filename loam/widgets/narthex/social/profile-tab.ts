@@ -12,7 +12,7 @@ import {
   importIdentityFromBundle,
   onIdentityChange,
 } from "../../../src/p2p/identity";
-import { pickImageAsDataUrl } from "../../../src/widgets/image-utils";
+import { pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
 import { OWN_CANVAS_BIN_WIDGET_ID, OWN_CANVAS_BIN_WIDGET_TYPE, ownCanvasBinWidget } from "../own-canvas-bin";
 import {

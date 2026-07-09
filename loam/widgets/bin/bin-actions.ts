@@ -5,7 +5,7 @@
  */
 
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
-import { log } from "../../src/utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import {
   getThumbnailDataUrl,

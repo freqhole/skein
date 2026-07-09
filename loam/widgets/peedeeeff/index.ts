@@ -9,7 +9,7 @@
  */
 
 import { Container, Graphics, Text } from "pixi.js";
-import { log } from "../../src/utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import {
   getDocumentPages,

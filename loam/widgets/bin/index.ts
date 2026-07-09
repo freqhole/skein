@@ -1,7 +1,7 @@
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics, Text } from "pixi.js";
 
-import { log } from "../../src/utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import { pickFiles, uploadFile } from "../../src/widgets/file-utils";
 import { fileSchema } from "../file";
 import { snatchAllInBin } from "./bin-actions";

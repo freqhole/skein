@@ -9,7 +9,7 @@
 import type { BiStreamLike, MiddenStreamNode } from "./iroh-network-adapter";
 import { FRIENDZ_ALPN } from "./iroh-network-adapter";
 import type { CanvasRoleOrRemoved, InvitableRole } from "../canvas/canvas-doc";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 
 // ---------------------------------------------------------------------------
 // constants

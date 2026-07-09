@@ -8,7 +8,7 @@
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics, Text } from "pixi.js";
 import { z } from "zod";
-import { log } from "../../src/utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import { CanvasStore } from "../../src/canvas/canvas-store";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import type {

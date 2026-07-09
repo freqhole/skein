@@ -21,7 +21,7 @@ import { ProfileStore } from "../canvas/profile-doc";
 import { Viewport } from "../canvas/viewport";
 import { createSkeinHarness } from "../harness/skein-harness";
 import { FriendzProtocol } from "../p2p/friends-protocol";
-import { FRIENDZ_ALPN, type IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
+import { FRIENDZ_ALPN, restrictBlobToPeers, type IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
 import { createWidgetDoc } from "../widgets/widget-doc";
 import {
   buildFriendzTestBridge,
@@ -83,7 +83,7 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
     registry: createTestRegistry(),
     repo: harness.repo,
     restrictBlobToPeers: (blake3Hash, peerNodeIds) =>
-      harness.iroh!.restrictBlobToPeers(blake3Hash, peerNodeIds),
+      restrictBlobToPeers(harness.iroh!, blake3Hash, peerNodeIds),
   });
 
   const irohAdapter = harness.iroh!;
@@ -212,7 +212,7 @@ async function joinCanvasForTest(docId: string): Promise<{ canvasDocId: string }
     registry: createTestRegistry(),
     repo: sharedRepo,
     restrictBlobToPeers: sharedIrohAdapter
-      ? (blake3Hash, peerNodeIds) => sharedIrohAdapter!.restrictBlobToPeers(blake3Hash, peerNodeIds)
+      ? (blake3Hash, peerNodeIds) => restrictBlobToPeers(sharedIrohAdapter!, blake3Hash, peerNodeIds)
       : undefined,
   });
 

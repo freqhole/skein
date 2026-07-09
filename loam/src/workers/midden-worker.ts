@@ -14,6 +14,7 @@
 
 import * as Comlink from "comlink";
 import { CancelToken, MiddenNode, MiddenNodeOptions } from "@freqhole/midden";
+import { MIDDEN_WORKER_READY_MESSAGE } from "@freqhole/reliquary/worker";
 
 let node: MiddenNode | null = null;
 
@@ -437,5 +438,6 @@ Comlink.expose(api);
 
 // ready signal AFTER Comlink registered its message listener — same race
 // (and same fix) as blob-worker.ts: an RPC posted before the listener
-// exists is dropped forever.
-postMessage("skein-midden-worker-ready");
+// exists is dropped forever. the exact literal matters: it must match
+// what @freqhole/reliquary/worker's WorkerMiddenNode client waits for.
+postMessage(MIDDEN_WORKER_READY_MESSAGE);

@@ -26,7 +26,7 @@ import { BroadcastChannelNetworkAdapter } from "@automerge/automerge-repo-networ
 import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb";
 import { CanvasStore } from "../canvas/canvas-store";
 import { ensureIdentity, getMiddenNode as getDefaultMiddenNode } from "../p2p/identity";
-import { IrohNetworkAdapter, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
+import { createIrohNetworkAdapter, type IrohNetworkAdapter, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
 import { handleSkeinStream } from "../p2p/skein-handler";
 
 export interface SkeinHarnessOptions {
@@ -185,7 +185,7 @@ export async function createSkeinHarness(
         options.getMiddenNode ??
         (async (): Promise<MiddenStreamNode> =>
           (await getDefaultMiddenNode()) as unknown as MiddenStreamNode);
-      iroh = new IrohNetworkAdapter(getMidden);
+      iroh = createIrohNetworkAdapter(getMidden);
 
       // register the skein/1 handler so this peer can serve blobs (and
       // answer ensure_blob probes) to other peers/hubs — mirrors what

@@ -62,11 +62,12 @@ export interface InitCanvasOptions {
   /**
    * optional hook that restricts a blob (by blake3 hash) to a given set of
    * peer node ids at the `iroh-blobs/*` transport layer — see
-   * `IrohNetworkAdapter.restrictBlobToPeers()`. when provided, the canvas
-   * keeps every file widget's blob allow-list in sync with this canvas's
-   * `.acl` (see `blob-acl-sync.ts`) for as long as the canvas stays open.
-   * omitted in test harnesses/narthex init that have no real blob transport
-   * to gate, or nothing worth gating (the narthex has no file widgets).
+   * `restrictBlobToPeers()` in `p2p/iroh-network-adapter.ts`. when provided,
+   * the canvas keeps every file widget's blob allow-list in sync with this
+   * canvas's `.acl` (see `blob-acl-sync.ts`) for as long as the canvas stays
+   * open. omitted in test harnesses/narthex init that have no real blob
+   * transport to gate, or nothing worth gating (the narthex has no file
+   * widgets).
    */
   restrictBlobToPeers?: (blake3Hash: string, peerNodeIds: string[]) => Promise<void>;
 }

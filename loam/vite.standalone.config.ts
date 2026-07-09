@@ -34,19 +34,35 @@ export default defineConfig({
     },
     sourcemap: true,
   },
-  // in tauri builds, alias @freqhole/midden to a stub (P2P transport is handled by the rust backend)
-  ...(isTauriBuild
-    ? {
-        resolve: {
-          alias: {
-            "@freqhole/midden": path.resolve(dirname, "src/stubs/midden-stub.ts"),
-          },
+  // in tauri builds, alias @freqhole/midden to a stub (P2P transport is handled by the rust backend).
+  // also alias the bare "midden" specifier - reliquary's blob worker dynamically
+  // imports it by that literal name (see @freqhole/reliquary/worker's
+  // midden-blake3.ts). browser builds point it at the real package; tauri
+  // builds point it at the same local stub @freqhole/midden is aliased to.
+  resolve: {
+    alias: isTauriBuild
+      ? {
+          "@freqhole/midden": path.resolve(dirname, "src/stubs/midden-stub.ts"),
+          midden: path.resolve(dirname, "src/stubs/midden-stub.ts"),
+        }
+      : {
+          midden: "@freqhole/midden",
         },
-      }
-    : {}),
+  },
   // exclude @freqhole/midden from esbuild pre-bundling — it contains a .wasm
   // file that esbuild can't handle; vite-plugin-wasm takes care of it instead.
   optimizeDeps: {
     exclude: ["@freqhole/midden"],
+  },
+  // allow serving the @freqhole/midden package (../../midden/pkg) and the
+  // @freqhole/reliquary package (../../reliquary/ts) - both sibling repos of
+  // skein, two levels above loam, linked in via a file: dependency. without
+  // this, the browser's worker import of reliquary's blob-worker.js (which
+  // resolves through the node_modules symlink to the real path outside
+  // loam's project root) is rejected by vite's dev-server fs allow list.
+  server: {
+    fs: {
+      allow: ["..", "../../midden", "../../reliquary"],
+    },
   },
 });

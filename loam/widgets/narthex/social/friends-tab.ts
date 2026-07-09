@@ -4,7 +4,7 @@
 
 import { Assets, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
 import type { DocumentId } from "@automerge/automerge-repo";
-import { log } from "../../../src/utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import { CanvasBinStore } from "../../../src/canvas/canvas-bin-doc";
 import { ProfileStore } from "../../../src/canvas/profile-doc";
 import {

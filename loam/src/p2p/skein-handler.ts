@@ -16,11 +16,12 @@
 // ---------------------------------------------------------------------------
 
 import type { BiStreamLike } from "./iroh-network-adapter";
-import { base64Encode } from "../workers/blob-worker-client";
-import * as blobStore from "../storage/skein-blob-store";
+import { base64Encode } from "@freqhole/reliquary/worker";
+import * as blobStore from "../storage/blob-store";
+import { getBlobDomain } from "../storage/blob-store";
 import { getMiddenNode as getMiddenNodeFromIdentity } from "./identity";
 import { isTauriMode, dispatch } from "./tauri-transport";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 
 // ---- peer message types ---------------------------------------------------
 // these match midden's PeerMessage enum (serde tag = "type", rename_all = "snake_case")
@@ -313,7 +314,7 @@ async function handleBlobMetadata(
         filename: record.filename,
         size: record.size,
         blake3: record.blake3 || null,
-        domain: record.domain,
+        domain: getBlobDomain(record),
         blob_type: record.blob_type,
       },
     }),

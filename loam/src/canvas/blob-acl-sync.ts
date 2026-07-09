@@ -1,6 +1,6 @@
 /**
  * mirrors a canvas's `.acl` onto the blob-level allow-list that
- * `IrohNetworkAdapter.restrictBlobToPeers()` (which forwards to
+ * `restrictBlobToPeers()` (`p2p/iroh-network-adapter.ts`, which forwards to
  * `MiddenNode::restrict_blob_to_peers` in `midden/src/lib.rs`) enforces at
  * the `iroh-blobs/*` transport layer.
  *
@@ -41,7 +41,7 @@
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import type { CanvasStore } from "./canvas-store";
 import { sharedBlobAclRegistry, type BlobAclRegistry } from "./blob-acl-registry";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 
 const TAG = "canvas.blob-acl-sync";
 

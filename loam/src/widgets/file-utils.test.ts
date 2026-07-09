@@ -34,21 +34,34 @@ vi.mock("../p2p/identity", () => ({
 
 // mock the blob store — the tauri-mode upload/dedup paths only ever touch
 // getBlobRecord/storeBlob/classifyDomain; mocking the whole module avoids
-// real IndexedDB/OPFS access.
+// real IndexedDB/OPFS access. storeBlob returns a fake record (the shared
+// package's real storeBlob computes blake3/sha256 from the bytes and
+// returns the stored record) — a generic default is enough everywhere
+// except the one test that asserts on the returned sha256 specifically.
 const mockGetBlobRecord = vi.fn<(blobId: string) => Promise<any>>();
-const mockStoreBlob = vi.fn<(...args: any[]) => Promise<void>>();
-const mockComputeSha256 = vi.fn<(data: ArrayBuffer) => Promise<string>>();
+const mockStoreBlob = vi.fn<(...args: any[]) => Promise<any>>(async (data: ArrayBuffer, meta: any) => ({
+  blob_id: "mock-stored-blob-id",
+  blake3: "mock-stored-blob-id",
+  sha256: "mock-stored-sha256",
+  filename: meta?.filename,
+  mime: meta?.mime,
+  size: data?.byteLength ?? 0,
+  blob_type: meta?.blob_type ?? "original",
+  parent_blob_id: meta?.parent_blob_id ?? null,
+  metadata: meta?.metadata,
+  created_at: Date.now(),
+}));
 const mockResolveBlob = vi.fn<(blobId: string, blake3?: string) => Promise<any>>();
 const mockHasBlobBytes = vi.fn<(blobId: string) => Promise<boolean>>();
-vi.mock("../storage/skein-blob-store", () => ({
+vi.mock("../storage/blob-store", () => ({
   hasBlobBytes: (...args: any[]) => mockHasBlobBytes(...args),
   getBlobRecord: (...args: any[]) => mockGetBlobRecord(...args),
   getBlobObjectURL: vi.fn(),
   storeBlob: (...args: any[]) => mockStoreBlob(...args),
-  computeSha256: (...args: any[]) => mockComputeSha256(...args),
   storeBlobFromFile: vi.fn(),
   resolveBlob: (...args: any[]) => mockResolveBlob(...args),
   getBlobData: vi.fn(),
+  getBlobDomain: (record: any) => record?.metadata?.domain ?? "file",
   classifyDomain: (mime: string) => {
     if (mime.startsWith("image/")) return "photo";
     if (mime.startsWith("video/")) return "video";
@@ -64,7 +77,7 @@ vi.mock("../storage/skein-blob-store", () => ({
 // proxy_request fallback download path (strategy 3 in
 // downloadBlobBytesFromPeer).
 const mockHashBlake3 = vi.fn<(bytes: Uint8Array) => Promise<string>>();
-vi.mock("../workers/blob-worker-client", () => ({
+vi.mock("@freqhole/reliquary/worker", () => ({
   base64Decode: vi.fn(async (b64: string) =>
     Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
   ),
@@ -730,29 +743,27 @@ describe("file-utils — tauri-mode branches", () => {
       expect(writable.close).not.toHaveBeenCalled();
     });
 
-    it("falls back to the buffered path when the doc has no blake3 hash", async () => {
+    it("fails fast when the doc has no blake3 hash (no compute-on-demand fallback — the transport package always requires blake3 up front)", async () => {
       mockIsTauriMode.mockReturnValue(false);
-      const payload = new Uint8Array([1, 2, 3]);
-      const streamFn = vi.fn();
+      const streamFn = vi.fn(async () => {
+        throw new Error("peer rejected empty blake3 hash");
+      });
       mockGetMiddenNode.mockResolvedValue({
         ensure_blob: vi.fn(async () => true),
         download_verified_streaming_with_ensure: streamFn,
-        // strategy 2 path: blake3 unknown, so the buffered by-id download runs
-        download_verified_by_id_progress: vi.fn(async () => [payload, "computed-hash"]),
       });
 
       const writable = makeWritable();
 
-      const result = await snatchBlobToDisk(
-        { ...blobInfo, blake3: "" },
-        { peer1: { nodeId: "remote-node-id" } },
-        writable as unknown as FileSystemWritableFileStream
-      );
+      await expect(
+        snatchBlobToDisk(
+          { ...blobInfo, blake3: "" },
+          { peer1: { nodeId: "remote-node-id" } },
+          writable as unknown as FileSystemWritableFileStream
+        )
+      ).rejects.toThrow("peer rejected empty blake3 hash");
 
-      expect(streamFn).not.toHaveBeenCalled();
-      expect(result.size).toBe(3);
-      expect(writable.write).toHaveBeenCalledTimes(1);
-      expect(writable.close).toHaveBeenCalledTimes(1);
+      expect(writable.write).not.toHaveBeenCalled();
     });
   });
 
@@ -952,7 +963,6 @@ describe("snatchBlob — concurrent/duplicate snatch races (browser mode)", () =
       ensure_blob: ensureBlob,
       download_verified_with_ensure_progress: downloadFn,
     });
-    mockComputeSha256.mockResolvedValue("sha256-of-payload");
     mockGetBlobRecord.mockResolvedValue(null);
 
     const info = {
@@ -1036,7 +1046,6 @@ describe("snatchBlob — concurrent/duplicate snatch races (browser mode)", () =
       ensure_blob: ensureBlob,
       download_verified_with_ensure_progress: downloadFn,
     });
-    mockComputeSha256.mockResolvedValue("sha256-of-payload");
     mockGetBlobRecord.mockResolvedValue(null);
 
     const peers = { peer1: { nodeId: "remote-node-id" } };
@@ -1084,7 +1093,6 @@ describe("snatchBlob — abort signal semantics (widget-deleted-mid-snatch scena
       ensure_blob: ensureBlob,
       download_verified_with_ensure_progress: downloadFn,
     });
-    mockComputeSha256.mockResolvedValue("sha256-of-payload");
     mockGetBlobRecord.mockResolvedValue(null);
 
     const abortController = new AbortController();
@@ -1274,9 +1282,9 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
     // both peers report they HAVE the blob (probe succeeds), but the
     // actual download fails for both (peer went offline mid-transfer, or
     // never really had the bytes despite a stale/incorrect ensure_blob
-    // response). no download_verified_by_id_progress / proxy_request
-    // fallback is configured, so downloadBlobBytesFromPeer's own "no
-    // fallback available" error is what should surface.
+    // response). no streaming/proxy strategy is configured, so the
+    // transport package's own last-real-error (not a generic "no fallback"
+    // message) is what should surface.
     const ensureBlob = vi.fn(async () => true);
     const downloadFn = vi.fn(async () => {
       throw new Error("peer connection reset mid-transfer");
@@ -1301,7 +1309,7 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
           peer2: { nodeId: "remote-node-id-2" },
         }
       )
-    ).rejects.toThrow("iroh-blobs download failed — no fallback available");
+    ).rejects.toThrow("peer connection reset mid-transfer");
 
     // both peers were genuinely tried for the download (retry-against-
     // next-peer worked), not just probed once and given up on.
@@ -1347,11 +1355,11 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
 });
 
 // ---------------------------------------------------------------------------
-// hash-mismatch / corrupted-transfer verification (downloadBlobBytesFromPeer).
+// hash-mismatch / corrupted-transfer verification (the skein/1 proxy_request
+// fallback, delegated to @freqhole/reliquary/transfer's snatchBlob).
 //
-// strategies 1/2 (iroh-blobs download_verified_with_ensure_progress /
-// download_verified_by_id_progress) get real cryptographic verification for
-// free from iroh-blobs itself: midden's Rust implementation
+// the bulk/streamed verified download strategies get real cryptographic
+// verification for free from iroh-blobs itself: midden's Rust implementation
 // (midden/src/lib.rs's download_verified) parses the REQUESTED blake3_hash
 // into an iroh_blobs::Hash and downloads via
 // `blobs_downloader.download(HashAndFormat::raw(hash), ...)`, then reads the
@@ -1360,23 +1368,21 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
 // requested hash's BAO tree during the transfer itself (a
 // DownloadProgressItem::Error/DownloadError surfaces as an Err before any
 // bytes are ever returned to JS). a mismatching response is therefore
-// rejected at the WASM/Rust layer, not silently handed back — so these two
+// rejected at the WASM/Rust layer, not silently handed back — so these
 // strategies are deliberately NOT re-verified again here; doing so would be
 // redundant, not a real gap. this is NOT tested here (would require a real
 // iroh-blobs transfer, out of scope for a mocked unit test) but is recorded
 // as the evidenced reasoning behind the design.
 //
-// strategy 3 (the skein/1 proxy_request JSON fallback, used only when a
-// peer is a tauri app whose rust backend doesn't accept the iroh-blobs
-// ALPN) has NO such transport-level guarantee — it's a plain base64 JSON
-// response. file-utils.ts already computes blake3 of the received bytes in
-// JS (via hashBlake3, reused from the blob worker rather than a new
-// dependency) and rejects on mismatch — these tests prove that check
-// actually catches a corrupted/malicious response instead of silently
-// accepting it.
+// the skein/1 proxy_request JSON fallback (used only when a peer is a
+// tauri app whose rust backend doesn't accept the iroh-blobs ALPN) has NO
+// such transport-level guarantee — it's a plain base64 JSON response. the
+// transport package computes blake3 of the received bytes and rejects on
+// mismatch — these tests prove that check actually catches a corrupted/
+// malicious response instead of silently accepting it.
 // ---------------------------------------------------------------------------
 
-describe("downloadBlobBytesFromPeer — proxy_request fallback hash verification", () => {
+describe("snatchBlob — proxy_request fallback hash verification", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIsTauriMode.mockReturnValue(false);
@@ -1384,7 +1390,7 @@ describe("downloadBlobBytesFromPeer — proxy_request fallback hash verification
 
   function mockProxyRequestNode(base64Payload: string) {
     return {
-      // no download_verified_with_ensure_progress / download_verified_by_id_progress
+      // no download_verified_with_ensure_progress / download_verified_streaming_with_ensure
       // — forces strategy 3 (proxy_request), same as a real tauri-peer target.
       ensure_blob: vi.fn(async () => true),
       proxy_request: vi.fn(async () => ({
@@ -1426,8 +1432,19 @@ describe("downloadBlobBytesFromPeer — proxy_request fallback hash verification
     const base64Payload = btoa(String.fromCharCode(...payload));
     mockGetMiddenNode.mockResolvedValue(mockProxyRequestNode(base64Payload));
     mockHashBlake3.mockResolvedValue("expected-hash-of-real-content");
-    mockComputeSha256.mockResolvedValue("sha256-of-payload");
     mockGetBlobRecord.mockResolvedValue(null);
+    mockStoreBlob.mockResolvedValueOnce({
+      blob_id: "expected-hash-of-real-content",
+      blake3: "expected-hash-of-real-content",
+      sha256: "sha256-of-payload",
+      filename: "clip.mp3",
+      mime: "audio/mpeg",
+      size: payload.length,
+      blob_type: "original",
+      parent_blob_id: null,
+      metadata: { domain: "audio", source: "snatch" },
+      created_at: Date.now(),
+    });
 
     const result = await snatchBlob(
       {
@@ -1446,7 +1463,9 @@ describe("downloadBlobBytesFromPeer — proxy_request fallback hash verification
     expect(result.blobId).toBe("expected-hash-of-real-content");
     expect(result.sha256).toBe("sha256-of-payload");
     expect(mockStoreBlob).toHaveBeenCalledTimes(1);
-    expect(mockStoreBlob.mock.calls[0][0]).toBe("expected-hash-of-real-content");
+    expect(mockStoreBlob.mock.calls[0][1]).toMatchObject({
+      metadata: { domain: "audio", source: "snatch" },
+    });
   });
 });
 
