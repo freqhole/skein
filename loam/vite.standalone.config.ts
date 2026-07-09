@@ -1,6 +1,6 @@
 import path from "path";
 import { fileURLToPath } from "url";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 
 import wasm from "vite-plugin-wasm";
 
@@ -10,14 +10,32 @@ const isTauriBuild = !!process.env.VITE_TAURI;
 // custom base path for deployment (e.g. VITE_SKEIN_BASE=/skein/ for cloudflare)
 const deployBase = process.env.VITE_SKEIN_BASE;
 
+// resolves the bare "midden" specifier reliquary's blob worker dynamically
+// imports (see @freqhole/reliquary/worker's midden-blake3.ts). a plain
+// `resolve.alias` entry does not reach a worker's own module graph - vite
+// builds worker bundles through a separate plugin pipeline from the main
+// app, so this has to be a real plugin included in both the main `plugins`
+// and `worker.plugins` lists below.
+function middenBareSpecifierPlugin(target: string): Plugin {
+  return {
+    name: "midden-bare-specifier",
+    resolveId(source) {
+      if (source === "midden") return this.resolve(target, undefined, { skipSelf: true });
+      return null;
+    },
+  };
+}
+
+const middenTarget = isTauriBuild ? path.resolve(dirname, "src/stubs/midden-stub.ts") : "@freqhole/midden";
+
 export default defineConfig({
   // wasm plugin is needed (automerge uses WASM internally).
   // only @freqhole/midden (iroh P2P transport) is stubbed in tauri builds.
-  plugins: [wasm()],
-  // worker bundles need the same plugin — blob-worker imports @freqhole/midden (WASM) for blake3.
+  plugins: [wasm(), middenBareSpecifierPlugin(middenTarget)],
+  // worker bundles need the same plugins — blob-worker imports @freqhole/midden (WASM) for blake3.
   worker: {
     format: "es",
-    plugins: () => [wasm()],
+    plugins: () => [wasm(), middenBareSpecifierPlugin(middenTarget)],
   },
   base: isTauriBuild ? "./" : deployBase || "/",
   // target esnext — the app requires modern browsers (wasm, top-level await, etc.)
@@ -35,19 +53,16 @@ export default defineConfig({
     sourcemap: true,
   },
   // in tauri builds, alias @freqhole/midden to a stub (P2P transport is handled by the rust backend).
-  // also alias the bare "midden" specifier - reliquary's blob worker dynamically
-  // imports it by that literal name (see @freqhole/reliquary/worker's
-  // midden-blake3.ts). browser builds point it at the real package; tauri
-  // builds point it at the same local stub @freqhole/midden is aliased to.
+  // the bare "midden" specifier (see middenBareSpecifierPlugin above) is
+  // handled by a plugin instead of resolve.alias so it also reaches worker
+  // bundles. tauri builds point both at the same local stub @freqhole/midden
+  // is aliased to.
   resolve: {
     alias: isTauriBuild
       ? {
           "@freqhole/midden": path.resolve(dirname, "src/stubs/midden-stub.ts"),
-          midden: path.resolve(dirname, "src/stubs/midden-stub.ts"),
         }
-      : {
-          midden: "@freqhole/midden",
-        },
+      : {},
   },
   // exclude @freqhole/midden from esbuild pre-bundling — it contains a .wasm
   // file that esbuild can't handle; vite-plugin-wasm takes care of it instead.

@@ -1536,3 +1536,80 @@ describe("getThumbnailDataUrl — tauri blob_thumbnail path", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// browser-mode blob probing — ALPN mismatch regression
+//
+// found via live browser-to-browser testing (two loam tabs, no tauri): a
+// browser-mode snatch/probe between two peers always fails with
+// "no peer has the blob (all probes failed)", even when the peer genuinely
+// has it. root cause, traced through real source across three repos:
+//
+// - `probeSinglePeer` (above, in this file) calls `nodeAny.ensure_blob(...)`
+//   directly on whatever `getMiddenNode()` returns. in pure browser mode
+//   that's the wasm `MiddenNode`'s own native `ensure_blob` method (see
+//   `@freqhole/midden`'s `workers/midden-worker.ts` passthrough).
+// - midden's native `ensure_blob`/`connect_to_peer` (midden/src/lib.rs)
+//   dials the peer using `FREQHOLE_ALPN` (`"freqhole/1"`), and its own doc
+//   comment says the receiving app is expected to route it: "for other
+//   ALPNs, return a BiStream to JS... the caller should check stream.alpn()
+//   to route the connection to the appropriate handler."
+// - loam only ever registers "skein/1" (handleSkeinStream) and the friendz
+//   ALPN as receiving handlers (see `standalone/boot.ts`,
+//   `standalone/friendz-wiring.ts`) - nothing answers "freqhole/1".
+// - tauri mode's equivalent call (`tauri-transport.ts`'s `ensure_blob` ->
+//   rust `blob_iroh_probe`) correctly dials via `b"skein/1"` instead (see
+//   skein's `tauri/src/commands.rs`) - matching the registered handler.
+//   pure browser mode has no equivalent client-side implementation; it only
+//   ever calls the node's native `ensure_blob`, which can never reach a
+//   registered handler.
+//
+// this test reproduces the gap directly against real production code (the
+// actual `IrohNetworkAdapter` from `@freqhole/reliquary/automerge`, and
+// loam's actual `registerAlpnHandler("skein/1", handleSkeinStream)` call
+// site), simulating exactly what midden's native ensure_blob does on the
+// wire: dial the peer via FREQHOLE_ALPN and wait for a response.
+// ---------------------------------------------------------------------------
+
+describe("browser-mode blob probing — ALPN mismatch regression", () => {
+  it("a stream on FREQHOLE_ALPN ('freqhole/1') - the ALPN midden's native ensure_blob actually dials - reaches a registered handler in skein's real browser-mode ALPN wiring", async () => {
+    const { IrohNetworkAdapter } = await import("@freqhole/reliquary/automerge");
+    const { createMockMidden, createMockBiStream } = await import("@freqhole/reliquary/testing");
+    const { handleSkeinStream } = await import("../p2p/skein-handler");
+
+    const mockMidden = createMockMidden();
+    const adapter = new IrohNetworkAdapter({
+      getNode: vi.fn(async () => mockMidden as any),
+      getIdentity: vi.fn(async () => ({ node_id: "a".repeat(64) })),
+      onIdentityChange: vi.fn(() => () => {}),
+    });
+
+    adapter.connect("local-peer-id" as any);
+    // this is the ONLY receiving handler skein's real browser-mode boot
+    // sequence registers for non-sync traffic (see boot.ts line ~416,
+    // friendz-wiring.ts line ~242) - reproduced verbatim here, not a
+    // simplification.
+    adapter.registerAlpnHandler("skein/1", handleSkeinStream);
+    await new Promise((r) => setTimeout(r, 20)); // let the accept loop start
+
+    // simulate exactly what midden's native ensure_blob does on the wire:
+    // dial the peer via FREQHOLE_ALPN and wait for a response. built
+    // directly with createMockBiStream (not mockMidden.open_bi, whose test
+    // double ignores the alpn argument and always defaults to the sync
+    // ALPN) so the stream is genuinely addressed to "freqhole/1".
+    const stream = createMockBiStream("peer-addr", "freqhole/1");
+    mockMidden.pushIncoming(stream);
+    await new Promise((r) => setTimeout(r, 20));
+
+    // desired/correct behavior: the peer answers the request (a real fix
+    // either routes ensure_blob-style probes over "skein/1" instead, or
+    // registers a "freqhole/1" handler that bridges to the same logic).
+    // today this fails - the stream gets closed with no response, because
+    // nothing in skein's real registered-handler set answers "freqhole/1",
+    // matching the exact production log line: "dropping inbound stream -
+    // no handler registered for ALPN: freqhole/1 registered handlers:
+    // ['skein/1', 'skein-friendz/1']".
+    expect(stream.close).not.toHaveBeenCalled();
+    expect(stream._written.length).toBeGreaterThan(0);
+  });
+});
