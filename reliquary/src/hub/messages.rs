@@ -43,6 +43,10 @@ impl HubPeerService {
             }
             FriendzEvent::PeerOffline { node_id } => {
                 tracing::info!(peer = %node_id, "peer went offline");
+                // drop the peer's fallback blob-availability entries so the
+                // snatch engine doesn't keep trying candidates that can no
+                // longer answer.
+                self.engine.clear_peer(&node_id);
             }
             FriendzEvent::MessageReceived {
                 from_node_id,

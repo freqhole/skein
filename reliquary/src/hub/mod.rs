@@ -290,16 +290,16 @@ impl HubPeerService {
         // it subscribes to hub_repo's doc_notify channel internally, so we
         // don't pass an external trigger — the legacy `snatch_trigger` field
         // below is kept only because canvas/messages prototype code still
-        // calls notify_one on it. the downloader and in-flight set are both
-        // shared with the storage node's own gc-protect callback, so a blob
-        // mid-download is never swept before it's ingested into blobz.
-        let downloader = storage
-            .downloader()
-            .expect("storage node's endpoint is already attached by the time the hub starts");
+        // calls notify_one on it. the engine shares the storage node's own
+        // downloader cell (not a point-in-time clone) so it keeps observing
+        // the same live downloader across any future attach/detach cycle,
+        // and shares the in-flight set with the node's own gc-protect
+        // callback, so a blob mid-download is never swept before it's
+        // ingested into blobz.
         let snatch_trigger_legacy = Arc::new(tokio::sync::Notify::new());
         let engine = Arc::new(freqhole_reliquary::snatch::SnatchEngine::new(
             blobz.clone(),
-            Arc::new(std::sync::RwLock::new(Some(downloader))),
+            storage.downloader_cell(),
             fs_store,
             storage.in_flight.clone(),
             node_id_str.clone(),
