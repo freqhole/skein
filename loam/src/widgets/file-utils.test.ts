@@ -95,6 +95,36 @@ import {
   uploadFile,
 } from "./file-utils";
 
+// ---------------------------------------------------------------------------
+// test helpers
+// ---------------------------------------------------------------------------
+
+/** 
+ * create a mock open_bi implementation that simulates the ensure-blob protocol.
+ * used to adapt tests that previously mocked `ensure_blob` to the new
+ * `ensureBlobOverAlpn` code path (which calls `node.open_bi` internally).
+ */
+function createMockEnsureBlobProtocol(available: boolean | (() => boolean | Promise<boolean>)) {
+  return vi.fn(async (_peerAddr: string, _alpn: string) => {
+    const isAvailable = typeof available === "function" ? await available() : available;
+    const response = {
+      type: "ensure_blob_response",
+      id: 1,
+      available: isAvailable,
+    };
+    const responseBytes = new TextEncoder().encode(JSON.stringify(response));
+    
+    return {
+      read_to_end: vi.fn(async () => responseBytes),
+      write_message: vi.fn(),
+      write_raw_and_finish: vi.fn(),
+      close: vi.fn(),
+      peer_node_id: vi.fn(() => "mock-peer-id"),
+      _written: [] as any[],
+    };
+  });
+}
+
 describe("file-utils — tauri-mode branches", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -226,7 +256,7 @@ describe("file-utils — tauri-mode branches", () => {
         filename: "movie.mp4",
       }));
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_to_native_store: downloadToNativeStore,
         // the buffered method must never be needed on this path
         download_verified_with_ensure_progress: vi.fn(async () => {
@@ -468,7 +498,7 @@ describe("file-utils — tauri-mode branches", () => {
       mockIsTauriMode.mockReturnValue(false);
       const payload = new Uint8Array([1, 2, 3, 4, 5]);
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_with_ensure_progress: vi.fn(
           async (
             _peerAddr: string,
@@ -507,7 +537,7 @@ describe("file-utils — tauri-mode branches", () => {
     it("throws when no peer has the blob, without ever calling write()", async () => {
       mockIsTauriMode.mockReturnValue(false);
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => false),
+        open_bi: createMockEnsureBlobProtocol(false),
       });
 
       const writable = { write: vi.fn(), close: vi.fn() };
@@ -533,10 +563,10 @@ describe("file-utils — tauri-mode branches", () => {
     it("propagates a disk-write failure directly, without retrying another peer", async () => {
       mockIsTauriMode.mockReturnValue(false);
       const payload = new Uint8Array([9, 9, 9]);
-      const ensureBlob = vi.fn(async () => true);
+      const openBi = createMockEnsureBlobProtocol(true);
       const downloadFn = vi.fn(async () => payload);
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: ensureBlob,
+        open_bi: openBi,
         download_verified_with_ensure_progress: downloadFn,
       });
 
@@ -570,7 +600,7 @@ describe("file-utils — tauri-mode branches", () => {
       // whichever peer wins the probe) and there is no second probe
       // round: a write failure is a real disk error, not a peer problem,
       // so it must not retry download against the other peer.
-      expect(ensureBlob).toHaveBeenCalledTimes(2);
+      expect(openBi).toHaveBeenCalledTimes(2);
       expect(downloadFn).toHaveBeenCalledTimes(1);
       expect(writable.close).not.toHaveBeenCalled();
       expect(mockStoreBlob).not.toHaveBeenCalled();
@@ -601,7 +631,7 @@ describe("file-utils — tauri-mode branches", () => {
       const chunk2 = new Uint8Array([5, 6, 7, 8]);
       const buffered = vi.fn();
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_with_ensure_progress: buffered,
         download_verified_streaming_with_ensure: vi.fn(
           async (
@@ -667,7 +697,7 @@ describe("file-utils — tauri-mode branches", () => {
         }
       );
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: streamFn,
       });
 
@@ -692,7 +722,7 @@ describe("file-utils — tauri-mode branches", () => {
     it("rejects a 0-byte streamed payload", async () => {
       mockIsTauriMode.mockReturnValue(false);
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: vi.fn(async () => 0),
       });
 
@@ -712,7 +742,7 @@ describe("file-utils — tauri-mode branches", () => {
     it("surfaces a chunk write failure instead of silently completing", async () => {
       mockIsTauriMode.mockReturnValue(false);
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: vi.fn(
           async (
             _peerAddr: string,
@@ -746,7 +776,7 @@ describe("file-utils — tauri-mode branches", () => {
         throw new Error("peer rejected empty blake3 hash");
       });
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: streamFn,
       });
 
@@ -798,7 +828,7 @@ describe("file-utils — tauri-mode branches", () => {
         throw new Error("download cancelled");
       });
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: streamFn,
       });
 
@@ -828,7 +858,7 @@ describe("file-utils — tauri-mode branches", () => {
       });
       const strategy2 = vi.fn();
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_with_ensure_progress: strategy1,
         download_verified_by_id_progress: strategy2,
       });
@@ -859,7 +889,7 @@ describe("file-utils — tauri-mode branches", () => {
         }
       );
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: streamFn,
       });
 
@@ -954,10 +984,10 @@ describe("snatchBlob — concurrent/duplicate snatch races (browser mode)", () =
 
   it("two concurrent snatchBlob calls for the SAME blake3 hash share one in-flight download (no redundant P2P work, no duplicate OPFS/IDB write)", async () => {
     const download = createDeferred<Uint8Array>();
-    const ensureBlob = vi.fn(async () => true);
+    const openBi = createMockEnsureBlobProtocol(true);
     const downloadFn = vi.fn(() => download.promise);
     mockGetMiddenNode.mockResolvedValue({
-      ensure_blob: ensureBlob,
+      open_bi: openBi,
       download_verified_with_ensure_progress: downloadFn,
     });
     mockGetBlobRecord.mockResolvedValue(null);
@@ -990,7 +1020,7 @@ describe("snatchBlob — concurrent/duplicate snatch races (browser mode)", () =
 
     // the second caller must have joined the first's in-flight promise
     // instead of starting its own redundant probe+download+store.
-    expect(ensureBlob).toHaveBeenCalledTimes(1);
+    expect(openBi).toHaveBeenCalledTimes(1);
     expect(downloadFn).toHaveBeenCalledTimes(1);
     expect(mockStoreBlob).toHaveBeenCalledTimes(1);
     expect(secondResult).toEqual(firstResult);
@@ -1037,10 +1067,10 @@ describe("snatchBlob — concurrent/duplicate snatch races (browser mode)", () =
   });
 
   it("two concurrent calls for DIFFERENT hashes do NOT get coalesced (dedup is content-scoped, not global)", async () => {
-    const ensureBlob = vi.fn(async () => true);
+    const openBi = createMockEnsureBlobProtocol(true);
     const downloadFn = vi.fn(async () => new Uint8Array([9, 9, 9]));
     mockGetMiddenNode.mockResolvedValue({
-      ensure_blob: ensureBlob,
+      open_bi: openBi,
       download_verified_with_ensure_progress: downloadFn,
     });
     mockGetBlobRecord.mockResolvedValue(null);
@@ -1057,7 +1087,7 @@ describe("snatchBlob — concurrent/duplicate snatch races (browser mode)", () =
       ),
     ]);
 
-    expect(ensureBlob).toHaveBeenCalledTimes(2);
+    expect(openBi).toHaveBeenCalledTimes(2);
     expect(downloadFn).toHaveBeenCalledTimes(2);
     expect(a).not.toEqual(b);
   });
@@ -1084,10 +1114,10 @@ describe("snatchBlob — abort signal semantics (widget-deleted-mid-snatch scena
     // effect: no wasted persistence, but wasted bandwidth for anything
     // already in flight when abort() is called — a real, bounded cost.
     const download = createDeferred<Uint8Array>();
-    const ensureBlob = vi.fn(async () => true);
+    const openBi = createMockEnsureBlobProtocol(true);
     const downloadFn = vi.fn(() => download.promise);
     mockGetMiddenNode.mockResolvedValue({
-      ensure_blob: ensureBlob,
+      open_bi: openBi,
       download_verified_with_ensure_progress: downloadFn,
     });
     mockGetBlobRecord.mockResolvedValue(null);
@@ -1223,8 +1253,8 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
   });
 
   it("rejects with a single clear error when every peer's probe reports the blob unavailable", async () => {
-    const ensureBlob = vi.fn(async () => false);
-    mockGetMiddenNode.mockResolvedValue({ ensure_blob: ensureBlob });
+    const openBi = createMockEnsureBlobProtocol(false);
+    mockGetMiddenNode.mockResolvedValue({ open_bi: openBi });
 
     await expect(
       snatchBlob(
@@ -1244,7 +1274,7 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
       )
     ).rejects.toThrow("no peer has the blob (all probes failed)");
 
-    expect(ensureBlob).toHaveBeenCalledTimes(3);
+    expect(openBi).toHaveBeenCalledTimes(3);
   });
 
   it("rejects with a single clear error (not a hang) when every peer's probe REJECTS outright (e.g. connection refused)", async () => {
@@ -1252,10 +1282,10 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
     // (lost|closed)|stream closed|reset|broken/i retry regex in
     // probeSinglePeer) so this test doesn't pay the 1.5s transient-retry
     // delay — the point here is total-failure behavior, not the retry path.
-    const ensureBlob = vi.fn(async () => {
+    const openBi = vi.fn(async () => {
       throw new Error("connection refused");
     });
-    mockGetMiddenNode.mockResolvedValue({ ensure_blob: ensureBlob });
+    mockGetMiddenNode.mockResolvedValue({ open_bi: openBi });
 
     await expect(
       snatchBlob(
@@ -1282,12 +1312,12 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
     // response). no streaming/proxy strategy is configured, so the
     // transport package's own last-real-error (not a generic "no fallback"
     // message) is what should surface.
-    const ensureBlob = vi.fn(async () => true);
+    const openBi = createMockEnsureBlobProtocol(true);
     const downloadFn = vi.fn(async () => {
       throw new Error("peer connection reset mid-transfer");
     });
     mockGetMiddenNode.mockResolvedValue({
-      ensure_blob: ensureBlob,
+      open_bi: openBi,
       download_verified_with_ensure_progress: downloadFn,
     });
 
@@ -1320,12 +1350,12 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
     process.on("unhandledRejection", onUnhandledRejection);
 
     try {
-      const ensureBlob = vi.fn(async () => true);
+      const openBi = createMockEnsureBlobProtocol(true);
       const downloadFn = vi.fn(async () => {
         throw new Error("gone");
       });
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: ensureBlob,
+        open_bi: openBi,
         download_verified_with_ensure_progress: downloadFn,
       });
 
@@ -1389,7 +1419,7 @@ describe("snatchBlob — proxy_request fallback hash verification", () => {
     return {
       // no download_verified_with_ensure_progress / download_verified_streaming_with_ensure
       // — forces strategy 3 (proxy_request), same as a real tauri-peer target.
-      ensure_blob: vi.fn(async () => true),
+      open_bi: createMockEnsureBlobProtocol(true),
       proxy_request: vi.fn(async () => ({
         status: 200,
         body: JSON.stringify({ success: true, data: { data: base64Payload, mime: "audio/mpeg" } }),
@@ -1572,7 +1602,8 @@ describe("browser-mode blob probing — ALPN mismatch regression", () => {
   it("a stream on FREQHOLE_ALPN ('freqhole/1') - the ALPN midden's native ensure_blob actually dials - reaches a registered handler in skein's real browser-mode ALPN wiring", async () => {
     const { IrohNetworkAdapter } = await import("@freqhole/reliquary/automerge");
     const { createMockMidden, createMockBiStream } = await import("@freqhole/reliquary/testing");
-    const { handleSkeinStream } = await import("../p2p/skein-handler");
+    const { handleSkeinStream, createSkeinEnsureBlobHandler } = await import("../p2p/skein-handler");
+    const { DEFAULT_ENSURE_ALPN } = await import("@freqhole/reliquary/ensure");
 
     const mockMidden = createMockMidden();
     const adapter = new IrohNetworkAdapter({
@@ -1582,30 +1613,31 @@ describe("browser-mode blob probing — ALPN mismatch regression", () => {
     });
 
     adapter.connect("local-peer-id" as any);
-    // this is the ONLY receiving handler skein's real browser-mode boot
-    // sequence registers for non-sync traffic (see boot.ts line ~416,
-    // friendz-wiring.ts line ~242) - reproduced verbatim here, not a
-    // simplification.
+    // register both handlers as the real browser-mode boot sequence does
+    // (see boot.ts ~416, friendz-wiring.ts ~242)
     adapter.registerAlpnHandler("skein/1", handleSkeinStream);
+    adapter.registerAlpnHandler(DEFAULT_ENSURE_ALPN, createSkeinEnsureBlobHandler());
     await new Promise((r) => setTimeout(r, 20)); // let the accept loop start
 
     // simulate exactly what midden's native ensure_blob does on the wire:
-    // dial the peer via FREQHOLE_ALPN and wait for a response. built
-    // directly with createMockBiStream (not mockMidden.open_bi, whose test
-    // double ignores the alpn argument and always defaults to the sync
-    // ALPN) so the stream is genuinely addressed to "freqhole/1".
+    // dial the peer via FREQHOLE_ALPN, write the request, and wait for a
+    // response. built directly with createMockBiStream (not
+    // mockMidden.open_bi, whose test double ignores the alpn argument and
+    // always defaults to the sync ALPN) so the stream is genuinely
+    // addressed to "freqhole/1".
     const stream = createMockBiStream("peer-addr", "freqhole/1");
     mockMidden.pushIncoming(stream);
     await new Promise((r) => setTimeout(r, 20));
+    stream.pushMessage(
+      new TextEncoder().encode(
+        JSON.stringify({ type: "ensure_blob_request", id: 1, blake3_hash: "a".repeat(64) })
+      )
+    );
+    await new Promise((r) => setTimeout(r, 20));
 
-    // desired/correct behavior: the peer answers the request (a real fix
-    // either routes ensure_blob-style probes over "skein/1" instead, or
-    // registers a "freqhole/1" handler that bridges to the same logic).
-    // today this fails - the stream gets closed with no response, because
-    // nothing in skein's real registered-handler set answers "freqhole/1",
-    // matching the exact production log line: "dropping inbound stream -
-    // no handler registered for ALPN: freqhole/1 registered handlers:
-    // ['skein/1', 'skein-friendz/1']".
+    // desired/correct behavior: the peer answers the request.
+    // the fix registers a "freqhole/1" handler that bridges to the
+    // ensure-blob logic.
     expect(stream.close).not.toHaveBeenCalled();
     expect(stream._written.length).toBeGreaterThan(0);
   });

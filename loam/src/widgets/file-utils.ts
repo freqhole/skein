@@ -54,6 +54,7 @@ import {
   type SnatchInfo as TransferSnatchInfo,
   type SnatchOptions as TransferSnatchOptions,
 } from "@freqhole/reliquary/transfer";
+import { ensureBlobOverAlpn } from "@freqhole/reliquary/ensure";
 
 const TAG = "file-utils";
 
@@ -779,14 +780,10 @@ async function probeSinglePeer(
     throw new DOMException("snatch cancelled", "AbortError");
   }
 
-  // both browser midden and TauriStreamNode expose the same `ensure_blob`
-  // shape (skein/1 protocol). the previous `invoke("p2p_probe_blob")`
-  // path referenced a freqhole-era command that doesn't exist in skein.
   const node = await getMiddenNode();
-  const nodeAny = node as any;
 
-  if (typeof nodeAny.ensure_blob !== "function") {
-    throw new Error("p2p node does not support ensure_blob");
+  if (typeof (node as any).open_bi !== "function") {
+    throw new Error("p2p node does not support open_bi (required for ensure-blob protocol)");
   }
 
   log.debug(
@@ -796,7 +793,7 @@ async function probeSinglePeer(
 
   const attempt = async (label: string): Promise<boolean> => {
     return await withPeerTimeout(
-      nodeAny.ensure_blob(peerAddr, info.blake3) as Promise<boolean>,
+      ensureBlobOverAlpn(node as any, peerAddr, info.blake3),
       PROBE_TIMEOUT_MS
     ).catch((err) => {
       log.warn(

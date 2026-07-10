@@ -16,7 +16,8 @@ import { buildP2PBridge } from "../dev/test-bridge";
 import type { SkeinTestBridgeSocial, ShareTestHooks } from "../dev/test-bridge";
 import { sharedBlobAclRegistry } from "../canvas/blob-acl-registry";
 import { preloadFonts } from "../fonts/font-loader";
-import { handleSkeinStream } from "../p2p/skein-handler";
+import { handleSkeinStream, createSkeinEnsureBlobHandler } from "../p2p/skein-handler";
+import { DEFAULT_ENSURE_ALPN } from "@freqhole/reliquary/ensure";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
 import {
   destroyBridge,
@@ -408,12 +409,13 @@ class SkeinRouter {
     });
     this.friendzDocUnsubs.push(unsubIdentity);
 
-    // register skein/1 ALPN handler early so the browser can serve blobs
+    // register ALPN handlers early so the browser can serve blobs
     // to peers regardless of friendz protocol initialization state.
-    // (friendz-wiring.ts also registers this, but that happens later and
+    // (friendz-wiring.ts also registers these, but that happens later and
     // only when navigating to the narthex with a valid identity.)
     if (!isTauriMode()) {
       this.irohAdapter.registerAlpnHandler("skein/1", handleSkeinStream);
+      this.irohAdapter.registerAlpnHandler(DEFAULT_ENSURE_ALPN, createSkeinEnsureBlobHandler());
     }
 
     // listen for hash changes (browser back/forward, programmatic navigation)

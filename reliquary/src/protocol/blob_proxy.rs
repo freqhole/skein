@@ -1,4 +1,4 @@
-//! `skein/1` blob-proxy glue.
+//! `freqhole/1` blob-proxy glue.
 //!
 //! the protocol handler, message types, and client-side probe helper all
 //! come from [`freqhole_reliquary::ensure`] — this module supplies only
@@ -27,8 +27,8 @@ use freqhole_reliquary::blobz::BlobStore;
 use freqhole_reliquary::ensure::EnsureBlobHandler;
 use freqhole_reliquary::gate::AccessGate;
 
-/// ALPN protocol identifier for skein blob-proxy connections.
-pub const SKEIN_ALPN: &[u8] = b"skein/1";
+/// ALPN protocol identifier for the shared ensure blob protocol.
+pub const ENSURE_ALPN: &[u8] = b"freqhole/1";
 
 /// gates `ensure_blob` requests on hub-friend status.
 struct FriendGate {
@@ -42,11 +42,11 @@ impl AccessGate for FriendGate {
     }
 }
 
-/// build the `skein/1` handler, gated on friend status.
+/// build the `freqhole/1` handler, gated on friend status.
 pub fn new_handler(
     store: &'static FsStore,
     blobz: Arc<dyn BlobStore>,
     friendz: friendz::Store,
 ) -> EnsureBlobHandler {
-    EnsureBlobHandler::new(SKEIN_ALPN, store, blobz, Arc::new(FriendGate { friendz }))
+    EnsureBlobHandler::new(ENSURE_ALPN, store, blobz, Arc::new(FriendGate { friendz }))
 }

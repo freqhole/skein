@@ -1177,7 +1177,7 @@ async fn prewarm_fs_store(state: &AppState, blob: &BlobRecord) {
 /// [`crate::streams::StreamRegistry::start_with_blobs`]) can serve it to a
 /// peer over verified streaming.
 ///
-/// called from the frontend's `handleEnsureBlob` over `skein/1`: when a
+/// called from the frontend's `handleEnsureBlob` over `freqhole/1`: when a
 /// peer probes us for a blob via `ensure_blob_request`, the JS layer
 /// dispatches this action so the underlying bytes are loaded into the
 /// FsStore before we reply `available: true`. without this preload, the
@@ -1670,7 +1670,7 @@ struct BlobIrohProbeArgs {
     blake3: String,
 }
 
-/// lightweight peer-availability probe over the `skein/1` ALPN.
+/// lightweight peer-availability probe over the `freqhole/1` ALPN.
 ///
 /// mirrors tomb's `grimoire::federation::p2p_client::ensure_blob` /
 /// `PeerConnection::ensure_blob` — opens a single bi stream, writes one
@@ -1716,7 +1716,7 @@ async fn blob_iroh_probe(
 
     let (endpoint, _, _) = ensure_network(state).await?;
     let conn = endpoint
-        .connect(iroh::EndpointAddr::from(node_id), b"skein/1")
+        .connect(iroh::EndpointAddr::from(node_id), b"freqhole/1")
         .await
         .map_err(|e| DispatchError::Stream(format!("connect: {e}")))?;
 

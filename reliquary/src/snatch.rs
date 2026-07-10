@@ -8,7 +8,7 @@
 //! it both for a full boot-time sweep and for single-doc rescans driven by
 //! `hub_repo`'s doc-change notifications. [`HubPeerProbeTransport`] asks a
 //! candidate peer whether it has a blob via `ensure_blob_request` over the
-//! `skein/1` ALPN, the same handshake `protocol::blob_proxy` uses for the
+//! `freqhole/1` ALPN, the same handshake `protocol::blob_proxy` uses for the
 //! ensure-request gate.
 //!
 //! this module also hosts the doc-shape helpers (`classify_doc`,
@@ -21,7 +21,7 @@ use iroh::Endpoint;
 use tokio::sync::broadcast;
 
 use crate::hub_repo::HubRepo;
-use crate::protocol::blob_proxy::SKEIN_ALPN;
+use crate::protocol::blob_proxy::ENSURE_ALPN;
 use freqhole_reliquary::ensure::PeerMessage;
 use freqhole_reliquary::snatch::{
     BlobDescriptor, BlobRefSource, PeerProbeTransport, ProbeError, SnatchEngine,
@@ -58,7 +58,7 @@ pub struct BlobRef {
 
 /// concrete [`SnatchEngine`] instantiation for the hub: scans automerge
 /// canvas/widget docs for blob references ([`HubBlobRefSource`]) and probes
-/// peers over the `skein/1` ALPN ([`HubPeerProbeTransport`]).
+/// peers over the `freqhole/1` ALPN ([`HubPeerProbeTransport`]).
 pub(crate) type HubSnatchEngine = SnatchEngine<HubBlobRefSource, HubPeerProbeTransport>;
 
 /// where the hub's blob references live: automerge canvas docs (file
@@ -305,7 +305,7 @@ impl BlobRefSource for HubBlobRefSource {
     }
 }
 
-/// probes a peer for blob availability over the `skein/1` ALPN
+/// probes a peer for blob availability over the `freqhole/1` ALPN
 /// (`ensure_blob_request`/`ensure_blob_response`), the same handshake
 /// `protocol::blob_proxy` uses for the ensure-request gate.
 pub(crate) struct HubPeerProbeTransport {
@@ -387,8 +387,7 @@ fn trunc(s: &str) -> &str {
     }
 }
 
-/// send `ensure_blob_request` to a single peer over the `skein/1` ALPN.
-
+/// send `ensure_blob_request` to a single peer over the `freqhole/1` ALPN.
 ///
 /// returns `true` if the peer has the blob and it's now available for download.
 async fn probe_single_peer(
@@ -403,7 +402,7 @@ async fn probe_single_peer(
     let addr = iroh::EndpointAddr::from(node_id);
 
     let conn = endpoint
-        .connect(addr, SKEIN_ALPN)
+        .connect(addr, ENSURE_ALPN)
         .await
         .map_err(|e| SnatchError::Connection(format!("{e}")))?;
 

@@ -20,7 +20,8 @@ import {
 
 import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
-import { handleSkeinStream } from "../p2p/skein-handler";
+import { handleSkeinStream, createSkeinEnsureBlobHandler } from "../p2p/skein-handler";
+import { DEFAULT_ENSURE_ALPN } from "@freqhole/reliquary/ensure";
 import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
 import { log } from "@freqhole/reliquary/utils";
 import { getBlobRecordByBlake3 } from "../storage/blob-store";
@@ -237,9 +238,10 @@ export async function initFriendzWiring(
     protocol.handleStream(stream);
   });
 
-  // register ALPN handler for incoming skein/1 streams (blob serving, proxy requests)
-  log.debug(TAG, "registering skein/1 handler on irohAdapter");
+  // register ALPN handlers for incoming skein/1 and freqhole/1 streams
+  log.debug(TAG, "registering skein/1 and freqhole/1 handlers on irohAdapter");
   irohAdapter.registerAlpnHandler("skein/1", handleSkeinStream);
+  irohAdapter.registerAlpnHandler(DEFAULT_ENSURE_ALPN, createSkeinEnsureBlobHandler());
 
   // collect unsub callbacks so the caller can tear everything down
   const unsubs: Array<() => void> = [];

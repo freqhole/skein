@@ -1,6 +1,6 @@
 //! blob-fetch ACL gate for the `iroh-blobs/*` verified-transfer ALPN.
 //!
-//! `skein/1`'s `ensure_blob` handshake (`protocol::blob_proxy.rs`) only
+//! `freqhole/1`'s `ensure_blob` handshake (`protocol::blob_proxy.rs`) only
 //! decides whether the hub *imports* a blob into its iroh-blobs store by
 //! reference - the actual bytes flow over `iroh-blobs/*`, which is what
 //! this module gates: a peer must (a) be a hub friend and (b) have a

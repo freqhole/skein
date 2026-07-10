@@ -59,6 +59,7 @@ pub const FRONTEND_ALPNS: &[&[u8]] = &[
     b"iroh/automerge-repo/1",
     b"skein-friendz/1",
     b"skein/1",
+    b"freqhole/1",
     // dedicated namespace kept around for future frontend-only sub-protocols.
     b"skein/frontend/0",
 ];

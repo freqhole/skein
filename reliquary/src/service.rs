@@ -4,7 +4,7 @@
 //!
 //! - `iroh/automerge-repo/1` — automerge sync via [`IrohRepo`] + [`hub_repo::HubRepo`]
 //! - `skein-friendz/1`       — presence/heartbeat/message dispatch via [`FriendzHandler`]
-//! - `skein/1`               — blob proxy (ensure-by-blake3) via [`freqhole_reliquary::ensure::EnsureBlobHandler`]
+//! - `freqhole/1`            — blob proxy (ensure-by-blake3) via [`freqhole_reliquary::ensure::EnsureBlobHandler`]
 //! - `iroh-blobs/4`          — iroh-blobs [`BlobsProtocol`] for verified transfer
 //!
 //! phase-1 scope intentionally excludes canvas invite flows, gossip digests,
@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::friendz;
 use crate::hub_repo::HubRepo;
-use crate::protocol::blob_proxy::SKEIN_ALPN;
+use crate::protocol::blob_proxy::ENSURE_ALPN;
 use crate::protocol::handler::{FriendzEvent, FriendzHandler};
 use crate::protocol::messages::{FriendzMessage, FRIENDZ_ALPN};
 use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
@@ -231,7 +231,7 @@ impl Service {
         let router = Router::builder(endpoint.clone())
             .accept(AUTOMERGE_REPO_ALPN, iroh_repo.clone())
             .accept(FRIENDZ_ALPN, friendz_handler.clone())
-            .accept(SKEIN_ALPN, blob_proxy)
+            .accept(ENSURE_ALPN, blob_proxy)
             .accept(iroh_blobs::ALPN, blobs_protocol)
             .spawn();
 

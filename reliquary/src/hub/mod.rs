@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::friendz;
 use crate::hub_repo::HubRepo;
-use crate::protocol::blob_proxy::SKEIN_ALPN;
+use crate::protocol::blob_proxy::ENSURE_ALPN;
 use crate::protocol::handler::{FriendzEvent, FriendzHandler};
 use crate::protocol::messages::{FriendzMessage, FRIENDZ_ALPN};
 use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
@@ -129,7 +129,7 @@ pub struct HubPeerService {
     pub(crate) canvas_doc_ids: Arc<Mutex<HashSet<String>>>,
     /// blob replication engine: scans automerge canvas/widget docs for
     /// blob references the hub doesn't have locally and fetches them from
-    /// peers over the `skein/1` ALPN. wrapped in [`Arc`] so it can be moved
+    /// peers over the `freqhole/1` ALPN. wrapped in [`Arc`] so it can be moved
     /// into the spawned run loop while the hub keeps a handle - e.g. to
     /// feed it peer-offered blob inventory via `offer_peer_blobs` once a
     /// `BlobOffer` message arrives.
@@ -278,7 +278,7 @@ impl HubPeerService {
         let router = iroh::protocol::Router::builder(endpoint.clone())
             .accept(AUTOMERGE_REPO_ALPN, iroh_repo.clone())
             .accept(FRIENDZ_ALPN, friendz.clone())
-            .accept(SKEIN_ALPN, blob_proxy)
+            .accept(ENSURE_ALPN, blob_proxy)
             .accept(iroh_blobs::ALPN, blobs_protocol)
             .accept(crate::protocol::hub_admin::HUB_ADMIN_ALPN, hub_admin)
             .spawn();
