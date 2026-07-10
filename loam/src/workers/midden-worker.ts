@@ -380,11 +380,10 @@ function unprotectBlob(blake3Hash: string): void {
   requireNode().unprotect_blob(blake3Hash);
 }
 
-async function computeBlake3(peerAddr: string, blobId: string): Promise<string | null> {
-  return (await requireNode().compute_blake3(peerAddr, blobId)) ?? null;
-}
-
-// ---- proxy requests --------------------------------------------------------
+// ---- api requests -----------------------------------------------------------
+// exposed as `proxyRequest` to match @freqhole/reliquary/worker's
+// MiddenWorkerApi contract, which this worker implements the receiving end
+// of.
 
 async function proxyRequest(
   peerAddr: string,
@@ -392,7 +391,7 @@ async function proxyRequest(
   path: string,
   body: string | null
 ): Promise<{ status: number; body: string }> {
-  return (await requireNode().proxy_request(peerAddr, method, path, body)) as {
+  return (await requireNode().api_request(peerAddr, method, path, body)) as {
     status: number;
     body: string;
   };
@@ -428,7 +427,6 @@ const api = {
   downloadCancel,
   protectBlob,
   unprotectBlob,
-  computeBlake3,
   proxyRequest,
 };
 

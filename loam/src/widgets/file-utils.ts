@@ -8,7 +8,9 @@
  *
  * thumbnail fetching has a P2P fallback: when the blob isn't available
  * locally (e.g. a peer uploaded it), we proxy the thumbnail request
- * through connected canvas peers via p2p_proxy_request.
+ * through connected canvas peers via the node's proxy_request method (a
+ * skein/1 stream exchange, real for a tauri node - see tauri-transport.ts -
+ * and a no-op for a browser node, which has no working skein/1 sender).
  *
  * snatch: download a full blob from a canvas peer via iroh-blobs verified
  * transfer, then ingest it into the local grimoire (creating a media_blobz
@@ -1554,24 +1556,6 @@ async function fetchFullBlobFromPeers(blobId: string, peers: PeersMap): Promise<
             );
             return URL.createObjectURL(blob);
           }
-
-          // fallback: proxy_request for blob data
-          if (!bytes && typeof nodeAny.proxy_request === "function") {
-            try {
-              const proxyResult = await withPeerTimeout<any>(
-                nodeAny.proxy_request(peerAddr, "GET", `/api/blobs/${blobId}/data`, null),
-                30000
-              );
-              if (proxyResult.status === 200) {
-                const parsed = JSON.parse(proxyResult.body);
-                if (parsed.success && parsed.data?.data && parsed.data?.mime) {
-                  return `data:${parsed.data.mime};base64,${parsed.data.data}`;
-                }
-              }
-            } catch {
-              // fall through to next peer
-            }
-          }
         } catch (err) {
           log.debug(
             TAG,
@@ -1587,45 +1571,10 @@ async function fetchFullBlobFromPeers(blobId: string, peers: PeersMap): Promise<
     return null;
   }
 
-  for (const peerAddr of peerAddrs) {
-    try {
-      const result = await withPeerTimeout(
-        invoke<any>("p2p_proxy_request", {
-          path: `/api/blobs/${blobId}/data`,
-          body: null,
-        }),
-        30000
-      );
-
-      if (result.status !== 200) {
-        continue;
-      }
-
-      const parsed = JSON.parse(result.body);
-      if (!parsed.success || !parsed.data) {
-        continue;
-      }
-
-      const { data, mime } = parsed.data;
-      if (!data || !mime) {
-        continue;
-      }
-
-      log.debug(
-        TAG,
-        `fetched full blob ${blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
-      );
-      return `data:${mime};base64,${data}`;
-    } catch (err) {
-      log.debug(
-        TAG,
-        `peer ${peerAddr.slice(0, 16)}... failed for full blob ${blobId.slice(0, 8)}...:`,
-        err
-      );
-      continue;
-    }
-  }
-
+  // tauri mode has no working P2P full-blob-data fallback here — blob
+  // transfer between tauri peers goes through the native iroh-blobs/skein/1
+  // download paths (see snatchFromBrowserPeer's download_to_native_store
+  // branch), not this preview-data-URL path.
   return null;
 }
 
@@ -2295,7 +2244,9 @@ async function fetchThumbnailLocal(blobId: string, size: number): Promise<string
  * try fetching thumbnail data by proxying the request through canvas peers.
  * iterates connected peers and tries each one until one succeeds.
  * uses the same /api/blobs/thumbnail_data endpoint on the remote side
- * via p2p_proxy_request, so the peer does all the thumbnail chain walking.
+ * via the node's proxy_request method, so the peer does all the thumbnail
+ * chain walking. only a tauri node's proxy_request (skein/1) actually
+ * reaches a peer - a browser node's proxy_request has no working sender.
  */
 async function fetchThumbnailFromPeers(
   blobId: string,
