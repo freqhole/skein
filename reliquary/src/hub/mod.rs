@@ -7,9 +7,12 @@
 //! split into submodules:
 //! - `messages`: friendz message dispatch (friend requests, profile, heartbeat)
 //! - `canvas`: canvas invite, update, and gossip digest handling
+//! - `wire`: skein-specific wire shapes layered on haruspex's core protocol
+//!   (`skein:`-namespaced app extensions, gossip digest's app payload)
 
 mod canvas;
 mod messages;
+mod wire;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -22,12 +25,14 @@ use tokio_util::sync::CancellationToken;
 use crate::friendz;
 use crate::hub_repo::HubRepo;
 use crate::protocol::blob_proxy::ENSURE_ALPN;
-use crate::protocol::handler::{FriendzEvent, FriendzHandler};
-use crate::protocol::messages::{FriendzMessage, FRIENDZ_ALPN};
 use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
 use crate::userz;
 use freqhole_reliquary::blobz::{BlobStore, NewBlobMeta};
 use freqhole_reliquary::node::StorageNode;
+use haruspex::protocol::{
+    CoreMessage, FriendzEvent, FriendzMessage, FriendzProtocolHandler, FriendzService,
+    FriendzTransportError, LocalProfile, FRIENDZ_ALPN,
+};
 
 use iroh_blobs::BlobsProtocol;
 
@@ -113,7 +118,7 @@ pub struct HubPeerService {
     pub(crate) iroh_repo: IrohRepo,
     /// custom automerge sync handler — processes CBOR messages from JS peers
     pub(crate) hub_repo: HubRepo,
-    pub(crate) friendz: FriendzHandler,
+    pub(crate) friendz: FriendzProtocolHandler,
     friendz_events: tokio::sync::mpsc::UnboundedReceiver<FriendzEvent>,
     /// the hub's own node ID as a string
     pub(crate) node_id_str: String,
@@ -211,12 +216,24 @@ impl HubPeerService {
         // wire automerge sync over iroh
         let iroh_repo = IrohRepo::new(endpoint.clone(), hub_repo.clone(), friendz_store.clone());
 
-        // friendz protocol handler (presence + messaging)
-        let (friendz, friendz_events) = FriendzHandler::new(
-            endpoint.clone(),
-            node_id_str.clone(),
-            config.username.clone(),
-        );
+        // friendz protocol service (presence + messaging) - `dispatch`
+        // auto-answers profile-request/hello/heartbeat directly on the
+        // inbound stream from the local profile configured below; every
+        // other message surfaces as `FriendzEvent::MessageReceived` for
+        // `handle_friendz_event`/`handle_message` (hub/messages.rs) to act on.
+        let (friendz_service, friendz_events) =
+            FriendzService::new(node_id_str.clone(), config.username.clone());
+        friendz_service
+            .set_local_profile(LocalProfile {
+                username: config.username.clone(),
+                bio: config.bio.clone(),
+                avatar_data_url: profile_avatar_data_url.clone(),
+                accent_color: Some(0),
+                profile_doc_id: None,
+                profile_updated_at: None,
+            })
+            .await;
+        let friendz = FriendzProtocolHandler::new(Arc::new(friendz_service));
 
         // iroh-blobs: serve verified blob data + accept blob-proxy requests.
         //
@@ -379,9 +396,10 @@ impl HubPeerService {
         let friendz = self.friendz.clone();
         let friendz_store_for_hb = self.friendz_store.clone();
         let local_node_id = self.node_id_str.clone();
+        let endpoint_for_heartbeat = self.endpoint.clone();
         let heartbeat_handle = tokio::spawn(async move {
             friendz
-                .run_heartbeat_loop(move || {
+                .run_heartbeat_loop(endpoint_for_heartbeat, move || {
                     let store = friendz_store_for_hb.clone();
                     let local = local_node_id.clone();
                     let result = tokio::task::block_in_place(|| {
@@ -420,6 +438,7 @@ impl HubPeerService {
         // username + bio + avatar changes sends one message, not three.
         let profile_changed = Arc::clone(&self.profile_changed);
         let friendz_for_profile = self.friendz.clone();
+        let endpoint_for_profile = self.endpoint.clone();
         let hub_profile_for_broadcast = Arc::clone(&self.hub_profile);
         let broadcast_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -434,22 +453,48 @@ impl HubPeerService {
                     _ = broadcast_cancel.cancelled() => break,
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                 }
-                let msg = {
+                let (msg, local_profile) = {
                     let p = hub_profile_for_broadcast.read().await;
-                    FriendzMessage::ProfileResponse {
+                    let msg = FriendzMessage::Core(CoreMessage::ProfileResponse {
+                        v: 1,
                         username: p.username.clone(),
                         bio: p.bio.clone(),
                         avatar_data_url: p.avatar_data_url.clone(),
                         accent_color: Some(p.accent_color),
-                    }
+                        profile_doc_id: None,
+                        profile_updated_at: None,
+                    });
+                    let local_profile = LocalProfile {
+                        username: p.username.clone(),
+                        bio: p.bio.clone(),
+                        avatar_data_url: p.avatar_data_url.clone(),
+                        accent_color: Some(p.accent_color),
+                        profile_doc_id: None,
+                        profile_updated_at: None,
+                    };
+                    (msg, local_profile)
                 };
-                let peers = friendz_for_profile.get_online_peers().await;
+                // keep the service's own auto-answer profile in sync too, so a
+                // fresh profile-request (not just this proactive broadcast)
+                // also sees the update.
+                friendz_for_profile
+                    .service()
+                    .set_local_profile(local_profile)
+                    .await;
+                let peers = friendz_for_profile.service().online_peers().await;
                 tracing::debug!(
                     peer_count = peers.len(),
                     "broadcasting updated hub profile to online peers"
                 );
                 for peer_id in peers {
-                    if let Err(e) = friendz_for_profile.send_message(&peer_id, &msg).await {
+                    if let Err(e) = send_friendz_message_via(
+                        &endpoint_for_profile,
+                        &friendz_for_profile,
+                        &peer_id,
+                        &msg,
+                    )
+                    .await
+                    {
                         tracing::debug!(
                             peer = %peer_id,
                             error = %e,
@@ -553,9 +598,40 @@ impl HubPeerService {
         &self.iroh_repo
     }
 
-    pub fn friendz(&self) -> &FriendzHandler {
+    pub fn friendz(&self) -> &FriendzProtocolHandler {
         &self.friendz
     }
+
+    /// send a friendz protocol message to a peer by node id. resolves the
+    /// node id into an `EndpointAddr` (relying on the endpoint's configured
+    /// discovery/relay - the same addressing haruspex's own heartbeat loop
+    /// uses for peers it only has a bare node id for) and opens a fresh
+    /// outbound stream; see [`FriendzProtocolHandler::send_message`]'s doc
+    /// comment for why this is fire-and-forget rather than request/reply.
+    pub(crate) async fn send_friendz_message(
+        &self,
+        peer_node_id: &str,
+        msg: &FriendzMessage,
+    ) -> Result<(), FriendzTransportError> {
+        send_friendz_message_via(&self.endpoint, &self.friendz, peer_node_id, msg).await
+    }
+}
+
+/// standalone helper behind [`HubPeerService::send_friendz_message`] - also
+/// used by the profile-broadcast task in `run()`, which only has clones of
+/// `endpoint`/`friendz`, not a `&HubPeerService`.
+async fn send_friendz_message_via(
+    endpoint: &iroh::Endpoint,
+    friendz: &FriendzProtocolHandler,
+    peer_node_id: &str,
+    msg: &FriendzMessage,
+) -> Result<(), FriendzTransportError> {
+    let public_key: iroh::PublicKey = peer_node_id
+        .parse()
+        .map_err(|e| FriendzTransportError::InvalidNodeId(format!("{e}")))?;
+    friendz
+        .send_message(endpoint, iroh::EndpointAddr::from(public_key), msg)
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -647,32 +723,4 @@ async fn process_hub_avatar(
     );
 
     Ok((data_url, blake3_to_persist))
-}
-
-/// human-readable name for a friendz message type (for logging).
-pub(crate) fn friendz_msg_type_name(msg: &FriendzMessage) -> &'static str {
-    match msg {
-        FriendzMessage::ProfileRequest => "profile-request",
-        FriendzMessage::ProfileResponse { .. } => "profile-response",
-        FriendzMessage::FriendRequest { .. } => "friend-request",
-        FriendzMessage::FriendAccept { .. } => "friend-accept",
-        FriendzMessage::FriendAcceptAck { .. } => "friend-accept-ack",
-        FriendzMessage::FriendReject { .. } => "friend-reject",
-        FriendzMessage::Heartbeat { .. } => "heartbeat",
-        FriendzMessage::CanvasInvite { .. } => "canvas-invite",
-        FriendzMessage::CanvasInviteAck { .. } => "canvas-invite-ack",
-        FriendzMessage::CanvasInviteAccept { .. } => "canvas-invite-accept",
-        FriendzMessage::CanvasInviteDecline { .. } => "canvas-invite-decline",
-        FriendzMessage::AclChange { .. } => "acl-change",
-        FriendzMessage::CanvasUpdate { .. } => "canvas-update",
-        FriendzMessage::CanvasDeleted { .. } => "canvas-deleted",
-        FriendzMessage::OfflineAnnouncement { .. } => "offline-announcement",
-        FriendzMessage::GossipDigest { .. } => "gossip-digest",
-        FriendzMessage::BlobSeek { .. } => "blob-seek",
-        FriendzMessage::BlobOffer { .. } => "blob-offer",
-        FriendzMessage::CanvasKnock { .. } => "canvas-knock",
-        FriendzMessage::CanvasKnockAck { .. } => "canvas-knock-ack",
-        FriendzMessage::CanvasKnockApprove { .. } => "canvas-knock-approve",
-        FriendzMessage::CanvasKnockDecline { .. } => "canvas-knock-decline",
-    }
 }

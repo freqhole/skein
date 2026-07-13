@@ -113,7 +113,7 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
   }
 
   // wire up a real FriendzProtocol instance so tests can drive the
-  // skein-friendz/1 handshake (friend requests, accepts) against another
+  // freqhole-friendz/1 handshake (friend requests, accepts) against another
   // browser peer or a real reliquary hub — production wiring for this lives
   // in standalone/friendz-wiring.ts, which writes into the real social
   // automerge doc; this harness has no narthex/social doc, so accepted

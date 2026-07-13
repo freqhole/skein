@@ -956,6 +956,7 @@ export async function initFriendzWiring(
           for (const knock of Object.values(canvasDoc.pendingKnocks ?? {})) {
             if (knock.requesterNodeId === peerNodeId) continue;
             pendingKnocks.push({
+              knockId: knock.knockId,
               canvasDocId,
               requesterNodeId: knock.requesterNodeId,
               requesterUsername: knock.requesterUsername,
@@ -1850,7 +1851,7 @@ export function wireKnockHandlers(deps: KnockHandlersDeps): void {
         return;
       }
 
-      store.recordKnock(msg.requesterNodeId, msg.requesterUsername, msg.message);
+      store.recordKnock(msg.requesterNodeId, msg.requesterUsername, msg.message, msg.knockId);
 
       if (fromNodeId !== msg.requesterNodeId) {
         onKnockRelayed?.({
@@ -1968,7 +1969,7 @@ export async function mergeGossipDigestKnocks(
   for (const knock of msg.pendingKnocks) {
     try {
       const store = await CanvasStore.open(repo, knock.canvasDocId as DocumentId);
-      store.recordKnock(knock.requesterNodeId, knock.requesterUsername, knock.message);
+      store.recordKnock(knock.requesterNodeId, knock.requesterUsername, knock.message, knock.knockId);
       log.debug(
         TAG,
         "gossip digest: merged pending knock for canvas:",

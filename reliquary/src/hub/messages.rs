@@ -3,11 +3,18 @@
 //! handles incoming friendz events (peer online/offline, messages) and
 //! dispatches to the appropriate handler. friend request/accept logic,
 //! profile exchange, and routing to canvas/gossip handlers all live here.
+//!
+//! `profile-request`, `hello`, and `heartbeat` are auto-answered by
+//! `haruspex::protocol::FriendzService::dispatch` itself (directly on the
+//! inbound stream, before this hub ever sees them) - this module only
+//! reacts to messages the service surfaces via `FriendzEvent::MessageReceived`
+//! for real business logic: friend requests, acl changes, gossip, canvas
+//! knocks, and blob inventory.
 
-use crate::protocol::handler::FriendzEvent;
-use crate::protocol::messages::FriendzMessage;
+use haruspex::protocol::{CoreMessage, FriendzEvent, FriendzMessage};
+use haruspex::stores::Role;
 
-use super::friendz_msg_type_name;
+use super::wire;
 use super::HubPeerService;
 
 impl HubPeerService {
@@ -54,7 +61,7 @@ impl HubPeerService {
             } => {
                 tracing::info!(
                     from = %from_node_id,
-                    msg_type = %friendz_msg_type_name(&message),
+                    msg_type = %message.message_type(),
                     "received friendz message"
                 );
                 self.handle_message(&from_node_id, *message).await;
@@ -70,39 +77,24 @@ impl HubPeerService {
     /// `reliquary friend allow <node-id>` first).
     pub(crate) async fn handle_message(&self, from_node_id: &str, message: FriendzMessage) {
         match message {
-            FriendzMessage::ProfileRequest => {
-                // hub peer shares its profile with anyone — no visibility check
-                let (hub_username, hub_bio, hub_avatar_data_url, hub_accent_color) = {
-                    let p = self.hub_profile.read().await;
-                    (
-                        p.username.clone(),
-                        p.bio.clone(),
-                        p.avatar_data_url.clone(),
-                        p.accent_color,
-                    )
-                };
-                tracing::info!(
-                    peer = %from_node_id,
-                    username = %hub_username,
-                    bio_len = hub_bio.len(),
-                    avatar_len = hub_avatar_data_url.len(),
-                    "responding to profile request"
-                );
-                let response = FriendzMessage::ProfileResponse {
-                    username: hub_username,
-                    bio: hub_bio,
-                    avatar_data_url: hub_avatar_data_url,
-                    accent_color: Some(hub_accent_color),
-                };
-                if let Err(e) = self.friendz.send_message(from_node_id, &response).await {
-                    tracing::warn!(
-                        peer = %from_node_id,
-                        error = %e,
-                        "failed to send profile response"
-                    );
-                }
+            FriendzMessage::Core(core) => self.handle_core_message(from_node_id, core).await,
+            FriendzMessage::AppExtension {
+                message_type,
+                payload,
+            } => {
+                self.handle_app_extension(from_node_id, &message_type, &payload)
+                    .await;
             }
-            FriendzMessage::ProfileResponse {
+        }
+    }
+
+    async fn handle_core_message(&self, from_node_id: &str, message: CoreMessage) {
+        match message {
+            CoreMessage::ProfileRequest { .. } => {
+                // auto-answered by FriendzService::dispatch from the local
+                // profile configured in hub/mod.rs - nothing to do here.
+            }
+            CoreMessage::ProfileResponse {
                 username,
                 bio,
                 avatar_data_url,
@@ -115,6 +107,11 @@ impl HubPeerService {
                 // blake3), and store only the blake3 reference in
                 // userz.avatar_blake3. mirrors how `process_hub_avatar`
                 // handles the hub's own avatar in hub/mod.rs.
+                //
+                // `profile_doc_id`/`profile_updated_at` are ignored - the
+                // hub doesn't track profile docs at all (see
+                // `GossipDigestProfileEntry`'s doc comment in haruspex's
+                // `protocol::messages`).
                 tracing::debug!(
                     peer = %from_node_id,
                     username = %username,
@@ -142,10 +139,10 @@ impl HubPeerService {
                     );
                 }
             }
-            FriendzMessage::FriendRequest {
-                from_node_id: _req_node_id,
+            CoreMessage::FriendRequest {
                 from_username,
                 is_hub: _,
+                ..
             } => {
                 // policy: auto-accept only if the peer was pre-approved by the
                 // operator (status = Allowed) or already accepted. unknown peers
@@ -234,7 +231,8 @@ impl HubPeerService {
                     hub_node_id = %self.node_id_str,
                     "sending friend-accept"
                 );
-                let accept = FriendzMessage::FriendAccept {
+                let accept = FriendzMessage::Core(CoreMessage::FriendAccept {
+                    v: 1,
                     from_node_id: self.node_id_str.clone(),
                     from_username: hub_username.clone(),
                     // this router is a hub's friendz handler — always flag
@@ -242,8 +240,8 @@ impl HubPeerService {
                     // section 3.2; the tauri-desktop-peer router in service.rs
                     // is NOT a hub and must never set this).
                     is_hub: Some(true),
-                };
-                match self.friendz.send_message(from_node_id, &accept).await {
+                });
+                match self.send_friendz_message(from_node_id, &accept).await {
                     Ok(()) => {
                         tracing::info!(peer = %from_node_id, "friend-accept sent successfully");
                     }
@@ -258,13 +256,16 @@ impl HubPeerService {
 
                 // proactively send our profile so the peer has our display name,
                 // bio, and avatar immediately (without waiting for a profile-request)
-                let profile_resp = FriendzMessage::ProfileResponse {
+                let profile_resp = FriendzMessage::Core(CoreMessage::ProfileResponse {
+                    v: 1,
                     username: hub_username,
                     bio: hub_bio,
                     avatar_data_url: hub_avatar_data_url,
                     accent_color: Some(hub_accent_color),
-                };
-                match self.friendz.send_message(from_node_id, &profile_resp).await {
+                    profile_doc_id: None,
+                    profile_updated_at: None,
+                });
+                match self.send_friendz_message(from_node_id, &profile_resp).await {
                     Ok(()) => {
                         tracing::info!(peer = %from_node_id, "profile-response sent after friend-accept");
                     }
@@ -278,8 +279,8 @@ impl HubPeerService {
                 }
 
                 // request their profile so we have their display name, bio, avatar
-                let profile_req = FriendzMessage::ProfileRequest;
-                match self.friendz.send_message(from_node_id, &profile_req).await {
+                let profile_req = FriendzMessage::Core(CoreMessage::ProfileRequest { v: 1 });
+                match self.send_friendz_message(from_node_id, &profile_req).await {
                     Ok(()) => {
                         tracing::info!(peer = %from_node_id, "profile-request sent after friend-accept");
                     }
@@ -295,10 +296,10 @@ impl HubPeerService {
                 // NOTE: no outbound sync dial — see PeerOnline handler comment.
                 // the JS side will establish sync when it needs to.
             }
-            FriendzMessage::FriendAccept {
-                from_node_id: _accept_node_id,
+            CoreMessage::FriendAccept {
                 from_username,
                 is_hub: _,
+                ..
             } => {
                 // a peer accepted our friend request (or is confirming mutual friendship).
                 // honor only if we already have a row for them — either Allowed
@@ -340,10 +341,11 @@ impl HubPeerService {
                 }
 
                 // send ack to complete the two-phase handshake
-                let ack = FriendzMessage::FriendAcceptAck {
+                let ack = FriendzMessage::Core(CoreMessage::FriendAcceptAck {
+                    v: 1,
                     from_node_id: self.node_id_str.clone(),
-                };
-                if let Err(e) = self.friendz.send_message(from_node_id, &ack).await {
+                });
+                if let Err(e) = self.send_friendz_message(from_node_id, &ack).await {
                     tracing::debug!(
                         peer = %from_node_id,
                         error = %e,
@@ -352,8 +354,8 @@ impl HubPeerService {
                 }
 
                 // request their profile
-                let profile_req = FriendzMessage::ProfileRequest;
-                if let Err(e) = self.friendz.send_message(from_node_id, &profile_req).await {
+                let profile_req = FriendzMessage::Core(CoreMessage::ProfileRequest { v: 1 });
+                if let Err(e) = self.send_friendz_message(from_node_id, &profile_req).await {
                     tracing::debug!(
                         peer = %from_node_id,
                         error = %e,
@@ -364,142 +366,53 @@ impl HubPeerService {
                 // NOTE: no outbound sync dial — see PeerOnline handler comment.
                 // the JS side will establish sync when it needs to.
             }
-            FriendzMessage::FriendAcceptAck {
-                from_node_id: _ack_node_id,
-            } => {
+            CoreMessage::FriendAcceptAck { .. } => {
                 tracing::debug!(
                     peer = %from_node_id,
                     "received friend-accept-ack, handshake complete"
                 );
             }
-            FriendzMessage::Heartbeat { .. } => {
-                // heartbeats are handled by the handler layer (presence tracking).
+            CoreMessage::FriendReject { .. } => {
+                tracing::info!(
+                    peer = %from_node_id,
+                    "received friend rejection"
+                );
+            }
+            CoreMessage::Heartbeat { .. } => {
+                // auto-handled by FriendzService::dispatch (presence
+                // tracking + the fast-ack reply on first appearance).
                 // nothing extra to do here.
             }
-            FriendzMessage::CanvasInvite {
-                invite_id,
-                canvas_doc_id,
-                canvas_title,
-                origin_node_id,
-                origin_username,
-                role,
-                ..
-            } => {
-                self.handle_canvas_invite(
-                    from_node_id,
-                    &invite_id,
-                    &canvas_doc_id,
-                    &canvas_title,
-                    &origin_node_id,
-                    &origin_username,
-                    &role,
-                )
-                .await;
+            CoreMessage::OfflineAnnouncement { .. } => {
+                // auto-handled by FriendzService::dispatch (removes the
+                // peer from presence and emits PeerOffline).
+                tracing::info!(peer = %from_node_id, "received offline announcement");
             }
-            FriendzMessage::CanvasInviteAck {
-                invite_id,
-                canvas_doc_id,
-                acker_node_id,
-            } => {
-                tracing::info!(
-                    peer = %from_node_id,
-                    invite_id = %invite_id,
-                    canvas_doc_id = %canvas_doc_id,
-                    acker = %acker_node_id,
-                    "received canvas invite ack"
-                );
+            CoreMessage::Hello { .. } | CoreMessage::HelloOk { .. } => {
+                // no capabilities are configured on this service today, so
+                // `dispatch` never sends `hello` on its own and never
+                // replies to one — inert for this hub until capabilities
+                // are wired up.
+                tracing::debug!(peer = %from_node_id, "received hello/hello-ok (unused)");
             }
-            FriendzMessage::CanvasInviteAccept {
-                invite_id,
-                canvas_doc_id,
-                accepter_node_id,
-            } => {
-                tracing::info!(
-                    peer = %from_node_id,
-                    invite_id = %invite_id,
-                    canvas_doc_id = %canvas_doc_id,
-                    accepter = %accepter_node_id,
-                    "received canvas invite accept"
-                );
+            CoreMessage::IdentityUpdate { .. } => {
+                // not adopted yet — low-risk to add later (see the friendz
+                // protocol spec's message-mapping table), no current caller.
+                tracing::debug!(peer = %from_node_id, "received identity-update (unused)");
             }
-            FriendzMessage::CanvasInviteDecline {
-                invite_id,
-                canvas_doc_id,
-                decliner_node_id,
-            } => {
-                tracing::info!(
-                    peer = %from_node_id,
-                    invite_id = %invite_id,
-                    canvas_doc_id = %canvas_doc_id,
-                    decliner = %decliner_node_id,
-                    "received canvas invite decline"
-                );
-            }
-            FriendzMessage::CanvasUpdate {
-                canvas_doc_id,
-                last_modified_at,
-                widget_count,
-                modified_by_node_id,
-                modified_by_username,
-            } => {
-                self.handle_canvas_update(
-                    from_node_id,
-                    &canvas_doc_id,
-                    &last_modified_at,
-                    widget_count,
-                    &modified_by_node_id,
-                    &modified_by_username,
-                )
-                .await;
-            }
-            FriendzMessage::CanvasDeleted {
-                canvas_doc_id,
-                canvas_title,
-                deleted_by,
-                deleted_by_username,
-                delete_mode,
-                deleted_at,
-            } => {
-                self.handle_canvas_deleted(
-                    from_node_id,
-                    &canvas_doc_id,
-                    &canvas_title,
-                    &deleted_by,
-                    &deleted_by_username,
-                    &delete_mode,
-                    &deleted_at,
-                )
-                .await;
-            }
-            FriendzMessage::GossipDigest {
-                canvas_updates,
-                pending_invites,
-                pending_knocks,
-                shared_canvas_ids,
-                profiles,
-            } => {
-                self.handle_gossip_digest(
-                    from_node_id,
-                    canvas_updates,
-                    pending_invites,
-                    pending_knocks,
-                    shared_canvas_ids,
-                    profiles,
-                )
-                .await;
-            }
-            FriendzMessage::AclChange {
-                canvas_doc_id,
-                canvas_title,
+            CoreMessage::AclChange {
+                resource_id,
+                resource_title,
                 target_node_id,
                 new_role,
                 changed_by,
                 changed_by_username,
+                ..
             } => {
                 tracing::info!(
                     peer = %from_node_id,
-                    canvas_doc_id = %canvas_doc_id,
-                    canvas_title = %canvas_title,
+                    resource_id = %resource_id,
+                    resource_title = ?resource_title,
                     target = %target_node_id,
                     new_role = ?new_role,
                     changed_by = %changed_by,
@@ -508,34 +421,36 @@ impl HubPeerService {
                 );
 
                 // if the hub was removed from this canvas, stop tracking it.
-                // soft-delete rather than hard-delete (see
-                // `HubDocStorage::soft_remove_canvas_id`'s doc comment) —
-                // the automerge doc + its persisted bytes survive so
-                // `reliquary maintenance restore` (or a later re-invite,
-                // which reactivates via `save_canvas_id`) can bring it back
-                // without re-syncing from scratch; a separate
+                // an absent `new_role` means revoked (haruspex's `AclChange`
+                // has no "removed" string literal - see the friendz protocol
+                // spec's message-mapping table). soft-delete rather than
+                // hard-delete (see `HubDocStorage::soft_remove_canvas_id`'s
+                // doc comment) — the automerge doc + its persisted bytes
+                // survive so `reliquary maintenance restore` (or a later
+                // re-invite, which reactivates via `save_canvas_id`) can
+                // bring it back without re-syncing from scratch; a separate
                 // `reliquary maintenance purge` sweep is what actually
                 // deletes the data, once an admin confirms it's safe to.
-                if target_node_id == self.node_id_str && new_role == "removed" {
+                if target_node_id == self.node_id_str && new_role.is_none() {
                     tracing::info!(
-                        canvas_doc_id = %canvas_doc_id,
-                        canvas_title = %canvas_title,
+                        resource_id = %resource_id,
+                        resource_title = ?resource_title,
                         changed_by = %changed_by,
                         "hub removed from canvas — soft-deleting (untracking, keeping data for maintenance)"
                     );
 
                     {
                         let mut ids = self.canvas_doc_ids.lock().await;
-                        ids.remove(&canvas_doc_id);
+                        ids.remove(&resource_id);
                     }
-                    self.hub_repo.soft_remove_canvas_id(&canvas_doc_id).await;
-                    self.hub_repo.evict_doc(&canvas_doc_id).await;
+                    self.hub_repo.soft_remove_canvas_id(&resource_id).await;
+                    self.hub_repo.evict_doc(&resource_id).await;
 
                     // sweep orphan blobs — soft-delete blobs unique to this canvas.
                     {
                         let blobz = self.blobz.clone();
                         let storage = self.hub_repo.storage().clone();
-                        let doc_id_owned = canvas_doc_id.clone();
+                        let doc_id_owned = resource_id.clone();
                         tokio::spawn(async move {
                             match crate::maintenance::sweep_canvas_blobs(
                                 &storage,
@@ -561,23 +476,26 @@ impl HubPeerService {
                     }
                 }
             }
-            FriendzMessage::FriendReject {
-                from_node_id: reject_node_id,
+            CoreMessage::GossipDigest {
+                pending_knocks,
+                profiles,
+                app_payload,
+                ..
             } => {
-                tracing::info!(
-                    peer = %from_node_id,
-                    reject_from = %reject_node_id,
-                    "received friend rejection"
-                );
+                let skein_payload: wire::SkeinGossipPayload = app_payload
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                self.handle_gossip_digest(
+                    from_node_id,
+                    skein_payload.canvas_updates,
+                    skein_payload.pending_invites,
+                    pending_knocks,
+                    skein_payload.shared_canvas_ids,
+                    profiles,
+                )
+                .await;
             }
-            FriendzMessage::OfflineAnnouncement { node_id } => {
-                tracing::info!(
-                    peer = %from_node_id,
-                    announced_node = %node_id,
-                    "received offline announcement"
-                );
-            }
-            FriendzMessage::BlobSeek { needed } => {
+            CoreMessage::BlobSeek { needed, .. } => {
                 tracing::info!(
                     peer = %from_node_id,
                     count = needed.len(),
@@ -600,8 +518,8 @@ impl HubPeerService {
                 );
 
                 if !available.is_empty() {
-                    let offer = FriendzMessage::BlobOffer { available };
-                    if let Err(e) = self.friendz.send_message(from_node_id, &offer).await {
+                    let offer = FriendzMessage::Core(CoreMessage::BlobOffer { v: 1, available });
+                    if let Err(e) = self.send_friendz_message(from_node_id, &offer).await {
                         tracing::warn!(
                             peer = %from_node_id,
                             error = %e,
@@ -610,7 +528,7 @@ impl HubPeerService {
                     }
                 }
             }
-            FriendzMessage::BlobOffer { available } => {
+            CoreMessage::BlobOffer { available, .. } => {
                 tracing::info!(
                     peer = %from_node_id,
                     count = available.len(),
@@ -619,62 +537,73 @@ impl HubPeerService {
 
                 self.engine.offer_peer_blobs(from_node_id, available);
             }
-            FriendzMessage::CanvasKnock {
+            CoreMessage::KnockRequest {
                 knock_id,
-                canvas_doc_id,
-                requester_node_id,
-                requester_username,
+                node_id,
+                username,
                 message,
+                scope,
+                ..
             } => {
+                let canvas_doc_id = match scope {
+                    haruspex::protocol::WireKnockScope::Resource { resource_id, .. } => resource_id,
+                    other => {
+                        tracing::debug!(
+                            peer = %from_node_id,
+                            scope = ?other,
+                            "ignoring knock-request with a non-resource scope"
+                        );
+                        return;
+                    }
+                };
                 self.handle_canvas_knock(
                     from_node_id,
                     &knock_id,
                     &canvas_doc_id,
-                    &requester_node_id,
-                    &requester_username,
+                    &node_id,
+                    username.as_deref().unwrap_or(""),
                     &message,
                 )
                 .await;
             }
-            FriendzMessage::CanvasKnockAck {
+            CoreMessage::KnockAck {
                 knock_id,
-                canvas_doc_id,
                 acker_node_id,
+                resource_id,
+                ..
             } => {
                 tracing::info!(
                     peer = %from_node_id,
                     knock_id = %knock_id,
-                    canvas_doc_id = %canvas_doc_id,
+                    resource_id = ?resource_id,
                     acker = %acker_node_id,
-                    "received canvas knock ack"
+                    "received knock ack"
                 );
             }
-            FriendzMessage::CanvasKnockApprove {
+            CoreMessage::KnockOutcome {
                 knock_id,
-                canvas_doc_id,
-                approver_node_id,
-                role,
+                status,
+                granted_role,
+                granted_resource_ids,
+                by_node_id,
+                ..
             } => {
                 tracing::info!(
                     peer = %from_node_id,
-                    knock_id = %knock_id,
-                    canvas_doc_id = %canvas_doc_id,
-                    approver = %approver_node_id,
-                    role = %role,
-                    "received canvas knock approve"
+                    knock_id = ?knock_id,
+                    status = ?status,
+                    granted_role = ?granted_role.map(role_str),
+                    granted_resource_ids = ?granted_resource_ids,
+                    by_node_id = ?by_node_id,
+                    "received knock outcome"
                 );
             }
-            FriendzMessage::CanvasKnockDecline {
-                knock_id,
-                canvas_doc_id,
-                decliner_node_id,
-            } => {
-                tracing::info!(
+            CoreMessage::Error { code, message, .. } => {
+                tracing::warn!(
                     peer = %from_node_id,
-                    knock_id = %knock_id,
-                    canvas_doc_id = %canvas_doc_id,
-                    decliner = %decliner_node_id,
-                    "received canvas knock decline"
+                    code = %code,
+                    message = %message,
+                    "received protocol error message"
                 );
             }
         }
@@ -746,4 +675,11 @@ impl HubPeerService {
             }
         }
     }
+}
+
+/// `Role`'s `Display`/logging helper - haruspex's `Role` derives `Serialize`
+/// (snake_case) but not `Display`; a small string view is nicer in tracing
+/// fields than the derived `Debug`.
+fn role_str(role: Role) -> &'static str {
+    role.as_str()
 }

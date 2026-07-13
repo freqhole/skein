@@ -275,7 +275,7 @@ impl Store {
     /// authorization purposes: status `Accepted` or `Allowed` (allowed peers
     /// haven't completed the handshake but the operator has pre-approved
     /// them). used to gate both the `iroh/automerge-repo/1` sync ALPN
-    /// (`sync::IrohRepo::accept`) and `skein-friendz/1`'s canvas invite
+    /// (`sync::IrohRepo::accept`) and `freqhole-friendz/1`'s canvas invite
     /// handling (`hub::HubPeerService::is_friend`).
     ///
     /// returns `false` (and logs) on a missing row or store error rather

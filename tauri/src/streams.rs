@@ -51,13 +51,13 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 /// so browser <-> tauri can negotiate the same protocols in either direction.
 ///
 /// when the in-process hub is enabled it would also want some of these alpns
-/// (`iroh/automerge-repo/1`, `skein-friendz/1`, `skein/1`, `iroh-bytes/4`).
+/// (`iroh/automerge-repo/1`, `freqhole-friendz/1`, `skein/1`, `iroh-bytes/4`).
 /// iroh only allows one handler per alpn at a time, so hub start currently
 /// loses to the frontend registry. resolving that overlap is tracked in
 /// `docs/tauri-progress.md` iteration 3.
 pub const FRONTEND_ALPNS: &[&[u8]] = &[
     b"iroh/automerge-repo/1",
-    b"skein-friendz/1",
+    b"freqhole-friendz/1",
     b"skein/1",
     b"freqhole/1",
     // dedicated namespace kept around for future frontend-only sub-protocols.
@@ -576,7 +576,7 @@ mod tests {
         let target_id = listener.id().to_string();
         let open_resp = open_bi_with_addr(
             target_addr(&listener),
-            "skein-friendz/1",
+            "freqhole-friendz/1",
             &dialer,
             &dialer_registry,
         )
@@ -609,7 +609,7 @@ mod tests {
         .expect("accept_stream timed out")
         .expect("accept_stream");
         let listener_handle = accept_resp["handle"].as_u64().expect("acc handle");
-        assert_eq!(accept_resp["alpn"].as_str().unwrap(), "skein-friendz/1");
+        assert_eq!(accept_resp["alpn"].as_str().unwrap(), "freqhole-friendz/1");
         assert_eq!(
             accept_resp["peer_node_id"].as_str().unwrap(),
             dialer.id().to_string(),
@@ -791,7 +791,7 @@ mod tests {
         // the listener's accept_bi resolves.
         let open = open_bi_with_addr(
             target_addr(&listener),
-            "skein-friendz/1",
+            "freqhole-friendz/1",
             &dialer,
             &dialer_registry,
         )

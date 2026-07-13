@@ -3,7 +3,8 @@
 //! wires an [`iroh::Endpoint`] into four protocol handlers:
 //!
 //! - `iroh/automerge-repo/1` — automerge sync via [`IrohRepo`] + [`hub_repo::HubRepo`]
-//! - `skein-friendz/1`       — presence/heartbeat/message dispatch via [`FriendzHandler`]
+//! - `freqhole-friendz/1`    — presence/heartbeat/message dispatch via haruspex's
+//!   `FriendzService`/[`FriendzProtocolHandler`]
 //! - `freqhole/1`            — blob proxy (ensure-by-blake3) via [`freqhole_reliquary::ensure::EnsureBlobHandler`]
 //! - `iroh-blobs/4`          — iroh-blobs [`BlobsProtocol`] for verified transfer
 //!
@@ -25,12 +26,14 @@ use tokio_util::sync::CancellationToken;
 use crate::friendz;
 use crate::hub_repo::HubRepo;
 use crate::protocol::blob_proxy::ENSURE_ALPN;
-use crate::protocol::handler::{FriendzEvent, FriendzHandler};
-use crate::protocol::messages::{FriendzMessage, FRIENDZ_ALPN};
 use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
 use crate::userz;
 use freqhole_reliquary::blobz::{BlobStore, SqliteBlobStore};
 use freqhole_reliquary::node::StorageNode;
+use haruspex::protocol::{
+    CoreMessage, FriendzEvent, FriendzMessage, FriendzProtocolHandler, FriendzService,
+    FriendzTransportError, LocalProfile, FRIENDZ_ALPN,
+};
 
 // ---------------------------------------------------------------------------
 // errors
@@ -110,7 +113,7 @@ pub struct ServiceConfig {
 #[derive(Clone)]
 pub struct ServiceHandle {
     endpoint: Endpoint,
-    friendz_handler: FriendzHandler,
+    friendz_handler: FriendzProtocolHandler,
     iroh_repo: IrohRepo,
     blobz: Arc<dyn BlobStore>,
     friendz_store: friendz::Store,
@@ -122,7 +125,7 @@ impl ServiceHandle {
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
-    pub fn friendz(&self) -> &FriendzHandler {
+    pub fn friendz(&self) -> &FriendzProtocolHandler {
         &self.friendz_handler
     }
     pub fn iroh_repo(&self) -> &IrohRepo {
@@ -148,7 +151,7 @@ impl ServiceHandle {
 pub struct Service {
     endpoint: Endpoint,
     router: Router,
-    friendz_handler: FriendzHandler,
+    friendz_handler: FriendzProtocolHandler,
     friendz_events: tokio::sync::mpsc::UnboundedReceiver<FriendzEvent>,
     iroh_repo: IrohRepo,
     blobz: Arc<dyn BlobStore>,
@@ -200,12 +203,24 @@ impl Service {
             .map_err(|e| ServiceError::HubRepo(format!("{e}")))?;
         let iroh_repo = IrohRepo::new(endpoint.clone(), hub_repo.clone(), friendz_store.clone());
 
-        // friendz presence
-        let (friendz_handler, friendz_events) = FriendzHandler::new(
-            endpoint.clone(),
-            node_id_str.clone(),
-            config.username.clone(),
-        );
+        // friendz presence — `dispatch` auto-answers profile-request/hello/
+        // heartbeat directly on the inbound stream from the local profile
+        // configured below; every other message surfaces as
+        // `FriendzEvent::MessageReceived` for `handle_friendz_message` to
+        // act on.
+        let (friendz_service, friendz_events) =
+            FriendzService::new(node_id_str.clone(), config.username.clone());
+        friendz_service
+            .set_local_profile(LocalProfile {
+                username: config.username.clone(),
+                bio: String::new(),
+                avatar_data_url: String::new(),
+                accent_color: None,
+                profile_doc_id: None,
+                profile_updated_at: None,
+            })
+            .await;
+        let friendz_handler = FriendzProtocolHandler::new(Arc::new(friendz_service));
 
         // iroh-blobs blob-proxy, backed by the caller-supplied FsStore.
         //
@@ -237,7 +252,7 @@ impl Service {
 
         tracing::info!(
             node_id = %node_id,
-            "reliquary service running with automerge-repo, skein-friendz, skein, and iroh-blobs"
+            "reliquary service running with automerge-repo, friendz, blob-proxy, and iroh-blobs"
         );
 
         Ok(Self {
@@ -278,12 +293,13 @@ impl Service {
 
         // heartbeat loop — reads the accepted friend list from our friendz store
         let heartbeat_friendz = self.friendz_handler.clone();
+        let heartbeat_endpoint = self.endpoint.clone();
         let heartbeat_store = self.friendz_store.clone();
         let heartbeat_cancel = cancel.clone();
         let heartbeat_handle = tokio::spawn(async move {
             tokio::select! {
                 _ = heartbeat_cancel.cancelled() => {}
-                _ = heartbeat_friendz.run_heartbeat_loop(move || {
+                _ = heartbeat_friendz.run_heartbeat_loop(heartbeat_endpoint, move || {
                     let store = heartbeat_store.clone();
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async move {
@@ -354,34 +370,52 @@ impl Service {
         Ok(())
     }
 
+    /// send a friendz protocol message to a peer by node id. see
+    /// `crate::hub`'s identically-named helper for the addressing
+    /// tradeoffs; duplicated here rather than shared since `Service` and
+    /// `hub::HubPeerService` are otherwise independent orchestrators.
+    async fn send_friendz_message(
+        &self,
+        peer_node_id: &str,
+        msg: &FriendzMessage,
+    ) -> Result<(), FriendzTransportError> {
+        let public_key: iroh::PublicKey = peer_node_id
+            .parse()
+            .map_err(|e| FriendzTransportError::InvalidNodeId(format!("{e}")))?;
+        self.friendz_handler
+            .send_message(&self.endpoint, iroh::EndpointAddr::from(public_key), msg)
+            .await
+    }
+
     async fn handle_friendz_message(
         &self,
         from: &str,
         msg: FriendzMessage,
     ) -> Result<(), ServiceError> {
-        match msg {
-            FriendzMessage::Heartbeat { .. } => {
-                // already touched above
+        let core = match msg {
+            FriendzMessage::Core(core) => core,
+            FriendzMessage::AppExtension { message_type, .. } => {
+                tracing::debug!(peer = %from, message_type = %message_type, "ignoring app extension in phase-1");
+                return Ok(());
             }
-            FriendzMessage::ProfileRequest => {
-                let reply = FriendzMessage::ProfileResponse {
-                    username: self.local_username.clone(),
-                    bio: String::new(),
-                    avatar_data_url: String::new(),
-                    accent_color: None,
-                };
-                if let Err(e) = self.friendz_handler.send_message(from, &reply).await {
-                    tracing::warn!(error = %e, peer = %from, "failed to send profile response");
-                }
+        };
+        match core {
+            CoreMessage::Heartbeat { .. } => {
+                // already touched above; the fast presence-ack reply is
+                // handled by FriendzService::dispatch itself.
             }
-            FriendzMessage::ProfileResponse { username, .. } => {
+            CoreMessage::ProfileRequest { .. } => {
+                // auto-answered by FriendzService::dispatch from the local
+                // profile configured in Service::start - nothing to do here.
+            }
+            CoreMessage::ProfileResponse { username, .. } => {
                 // phase-1: ignore avatar_data_url; userz.avatar_blake3 takes a
                 // blake3 hash, not a data url. avatar transfer comes back later.
                 self.userz
                     .upsert_profile(from, Some(&username), None, None)
                     .await?;
             }
-            FriendzMessage::FriendRequest {
+            CoreMessage::FriendRequest {
                 from_username,
                 is_hub,
                 ..
@@ -397,19 +431,20 @@ impl Service {
                 if is_hub == Some(true) {
                     self.userz.mark_as_hub(from).await?;
                 }
-                let ack = FriendzMessage::FriendAccept {
+                let ack = FriendzMessage::Core(CoreMessage::FriendAccept {
+                    v: 1,
                     from_node_id: self.node_id_str.clone(),
                     from_username: self.local_username.clone(),
                     // this router is the tauri-desktop outbound-only peer, NOT
                     // a hub (see docs/hub-and-profile-plan.md section 3.2) — never
                     // set the hub flag here, matching an ordinary browser peer.
                     is_hub: None,
-                };
-                if let Err(e) = self.friendz_handler.send_message(from, &ack).await {
+                });
+                if let Err(e) = self.send_friendz_message(from, &ack).await {
                     tracing::warn!(error = %e, peer = %from, "failed to send friend-accept");
                 }
             }
-            FriendzMessage::FriendAccept {
+            CoreMessage::FriendAccept {
                 from_username,
                 is_hub,
                 ..
@@ -422,11 +457,11 @@ impl Service {
                     self.userz.mark_as_hub(from).await?;
                 }
             }
-            FriendzMessage::FriendReject { .. } => {
+            CoreMessage::FriendReject { .. } => {
                 self.friendz_store.delete(from).await?;
             }
             other => {
-                tracing::debug!(peer = %from, msg = ?other, "ignoring friendz message in phase-1");
+                tracing::debug!(peer = %from, msg_type = %other.message_type(), "ignoring friendz message in phase-1");
             }
         }
         Ok(())
@@ -481,7 +516,7 @@ impl Service {
         &self.endpoint
     }
 
-    pub fn friendz(&self) -> &FriendzHandler {
+    pub fn friendz(&self) -> &FriendzProtocolHandler {
         &self.friendz_handler
     }
 

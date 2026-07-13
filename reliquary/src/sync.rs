@@ -143,7 +143,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for LoggingIo<T> {
 /// `Accepted` or `Allowed` status (see `friendz::Store::is_friend`) may sync
 /// documents through this handler. this is the actual canvas-doc CRDT sync
 /// path, so it's the most security-sensitive ALPN the hub registers, every
-/// other authorization gate in this codebase (`skein-friendz/1`'s canvas
+/// other authorization gate in this codebase (`freqhole-friendz/1`'s canvas
 /// invite handling, `HubPeerService::is_friend`) exists downstream of this
 /// same check.
 ///

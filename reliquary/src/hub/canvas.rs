@@ -6,13 +6,17 @@
 //! - relaying canvas updates to other online friends
 //! - computing and sending gossip digests on peer-online events
 //! - processing incoming gossip digests (canvas updates + pending invites)
+//!
+//! canvas invite/update/deletion have no equivalent in haruspex's core
+//! friendz protocol, so they travel as `skein:`-namespaced app-extension
+//! messages (see `super::wire`). gossip digest's canvas-specific data rides
+//! in that message's generic `appPayload` field for the same reason.
 
 use std::collections::HashSet;
 
-use crate::protocol::messages::{
-    FriendzMessage, GossipDigestCanvasUpdate, GossipDigestPendingInvite, GossipDigestPendingKnock,
-};
+use haruspex::protocol::{CoreMessage, FriendzMessage, GossipDigestPendingKnock, WireKnockScope};
 
+use super::wire;
 use super::HubPeerService;
 
 impl HubPeerService {
@@ -34,8 +38,8 @@ impl HubPeerService {
             return;
         }
 
-        let mut canvas_updates: Vec<GossipDigestCanvasUpdate> = Vec::new();
-        let mut pending_invites: Vec<GossipDigestPendingInvite> = Vec::new();
+        let mut canvas_updates: Vec<wire::GossipDigestCanvasUpdate> = Vec::new();
+        let mut pending_invites: Vec<wire::GossipDigestPendingInvite> = Vec::new();
         let mut pending_knocks: Vec<GossipDigestPendingKnock> = Vec::new();
         let mut shared_canvas_ids: Vec<String> = Vec::new();
 
@@ -137,17 +141,24 @@ impl HubPeerService {
             "sending gossip digest"
         );
 
-        let digest = FriendzMessage::GossipDigest {
+        let app_payload = serde_json::to_value(wire::SkeinGossipPayload {
             canvas_updates,
             pending_invites,
-            pending_knocks,
             shared_canvas_ids,
-            // the hub doesn't track profile docs at all — see
-            // `GossipDigestProfileEntry`'s doc comment in `protocol/messages.rs`.
-            profiles: Vec::new(),
-        };
+        })
+        .ok();
 
-        if let Err(e) = self.friendz.send_message(peer_node_id, &digest).await {
+        let digest = FriendzMessage::Core(CoreMessage::GossipDigest {
+            v: 1,
+            pending_knocks,
+            // the hub doesn't track profile docs at all — see
+            // `GossipDigestProfileEntry`'s doc comment in haruspex's
+            // `protocol::messages`.
+            profiles: Vec::new(),
+            app_payload,
+        });
+
+        if let Err(e) = self.send_friendz_message(peer_node_id, &digest).await {
             tracing::warn!(
                 peer = %peer_node_id,
                 error = %e,
@@ -163,32 +174,26 @@ impl HubPeerService {
     /// handle an incoming canvas invite from a friend.
     ///
     /// the hub auto-accepts all canvas invites from known friends:
-    /// 1. send CanvasInviteAck (receipt acknowledgment)
-    /// 2. send CanvasInviteAccept (auto-accept)
+    /// 1. send a canvas-invite-ack (receipt acknowledgment)
+    /// 2. send a canvas-invite-accept (auto-accept)
     /// 3. track the canvas doc ID for future gossip
     /// 4. write ourselves into the canvas doc's peers map (async retry)
     ///
     /// hub_repo receives docs passively when the JS peer syncs them — no
     /// explicit document request is needed.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_canvas_invite(
         &self,
         from_node_id: &str,
-        invite_id: &str,
-        canvas_doc_id: &str,
-        canvas_title: &str,
-        origin_node_id: &str,
-        origin_username: &str,
-        role: &str,
+        ext: wire::CanvasInviteExt,
     ) {
         tracing::info!(
             peer = %from_node_id,
-            invite_id = %invite_id,
-            canvas_doc_id = %canvas_doc_id,
-            canvas_title = %canvas_title,
-            origin = %origin_node_id,
-            origin_username = %origin_username,
-            role = ?role,
+            invite_id = %ext.invite_id,
+            canvas_doc_id = %ext.canvas_doc_id,
+            canvas_title = %ext.canvas_title,
+            origin = %ext.origin_node_id,
+            origin_username = %ext.origin_username,
+            role = %ext.role,
             "received canvas invite"
         );
 
@@ -202,12 +207,15 @@ impl HubPeerService {
         }
 
         // 1. send ack (receipt confirmation)
-        let ack = FriendzMessage::CanvasInviteAck {
-            invite_id: invite_id.to_string(),
-            canvas_doc_id: canvas_doc_id.to_string(),
-            acker_node_id: self.node_id_str.clone(),
-        };
-        if let Err(e) = self.friendz.send_message(from_node_id, &ack).await {
+        let ack = wire::build_extension(
+            wire::EXT_CANVAS_INVITE_ACK,
+            &wire::CanvasInviteAckExt {
+                invite_id: ext.invite_id.clone(),
+                canvas_doc_id: ext.canvas_doc_id.clone(),
+                acker_node_id: self.node_id_str.clone(),
+            },
+        );
+        if let Err(e) = self.send_friendz_message(from_node_id, &ack).await {
             tracing::warn!(
                 peer = %from_node_id,
                 error = %e,
@@ -216,18 +224,21 @@ impl HubPeerService {
         } else {
             tracing::info!(
                 peer = %from_node_id,
-                invite_id = %invite_id,
+                invite_id = %ext.invite_id,
                 "canvas invite ack sent"
             );
         }
 
         // 2. auto-accept
-        let accept = FriendzMessage::CanvasInviteAccept {
-            invite_id: invite_id.to_string(),
-            canvas_doc_id: canvas_doc_id.to_string(),
-            accepter_node_id: self.node_id_str.clone(),
-        };
-        if let Err(e) = self.friendz.send_message(from_node_id, &accept).await {
+        let accept = wire::build_extension(
+            wire::EXT_CANVAS_INVITE_ACCEPT,
+            &wire::CanvasInviteAcceptExt {
+                invite_id: ext.invite_id.clone(),
+                canvas_doc_id: ext.canvas_doc_id.clone(),
+                accepter_node_id: self.node_id_str.clone(),
+            },
+        );
+        if let Err(e) = self.send_friendz_message(from_node_id, &accept).await {
             tracing::warn!(
                 peer = %from_node_id,
                 error = %e,
@@ -236,8 +247,8 @@ impl HubPeerService {
         } else {
             tracing::info!(
                 peer = %from_node_id,
-                invite_id = %invite_id,
-                canvas_doc_id = %canvas_doc_id,
+                invite_id = %ext.invite_id,
+                canvas_doc_id = %ext.canvas_doc_id,
                 "canvas invite accepted"
             );
         }
@@ -261,17 +272,17 @@ impl HubPeerService {
         // 3. track the canvas doc ID for gossip
         {
             let mut ids = self.canvas_doc_ids.lock().await;
-            ids.insert(canvas_doc_id.to_string());
+            ids.insert(ext.canvas_doc_id.clone());
         }
-        self.hub_repo.save_canvas_id(canvas_doc_id).await;
+        self.hub_repo.save_canvas_id(&ext.canvas_doc_id).await;
         tracing::info!(
-            canvas_doc_id = %canvas_doc_id,
+            canvas_doc_id = %ext.canvas_doc_id,
             "canvas doc added to hub tracking set"
         );
 
         // 4. write ourselves into the canvas doc's peers map (async — doc may
         //    not be synced yet, so we retry in the background)
-        self.schedule_write_self_to_canvas(canvas_doc_id);
+        self.schedule_write_self_to_canvas(&ext.canvas_doc_id);
 
         // 5. trigger a blob snatch scan after a delay — gives automerge sync
         //    time to deliver the canvas doc + widget state docs before scanning
@@ -300,9 +311,9 @@ impl HubPeerService {
     /// `pendingKnocks` entry directly in the hub's copy of the canvas doc
     /// (see [`record_knock_in_canvas_doc`] for the exact idempotency
     /// rules, mirroring `CanvasStore.recordKnock()`'s TS-side logic), then
-    /// sends a `canvas-knock-ack` back immediately (plan doc section 5.2) —
-    /// normal automerge sync then propagates the new entry to every
-    /// admin's device, no further push logic needed.
+    /// sends a `knock-ack` back immediately — normal automerge sync then
+    /// propagates the new entry to every admin's device, no further push
+    /// logic needed.
     pub(crate) async fn handle_canvas_knock(
         &self,
         from_node_id: &str,
@@ -333,6 +344,7 @@ impl HubPeerService {
             }
         };
 
+        let knock_id_owned = knock_id.to_string();
         let requester_node_id_owned = requester_node_id.to_string();
         let requester_username_owned = requester_username.to_string();
         let message_owned = message.to_string();
@@ -340,6 +352,7 @@ impl HubPeerService {
         let recorded = tokio::task::spawn_blocking(move || {
             record_knock_in_canvas_doc(
                 &handle,
+                &knock_id_owned,
                 &requester_node_id_owned,
                 &requester_username_owned,
                 &message_owned,
@@ -356,12 +369,13 @@ impl HubPeerService {
             return;
         }
 
-        let ack = FriendzMessage::CanvasKnockAck {
+        let ack = FriendzMessage::Core(CoreMessage::KnockAck {
+            v: 1,
             knock_id: knock_id.to_string(),
-            canvas_doc_id: canvas_doc_id.to_string(),
             acker_node_id: self.node_id_str.clone(),
-        };
-        if let Err(e) = self.friendz.send_message(from_node_id, &ack).await {
+            resource_id: Some(canvas_doc_id.to_string()),
+        });
+        if let Err(e) = self.send_friendz_message(from_node_id, &ack).await {
             tracing::warn!(
                 peer = %from_node_id,
                 error = %e,
@@ -495,47 +509,46 @@ impl HubPeerService {
     pub(crate) async fn handle_canvas_update(
         &self,
         from_node_id: &str,
-        canvas_doc_id: &str,
-        last_modified_at: &str,
-        widget_count: u32,
-        modified_by_node_id: &str,
-        modified_by_username: &str,
+        ext: wire::CanvasUpdateExt,
     ) {
         let is_tracked = {
             let ids = self.canvas_doc_ids.lock().await;
-            ids.contains(canvas_doc_id)
+            ids.contains(&ext.canvas_doc_id)
         };
 
         if is_tracked {
             tracing::info!(
                 peer = %from_node_id,
-                canvas_doc_id = %canvas_doc_id,
-                last_modified_at = %last_modified_at,
-                widget_count = widget_count,
-                modified_by = %modified_by_node_id,
-                modified_by_username = %modified_by_username,
+                canvas_doc_id = %ext.canvas_doc_id,
+                last_modified_at = %ext.last_modified_at,
+                widget_count = ext.widget_count,
+                modified_by = %ext.modified_by_node_id,
+                modified_by_username = %ext.modified_by_username,
                 "canvas update on tracked canvas (available for gossip relay)"
             );
 
             // relay this update to other online friends who are on this canvas
             // (but not the sender and not the modifier)
-            let online_peers = self.friendz.get_online_peers().await;
+            let online_peers = self.friendz.service().online_peers().await;
             for peer_id in &online_peers {
-                if peer_id == from_node_id || peer_id == modified_by_node_id {
+                if peer_id == from_node_id || peer_id == &ext.modified_by_node_id {
                     continue;
                 }
                 // only relay to friends
                 if !self.is_friend(peer_id).await {
                     continue;
                 }
-                let update = FriendzMessage::CanvasUpdate {
-                    canvas_doc_id: canvas_doc_id.to_string(),
-                    last_modified_at: last_modified_at.to_string(),
-                    widget_count,
-                    modified_by_node_id: modified_by_node_id.to_string(),
-                    modified_by_username: modified_by_username.to_string(),
-                };
-                if let Err(e) = self.friendz.send_message(peer_id, &update).await {
+                let update = wire::build_extension(
+                    wire::EXT_CANVAS_UPDATE,
+                    &wire::CanvasUpdateExt {
+                        canvas_doc_id: ext.canvas_doc_id.clone(),
+                        last_modified_at: ext.last_modified_at.clone(),
+                        widget_count: ext.widget_count,
+                        modified_by_node_id: ext.modified_by_node_id.clone(),
+                        modified_by_username: ext.modified_by_username.clone(),
+                    },
+                );
+                if let Err(e) = self.send_friendz_message(peer_id, &update).await {
                     tracing::debug!(
                         peer = %peer_id,
                         error = %e,
@@ -544,7 +557,7 @@ impl HubPeerService {
                 } else {
                     tracing::debug!(
                         peer = %peer_id,
-                        canvas_doc_id = %canvas_doc_id,
+                        canvas_doc_id = %ext.canvas_doc_id,
                         "relayed canvas update"
                     );
                 }
@@ -552,7 +565,7 @@ impl HubPeerService {
         } else {
             tracing::debug!(
                 peer = %from_node_id,
-                canvas_doc_id = %canvas_doc_id,
+                canvas_doc_id = %ext.canvas_doc_id,
                 "received canvas update for untracked canvas — ignoring"
             );
         }
@@ -562,26 +575,20 @@ impl HubPeerService {
     ///
     /// if the hub tracks this canvas, untrack it and relay the deletion
     /// to other online friends who are on this canvas.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_canvas_deleted(
         &self,
         from_node_id: &str,
-        canvas_doc_id: &str,
-        canvas_title: &str,
-        deleted_by: &str,
-        deleted_by_username: &str,
-        delete_mode: &str,
-        deleted_at: &str,
+        ext: wire::CanvasDeletedExt,
     ) {
         let is_tracked = {
             let ids = self.canvas_doc_ids.lock().await;
-            ids.contains(canvas_doc_id)
+            ids.contains(&ext.canvas_doc_id)
         };
 
         if !is_tracked {
             tracing::debug!(
                 peer = %from_node_id,
-                canvas_doc_id = %canvas_doc_id,
+                canvas_doc_id = %ext.canvas_doc_id,
                 "received canvas-deleted for untracked canvas — ignoring"
             );
             return;
@@ -589,12 +596,12 @@ impl HubPeerService {
 
         tracing::info!(
             peer = %from_node_id,
-            canvas_doc_id = %canvas_doc_id,
-            canvas_title = %canvas_title,
-            deleted_by = %deleted_by,
-            deleted_by_username = %deleted_by_username,
-            delete_mode = %delete_mode,
-            deleted_at = %deleted_at,
+            canvas_doc_id = %ext.canvas_doc_id,
+            canvas_title = %ext.canvas_title,
+            deleted_by = %ext.deleted_by,
+            deleted_by_username = %ext.deleted_by_username,
+            delete_mode = %ext.delete_mode,
+            deleted_at = %ext.deleted_at,
             "canvas deleted — untracking (soft-delete) and relaying"
         );
 
@@ -606,16 +613,18 @@ impl HubPeerService {
         // notification handler.
         {
             let mut ids = self.canvas_doc_ids.lock().await;
-            ids.remove(canvas_doc_id);
+            ids.remove(&ext.canvas_doc_id);
         }
-        self.hub_repo.soft_remove_canvas_id(canvas_doc_id).await;
-        self.hub_repo.evict_doc(canvas_doc_id).await;
+        self.hub_repo
+            .soft_remove_canvas_id(&ext.canvas_doc_id)
+            .await;
+        self.hub_repo.evict_doc(&ext.canvas_doc_id).await;
 
         // sweep orphan blobs — soft-delete blobs unique to this now-deleted canvas.
         {
             let blobz = self.blobz.clone();
             let storage = self.hub_repo.storage().clone();
-            let doc_id_owned = canvas_doc_id.to_string();
+            let doc_id_owned = ext.canvas_doc_id.clone();
             tokio::spawn(async move {
                 match crate::maintenance::sweep_canvas_blobs(
                     &storage,
@@ -641,23 +650,26 @@ impl HubPeerService {
         }
 
         // relay to other online friends (not the sender, not the deleter)
-        let online_peers = self.friendz.get_online_peers().await;
+        let online_peers = self.friendz.service().online_peers().await;
         for peer_id in &online_peers {
-            if peer_id == from_node_id || peer_id == deleted_by {
+            if peer_id == from_node_id || peer_id == &ext.deleted_by {
                 continue;
             }
             if !self.is_friend(peer_id).await {
                 continue;
             }
-            let msg = FriendzMessage::CanvasDeleted {
-                canvas_doc_id: canvas_doc_id.to_string(),
-                canvas_title: canvas_title.to_string(),
-                deleted_by: deleted_by.to_string(),
-                deleted_by_username: deleted_by_username.to_string(),
-                delete_mode: delete_mode.to_string(),
-                deleted_at: deleted_at.to_string(),
-            };
-            if let Err(e) = self.friendz.send_message(peer_id, &msg).await {
+            let msg = wire::build_extension(
+                wire::EXT_CANVAS_DELETED,
+                &wire::CanvasDeletedExt {
+                    canvas_doc_id: ext.canvas_doc_id.clone(),
+                    canvas_title: ext.canvas_title.clone(),
+                    deleted_by: ext.deleted_by.clone(),
+                    deleted_by_username: ext.deleted_by_username.clone(),
+                    delete_mode: ext.delete_mode.clone(),
+                    deleted_at: ext.deleted_at.clone(),
+                },
+            );
+            if let Err(e) = self.send_friendz_message(peer_id, &msg).await {
                 tracing::debug!(
                     peer = %peer_id,
                     error = %e,
@@ -666,7 +678,7 @@ impl HubPeerService {
             } else {
                 tracing::debug!(
                     peer = %peer_id,
-                    canvas_doc_id = %canvas_doc_id,
+                    canvas_doc_id = %ext.canvas_doc_id,
                     "relayed canvas-deleted"
                 );
             }
@@ -690,17 +702,18 @@ impl HubPeerService {
     ///   the original requester.
     /// - profiles: not yet handled — the hub has no profile-doc tracking of
     ///   its own (see `GossipDigestProfileEntry`'s doc comment in
-    ///   `protocol/messages.rs`). logged for visibility, not acted on.
+    ///   haruspex's `protocol::messages`). logged for visibility, not acted
+    ///   on.
     ///
     /// hub_repo receives docs passively via sync — no explicit request needed.
     pub(crate) async fn handle_gossip_digest(
         &self,
         from_node_id: &str,
-        canvas_updates: Vec<GossipDigestCanvasUpdate>,
-        pending_invites: Vec<GossipDigestPendingInvite>,
+        canvas_updates: Vec<wire::GossipDigestCanvasUpdate>,
+        pending_invites: Vec<wire::GossipDigestPendingInvite>,
         pending_knocks: Vec<GossipDigestPendingKnock>,
         shared_canvas_ids: Vec<String>,
-        profiles: Vec<crate::protocol::messages::GossipDigestProfileEntry>,
+        profiles: Vec<haruspex::protocol::GossipDigestProfileEntry>,
     ) {
         tracing::info!(
             peer = %from_node_id,
@@ -765,7 +778,7 @@ impl HubPeerService {
                 canvas_title = %invite.canvas_title,
                 invited_by = %invite.invited_by,
                 invited_by_username = %invite.invited_by_username,
-                role = ?invite.role,
+                role = %invite.role,
                 "gossip: treating pending invite as new canvas invite"
             );
 
@@ -778,19 +791,22 @@ impl HubPeerService {
 
             // send accept back to the inviter (if they're online and not the
             // relay peer, send to them; otherwise send to the relay peer)
-            let accept_target = if self.friendz.is_online(&invite.invited_by).await {
+            let accept_target = if self.friendz.service().is_online(&invite.invited_by).await {
                 &invite.invited_by
             } else {
                 from_node_id
             };
 
             let invite_id = uuid::Uuid::new_v4().to_string();
-            let accept = FriendzMessage::CanvasInviteAccept {
-                invite_id,
-                canvas_doc_id: invite.canvas_doc_id.clone(),
-                accepter_node_id: self.node_id_str.clone(),
-            };
-            if let Err(e) = self.friendz.send_message(accept_target, &accept).await {
+            let accept = wire::build_extension(
+                wire::EXT_CANVAS_INVITE_ACCEPT,
+                &wire::CanvasInviteAcceptExt {
+                    invite_id,
+                    canvas_doc_id: invite.canvas_doc_id.clone(),
+                    accepter_node_id: self.node_id_str.clone(),
+                },
+            );
+            if let Err(e) = self.send_friendz_message(accept_target, &accept).await {
                 tracing::debug!(
                     peer = %accept_target,
                     error = %e,
@@ -824,25 +840,39 @@ impl HubPeerService {
         // connected to the hub, including ones that come online later and
         // were never directly connected to the original requester. best
         // effort per entry: silently skipped if the hub doesn't hold that
-        // canvas doc at all.
+        // canvas doc at all, or if the knock's scope isn't a resource scope
+        // (a canvas knock is always `WireKnockScope::Resource`).
         for knock in &pending_knocks {
-            let handle = match self.hub_repo.find(&knock.canvas_doc_id).await {
+            let canvas_doc_id = match &knock.scope {
+                WireKnockScope::Resource { resource_id, .. } => resource_id.clone(),
+                _ => {
+                    tracing::debug!(
+                        peer = %from_node_id,
+                        knock_id = %knock.knock_id,
+                        "gossip: relayed knock has a non-resource scope — skipping"
+                    );
+                    continue;
+                }
+            };
+            let handle = match self.hub_repo.find(&canvas_doc_id).await {
                 Some(h) => h,
                 None => {
                     tracing::debug!(
-                        canvas_doc_id = %knock.canvas_doc_id,
+                        canvas_doc_id = %canvas_doc_id,
                         peer = %from_node_id,
                         "gossip: relayed knock for a canvas the hub doesn't hold — skipping"
                     );
                     continue;
                 }
             };
-            let requester_node_id = knock.requester_node_id.clone();
-            let requester_username = knock.requester_username.clone();
+            let knock_id = knock.knock_id.clone();
+            let requester_node_id = knock.node_id.clone();
+            let requester_username = knock.username.clone().unwrap_or_default();
             let message = knock.message.clone();
             let recorded = tokio::task::spawn_blocking(move || {
                 record_knock_in_canvas_doc(
                     &handle,
+                    &knock_id,
                     &requester_node_id,
                     &requester_username,
                     &message,
@@ -853,8 +883,8 @@ impl HubPeerService {
             if recorded {
                 tracing::info!(
                     peer = %from_node_id,
-                    canvas_doc_id = %knock.canvas_doc_id,
-                    requester = %knock.requester_node_id,
+                    canvas_doc_id = %canvas_doc_id,
+                    requester = %knock.node_id,
                     "gossip: merged relayed knock into hub's canvas doc"
                 );
             }
@@ -1015,10 +1045,11 @@ impl HubPeerService {
             "sending blob seek"
         );
 
-        let seek = FriendzMessage::BlobSeek {
+        let seek = FriendzMessage::Core(CoreMessage::BlobSeek {
+            v: 1,
             needed: missing_hashes,
-        };
-        if let Err(e) = self.friendz.send_message(peer_node_id, &seek).await {
+        });
+        if let Err(e) = self.send_friendz_message(peer_node_id, &seek).await {
             tracing::warn!(
                 peer = %peer_node_id,
                 error = %e,
@@ -1240,6 +1271,11 @@ fn write_self_to_canvas_doc(
 /// duplicate — so this function only ever needs two branches: "insert a
 /// fresh entry" or "no-op, it's already there."
 ///
+/// this is the hub's own durable persistence for canvas knocks: the entry
+/// lives in the canvas automerge doc, which `hub_repo` persists to sqlite
+/// and syncs to every peer on the canvas, so a knock survives a hub
+/// restart without needing a separate relational knock store.
+///
 /// returns `true` if the knock is now recorded (either freshly inserted or
 /// already present from an earlier attempt), `false` if the canvas doc has
 /// no content yet (not synced) and nothing could be written — same
@@ -1248,6 +1284,7 @@ fn write_self_to_canvas_doc(
 /// runs inside `spawn_blocking` because doc access holds a lock.
 fn record_knock_in_canvas_doc(
     handle: &crate::hub_repo::DocHandle,
+    knock_id: &str,
     requester_node_id: &str,
     requester_username: &str,
     message: &str,
@@ -1284,6 +1321,7 @@ fn record_knock_in_canvas_doc(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
 
+        let kid = knock_id.to_string();
         let nid = requester_node_id.to_string();
         let uname = requester_username.to_string();
         let msg = message.to_string();
@@ -1303,6 +1341,7 @@ fn record_knock_in_canvas_doc(
             }
 
             let knock_obj = tx.put_object(&pending_obj, nid.as_str(), automerge::ObjType::Map)?;
+            tx.put(&knock_obj, "knockId", kid.as_str())?;
             tx.put(&knock_obj, "requesterNodeId", nid.as_str())?;
             tx.put(&knock_obj, "requesterUsername", uname.as_str())?;
             tx.put(&knock_obj, "message", msg.as_str())?;
@@ -1331,14 +1370,15 @@ fn record_knock_in_canvas_doc(
 /// read a canvas document's automerge state to extract gossip-relevant data
 /// for a specific peer.
 ///
-/// returns (optional canvas update, optional pending invite, peer_is_participant, is_deleted)
-/// for gossip digest. runs inside spawn_blocking because doc access holds a lock.
+/// returns (optional canvas update, optional pending invite, pending knocks,
+/// peer_is_participant, is_deleted) for gossip digest. runs inside
+/// spawn_blocking because doc access holds a lock.
 fn read_canvas_for_gossip(
     handle: &crate::hub_repo::DocHandle,
     peer_node_id: &str,
 ) -> (
-    Option<GossipDigestCanvasUpdate>,
-    Option<GossipDigestPendingInvite>,
+    Option<wire::GossipDigestCanvasUpdate>,
+    Option<wire::GossipDigestPendingInvite>,
     Vec<GossipDigestPendingKnock>,
     bool, // peer_is_participant: true if peer is in peers or pendingInvites
     bool, // is_deleted: true if canvas has been tombstoned
@@ -1360,8 +1400,8 @@ fn read_canvas_for_gossip(
     }
 
     handle.with_document(|doc| {
-        let mut update: Option<GossipDigestCanvasUpdate> = None;
-        let mut invite: Option<GossipDigestPendingInvite> = None;
+        let mut update: Option<wire::GossipDigestCanvasUpdate> = None;
+        let mut invite: Option<wire::GossipDigestPendingInvite> = None;
         let mut peer_is_participant = false;
 
         // check for tombstone
@@ -1400,7 +1440,7 @@ fn read_canvas_for_gossip(
                 let last_modified = read_str(doc, &automerge::ROOT, "lastModified");
                 let last_modified_by = read_str(doc, &automerge::ROOT, "lastModifiedBy");
                 return (
-                    Some(GossipDigestCanvasUpdate {
+                    Some(wire::GossipDigestCanvasUpdate {
                         canvas_doc_id: canvas_doc_id.clone(),
                         last_modified_at: last_modified,
                         last_modified_by,
@@ -1432,7 +1472,7 @@ fn read_canvas_for_gossip(
                 let peer_last_seen = read_str(doc, &peer_entry_obj, "lastSeenAt");
 
                 if !last_modified.is_empty() && last_modified > peer_last_seen {
-                    update = Some(GossipDigestCanvasUpdate {
+                    update = Some(wire::GossipDigestCanvasUpdate {
                         canvas_doc_id: canvas_doc_id.clone(),
                         last_modified_at: last_modified.clone(),
                         last_modified_by: last_modified_by.clone(),
@@ -1467,11 +1507,20 @@ fn read_canvas_for_gossip(
                     let requester_username = read_str(doc, &knock_obj, "requesterUsername");
                     let message = read_str(doc, &knock_obj, "message");
                     let knocked_at = read_str(doc, &knock_obj, "knockedAt");
+                    let knock_id = read_str(doc, &knock_obj, "knockId");
                     pending_knocks.push(GossipDigestPendingKnock {
-                        canvas_doc_id: canvas_doc_id.clone(),
-                        requester_node_id,
-                        requester_username,
+                        knock_id,
+                        node_id: requester_node_id,
+                        username: if requester_username.is_empty() {
+                            None
+                        } else {
+                            Some(requester_username)
+                        },
                         message,
+                        scope: WireKnockScope::Resource {
+                            resource_id: canvas_doc_id.clone(),
+                            requested_role: None,
+                        },
                         knocked_at,
                     });
                 }
@@ -1495,8 +1544,8 @@ fn read_canvas_for_gossip(
                     let invited_by_username = read_str(doc, &invite_obj, "invitedByUsername");
 
                     // "admin"/"member"/"viewer" straight from the doc, no
-                    // enum conversion (see the note in
-                    // `protocol/messages.rs` above `GossipDigestCanvasUpdate`).
+                    // enum conversion (skein's canvas roles are plain
+                    // strings, unlike haruspex's typed `Role`).
                     let role = read_str(doc, &invite_obj, "role");
 
                     let invited_at = read_str(doc, &invite_obj, "invitedAt");
@@ -1514,7 +1563,7 @@ fn read_canvas_for_gossip(
 
                     let preview_url = read_str(doc, &automerge::ROOT, "previewUrl");
 
-                    invite = Some(GossipDigestPendingInvite {
+                    invite = Some(wire::GossipDigestPendingInvite {
                         canvas_doc_id: canvas_doc_id.clone(),
                         canvas_title: title,
                         canvas_description: description,
@@ -1539,6 +1588,78 @@ fn read_canvas_for_gossip(
 
         (update, invite, pending_knocks, peer_is_participant, false)
     })
+}
+
+// ---------------------------------------------------------------------------
+// app-extension dispatch (called from hub/messages.rs)
+// ---------------------------------------------------------------------------
+
+impl HubPeerService {
+    /// route a `skein:`-namespaced app-extension message to the right
+    /// handler. unrecognized extension types are logged and dropped.
+    pub(crate) async fn handle_app_extension(
+        &self,
+        from_node_id: &str,
+        message_type: &str,
+        payload: &serde_json::Value,
+    ) {
+        match message_type {
+            wire::EXT_CANVAS_INVITE => match wire::parse_extension(payload) {
+                Some(ext) => self.handle_canvas_invite(from_node_id, ext).await,
+                None => {
+                    tracing::warn!(peer = %from_node_id, "malformed skein:canvas-invite payload")
+                }
+            },
+            wire::EXT_CANVAS_INVITE_ACK => {
+                if let Some(ext) = wire::parse_extension::<wire::CanvasInviteAckExt>(payload) {
+                    tracing::info!(
+                        peer = %from_node_id,
+                        invite_id = %ext.invite_id,
+                        canvas_doc_id = %ext.canvas_doc_id,
+                        acker = %ext.acker_node_id,
+                        "received canvas invite ack"
+                    );
+                }
+            }
+            wire::EXT_CANVAS_INVITE_ACCEPT => {
+                if let Some(ext) = wire::parse_extension::<wire::CanvasInviteAcceptExt>(payload) {
+                    tracing::info!(
+                        peer = %from_node_id,
+                        invite_id = %ext.invite_id,
+                        canvas_doc_id = %ext.canvas_doc_id,
+                        accepter = %ext.accepter_node_id,
+                        "received canvas invite accept"
+                    );
+                }
+            }
+            wire::EXT_CANVAS_INVITE_DECLINE => {
+                if let Some(ext) = wire::parse_extension::<wire::CanvasInviteDeclineExt>(payload) {
+                    tracing::info!(
+                        peer = %from_node_id,
+                        invite_id = %ext.invite_id,
+                        canvas_doc_id = %ext.canvas_doc_id,
+                        decliner = %ext.decliner_node_id,
+                        "received canvas invite decline"
+                    );
+                }
+            }
+            wire::EXT_CANVAS_UPDATE => match wire::parse_extension(payload) {
+                Some(ext) => self.handle_canvas_update(from_node_id, ext).await,
+                None => {
+                    tracing::warn!(peer = %from_node_id, "malformed skein:canvas-update payload")
+                }
+            },
+            wire::EXT_CANVAS_DELETED => match wire::parse_extension(payload) {
+                Some(ext) => self.handle_canvas_deleted(from_node_id, ext).await,
+                None => {
+                    tracing::warn!(peer = %from_node_id, "malformed skein:canvas-deleted payload")
+                }
+            },
+            other => {
+                tracing::debug!(peer = %from_node_id, message_type = %other, "ignoring unknown app extension");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1587,7 +1708,7 @@ mod tests {
         db_path: &std::path::Path,
         canvas_doc_id: &str,
         member_node_id: &str,
-        knock: Option<(&str, &str, &str)>, // (requester_node_id, username, message)
+        knock: Option<(&str, &str, &str, &str)>, // (knock_id, requester_node_id, username, message)
     ) -> HubRepo {
         let storage = crate::hub_repo::HubDocStorage::new(db_path)
             .await
@@ -1604,11 +1725,12 @@ mod tests {
             let peer_entry = tx.put_object(&peers, member_node_id, automerge::ObjType::Map)?;
             tx.put(&peer_entry, "lastSeenAt", "2025-01-01T00:00:00Z")?;
 
-            if let Some((requester_node_id, username, message)) = knock {
+            if let Some((knock_id, requester_node_id, username, message)) = knock {
                 let pending =
                     tx.put_object(automerge::ROOT, "pendingKnocks", automerge::ObjType::Map)?;
                 let knock_obj =
                     tx.put_object(&pending, requester_node_id, automerge::ObjType::Map)?;
+                tx.put(&knock_obj, "knockId", knock_id)?;
                 tx.put(&knock_obj, "requesterNodeId", requester_node_id)?;
                 tx.put(&knock_obj, "requesterUsername", username)?;
                 tx.put(&knock_obj, "message", message)?;
@@ -1633,7 +1755,7 @@ mod tests {
             &db_path,
             "canvas-1",
             "member-node",
-            Some(("requester-1", "alice", "let me in")),
+            Some(("knock-1", "requester-1", "alice", "let me in")),
         )
         .await;
         let handle = hub_repo
@@ -1649,10 +1771,14 @@ mod tests {
         assert!(peer_is_participant);
         assert!(!is_deleted);
         assert_eq!(knocks.len(), 1);
-        assert_eq!(knocks[0].canvas_doc_id, "canvas-1");
-        assert_eq!(knocks[0].requester_node_id, "requester-1");
-        assert_eq!(knocks[0].requester_username, "alice");
+        assert_eq!(knocks[0].knock_id, "knock-1");
+        assert_eq!(knocks[0].node_id, "requester-1");
+        assert_eq!(knocks[0].username.as_deref(), Some("alice"));
         assert_eq!(knocks[0].message, "let me in");
+        match &knocks[0].scope {
+            WireKnockScope::Resource { resource_id, .. } => assert_eq!(resource_id, "canvas-1"),
+            other => panic!("expected a resource scope, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1667,7 +1793,7 @@ mod tests {
             &db_path,
             "canvas-1",
             "requester-1",
-            Some(("requester-1", "alice", "let me in")),
+            Some(("knock-1", "requester-1", "alice", "let me in")),
         )
         .await;
         let handle = hub_repo
@@ -1691,7 +1817,7 @@ mod tests {
             &db_path,
             "canvas-1",
             "member-node",
-            Some(("requester-1", "alice", "let me in")),
+            Some(("knock-1", "requester-1", "alice", "let me in")),
         )
         .await;
         let handle = hub_repo
@@ -1747,8 +1873,13 @@ mod tests {
         // blocking RwLock calls — always run inside `spawn_blocking`, same
         // as every production call site.
         tokio::task::spawn_blocking(move || {
-            let recorded =
-                record_knock_in_canvas_doc(&handle, "requester-1", "alice", "hello, let me in");
+            let recorded = record_knock_in_canvas_doc(
+                &handle,
+                "knock-1",
+                "requester-1",
+                "alice",
+                "hello, let me in",
+            );
             assert!(recorded, "a knock into a synced doc should be recorded");
 
             use automerge::ReadDoc;
@@ -1762,6 +1893,8 @@ mod tests {
                     .unwrap()
                     .expect("knock entry should exist");
 
+                let (knock_id_val, _) = doc.get(&knock_obj, "knockId").unwrap().unwrap();
+                assert_eq!(knock_id_val.to_str(), Some("knock-1"));
                 let (username_val, _) = doc.get(&knock_obj, "requesterUsername").unwrap().unwrap();
                 assert_eq!(username_val.to_str(), Some("alice"));
                 let (message_val, _) = doc.get(&knock_obj, "message").unwrap().unwrap();
@@ -1797,6 +1930,7 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             assert!(record_knock_in_canvas_doc(
                 &handle,
+                "knock-1",
                 "requester-1",
                 "alice",
                 "first message"
@@ -1807,6 +1941,7 @@ mod tests {
             // "already pending, no decisions yet -> return unchanged" rule.
             assert!(record_knock_in_canvas_doc(
                 &handle,
+                "knock-1",
                 "requester-1",
                 "mallory",
                 "second message"
@@ -1860,7 +1995,7 @@ mod tests {
             .expect("doc should be found");
 
         let recorded = tokio::task::spawn_blocking(move || {
-            record_knock_in_canvas_doc(&handle, "requester-1", "alice", "hi")
+            record_knock_in_canvas_doc(&handle, "knock-1", "requester-1", "alice", "hi")
         })
         .await
         .expect("spawn_blocking should not panic");

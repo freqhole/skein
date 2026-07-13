@@ -236,12 +236,14 @@ export class CanvasStore {
   recordKnock(
     requesterNodeId: string,
     requesterUsername: string,
-    message: string
+    message: string,
+    knockId?: string
   ): PendingCanvasKnock {
     this.handle.change((doc) => {
       if (!doc.pendingKnocks) doc.pendingKnocks = {} as Record<string, PendingCanvasKnock>;
       if (!doc.pendingKnocks[requesterNodeId]) {
         doc.pendingKnocks[requesterNodeId] = {
+          knockId: knockId ?? crypto.randomUUID(),
           requesterNodeId,
           requesterUsername,
           message,

@@ -95,9 +95,11 @@ const OPFS_STORE_DIR = "midden-blob-store";
 const STORE_LOCK_NAME = "skein-midden-blob-store";
 
 /** skein's own protocol ALPNs, registered alongside the package's default
- *  set: blob proxying/small stream requests, and the friends protocol. */
+ *  set: blob proxying/small stream requests, and the shared friendz
+ *  protocol (`@freqhole/haruspex/protocol`'s `freqhole-friendz/1`, not a
+ *  skein-specific one - see `p2p/iroh-network-adapter.ts`'s `FRIENDZ_ALPN`). */
 const SKEIN_ALPN = "skein/1";
-const SKEIN_FRIENDZ_ALPN = "skein-friendz/1";
+const FRIENDZ_ALPN = "freqhole-friendz/1";
 
 /** resolves when we know whether this worker owns the store lock. the lock
  *  (when granted) is held for the worker's lifetime via a never-resolving
@@ -150,7 +152,7 @@ async function init(
   const options = new MiddenNodeOptions();
   options.secret_key = secretKey ?? undefined;
   options.opfs_store_dir = storeDir;
-  options.extra_alpns = [SKEIN_ALPN, SKEIN_FRIENDZ_ALPN];
+  options.extra_alpns = [SKEIN_ALPN, FRIENDZ_ALPN];
 
   node = await MiddenNode.create_with_options(options);
   const sk = node.secret_key();

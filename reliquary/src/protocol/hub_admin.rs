@@ -6,10 +6,11 @@
 //! mirrors the CLI's `reliquary friend allow/list/remove` subcommands
 //! (`main.rs`'s `FriendCommand`) for consistent semantics.
 //!
-//! this is deliberately distinct from `skein-friendz/1` (peer-to-peer friend
-//! requests between any two skein nodes): `skein-friendz/1` is for ordinary
-//! friend-request handshaking between any two peers, while this protocol is
-//! for a privileged remote peer to administer *this hub's* allow-list.
+//! this is deliberately distinct from `freqhole-friendz/1` (peer-to-peer
+//! friend requests between any two skein nodes): `freqhole-friendz/1` is for
+//! ordinary friend-request handshaking between any two peers, while this
+//! protocol is for a privileged remote peer to administer *this hub's*
+//! allow-list.
 //!
 //! every request is checked against the `adminz` table before acting; a
 //! caller whose node id isn't in `adminz` gets back [`AdminResponse::NotAdmin`]

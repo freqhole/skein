@@ -70,7 +70,7 @@ export interface SkeinP2PBridge {
    * stop maintaining the automerge-repo-level connection to a peer added via
    * `addPeer()` — closes the existing stream and stops reconnecting.
    * delegates to `IrohNetworkAdapter.forgetPeer()`. useful for tests that
-   * need to prove some *other* delivery path (e.g. the skein-friendz/1
+   * need to prove some *other* delivery path (e.g. the freqhole-friendz/1
    * gossip-digest message) works on its own, independent of ordinary
    * automerge doc-sync — severing this link means the automerge-repo
    * `Repo` genuinely has no way left to sync changes with that peer.
@@ -173,7 +173,7 @@ export interface SkeinP2PBridge {
  * friendz test bridge — methods only available when the page was
  * bootstrapped with a real FriendzProtocol instance (test-harness-p2p.html).
  *
- * this drives the `skein-friendz/1` handshake against any peer by node id —
+ * this drives the `freqhole-friendz/1` handshake against any peer by node id —
  * another browser peer or a real reliquary hub, the protocol doesn't
  * distinguish between the two. production wiring lives in
  * `standalone/friendz-wiring.ts` and writes into the real social automerge
@@ -919,6 +919,7 @@ export function buildKnockTestBridge(options: {
       const knocks = Object.values(doc.pendingKnocks ?? {})
         .filter((k) => k.requesterNodeId !== peerNodeId)
         .map((k) => ({
+          knockId: k.knockId,
           canvasDocId,
           requesterNodeId: k.requesterNodeId,
           requesterUsername: k.requesterUsername,

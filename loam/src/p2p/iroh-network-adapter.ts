@@ -24,8 +24,10 @@ import { getStoredIdentity, onIdentityChange } from "./identity";
 export { IrohNetworkAdapter, SYNC_ALPN };
 export type { BiStreamLike, ConnectionSummary, EndpointState, MiddenStreamNode };
 
-/** alpn for friend requests, profile sharing, and presence heartbeat. */
-export const FRIENDZ_ALPN = "skein-friendz/1";
+/** alpn for friend requests, profile sharing, presence, knocks, and acl
+ *  notifications - the shared `@freqhole/haruspex/protocol` wire format,
+ *  not a skein-specific one. */
+export const FRIENDZ_ALPN = "freqhole-friendz/1";
 
 /**
  * build an `IrohNetworkAdapter` wired up with skein's own p2p identity

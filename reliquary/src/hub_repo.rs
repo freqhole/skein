@@ -1204,8 +1204,8 @@ mod tests {
     /// connection (an in-flight `handle_connection` loop, here driven by an
     /// in-memory `tokio::io::duplex` pair rather than a real iroh stream,
     /// matching this crate's existing precedent for testing `hub_repo`/
-    /// `sync` logic without a live network - see `protocol::codec`'s tests
-    /// and `sync::tests`'s doc comments) can be cancelled from outside its
+    /// `sync` logic without a live network - see `sync::tests`'s doc
+    /// comments) can be cancelled from outside its
     /// own loop, and the loop actually stops promptly rather than running
     /// until the peer disconnects on its own.
     #[tokio::test]

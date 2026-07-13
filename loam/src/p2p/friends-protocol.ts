@@ -1,13 +1,34 @@
 // ---------------------------------------------------------------------------
-// friends protocol handler — skein-friendz/1
+// friendz protocol adapter — freqhole-friendz/1
 //
-// handles P2P communication for friend requests, profile sharing, and
-// presence heartbeat over the skein-friendz/1 ALPN. runs alongside
-// the automerge sync adapter, sharing the same midden WASM transport.
+// bridges skein's existing friend/presence/knock/canvas UI and business
+// logic onto the shared wire protocol owned by `@freqhole/haruspex/protocol`
+// (`FriendzClient`, `CoreMessage`, `AppExtensionMessage`), instead of a
+// bespoke skein-only codec. presence, friend requests, knocks, and acl
+// notifications ride the protocol's core message set; canvas invite/update/
+// delete notifications (skein-only concepts with no core equivalent) ride
+// as `skein:`-namespaced app-extension messages.
+//
+// this file keeps the same public `FriendzProtocol` class shape (method
+// names, event-handler properties, message field names) that existed
+// before this protocol swap, so the rest of skein's already-tested friend/
+// canvas/knock business logic (friendz-wiring.ts, friendz-bridge.ts, the
+// p2p test harness) doesn't need to relearn new field names for concepts
+// whose shape didn't change - only the actual bytes on the wire changed,
+// and the handful of messages whose shape genuinely did change (acl-change,
+// canvas-knock*, gossip-digest) are translated here, in one place.
 // ---------------------------------------------------------------------------
 
+import {
+  createFriendzClient,
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_HEARTBEAT_TIMEOUT_MS,
+  type CoreMessage,
+  type FriendzClient,
+  type FriendzMessage as WireMessage,
+  type WireRole,
+} from "@freqhole/haruspex/protocol";
 import type { BiStreamLike, MiddenStreamNode } from "./iroh-network-adapter";
-import { FRIENDZ_ALPN } from "./iroh-network-adapter";
 import type { CanvasRoleOrRemoved, InvitableRole } from "../canvas/canvas-doc";
 import { log } from "@freqhole/reliquary/utils";
 
@@ -17,17 +38,26 @@ import { log } from "@freqhole/reliquary/utils";
 
 const TAG = "p2p.friendz";
 
-/** how often to send heartbeat pings to friends (ms). */
-export const HEARTBEAT_INTERVAL_MS = 30_000;
+/** how often to send heartbeat pings to friends (ms). matches the shared
+ *  protocol's own default, so `FriendzClient`'s online/offline window and
+ *  this adapter's own send cadence agree. */
+export const HEARTBEAT_INTERVAL_MS = DEFAULT_HEARTBEAT_INTERVAL_MS;
 
 /** time after last heartbeat before marking a friend offline (ms). */
-export const HEARTBEAT_TIMEOUT_MS = 90_000;
+export const HEARTBEAT_TIMEOUT_MS = DEFAULT_HEARTBEAT_TIMEOUT_MS;
 
 /** interval for probing offline friends to see if they came back (ms). */
 export const DISCOVERY_SWEEP_MS = 300_000; // 5 min
 
 // ---------------------------------------------------------------------------
-// protocol message types
+// message shapes consumed by this app's callbacks/senders
+//
+// these are no longer wire formats (the shared protocol owns the actual
+// bytes) - they're this adapter's own internal shape for the concepts
+// skein's UI/business logic cares about. most are unchanged from before
+// this protocol swap; a few (canvas-knock*, acl-change, gossip-digest) are
+// translated to/from the shared protocol's shapes, documented at each
+// translation site below.
 // ---------------------------------------------------------------------------
 
 /** request the peer's profile. */
@@ -35,63 +65,43 @@ export interface ProfileRequestMessage {
   type: "profile-request";
 }
 
-/** response with profile data. */
 export interface ProfileResponseMessage {
   type: "profile-response";
   username: string;
   bio: string;
   avatarDataUrl: string;
-  /** the sender's own profile accent color, if they have one set.
-   *  omitted (not sent as a default) when the sender has no accent color
-   *  configured — matches the optional-field-omission convention already
-   *  used elsewhere in this file (e.g. `isHub`, `profileDocId`). */
   accentColor?: number;
-  /** pointer to the sender's profile automerge doc (docs/hub-and-profile-plan.md
-   *  section 6), if they have one. omitted (not sent as "") when the
-   *  sender has no profile doc yet — matches the optional-field-omission
-   *  convention already used elsewhere in this file (e.g. `isHub`). */
   profileDocId?: string;
-  /** ISO timestamp mirroring `ProfileStore.updatedAt()` at send time —
-   *  lets the receiver compare against any cached copy for staleness. */
   profileUpdatedAt?: string;
 }
 
-/** send a friend request to a peer. */
 export interface FriendRequestMessage {
   type: "friend-request";
   fromNodeId: string;
   fromUsername: string;
-  /** true only when the sender is a reliquary hub node (see
-   *  docs/hub-and-profile-plan.md section 3) — never sent by a browser
-   *  peer, omitted rather than sent as `false`. */
   isHub?: boolean;
 }
 
-/** accept an incoming friend request. */
 export interface FriendAcceptMessage {
   type: "friend-accept";
   fromNodeId: string;
   fromUsername: string;
-  /** true only when the sender is a reliquary hub node (see
-   *  docs/hub-and-profile-plan.md section 3) — never sent by a browser
-   *  peer, omitted rather than sent as `false`. */
   isHub?: boolean;
 }
 
-/** reject an incoming friend request. */
 export interface FriendRejectMessage {
   type: "friend-reject";
   fromNodeId: string;
 }
 
-/** lightweight activity summary for a shared canvas, piggybacked on heartbeat. */
+/** lightweight activity summary for a shared canvas, piggybacked on
+ *  heartbeat via the shared protocol's generic `appPayload` field. */
 export interface CanvasActivityEntry {
   canvasDocId: string;
-  lastModifiedAt: string; // ISO timestamp of most recent change
-  widgetCount: number; // cheap proxy for "how much stuff is there"
+  lastModifiedAt: string;
+  widgetCount: number;
 }
 
-/** periodic presence ping. */
 export interface HeartbeatMessage {
   type: "heartbeat";
   nodeId: string;
@@ -99,13 +109,12 @@ export interface HeartbeatMessage {
   canvasActivity?: CanvasActivityEntry[];
 }
 
-/** acknowledge a friend-accept (two-phase handshake). */
 export interface FriendAcceptAckMessage {
   type: "friend-accept-ack";
   fromNodeId: string;
 }
 
-/** send a canvas invite (or relay via gossip). */
+/** sent as a `skein:canvas-invite` app-extension message. */
 export interface CanvasInviteMessage {
   type: "canvas-invite";
   inviteId: string;
@@ -121,7 +130,6 @@ export interface CanvasInviteMessage {
   acked: string[];
 }
 
-/** acknowledge receipt of a canvas invite. */
 export interface CanvasInviteAckMessage {
   type: "canvas-invite-ack";
   inviteId: string;
@@ -129,7 +137,6 @@ export interface CanvasInviteAckMessage {
   ackerNodeId: string;
 }
 
-/** accept a canvas invite. */
 export interface CanvasInviteAcceptMessage {
   type: "canvas-invite-accept";
   inviteId: string;
@@ -137,7 +144,6 @@ export interface CanvasInviteAcceptMessage {
   accepterNodeId: string;
 }
 
-/** decline a canvas invite. */
 export interface CanvasInviteDeclineMessage {
   type: "canvas-invite-decline";
   inviteId: string;
@@ -145,16 +151,11 @@ export interface CanvasInviteDeclineMessage {
   declinerNodeId: string;
 }
 
-/**
- * send a knock (access request), or relay one — same structural shape as
- * `CanvasInviteMessage`. see docs/knock-and-hub-relay-plan.md section 4.
- */
+/** a canvas knock (access request) - sent/received as the shared
+ *  protocol's `knock-request`, scoped to a resource (`scope.resourceId`
+ *  = `canvasDocId`). */
 export interface CanvasKnockMessage {
   type: "canvas-knock";
-  /** stable id for this specific knock attempt, for acking. a requester
-   *  retrying after a timeout should reuse a fresh id per attempt — dedup
-   *  happens on `requesterNodeId` (see `CanvasStore.recordKnock()`), not on
-   *  `knockId`. */
   knockId: string;
   canvasDocId: string;
   requesterNodeId: string;
@@ -162,18 +163,21 @@ export interface CanvasKnockMessage {
   message: string;
 }
 
-/** acknowledge receipt of a canvas knock. */
+/** sent/received as the shared protocol's `knock-ack`. */
 export interface CanvasKnockAckMessage {
   type: "canvas-knock-ack";
   knockId: string;
   canvasDocId: string;
-  /** node id of whoever recorded the knock into `pendingKnocks` — lets the
-   *  requester's UI move from "sending…" to "request received, waiting for
-   *  an admin" with a real delivery confirmation. */
   ackerNodeId: string;
 }
 
-/** approve a pending knock. */
+/**
+ * an approved knock - synthesized from the shared protocol's single
+ * `knock-outcome` message (`status: "accepted"`). `canvasDocId` is
+ * recovered from `grantedResourceIds[0]` (the wire message doesn't carry
+ * `canvasDocId` directly - the receiver correlates by `knockId` instead,
+ * per the shared protocol's design).
+ */
 export interface CanvasKnockApproveMessage {
   type: "canvas-knock-approve";
   knockId: string;
@@ -182,7 +186,11 @@ export interface CanvasKnockApproveMessage {
   role: InvitableRole;
 }
 
-/** decline a pending knock. */
+/**
+ * a declined knock - synthesized from `knock-outcome` (`status:
+ * "denied"`). `canvasDocId` is not recoverable here (the wire message
+ * carries no resource id for a denial) - always `""`.
+ */
 export interface CanvasKnockDeclineMessage {
   type: "canvas-knock-decline";
   knockId: string;
@@ -190,7 +198,10 @@ export interface CanvasKnockDeclineMessage {
   declinerNodeId: string;
 }
 
-/** notify a peer that their ACL role changed. */
+/** sent/received as the shared protocol's `acl-change`, with
+ *  `canvasDocId`/`canvasTitle` renamed to `resourceId`/`resourceTitle` on
+ *  the wire, and `newRole: "removed"` represented as an absent `newRole`
+ *  field (the shared protocol has no "removed" role literal). */
 export interface AclChangeMessage {
   type: "acl-change";
   canvasDocId: string;
@@ -201,7 +212,7 @@ export interface AclChangeMessage {
   changedByUsername: string;
 }
 
-/** notify a peer that a shared canvas was modified. */
+/** sent as a `skein:canvas-update` app-extension message. */
 export interface CanvasUpdateMessage {
   type: "canvas-update";
   canvasDocId: string;
@@ -211,7 +222,7 @@ export interface CanvasUpdateMessage {
   modifiedByUsername: string;
 }
 
-/** notify a peer that a shared canvas was deleted or purged. */
+/** sent as a `skein:canvas-deleted` app-extension message. */
 export interface CanvasDeletedMessage {
   type: "canvas-deleted";
   canvasDocId: string;
@@ -222,13 +233,13 @@ export interface CanvasDeletedMessage {
   deletedAt: string;
 }
 
-/** sent when a peer is about to go offline (tab close / app exit). */
 export interface OfflineAnnouncementMessage {
   type: "offline-announcement";
   nodeId: string;
 }
 
-/** a canvas update entry in a gossip digest. */
+/** skein-only canvas-update summary - carried in the shared protocol's
+ *  `gossip-digest.appPayload`, alongside `pendingInvites`/`sharedCanvasIds`. */
 export interface GossipDigestCanvasUpdate {
   canvasDocId: string;
   lastModifiedAt: string;
@@ -236,7 +247,7 @@ export interface GossipDigestCanvasUpdate {
   deleted?: boolean;
 }
 
-/** a pending invite entry in a gossip digest. */
+/** skein-only pending-invite summary - carried in `appPayload`. */
 export interface GossipDigestPendingInvite {
   canvasDocId: string;
   canvasTitle: string;
@@ -249,13 +260,12 @@ export interface GossipDigestPendingInvite {
   invitedAt: string;
 }
 
-/** a pending knock entry in a gossip digest — mirrors
- *  `GossipDigestPendingInvite` exactly. anything arriving via this path is
- *  by definition relayed (the digest sender is never the requester
- *  themselves in practice — a requester gossips its own knock nowhere), so
- *  there's no `relayedBy` field here: the receiving peer already knows the
- *  digest's `fromNodeId` is the relayer. */
+/** a pending knock entry in a gossip digest - sent/received as the shared
+ *  protocol's `GossipDigestPendingKnock`, which (unlike this app's own
+ *  `PendingCanvasKnock` map) requires a `knockId` and a `scope` rather
+ *  than a bare `canvasDocId`. */
 export interface GossipDigestPendingKnock {
+  knockId: string;
   canvasDocId: string;
   requesterNodeId: string;
   requesterUsername: string;
@@ -263,156 +273,64 @@ export interface GossipDigestPendingKnock {
   knockedAt: string;
 }
 
-/** a profile-doc pointer entry in a gossip digest (docs/hub-and-profile-plan.md
- *  section 6's "hub gossip of profile docs") — relays what the sender
- *  knows about a peer's profile doc (their own, or a mutual friend's
- *  learned earlier) so the receiver can sync/update it without a direct
- *  connection to the profile's owner. mirrors `GossipDigestPendingKnock`'s
- *  "just a pointer + timestamp, let ordinary automerge sync pull the real
- *  doc" shape. */
+/** a profile-doc pointer entry in a gossip digest - identical shape on
+ *  both sides of the wire, no translation needed. */
 export interface GossipDigestProfileEntry {
-  /** whose profile this is (not necessarily the digest's sender). */
   peerNodeId: string;
   profileDocId: string;
-  /** ISO timestamp mirroring `ProfileStore.updatedAt()` — lets the
-   *  receiver skip entries no newer than what it already has cached. */
   updatedAt: string;
 }
 
-/** gossip digest sent when a peer comes online.
- *  bundles canvas updates, pending invites, pending knocks, and profile-doc
- *  pointers for the receiving peer, computed from the sender's local state. */
+/** gossip digest sent when a peer comes online. `canvasUpdates`/
+ *  `pendingInvites`/`sharedCanvasIds` have no core-protocol equivalent and
+ *  ride in the wire message's generic `appPayload` field; `pendingKnocks`/
+ *  `profiles` are translated to/from the shared protocol's own shapes. */
 export interface GossipDigestMessage {
   type: "gossip-digest";
   canvasUpdates: GossipDigestCanvasUpdate[];
   pendingInvites: GossipDigestPendingInvite[];
   pendingKnocks: GossipDigestPendingKnock[];
   sharedCanvasIds?: string[];
-  /** optional/omit-if-empty, same convention as `sharedCanvasIds` —
-   *  older peers without this field simply never relay/receive profile
-   *  pointers, no wire-format break. */
   profiles?: GossipDigestProfileEntry[];
 }
 
-/** batch blob availability query — "i need these blobs, which do you have?"
- *  sent by the hub to peers when it has missing blobs without snatchedBy info.
- *  the receiver checks locally and responds with blob-offer. */
+/** batch blob availability query - sent/received as the shared protocol's
+ *  `blob-seek`, unchanged shape. */
 export interface BlobSeekMessage {
   type: "blob-seek";
   needed: string[];
 }
 
-/** batch blob availability response — "i have these blobs."
- *  sent in response to a BlobSeek. contains the subset of requested hashes
- *  that the responder has locally. */
+/** batch blob availability response - sent/received as `blob-offer`,
+ *  unchanged shape. */
 export interface BlobOfferMessage {
   type: "blob-offer";
   available: string[];
 }
 
-/** union of all protocol messages. */
-export type FriendzMessage =
-  | ProfileRequestMessage
-  | ProfileResponseMessage
-  | FriendRequestMessage
-  | FriendAcceptMessage
-  | FriendAcceptAckMessage
-  | FriendRejectMessage
-  | HeartbeatMessage
-  | CanvasInviteMessage
-  | CanvasInviteAckMessage
-  | CanvasInviteAcceptMessage
-  | CanvasInviteDeclineMessage
-  | CanvasKnockMessage
-  | CanvasKnockAckMessage
-  | CanvasKnockApproveMessage
-  | CanvasKnockDeclineMessage
-  | AclChangeMessage
-  | CanvasUpdateMessage
-  | CanvasDeletedMessage
-  | OfflineAnnouncementMessage
-  | GossipDigestMessage
-  | BlobSeekMessage
-  | BlobOfferMessage;
-
 // ---------------------------------------------------------------------------
-// message encoding / decoding
-//
-// messages are JSON-encoded and written as UTF-8 over the BiStream.
-// the midden BiStream's write_message/read_message handles
-// length-delimited framing, so we just need JSON serialization.
+// event callback types
 // ---------------------------------------------------------------------------
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-
-/** encode a protocol message to bytes for sending over a BiStream. */
-export function encodeMessage(msg: FriendzMessage): Uint8Array {
-  return encoder.encode(JSON.stringify(msg));
-}
-
-/** decode bytes from a BiStream into a protocol message. */
-export function decodeMessage(data: Uint8Array): FriendzMessage {
-  const text = decoder.decode(data);
-  return JSON.parse(text) as FriendzMessage;
-}
-
-// ---------------------------------------------------------------------------
-// event types for the protocol handler
-// ---------------------------------------------------------------------------
-
-/** callback for when a friend request is received from a remote peer. */
 export type OnFriendRequest = (request: FriendRequestMessage, fromNodeId: string) => void;
-
-/** callback for when a friend request is accepted by a remote peer. */
 export type OnFriendAccept = (accept: FriendAcceptMessage, fromNodeId: string) => void;
-
-/** callback for when a friend request is rejected by a remote peer. */
 export type OnFriendReject = (reject: FriendRejectMessage, fromNodeId: string) => void;
-
-/** callback for when a profile response is received from a remote peer. */
 export type OnProfileResponse = (profile: ProfileResponseMessage, fromNodeId: string) => void;
-
-/** callback for when a heartbeat is received from a remote peer. */
 export type OnHeartbeat = (heartbeat: HeartbeatMessage, fromNodeId: string) => void;
-
-/** callback for when a friend-accept-ack is received from a remote peer. */
 export type OnFriendAcceptAck = (ack: FriendAcceptAckMessage, fromNodeId: string) => void;
-
-/** callback for when a canvas invite is received from a remote peer. */
 export type OnCanvasInvite = (invite: CanvasInviteMessage, fromNodeId: string) => void;
-
-/** callback for when a canvas invite ack is received from a remote peer. */
 export type OnCanvasInviteAck = (ack: CanvasInviteAckMessage, fromNodeId: string) => void;
-
-/** callback for when a canvas invite is accepted by a remote peer. */
 export type OnCanvasInviteAccept = (accept: CanvasInviteAcceptMessage, fromNodeId: string) => void;
-
-/** callback for when a canvas invite is declined by a remote peer. */
 export type OnCanvasInviteDecline = (
   decline: CanvasInviteDeclineMessage,
   fromNodeId: string
 ) => void;
-
-/** callback for when a canvas knock is received from a remote peer. */
 export type OnCanvasKnock = (knock: CanvasKnockMessage, fromNodeId: string) => void;
-
-/** callback for when a canvas knock ack is received from a remote peer. */
 export type OnCanvasKnockAck = (ack: CanvasKnockAckMessage, fromNodeId: string) => void;
-
-/** callback for when a canvas knock is approved by a remote peer. */
 export type OnCanvasKnockApprove = (approve: CanvasKnockApproveMessage, fromNodeId: string) => void;
-
-/** callback for when a canvas knock is declined by a remote peer. */
 export type OnCanvasKnockDecline = (decline: CanvasKnockDeclineMessage, fromNodeId: string) => void;
-
-/** callback for when an ACL change notification is received from a remote peer. */
 export type OnAclChange = (change: AclChangeMessage, fromNodeId: string) => void;
-
-/** callback for when a canvas update notification is received from a remote peer. */
 export type OnCanvasUpdate = (msg: CanvasUpdateMessage, fromNodeId: string) => void;
-
-/** callback for when a canvas-deleted notification is received from a remote peer. */
 export type OnCanvasDeleted = (msg: CanvasDeletedMessage, fromNodeId: string) => void;
 
 // ---------------------------------------------------------------------------
@@ -422,17 +340,8 @@ export type OnCanvasDeleted = (msg: CanvasDeletedMessage, fromNodeId: string) =>
 export interface FriendzProtocolOptions {
   /** factory to get the midden node for outbound connections. */
   getMidden: () => Promise<MiddenStreamNode>;
-
-  /** local node ID (from identity). */
   localNodeId: string;
-
-  /** local username (from profile). */
   localUsername: string;
-
-  /** callback to get the local profile for responding to profile requests.
-   *  `profileDocId`/`profileUpdatedAt` are optional — omitted (not sent as
-   *  ""/undefined explicitly) when the caller has no profile doc wired up
-   *  yet (see docs/hub-and-profile-plan.md section 6). */
   getLocalProfile: () => {
     username: string;
     bio: string;
@@ -441,153 +350,73 @@ export interface FriendzProtocolOptions {
     profileDocId?: string;
     profileUpdatedAt?: string;
   };
-
-  /** callback to check if a node ID is a known friend. */
   isFriend: (nodeId: string) => boolean;
-
-  /** privacy: who can see our profile ("friends" | "everyone" | "nobody"). */
   profileVisibility?: "friends" | "everyone" | "nobody";
-
-  /** privacy: who can send us friend requests ("everyone" | "nobody"). */
   friendRequestsFrom?: "everyone" | "nobody";
-
-  /** privacy: who can send us canvas invites ("everyone" | "friends" | "nobody"). */
   canvasInvitesFrom?: "everyone" | "friends" | "nobody";
-
-  /** callback that returns canvas activity entries to piggyback on heartbeats. */
   getCanvasActivity?: () => CanvasActivityEntry[];
 }
 
+function coreMessage(message: CoreMessage): WireMessage {
+  return { kind: "core", message };
+}
+
+function extensionMessage(messageType: string, payload: Record<string, unknown>): WireMessage {
+  return { kind: "app-extension", messageType, payload };
+}
+
 /**
- * handles the skein-friendz/1 protocol for friend requests,
- * profile sharing, and presence heartbeat.
+ * handles the shared friendz protocol (`freqhole-friendz/1`) for friend
+ * requests, profile sharing, presence heartbeat, canvas knocks, acl
+ * change notifications, and gossip digests - plus skein's own canvas
+ * invite/update/delete notifications, carried as app-extension messages.
  *
  * usage:
  *   const friendz = new FriendzProtocol({ getMidden, localNodeId, ... });
  *   adapter.registerAlpnHandler(FRIENDZ_ALPN, (stream) => friendz.handleStream(stream));
- *
- *   // send a friend request
- *   await friendz.sendFriendRequest(peerNodeId);
- *
- *   // listen for incoming requests
- *   friendz.onFriendRequest = (req, fromNodeId) => { ... };
  */
 export class FriendzProtocol {
-  private getMidden: () => Promise<MiddenStreamNode>;
+  private client: FriendzClient;
   private localNodeId: string;
   private localUsername: string;
-  private getLocalProfile: () => {
-    username: string;
-    bio: string;
-    avatarDataUrl: string;
-    accentColor?: number;
-    profileDocId?: string;
-    profileUpdatedAt?: string;
-  };
+  private getLocalProfile: FriendzProtocolOptions["getLocalProfile"];
   private isFriend: (nodeId: string) => boolean;
   private profileVisibility: "friends" | "everyone" | "nobody";
   private friendRequestsFrom: "everyone" | "nobody";
   private canvasInvitesFrom: "everyone" | "friends" | "nobody";
   private getCanvasActivity: (() => CanvasActivityEntry[]) | null;
 
-  /** active BiStreams to peers, keyed by node ID. */
-  private streams = new Map<string, BiStreamLike>();
-
-  /** in-flight stream opens to deduplicate concurrent sendMessage calls. */
-  private pendingConnections = new Map<string, Promise<BiStreamLike>>();
-
-  /** last seen timestamps for heartbeat tracking, keyed by node ID. */
-  private lastSeen = new Map<string, number>();
-
-  /** heartbeat interval timer. */
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-
-  /** discovery sweep timer for probing offline friends. */
   private discoveryTimer: ReturnType<typeof setInterval> | null = null;
-
-  /** stored friend node ID getter from startHeartbeat, used by discovery sweep. */
   private getFriendNodeIds: (() => string[]) | null = null;
-
-  /** online/offline change listeners. */
-  private onlineChangeListeners: Array<() => void> = [];
-
-  private _destroyed = false;
 
   // --- event handlers (set by the consumer) ---
 
-  /** called when a friend request is received. */
   onFriendRequest: OnFriendRequest | null = null;
-
-  /** called when a friend accept is received. */
   onFriendAccept: OnFriendAccept | null = null;
-
-  /** called when a friend reject is received. */
   onFriendReject: OnFriendReject | null = null;
-
-  /** called when a profile response is received. */
   onProfileResponse: OnProfileResponse | null = null;
-
-  /** called when a heartbeat is received. */
   onHeartbeat: OnHeartbeat | null = null;
-
-  /** called when a friend-accept-ack is received. */
   onFriendAcceptAck: OnFriendAcceptAck | null = null;
-
-  /** called when a canvas invite is received. */
   onCanvasInvite: OnCanvasInvite | null = null;
-
-  /** called when a canvas invite ack is received. */
   onCanvasInviteAck: OnCanvasInviteAck | null = null;
-
-  /** called when a canvas invite is accepted. */
   onCanvasInviteAccept: OnCanvasInviteAccept | null = null;
-
-  /** called when a canvas invite is declined. */
   onCanvasInviteDecline: OnCanvasInviteDecline | null = null;
-
-  /** called when a canvas knock is received. */
   onCanvasKnock: OnCanvasKnock | null = null;
-
-  /** called when a canvas knock ack is received. */
   onCanvasKnockAck: OnCanvasKnockAck | null = null;
-
-  /** called when a canvas knock is approved. */
   onCanvasKnockApprove: OnCanvasKnockApprove | null = null;
-
-  /** called when a canvas knock is declined. */
   onCanvasKnockDecline: OnCanvasKnockDecline | null = null;
-
-  /** called when an ACL change notification is received. */
   onAclChange: OnAclChange | null = null;
-
-  /** called when canvas activity entries arrive in a heartbeat. */
   onCanvasActivity: ((entries: CanvasActivityEntry[], fromNodeId: string) => void) | null = null;
-
-  /** called when a peer stream is fully connected and the read loop has started. */
   onPeerConnected: ((peerNodeId: string) => void) | null = null;
-
-  /** called when a peer transitions from offline/unknown to online.
-   *  fires on the !wasOnline heartbeat transition, which happens on BOTH sides
-   *  during the initial handshake — making gossip exchange bidirectional. */
   onPeerBecameOnline: ((peerNodeId: string) => void) | null = null;
-
-  /** called after each heartbeat tick with the list of friend node IDs. */
   onAfterHeartbeatTick: ((friendNodeIds: string[]) => void) | null = null;
-
-  /** called when a canvas update notification is received. */
   onCanvasUpdate: OnCanvasUpdate | null = null;
-
-  /** called when a canvas-deleted notification is received. */
   onCanvasDeleted: OnCanvasDeleted | null = null;
-
-  /** called when a gossip digest is received from a peer that just came online. */
   onGossipDigest: ((msg: GossipDigestMessage, fromNodeId: string) => void) | null = null;
-
-  /** called when a blob-seek is received from a peer. */
   onBlobSeek: ((msg: BlobSeekMessage, fromNodeId: string) => void) | null = null;
 
   constructor(options: FriendzProtocolOptions) {
-    this.getMidden = options.getMidden;
     this.localNodeId = options.localNodeId;
     this.localUsername = options.localUsername;
     this.getLocalProfile = options.getLocalProfile;
@@ -596,74 +425,86 @@ export class FriendzProtocol {
     this.friendRequestsFrom = options.friendRequestsFrom ?? "everyone";
     this.canvasInvitesFrom = options.canvasInvitesFrom ?? "everyone";
     this.getCanvasActivity = options.getCanvasActivity ?? null;
+
+    this.client = createFriendzClient({
+      getNode: options.getMidden,
+      localNodeId: options.localNodeId,
+      localUsername: options.localUsername,
+      heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,
+      onMessage: (msg, fromNodeId) => this.handleWireMessage(msg, fromNodeId),
+      onPeerBecameOnline: (nodeId) => {
+        // fast presence ack: reply immediately so a newly-online peer
+        // learns we're online too, without waiting for the next
+        // heartbeat tick (up to HEARTBEAT_INTERVAL_MS later).
+        this.sendHeartbeatMessage(nodeId).catch(() => {
+          // silent - just a presence ack, not critical.
+        });
+        this.onPeerBecameOnline?.(nodeId);
+      },
+      onPeerWentOffline: () => {
+        // no dedicated per-peer callback existed for this transition
+        // before this protocol swap - `onOnlineChange` subscribers (which
+        // FriendzClient already notifies internally) are the only signal
+        // this app ever exposed for it.
+      },
+      onDecodeError: (err, fromNodeId) => {
+        log.warn(TAG, "failed to decode message from:", fromNodeId.slice(0, 16) + "...", err);
+      },
+    });
   }
 
   // --- incoming stream handling (called by the ALPN router) ---
 
-  /**
-   * handle an incoming skein-friendz/1 stream.
-   * this is registered as the ALPN handler with the iroh adapter.
-   */
   handleStream(stream: BiStreamLike): void {
-    const peerId = stream.peer_node_id();
-    log.debug(TAG, "incoming stream from:", peerId.slice(0, 16) + "...");
-
-    // store the stream for potential replies
-    const existing = this.streams.get(peerId);
-    if (existing) {
-      existing.close();
-    }
-    this.streams.set(peerId, stream);
-
-    // start reading messages
-    this.readLoop(peerId, stream);
-
-    this.onPeerConnected?.(peerId);
+    log.debug(TAG, "incoming stream from:", stream.peer_node_id().slice(0, 16) + "...");
+    this.client.handleIncomingStream(stream);
+    this.onPeerConnected?.(stream.peer_node_id());
   }
 
-  private async readLoop(peerId: string, stream: BiStreamLike): Promise<void> {
-    try {
-      while (!this._destroyed) {
-        const data = await stream.read_message();
-        if (!data) {
-          // stream closed
-          log.debug(TAG, "stream closed by peer:", peerId.slice(0, 16) + "...");
-          break;
-        }
-
-        try {
-          const msg = decodeMessage(data);
-          this.handleMessage(msg, peerId, stream);
-        } catch (err) {
-          log.warn(TAG, "failed to decode message from:", peerId.slice(0, 16) + "...", err);
-        }
-      }
-    } catch (err) {
-      // if this stream was replaced by a newer one, the close error is expected —
-      // the new stream is already handling this peer, so don't mark them offline
-      const wasReplaced = this.streams.get(peerId) !== stream;
-      if (!this._destroyed && !wasReplaced) {
-        log.warn(TAG, "read loop error from:", peerId.slice(0, 16) + "...", err);
-        // clear lastSeen so isOnline() returns false immediately
-        this.lastSeen.delete(peerId);
-        this.emitOnlineChange();
-      }
-    } finally {
-      // clean up stream reference if it's still the current one
-      if (this.streams.get(peerId) === stream) {
-        this.streams.delete(peerId);
-      }
-    }
+  private async sendHeartbeatMessage(peerNodeId: string): Promise<void> {
+    await this.client.sendMessage(peerNodeId, this.buildHeartbeatMessage());
   }
 
-  private handleMessage(msg: FriendzMessage, fromNodeId: string, stream: BiStreamLike): void {
+  private buildHeartbeatMessage(): WireMessage {
+    const activity = this.getCanvasActivity?.() ?? [];
+    return coreMessage({
+      type: "heartbeat",
+      v: 1,
+      nodeId: this.localNodeId,
+      username: this.localUsername,
+      appPayload: activity.length > 0 ? activity : undefined,
+    });
+  }
+
+  // --- wire message dispatch ---
+
+  private handleWireMessage(msg: WireMessage, fromNodeId: string): void {
+    if (msg.kind === "app-extension") {
+      this.handleAppExtension(msg.messageType, msg.payload, fromNodeId);
+      return;
+    }
+    this.handleCoreMessage(msg.message, fromNodeId);
+  }
+
+  private handleCoreMessage(msg: CoreMessage, fromNodeId: string): void {
     switch (msg.type) {
       case "profile-request":
-        this.handleProfileRequest(fromNodeId, stream);
+        this.handleProfileRequest(fromNodeId);
         break;
 
       case "profile-response":
-        this.onProfileResponse?.(msg, fromNodeId);
+        this.onProfileResponse?.(
+          {
+            type: "profile-response",
+            username: msg.username,
+            bio: msg.bio,
+            avatarDataUrl: msg.avatarDataUrl,
+            ...(msg.accentColor !== undefined ? { accentColor: msg.accentColor } : {}),
+            ...(msg.profileDocId ? { profileDocId: msg.profileDocId } : {}),
+            ...(msg.profileUpdatedAt ? { profileUpdatedAt: msg.profileUpdatedAt } : {}),
+          },
+          fromNodeId
+        );
         break;
 
       case "friend-request":
@@ -671,195 +512,278 @@ export class FriendzProtocol {
         break;
 
       case "friend-accept":
-        this.onFriendAccept?.(msg, fromNodeId);
+        this.onFriendAccept?.(
+          {
+            type: "friend-accept",
+            fromNodeId: msg.fromNodeId,
+            fromUsername: msg.fromUsername,
+            ...(msg.isHub !== undefined ? { isHub: msg.isHub } : {}),
+          },
+          fromNodeId
+        );
         break;
 
       case "friend-reject":
-        this.onFriendReject?.(msg, fromNodeId);
+        this.onFriendReject?.({ type: "friend-reject", fromNodeId: msg.fromNodeId }, fromNodeId);
+        break;
+
+      case "friend-accept-ack":
+        this.onFriendAcceptAck?.(
+          { type: "friend-accept-ack", fromNodeId: msg.fromNodeId },
+          fromNodeId
+        );
         break;
 
       case "heartbeat": {
-        const wasOnline =
-          this.lastSeen.has(fromNodeId) &&
-          Date.now() - this.lastSeen.get(fromNodeId)! < HEARTBEAT_TIMEOUT_MS;
-        this.lastSeen.set(fromNodeId, Date.now());
-        this.emitOnlineChange();
-        this.onHeartbeat?.(msg, fromNodeId);
-        if (msg.canvasActivity && msg.canvasActivity.length > 0) {
-          this.onCanvasActivity?.(msg.canvasActivity, fromNodeId);
-        }
-        // fast presence ACK: if this is the first heartbeat from a newly-online peer,
-        // reply immediately so they know we're online too
-        if (!wasOnline) {
-          log.debug(TAG, "peer online:", fromNodeId.slice(0, 16) + "...");
-          const activity = this.getCanvasActivity?.() ?? [];
-          const reply: HeartbeatMessage = {
-            type: "heartbeat",
-            nodeId: this.localNodeId,
-            username: this.localUsername,
-            canvasActivity: activity.length > 0 ? activity : undefined,
-          };
-          this.sendMessage(fromNodeId, reply).catch(() => {
-            // silent — just a presence ack, not critical
-          });
-          this.onPeerBecameOnline?.(fromNodeId);
+        this.onHeartbeat?.(
+          { type: "heartbeat", nodeId: msg.nodeId, username: msg.username },
+          fromNodeId
+        );
+        if (Array.isArray(msg.appPayload) && msg.appPayload.length > 0) {
+          this.onCanvasActivity?.(msg.appPayload as CanvasActivityEntry[], fromNodeId);
         }
         break;
       }
 
-      case "friend-accept-ack":
-        this.onFriendAcceptAck?.(msg, fromNodeId);
+      case "offline-announcement":
+        // FriendzClient already marks the peer offline internally before
+        // this handler runs - no app-level callback existed for this
+        // transition before this protocol swap either.
         break;
 
-      case "canvas-invite":
-        this.handleCanvasInvite(msg, fromNodeId);
+      case "hello":
+      case "hello-ok":
+        // confirmed no-op for this migration - neither this app's connect
+        // flow nor FriendzClient implements a handshake; presence is
+        // purely heartbeat-timeout-based on both sides.
         break;
 
-      case "canvas-invite-ack":
-        this.onCanvasInviteAck?.(msg, fromNodeId);
+      case "knock-request": {
+        if (msg.scope.kind !== "resource") {
+          log.warn(TAG, "ignoring knock-request with non-resource scope:", msg.scope.kind);
+          break;
+        }
+        this.onCanvasKnock?.(
+          {
+            type: "canvas-knock",
+            knockId: msg.knockId,
+            canvasDocId: msg.scope.resourceId,
+            requesterNodeId: msg.nodeId,
+            requesterUsername: msg.username ?? "",
+            message: msg.message,
+          },
+          fromNodeId
+        );
+        break;
+      }
+
+      case "knock-ack":
+        this.onCanvasKnockAck?.(
+          {
+            type: "canvas-knock-ack",
+            knockId: msg.knockId,
+            canvasDocId: msg.resourceId ?? "",
+            ackerNodeId: msg.ackerNodeId,
+          },
+          fromNodeId
+        );
         break;
 
-      case "canvas-invite-accept":
-        this.onCanvasInviteAccept?.(msg, fromNodeId);
+      case "knock-outcome":
+        this.handleKnockOutcome(msg, fromNodeId);
         break;
 
-      case "canvas-invite-decline":
-        this.onCanvasInviteDecline?.(msg, fromNodeId);
-        break;
-
-      case "canvas-knock":
-        this.onCanvasKnock?.(msg, fromNodeId);
-        break;
-
-      case "canvas-knock-ack":
-        this.onCanvasKnockAck?.(msg, fromNodeId);
-        break;
-
-      case "canvas-knock-approve":
-        this.onCanvasKnockApprove?.(msg, fromNodeId);
-        break;
-
-      case "canvas-knock-decline":
-        this.onCanvasKnockDecline?.(msg, fromNodeId);
+      case "identity-update":
+        // not adopted this pass - no consumer needs it yet.
         break;
 
       case "acl-change":
-        this.onAclChange?.(msg, fromNodeId);
-        break;
-
-      case "canvas-update":
-        this.onCanvasUpdate?.(msg, fromNodeId);
-        break;
-
-      case "canvas-deleted":
-        this.onCanvasDeleted?.(msg, fromNodeId);
+        this.onAclChange?.(
+          {
+            type: "acl-change",
+            canvasDocId: msg.resourceId,
+            canvasTitle: msg.resourceTitle ?? "",
+            targetNodeId: msg.targetNodeId,
+            // skein never grants "root" - the wire vocabulary's one extra
+            // literal haruspex's own callers (not skein) use.
+            newRole: (msg.newRole as CanvasRoleOrRemoved | undefined) ?? "removed",
+            changedBy: msg.changedBy,
+            changedByUsername: msg.changedByUsername,
+          },
+          fromNodeId
+        );
         break;
 
       case "gossip-digest":
-        this.onGossipDigest?.(msg, fromNodeId);
+        this.handleGossipDigest(msg, fromNodeId);
         break;
 
       case "blob-seek":
-        this.onBlobSeek?.(msg, fromNodeId);
+        this.onBlobSeek?.({ type: "blob-seek", needed: msg.needed }, fromNodeId);
         break;
 
       case "blob-offer":
-        // blob-offer is a response to our blob-seek — browser peers don't
-        // currently send blob-seek, so this is a no-op placeholder.
+        // response to our own blob-seek - browser peers don't currently
+        // send blob-seek, so this is a no-op placeholder, same as before
+        // this protocol swap.
         log.debug(
           TAG,
           "received blob-offer from:",
           fromNodeId.slice(0, 16) + "...",
           "available:",
-          (msg as BlobOfferMessage).available.length
+          msg.available.length
         );
         break;
 
-      case "offline-announcement":
-        if (this.lastSeen.has(msg.nodeId)) {
-          log.debug(TAG, "peer offline (announced):", msg.nodeId.slice(0, 16) + "...");
-          this.lastSeen.delete(msg.nodeId);
-          this.emitOnlineChange();
-        }
+      case "error":
+        // left unused for this pass - no code path needs it yet.
         break;
 
       default:
-        log.warn(TAG, "unknown message type from:", fromNodeId.slice(0, 16) + "...", msg);
+        log.warn(TAG, "unhandled core message type from:", fromNodeId.slice(0, 16) + "...", msg);
     }
   }
 
-  private handleProfileRequest(fromNodeId: string, stream: BiStreamLike): void {
-    log.debug(
-      TAG,
-      "handleProfileRequest from " +
-        fromNodeId.slice(0, 16) +
-        "... (visibility=" +
-        this.profileVisibility +
-        ")"
-    );
-    // check privacy settings
-    if (this.profileVisibility === "nobody") {
-      log.debug(TAG, "ignoring profile request (visibility: nobody)");
+  private handleKnockOutcome(
+    msg: Extract<CoreMessage, { type: "knock-outcome" }>,
+    fromNodeId: string
+  ): void {
+    if (msg.status === "accepted") {
+      this.onCanvasKnockApprove?.(
+        {
+          type: "canvas-knock-approve",
+          knockId: msg.knockId ?? "",
+          canvasDocId: msg.grantedResourceIds[0] ?? "",
+          approverNodeId: msg.byNodeId ?? fromNodeId,
+          role: (msg.grantedRole as InvitableRole) ?? "viewer",
+        },
+        fromNodeId
+      );
       return;
     }
+    if (msg.status === "denied") {
+      this.onCanvasKnockDecline?.(
+        {
+          type: "canvas-knock-decline",
+          knockId: msg.knockId ?? "",
+          canvasDocId: "",
+          declinerNodeId: msg.byNodeId ?? fromNodeId,
+        },
+        fromNodeId
+      );
+    }
+    // "pending" outcomes aren't sent/expected by skein - ignored.
+  }
+
+  private handleGossipDigest(
+    msg: Extract<CoreMessage, { type: "gossip-digest" }>,
+    fromNodeId: string
+  ): void {
+    const extra =
+      msg.appPayload && typeof msg.appPayload === "object" && !Array.isArray(msg.appPayload)
+        ? (msg.appPayload as {
+            canvasUpdates?: GossipDigestCanvasUpdate[];
+            pendingInvites?: GossipDigestPendingInvite[];
+            sharedCanvasIds?: string[];
+          })
+        : {};
+
+    const pendingKnocks: GossipDigestPendingKnock[] = [];
+    for (const knock of msg.pendingKnocks ?? []) {
+      if (knock.scope.kind !== "resource") continue;
+      pendingKnocks.push({
+        knockId: knock.knockId,
+        canvasDocId: knock.scope.resourceId,
+        requesterNodeId: knock.nodeId,
+        requesterUsername: knock.username ?? "",
+        message: knock.message,
+        knockedAt: knock.knockedAt,
+      });
+    }
+
+    this.onGossipDigest?.(
+      {
+        type: "gossip-digest",
+        canvasUpdates: extra.canvasUpdates ?? [],
+        pendingInvites: extra.pendingInvites ?? [],
+        pendingKnocks,
+        ...(extra.sharedCanvasIds ? { sharedCanvasIds: extra.sharedCanvasIds } : {}),
+        ...(msg.profiles && msg.profiles.length > 0 ? { profiles: msg.profiles } : {}),
+      },
+      fromNodeId
+    );
+  }
+
+  private handleAppExtension(
+    messageType: string,
+    payload: Record<string, unknown>,
+    fromNodeId: string
+  ): void {
+    switch (messageType) {
+      case "skein:canvas-invite":
+        this.handleCanvasInvite(payload as unknown as CanvasInviteMessage, fromNodeId);
+        break;
+      case "skein:canvas-invite-ack":
+        this.onCanvasInviteAck?.(payload as unknown as CanvasInviteAckMessage, fromNodeId);
+        break;
+      case "skein:canvas-invite-accept":
+        this.onCanvasInviteAccept?.(payload as unknown as CanvasInviteAcceptMessage, fromNodeId);
+        break;
+      case "skein:canvas-invite-decline":
+        this.onCanvasInviteDecline?.(payload as unknown as CanvasInviteDeclineMessage, fromNodeId);
+        break;
+      case "skein:canvas-update":
+        this.onCanvasUpdate?.(payload as unknown as CanvasUpdateMessage, fromNodeId);
+        break;
+      case "skein:canvas-deleted":
+        this.onCanvasDeleted?.(payload as unknown as CanvasDeletedMessage, fromNodeId);
+        break;
+      default:
+        log.debug(TAG, "ignoring unknown app-extension type:", messageType);
+    }
+  }
+
+  private handleProfileRequest(fromNodeId: string): void {
+    if (this.profileVisibility === "nobody") return;
     if (this.profileVisibility === "friends" && !this.isFriend(fromNodeId)) {
       log.debug(TAG, "ignoring profile request from non-friend:", fromNodeId.slice(0, 16) + "...");
       return;
     }
 
     const profile = this.getLocalProfile();
-    const response: ProfileResponseMessage = {
+    const response = coreMessage({
       type: "profile-response",
+      v: 1,
       username: profile.username,
       bio: profile.bio,
       avatarDataUrl: profile.avatarDataUrl,
       ...(profile.accentColor !== undefined ? { accentColor: profile.accentColor } : {}),
       ...(profile.profileDocId ? { profileDocId: profile.profileDocId } : {}),
       ...(profile.profileUpdatedAt ? { profileUpdatedAt: profile.profileUpdatedAt } : {}),
-    };
-
-    log.debug(
-      TAG,
-      "handleProfileRequest sending profile-response to " + fromNodeId.slice(0, 16) + "..."
-    );
-    stream.write_message(encodeMessage(response)).catch((err) => {
+    });
+    this.client.sendMessage(fromNodeId, response).catch((err) => {
       log.warn(TAG, "failed to send profile response:", err);
     });
   }
 
-  private handleFriendRequest(msg: FriendRequestMessage, fromNodeId: string): void {
-    log.debug(
-      TAG,
-      "handleFriendRequest from " +
-        fromNodeId.slice(0, 16) +
-        "... (fromUsername=" +
-        (msg.fromUsername ?? "?") +
-        ")"
+  private handleFriendRequest(
+    msg: Extract<CoreMessage, { type: "friend-request" }>,
+    fromNodeId: string
+  ): void {
+    if (this.friendRequestsFrom === "nobody") return;
+    this.onFriendRequest?.(
+      {
+        type: "friend-request",
+        fromNodeId: msg.fromNodeId,
+        fromUsername: msg.fromUsername,
+        ...(msg.isHub !== undefined ? { isHub: msg.isHub } : {}),
+      },
+      fromNodeId
     );
-    // check privacy settings
-    if (this.friendRequestsFrom === "nobody") {
-      log.debug(TAG, "ignoring friend request (requests disabled)");
-      return;
-    }
-
-    if (!this.onFriendRequest) {
-      log.warn(
-        TAG,
-        "handleFriendRequest: no onFriendRequest listener registered — dropping request from " +
-          fromNodeId.slice(0, 16) +
-          "..."
-      );
-      return;
-    }
-
-    this.onFriendRequest(msg, fromNodeId);
   }
 
   private handleCanvasInvite(msg: CanvasInviteMessage, fromNodeId: string): void {
-    if (this.canvasInvitesFrom === "nobody") {
-      log.debug(TAG, "ignoring canvas invite (invites disabled)");
-      return;
-    }
+    if (this.canvasInvitesFrom === "nobody") return;
     if (this.canvasInvitesFrom === "friends" && !this.isFriend(fromNodeId)) {
       log.debug(TAG, "ignoring canvas invite from non-friend:", fromNodeId.slice(0, 16) + "...");
       return;
@@ -869,178 +793,274 @@ export class FriendzProtocol {
 
   // --- outbound protocol actions ---
 
-  /**
-   * send a friend request to a peer.
-   * opens a new stream if we don't have one, sends the request message.
-   */
   async sendFriendRequest(peerNodeId: string): Promise<void> {
-    log.debug(
-      TAG,
-      "sendFriendRequest -> " +
-        peerNodeId.slice(0, 16) +
-        "... (fromUsername=" +
-        this.localUsername +
-        ")"
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({
+        type: "friend-request",
+        v: 1,
+        fromNodeId: this.localNodeId,
+        fromUsername: this.localUsername,
+      })
     );
-    const msg: FriendRequestMessage = {
-      type: "friend-request",
-      fromNodeId: this.localNodeId,
-      fromUsername: this.localUsername,
-    };
-    await this.sendMessage(peerNodeId, msg);
-    log.debug(TAG, "sendFriendRequest delivered to " + peerNodeId.slice(0, 16) + "...");
   }
 
-  /**
-   * accept a friend request from a peer.
-   */
   async sendFriendAccept(peerNodeId: string): Promise<void> {
-    const msg: FriendAcceptMessage = {
-      type: "friend-accept",
-      fromNodeId: this.localNodeId,
-      fromUsername: this.localUsername,
-    };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({
+        type: "friend-accept",
+        v: 1,
+        fromNodeId: this.localNodeId,
+        fromUsername: this.localUsername,
+      })
+    );
   }
 
-  /**
-   * reject a friend request from a peer.
-   */
   async sendFriendReject(peerNodeId: string): Promise<void> {
-    const msg: FriendRejectMessage = {
-      type: "friend-reject",
-      fromNodeId: this.localNodeId,
-    };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({ type: "friend-reject", v: 1, fromNodeId: this.localNodeId })
+    );
   }
 
-  /**
-   * request a peer's profile.
-   */
   async requestProfile(peerNodeId: string): Promise<void> {
-    log.debug(TAG, "requestProfile -> " + peerNodeId.slice(0, 16) + "...");
-    const msg: ProfileRequestMessage = { type: "profile-request" };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(peerNodeId, coreMessage({ type: "profile-request", v: 1 }));
   }
 
   /** send a friend-accept-ack to complete the two-phase handshake. */
   async sendFriendAcceptAck(peerNodeId: string): Promise<void> {
-    const msg: FriendAcceptAckMessage = {
-      type: "friend-accept-ack",
-      fromNodeId: this.localNodeId,
-    };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({ type: "friend-accept-ack", v: 1, fromNodeId: this.localNodeId })
+    );
   }
 
-  /** send a canvas invite to a peer. */
   async sendCanvasInvite(
     peerNodeId: string,
     invite: Omit<CanvasInviteMessage, "type">
   ): Promise<void> {
-    const msg: CanvasInviteMessage = { type: "canvas-invite", ...invite };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      extensionMessage("skein:canvas-invite", { type: "skein:canvas-invite", v: 1, ...invite })
+    );
   }
 
-  /** send a canvas invite ack to a peer. */
   async sendCanvasInviteAck(
     peerNodeId: string,
     ack: Omit<CanvasInviteAckMessage, "type">
   ): Promise<void> {
-    const msg: CanvasInviteAckMessage = { type: "canvas-invite-ack", ...ack };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      extensionMessage("skein:canvas-invite-ack", {
+        type: "skein:canvas-invite-ack",
+        v: 1,
+        ...ack,
+      })
+    );
   }
 
-  /** accept a canvas invite. */
   async sendCanvasInviteAccept(
     peerNodeId: string,
     accept: Omit<CanvasInviteAcceptMessage, "type">
   ): Promise<void> {
-    const msg: CanvasInviteAcceptMessage = { type: "canvas-invite-accept", ...accept };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      extensionMessage("skein:canvas-invite-accept", {
+        type: "skein:canvas-invite-accept",
+        v: 1,
+        ...accept,
+      })
+    );
   }
 
-  /** decline a canvas invite. */
   async sendCanvasInviteDecline(
     peerNodeId: string,
     decline: Omit<CanvasInviteDeclineMessage, "type">
   ): Promise<void> {
-    const msg: CanvasInviteDeclineMessage = { type: "canvas-invite-decline", ...decline };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      extensionMessage("skein:canvas-invite-decline", {
+        type: "skein:canvas-invite-decline",
+        v: 1,
+        ...decline,
+      })
+    );
   }
 
-  /** send a canvas knock to a peer (or relay one onward). */
+  /** send a canvas knock to a peer - translated to `knock-request`,
+   *  `canvasDocId` becoming `scope: { kind: "resource", resourceId }`.
+   *  only actually invoked from the dev p2p test harness today - no
+   *  production caller sends its own knock through this class (see the
+   *  E3 migration report for how this was confirmed). */
   async sendCanvasKnock(peerNodeId: string, knock: Omit<CanvasKnockMessage, "type">): Promise<void> {
-    const msg: CanvasKnockMessage = { type: "canvas-knock", ...knock };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({
+        type: "knock-request",
+        v: 1,
+        knockId: knock.knockId,
+        nodeId: knock.requesterNodeId,
+        username: knock.requesterUsername,
+        message: knock.message,
+        scope: { kind: "resource", resourceId: knock.canvasDocId },
+      })
+    );
   }
 
-  /** send a canvas knock ack to a peer. */
   async sendCanvasKnockAck(
     peerNodeId: string,
     ack: Omit<CanvasKnockAckMessage, "type">
   ): Promise<void> {
-    const msg: CanvasKnockAckMessage = { type: "canvas-knock-ack", ...ack };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({
+        type: "knock-ack",
+        v: 1,
+        knockId: ack.knockId,
+        ackerNodeId: ack.ackerNodeId,
+        resourceId: ack.canvasDocId,
+      })
+    );
   }
 
-  /** approve a canvas knock. */
+  /** approve a canvas knock - translated to `knock-outcome` with
+   *  `status: "accepted"`; `canvasDocId` travels as the sole entry in
+   *  `grantedResourceIds` (the wire message has no dedicated field for
+   *  it). */
   async sendCanvasKnockApprove(
     peerNodeId: string,
     approve: Omit<CanvasKnockApproveMessage, "type">
   ): Promise<void> {
-    const msg: CanvasKnockApproveMessage = { type: "canvas-knock-approve", ...approve };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({
+        type: "knock-outcome",
+        v: 1,
+        knockId: approve.knockId,
+        status: "accepted",
+        grantedRole: approve.role as WireRole,
+        grantedResourceIds: [approve.canvasDocId],
+        byNodeId: approve.approverNodeId,
+      })
+    );
   }
 
-  /** decline a canvas knock. */
+  /** decline a canvas knock - translated to `knock-outcome` with
+   *  `status: "denied"`. `canvasDocId` is dropped (not carried by a
+   *  denial on the wire) - the receiver correlates by `knockId` alone. */
   async sendCanvasKnockDecline(
     peerNodeId: string,
     decline: Omit<CanvasKnockDeclineMessage, "type">
   ): Promise<void> {
-    const msg: CanvasKnockDeclineMessage = { type: "canvas-knock-decline", ...decline };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({
+        type: "knock-outcome",
+        v: 1,
+        knockId: decline.knockId,
+        status: "denied",
+        grantedResourceIds: [],
+        byNodeId: decline.declinerNodeId,
+      })
+    );
   }
 
-  /** send an ACL change notification to a peer. */
+  /** notify a peer their acl role changed - translated to `acl-change`;
+   *  `newRole: "removed"` is sent as an absent `newRole` field. */
   async sendAclChange(peerNodeId: string, change: Omit<AclChangeMessage, "type">): Promise<void> {
-    const msg: AclChangeMessage = { type: "acl-change", ...change };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({
+        type: "acl-change",
+        v: 1,
+        resourceId: change.canvasDocId,
+        resourceTitle: change.canvasTitle,
+        targetNodeId: change.targetNodeId,
+        ...(change.newRole !== "removed" ? { newRole: change.newRole } : {}),
+        changedBy: change.changedBy,
+        changedByUsername: change.changedByUsername,
+      })
+    );
   }
 
-  /** send a canvas update notification to a peer. */
   async sendCanvasUpdate(
     peerNodeId: string,
     update: Omit<CanvasUpdateMessage, "type">
   ): Promise<void> {
-    const msg: CanvasUpdateMessage = { type: "canvas-update", ...update };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      extensionMessage("skein:canvas-update", { type: "skein:canvas-update", v: 1, ...update })
+    );
   }
 
-  /** send a canvas-deleted notification to a peer. */
   async sendCanvasDeleted(
     peerNodeId: string,
     deleted: Omit<CanvasDeletedMessage, "type">
   ): Promise<void> {
-    const msg: CanvasDeletedMessage = { type: "canvas-deleted", ...deleted };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      extensionMessage("skein:canvas-deleted", { type: "skein:canvas-deleted", v: 1, ...deleted })
+    );
   }
 
-  /** send a gossip digest to a peer (triggered on peer-online transition). */
+  /** send a gossip digest - `canvasUpdates`/`pendingInvites`/
+   *  `sharedCanvasIds` ride in the wire message's generic `appPayload`
+   *  field (omitted entirely when there's nothing to say); `pendingKnocks`
+   *  entries are translated to the shared protocol's `knockId`/`scope`
+   *  shape. */
   async sendGossipDigest(
     peerNodeId: string,
     digest: Omit<GossipDigestMessage, "type">
   ): Promise<void> {
-    const msg: GossipDigestMessage = { type: "gossip-digest", ...digest };
-    await this.sendMessage(peerNodeId, msg);
+    const appPayload =
+      digest.canvasUpdates.length > 0 ||
+      digest.pendingInvites.length > 0 ||
+      (digest.sharedCanvasIds?.length ?? 0) > 0
+        ? {
+            canvasUpdates: digest.canvasUpdates,
+            pendingInvites: digest.pendingInvites,
+            sharedCanvasIds: digest.sharedCanvasIds ?? [],
+          }
+        : undefined;
+
+    const pendingKnocks = digest.pendingKnocks.map((knock) => ({
+      knockId: knock.knockId,
+      nodeId: knock.requesterNodeId,
+      username: knock.requesterUsername,
+      message: knock.message,
+      scope: { kind: "resource" as const, resourceId: knock.canvasDocId },
+      knockedAt: knock.knockedAt,
+    }));
+
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({
+        type: "gossip-digest",
+        v: 1,
+        pendingKnocks,
+        profiles: digest.profiles ?? [],
+        appPayload,
+      })
+    );
   }
 
   /** send a blob-offer response to a peer's blob-seek query. */
   async sendBlobOffer(peerNodeId: string, offer: Omit<BlobOfferMessage, "type">): Promise<void> {
-    const msg: BlobOfferMessage = { type: "blob-offer", ...offer };
-    await this.sendMessage(peerNodeId, msg);
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({ type: "blob-offer", v: 1, available: offer.available })
+    );
   }
 
   // --- heartbeat ---
+  //
+  // FriendzClient owns presence bookkeeping (isOnline/getOnlinePeers,
+  // marking peers online/offline from received heartbeat/offline-
+  // announcement messages) - this class layers its own send-scheduling on
+  // top (initial announce round, onAfterHeartbeatTick, discovery sweep)
+  // rather than using the client's own startHeartbeat(), since that hook
+  // has no equivalent for those two callbacks.
 
   /**
    * start the periodic heartbeat to all connected friend peers.
@@ -1050,106 +1070,54 @@ export class FriendzProtocol {
     this.stopHeartbeat();
     this.getFriendNodeIds = getFriendNodeIds;
 
-    const buildHeartbeatMsg = (): HeartbeatMessage => {
-      const activity = this.getCanvasActivity?.() ?? [];
-      return {
-        type: "heartbeat",
-        nodeId: this.localNodeId,
-        username: this.localUsername,
-        canvasActivity: activity.length > 0 ? activity : undefined,
-      };
-    };
-
-    // initial announce round: send to ALL friends so online peers can reply
+    // initial announce round: send to ALL friends so online peers can reply.
     const allFriends = getFriendNodeIds();
-    const msg = buildHeartbeatMsg();
+    const msg = this.buildHeartbeatMessage();
     for (const peerId of allFriends) {
-      this.sendMessage(peerId, msg).catch((err) => {
+      this.client.sendMessage(peerId, msg).catch((err) => {
         log.warn(TAG, "initial announce failed for:", peerId.slice(0, 16) + "...", err);
       });
     }
     this.onAfterHeartbeatTick?.(allFriends);
 
-    // regular heartbeat: send only to online peers
+    // regular heartbeat: send only to online peers.
     const sendHeartbeats = async () => {
-      const hbMsg = buildHeartbeatMsg();
-      const onlinePeers = this.getOnlinePeers();
+      const hbMsg = this.buildHeartbeatMessage();
+      const onlinePeers = this.client.getOnlinePeers();
       for (const peerId of onlinePeers) {
-        this.sendMessage(peerId, hbMsg).catch((err) => {
+        this.client.sendMessage(peerId, hbMsg).catch((err) => {
           log.warn(TAG, "heartbeat failed for:", peerId.slice(0, 16) + "...", err);
         });
       }
-
-      // check for peers that timed out since last tick
-      const now = Date.now();
-      for (const [nodeId, lastSeenAt] of this.lastSeen) {
-        if (now - lastSeenAt >= HEARTBEAT_TIMEOUT_MS) {
-          log.debug(TAG, "peer offline (timeout):", nodeId.slice(0, 16) + "...");
-          this.lastSeen.delete(nodeId);
-          this.emitOnlineChange();
-        }
-      }
-
       this.onAfterHeartbeatTick?.(getFriendNodeIds());
     };
 
-    this.heartbeatTimer = setInterval(sendHeartbeats, HEARTBEAT_INTERVAL_MS);
+    this.heartbeatTimer = setInterval(() => {
+      void sendHeartbeats();
+    }, HEARTBEAT_INTERVAL_MS);
 
-    // discovery sweep: periodically probe offline friends
+    // discovery sweep: periodically probe offline friends.
     this.discoveryTimer = setInterval(() => {
       const friends = this.getFriendNodeIds?.() ?? [];
-      const sweepMsg = buildHeartbeatMsg();
+      const sweepMsg = this.buildHeartbeatMessage();
       for (const peerId of friends) {
-        if (this.isOnline(peerId)) continue; // skip already-online
-        this.sendMessage(peerId, sweepMsg).catch(() => {
-          // silent — they're probably offline
+        if (this.client.isOnline(peerId)) continue; // skip already-online
+        this.client.sendMessage(peerId, sweepMsg).catch(() => {
+          // silent - they're probably offline
         });
       }
     }, DISCOVERY_SWEEP_MS);
   }
 
-  /** send a single heartbeat to a specific peer (used after transport reconnection). */
-  async sendHeartbeatTo(peerNodeId: string): Promise<void> {
-    // invalidate any stale stream for this peer
-    const existing = this.streams.get(peerNodeId);
-    if (existing) {
-      existing.close();
-      this.streams.delete(peerNodeId);
-    }
-
-    const activity = this.getCanvasActivity?.() ?? [];
-    const msg: HeartbeatMessage = {
-      type: "heartbeat",
-      nodeId: this.localNodeId,
-      username: this.localUsername,
-      canvasActivity: activity.length > 0 ? activity : undefined,
-    };
-    await this.sendMessage(peerNodeId, msg);
-  }
-
-  /** send a one-shot heartbeat to a single peer (e.g. when viewing their profile or sharing a canvas). */
+  /** send a one-shot heartbeat to a single peer (e.g. when viewing their
+   *  profile or sharing a canvas). */
   async probePeer(nodeId: string): Promise<void> {
-    const activity = this.getCanvasActivity?.() ?? [];
-    const msg: HeartbeatMessage = {
-      type: "heartbeat",
-      nodeId: this.localNodeId,
-      username: this.localUsername,
-      canvasActivity: activity.length > 0 ? activity : undefined,
-    };
-    await this.sendMessage(nodeId, msg);
+    await this.sendHeartbeatMessage(nodeId);
   }
 
   /** announce to all online peers that we're going offline. fire-and-forget. */
   announceOffline(): void {
-    const msg: OfflineAnnouncementMessage = {
-      type: "offline-announcement",
-      nodeId: this.localNodeId,
-    };
-    for (const peerId of this.getOnlinePeers()) {
-      this.sendMessage(peerId, msg).catch(() => {
-        // fire-and-forget — we're shutting down
-      });
-    }
+    this.client.announceOffline();
   }
 
   /** stop the heartbeat interval. */
@@ -1171,23 +1139,14 @@ export class FriendzProtocol {
    * a peer is online if we received a heartbeat within the timeout window.
    */
   isOnline(nodeId: string): boolean {
-    const lastSeenAt = this.lastSeen.get(nodeId);
-    if (!lastSeenAt) return false;
-    return Date.now() - lastSeenAt < HEARTBEAT_TIMEOUT_MS;
+    return this.client.isOnline(nodeId);
   }
 
   /**
    * get all peer node IDs that are currently considered online.
    */
   getOnlinePeers(): string[] {
-    const now = Date.now();
-    const online: string[] = [];
-    for (const [nodeId, lastSeenAt] of this.lastSeen) {
-      if (now - lastSeenAt < HEARTBEAT_TIMEOUT_MS) {
-        online.push(nodeId);
-      }
-    }
-    return online;
+    return this.client.getOnlinePeers();
   }
 
   /**
@@ -1195,71 +1154,7 @@ export class FriendzProtocol {
    * returns an unsubscribe function.
    */
   onOnlineChange(handler: () => void): () => void {
-    this.onlineChangeListeners.push(handler);
-    return () => {
-      const idx = this.onlineChangeListeners.indexOf(handler);
-      if (idx !== -1) this.onlineChangeListeners.splice(idx, 1);
-    };
-  }
-
-  private emitOnlineChange(): void {
-    for (const handler of this.onlineChangeListeners) {
-      handler();
-    }
-  }
-
-  // --- internal helpers ---
-
-  /**
-   * send a message to a peer, opening a new stream if needed.
-   */
-  private async sendMessage(peerNodeId: string, msg: FriendzMessage): Promise<void> {
-    let stream = this.streams.get(peerNodeId);
-    const reused = !!stream;
-
-    if (!stream) {
-      // check if there's an in-flight connection attempt
-      let pending = this.pendingConnections.get(peerNodeId);
-      if (!pending) {
-        // start a new connection
-        pending = this.openStream(peerNodeId);
-        this.pendingConnections.set(peerNodeId, pending);
-      }
-
-      try {
-        stream = await pending;
-      } finally {
-        this.pendingConnections.delete(peerNodeId);
-      }
-    }
-
-    log.debug(
-      TAG,
-      "sendMessage type=" +
-        msg.type +
-        " -> " +
-        peerNodeId.slice(0, 16) +
-        "... (" +
-        (reused ? "reused" : "new") +
-        " stream)"
-    );
-    await stream.write_message(encodeMessage(msg));
-  }
-
-  private async openStream(peerNodeId: string): Promise<BiStreamLike> {
-    log.debug(TAG, "openStream -> " + peerNodeId.slice(0, 16) + "... on " + FRIENDZ_ALPN);
-    try {
-      const midden = await this.getMidden();
-      const stream = await midden.open_bi(peerNodeId, FRIENDZ_ALPN);
-      this.streams.set(peerNodeId, stream);
-      // start reading responses on this stream
-      this.readLoop(peerNodeId, stream);
-      log.debug(TAG, "openStream connected to " + peerNodeId.slice(0, 16) + "...");
-      return stream;
-    } catch (err) {
-      log.error(TAG, "failed to open stream to:", peerNodeId.slice(0, 16) + "...", err);
-      throw err;
-    }
+    return this.client.onOnlineChange(handler);
   }
 
   /** get the current local username. */
@@ -1293,20 +1188,12 @@ export class FriendzProtocol {
   }
 
   /**
-   * clean up all streams, timers, and listeners.
+   * clean up the transport, timers, and event handler references.
    */
   destroy(): void {
-    this._destroyed = true;
     this.stopHeartbeat();
-
-    for (const [, stream] of this.streams) {
-      stream.close();
-    }
-    this.streams.clear();
-    this.pendingConnections.clear();
-    this.lastSeen.clear();
+    this.client.destroy();
     this.getFriendNodeIds = null;
-    this.onlineChangeListeners = [];
     this.onFriendRequest = null;
     this.onFriendAccept = null;
     this.onFriendReject = null;
@@ -1327,6 +1214,8 @@ export class FriendzProtocol {
     this.onPeerBecameOnline = null;
     this.onAfterHeartbeatTick = null;
     this.onCanvasUpdate = null;
+    this.onCanvasDeleted = null;
     this.onGossipDigest = null;
+    this.onBlobSeek = null;
   }
 }

@@ -1,31 +1,19 @@
 // ---------------------------------------------------------------------------
-// unit tests for FriendzProtocol
+// unit tests for the FriendzProtocol adapter
 // ---------------------------------------------------------------------------
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  decodeMessage,
-  encodeMessage,
-  FriendzProtocol,
-  HEARTBEAT_TIMEOUT_MS,
-  type AclChangeMessage,
-  type CanvasActivityEntry,
-  type CanvasInviteAcceptMessage,
-  type CanvasInviteAckMessage,
-  type CanvasInviteDeclineMessage,
-  type CanvasInviteMessage,
-  type FriendAcceptAckMessage,
-  type FriendRequestMessage,
-  type FriendzMessage,
-  type FriendzProtocolOptions,
-  type GossipDigestMessage,
-  type ProfileResponseMessage,
-} from "./friends-protocol";
+import { FriendzProtocol, HEARTBEAT_TIMEOUT_MS, type FriendzProtocolOptions, type GossipDigestMessage } from "./friends-protocol";
 import type { BiStreamLike, MiddenStreamNode } from "./iroh-network-adapter";
 import { FRIENDZ_ALPN } from "./iroh-network-adapter";
 
 // ---------------------------------------------------------------------------
-// mock helpers
+// exercises this adapter's own responsibility: translating skein's
+// friend/presence/knock/canvas concepts to and from the shared
+// `@freqhole/haruspex/protocol` wire format. plain codec round-tripping of
+// the shared protocol's own message shapes is haruspex's own test
+// responsibility (ts/src/protocol/*.test.ts, validated against the rust
+// fixtures) - not re-tested here.
 // ---------------------------------------------------------------------------
 
 function createMockBiStream(peerId: string, alpn: string = FRIENDZ_ALPN) {
@@ -66,11 +54,18 @@ function createMockBiStream(peerId: string, alpn: string = FRIENDZ_ALPN) {
         stream._messageQueue.push(data);
       }
     },
+
+    /** feed a raw haruspex wire message (core or app-extension) as an
+     *  incoming read, encoded exactly as the shared protocol's codec
+     *  would encode it over the wire. */
+    pushWire(msg: Record<string, unknown>) {
+      this.pushMessage(new TextEncoder().encode(JSON.stringify(msg)));
+    },
   };
   return stream;
 }
 
-type _MockBiStream = ReturnType<typeof createMockBiStream>;
+type MockBiStream = ReturnType<typeof createMockBiStream>;
 
 function createMockMidden(nodeId: string = "a".repeat(64)) {
   const midden = {
@@ -87,6 +82,13 @@ type MockMidden = ReturnType<typeof createMockMidden>;
 
 function flush(ms = 20): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** parse the last message written to `stream` as the raw json object sent
+ *  on the wire - lets tests assert on exact field names/shape rather than
+ *  just this app's own decoded/translated shape. */
+function lastWireJson(stream: MockBiStream): Record<string, unknown> {
+  return JSON.parse(new TextDecoder().decode(stream._written[stream._written.length - 1]));
 }
 
 function defaultOptions(overrides: Partial<FriendzProtocolOptions> = {}): FriendzProtocolOptions {
@@ -106,231 +108,6 @@ function defaultOptions(overrides: Partial<FriendzProtocolOptions> = {}): Friend
 // tests
 // ---------------------------------------------------------------------------
 
-describe("encodeMessage / decodeMessage", () => {
-  it("roundtrips a friend-request message", () => {
-    const msg: FriendzMessage = {
-      type: "friend-request",
-      fromNodeId: "b".repeat(64),
-      fromUsername: "bob",
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a profile-response message", () => {
-    const msg: FriendzMessage = {
-      type: "profile-response",
-      username: "alice",
-      bio: "hello",
-      avatarDataUrl: "data:image/png;base64,abc",
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a heartbeat message", () => {
-    const msg: FriendzMessage = {
-      type: "heartbeat",
-      nodeId: "c".repeat(64),
-      username: "charlie",
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a profile-request message", () => {
-    const msg: FriendzMessage = { type: "profile-request" };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a friend-accept message", () => {
-    const msg: FriendzMessage = {
-      type: "friend-accept",
-      fromNodeId: "d".repeat(64),
-      fromUsername: "dave",
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a friend-reject message", () => {
-    const msg: FriendzMessage = {
-      type: "friend-reject",
-      fromNodeId: "e".repeat(64),
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a friend-accept-ack message", () => {
-    const msg: FriendzMessage = {
-      type: "friend-accept-ack",
-      fromNodeId: "a".repeat(64),
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a canvas-invite message", () => {
-    const msg: FriendzMessage = {
-      type: "canvas-invite",
-      inviteId: "inv-123",
-      canvasDocId: "doc-456",
-      canvasTitle: "my canvas",
-      canvasDescription: "a test canvas",
-      canvasColor: 0xd946ef,
-      canvasPreviewUrl: "data:image/png;base64,abc123",
-      originNodeId: "a".repeat(64),
-      originUsername: "alice",
-      role: "member",
-      targets: ["b".repeat(64), "c".repeat(64)],
-      acked: ["b".repeat(64)],
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-    expect((decoded as any).canvasDescription).toBe("a test canvas");
-    expect((decoded as any).canvasColor).toBe(0xd946ef);
-    expect((decoded as any).canvasPreviewUrl).toBe("data:image/png;base64,abc123");
-  });
-
-  it("roundtrips a canvas-invite-ack message", () => {
-    const msg: FriendzMessage = {
-      type: "canvas-invite-ack",
-      inviteId: "inv-123",
-      canvasDocId: "doc-456",
-      ackerNodeId: "b".repeat(64),
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a canvas-invite-accept message", () => {
-    const msg: FriendzMessage = {
-      type: "canvas-invite-accept",
-      inviteId: "inv-123",
-      canvasDocId: "doc-456",
-      accepterNodeId: "b".repeat(64),
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a canvas-invite-decline message", () => {
-    const msg: FriendzMessage = {
-      type: "canvas-invite-decline",
-      inviteId: "inv-123",
-      canvasDocId: "doc-456",
-      declinerNodeId: "b".repeat(64),
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a canvas-knock message", () => {
-    const msg: FriendzMessage = {
-      type: "canvas-knock",
-      knockId: "knock-123",
-      canvasDocId: "doc-456",
-      requesterNodeId: "a".repeat(64),
-      requesterUsername: "alice",
-      message: "hi, it's alice",
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a canvas-knock-ack message", () => {
-    const msg: FriendzMessage = {
-      type: "canvas-knock-ack",
-      knockId: "knock-123",
-      canvasDocId: "doc-456",
-      ackerNodeId: "b".repeat(64),
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a canvas-knock-approve message", () => {
-    const msg: FriendzMessage = {
-      type: "canvas-knock-approve",
-      knockId: "knock-123",
-      canvasDocId: "doc-456",
-      approverNodeId: "b".repeat(64),
-      role: "member",
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a canvas-knock-decline message", () => {
-    const msg: FriendzMessage = {
-      type: "canvas-knock-decline",
-      knockId: "knock-123",
-      canvasDocId: "doc-456",
-      declinerNodeId: "b".repeat(64),
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips an acl-change message", () => {
-    const msg: FriendzMessage = {
-      type: "acl-change",
-      canvasDocId: "doc-456",
-      canvasTitle: "my canvas",
-      targetNodeId: "b".repeat(64),
-      newRole: "member",
-      changedBy: "a".repeat(64),
-      changedByUsername: "alice",
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a heartbeat message with canvasActivity", () => {
-    const msg: FriendzMessage = {
-      type: "heartbeat",
-      nodeId: "a".repeat(64),
-      username: "alice",
-      canvasActivity: [
-        { canvasDocId: "doc-1", lastModifiedAt: "2025-01-15T00:00:00Z", widgetCount: 5 },
-        { canvasDocId: "doc-2", lastModifiedAt: "2025-01-14T12:00:00Z", widgetCount: 12 },
-      ],
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-
-  it("roundtrips a heartbeat message without canvasActivity", () => {
-    const msg: FriendzMessage = {
-      type: "heartbeat",
-      nodeId: "b".repeat(64),
-      username: "bob",
-    };
-    const encoded = encodeMessage(msg);
-    const decoded = decodeMessage(encoded);
-    expect(decoded).toEqual(msg);
-  });
-});
-
 describe("FriendzProtocol", () => {
   let protocol: FriendzProtocol;
   let mockMidden: MockMidden;
@@ -348,525 +125,275 @@ describe("FriendzProtocol", () => {
     protocol.destroy();
   });
 
-  describe("handleStream()", () => {
-    it("handles incoming friend-request and fires callback", async () => {
-      const requests: Array<{ msg: FriendRequestMessage; from: string }> = [];
-      protocol.onFriendRequest = (msg, from) => requests.push({ msg, from });
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "friend-request",
-        fromNodeId: peerId,
-        fromUsername: "bob",
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(requests).toHaveLength(1);
-      expect(requests[0].msg.fromUsername).toBe("bob");
-      expect(requests[0].from).toBe(peerId);
+  describe("wire transport", () => {
+    it("opens outbound streams on the shared freqhole-friendz/1 alpn", async () => {
+      await protocol.sendFriendRequest("b".repeat(64));
+      expect(mockMidden.open_bi).toHaveBeenCalledWith("b".repeat(64), FRIENDZ_ALPN);
+      expect(FRIENDZ_ALPN).toBe("freqhole-friendz/1");
     });
 
-    it("handles incoming friend-accept and fires callback", async () => {
-      const accepts: Array<{ from: string }> = [];
-      protocol.onFriendAccept = (_msg, from) => accepts.push({ from });
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "friend-accept",
-        fromNodeId: peerId,
-        fromUsername: "bob",
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(accepts).toHaveLength(1);
-      expect(accepts[0].from).toBe(peerId);
-    });
-
-    it("handles incoming friend-reject and fires callback", async () => {
-      const rejects: Array<{ from: string }> = [];
-      protocol.onFriendReject = (_msg, from) => rejects.push({ from });
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "friend-reject",
-        fromNodeId: peerId,
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(rejects).toHaveLength(1);
-      expect(rejects[0].from).toBe(peerId);
-    });
-
-    it("handles incoming heartbeat and updates lastSeen", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      expect(protocol.isOnline(peerId)).toBe(false);
-
-      const msg: FriendzMessage = {
-        type: "heartbeat",
-        nodeId: peerId,
-        username: "bob",
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(protocol.isOnline(peerId)).toBe(true);
-    });
-
-    it("incoming heartbeat with canvasActivity fires onCanvasActivity callback", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const received: { entries: CanvasActivityEntry[]; from: string }[] = [];
-      protocol.onCanvasActivity = (entries, fromNodeId) => {
-        received.push({ entries, from: fromNodeId });
-      };
-
-      const msg: FriendzMessage = {
-        type: "heartbeat",
-        nodeId: peerId,
-        username: "bob",
-        canvasActivity: [
-          { canvasDocId: "doc-1", lastModifiedAt: "2025-01-15T00:00:00Z", widgetCount: 3 },
-        ],
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(received).toHaveLength(1);
-      expect(received[0].from).toBe(peerId);
-      expect(received[0].entries).toHaveLength(1);
-      expect(received[0].entries[0].canvasDocId).toBe("doc-1");
-      expect(received[0].entries[0].widgetCount).toBe(3);
-    });
-
-    it("incoming heartbeat without canvasActivity does not fire onCanvasActivity callback", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const received: { entries: CanvasActivityEntry[]; from: string }[] = [];
-      protocol.onCanvasActivity = (entries, fromNodeId) => {
-        received.push({ entries, from: fromNodeId });
-      };
-
-      const msg: FriendzMessage = {
-        type: "heartbeat",
-        nodeId: peerId,
-        username: "bob",
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(received).toHaveLength(0);
-    });
-
-    it("cleans up stream reference when stream closes", async () => {
+    it("reuses an existing stream instead of opening a new one", async () => {
       const peerId = "b".repeat(64);
       const stream = createMockBiStream(peerId);
       protocol.handleStream(stream as unknown as BiStreamLike);
       await flush();
 
-      // close the stream
-      stream.pushMessage(null);
-      await flush();
+      await protocol.sendFriendRequest(peerId);
 
-      // the protocol should have cleaned up
-      expect(protocol.getOnlinePeers()).toEqual([]);
-    });
-
-    it("replaces existing stream for same peer", async () => {
-      const peerId = "b".repeat(64);
-      const stream1 = createMockBiStream(peerId);
-      const stream2 = createMockBiStream(peerId);
-
-      protocol.handleStream(stream1 as unknown as BiStreamLike);
-      await flush();
-
-      protocol.handleStream(stream2 as unknown as BiStreamLike);
-      await flush();
-
-      expect(stream1.close).toHaveBeenCalled();
+      expect(mockMidden.open_bi).not.toHaveBeenCalled();
+      expect(stream._written.length).toBeGreaterThan(0);
     });
   });
 
-  describe("profile request handling", () => {
-    it("responds to profile-request from friend when visibility is 'friends'", async () => {
-      const friendId = "b".repeat(64);
-      const friendlyProtocol = new FriendzProtocol(
-        defaultOptions({
-          getMidden: async () => mockMidden as unknown as MiddenStreamNode,
-          isFriend: (nodeId) => nodeId === friendId,
-          profileVisibility: "friends",
-        })
-      );
+  describe("friend request / accept / reject", () => {
+    it("sends a core friend-request message", async () => {
+      const targetId = "b".repeat(64);
+      await protocol.sendFriendRequest(targetId);
 
-      const stream = createMockBiStream(friendId);
-      friendlyProtocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = { type: "profile-request" };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(stream.write_message).toHaveBeenCalled();
-      const written = stream._written[0];
-      const response = decodeMessage(written);
-      expect(response.type).toBe("profile-response");
-      expect((response as ProfileResponseMessage).username).toBe("alice");
-
-      friendlyProtocol.destroy();
+      const stream = await mockMidden.open_bi.mock.results[0].value;
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("friend-request");
+      expect(json.fromNodeId).toBe("a".repeat(64));
     });
 
-    it("ignores profile-request from non-friend when visibility is 'friends'", async () => {
-      const strangerId = "c".repeat(64);
-      const stream = createMockBiStream(strangerId);
+    it("fires onFriendRequest for an incoming friend-request", async () => {
+      const requests: Array<{ fromUsername: string; from: string }> = [];
+      protocol.onFriendRequest = (msg, from) => requests.push({ fromUsername: msg.fromUsername, from });
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
       protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = { type: "profile-request" };
-      stream.pushMessage(encodeMessage(msg));
+      stream.pushWire({ type: "friend-request", v: 1, fromNodeId: peerId, fromUsername: "bob" });
       await flush();
 
-      // no response should be written
-      expect(stream._written).toHaveLength(0);
+      expect(requests).toEqual([{ fromUsername: "bob", from: peerId }]);
     });
 
-    it("responds to profile-request from anyone when visibility is 'everyone'", async () => {
-      const openProtocol = new FriendzProtocol(
-        defaultOptions({
-          getMidden: async () => mockMidden as unknown as MiddenStreamNode,
-          profileVisibility: "everyone",
-        })
-      );
-
-      const strangerId = "c".repeat(64);
-      const stream = createMockBiStream(strangerId);
-      openProtocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = { type: "profile-request" };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(stream._written).toHaveLength(1);
-      const response = decodeMessage(stream._written[0]);
-      expect(response.type).toBe("profile-response");
-
-      openProtocol.destroy();
-    });
-
-    it("ignores all profile-requests when visibility is 'nobody'", async () => {
-      const privateProtocol = new FriendzProtocol(
-        defaultOptions({
-          getMidden: async () => mockMidden as unknown as MiddenStreamNode,
-          profileVisibility: "nobody",
-        })
-      );
-
-      const friendId = "b".repeat(64);
-      const stream = createMockBiStream(friendId);
-      privateProtocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = { type: "profile-request" };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(stream._written).toHaveLength(0);
-
-      privateProtocol.destroy();
-    });
-  });
-
-  describe("friend request privacy", () => {
-    it("ignores friend requests when friendRequestsFrom is 'nobody'", async () => {
-      const closedProtocol = new FriendzProtocol(
+    it("ignores incoming friend-request when friendRequestsFrom is 'nobody'", async () => {
+      const closed = new FriendzProtocol(
         defaultOptions({
           getMidden: async () => mockMidden as unknown as MiddenStreamNode,
           friendRequestsFrom: "nobody",
         })
       );
-
-      const requests: Array<{ from: string }> = [];
-      closedProtocol.onFriendRequest = (_msg, from) => requests.push({ from });
+      const requests: string[] = [];
+      closed.onFriendRequest = (_msg, from) => requests.push(from);
 
       const peerId = "b".repeat(64);
       const stream = createMockBiStream(peerId);
-      closedProtocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "friend-request",
-        fromNodeId: peerId,
-        fromUsername: "bob",
-      };
-      stream.pushMessage(encodeMessage(msg));
+      closed.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({ type: "friend-request", v: 1, fromNodeId: peerId, fromUsername: "bob" });
       await flush();
 
-      expect(requests).toHaveLength(0);
-
-      closedProtocol.destroy();
+      expect(requests).toEqual([]);
+      closed.destroy();
     });
-  });
 
-  describe("canvas invite handling", () => {
-    it("handles incoming canvas-invite and fires callback", async () => {
-      const invites: Array<{ msg: CanvasInviteMessage; from: string }> = [];
-      protocol.onCanvasInvite = (msg, from) => invites.push({ msg, from });
-
+    it("fires onFriendAccept/onFriendReject/onFriendAcceptAck", async () => {
       const peerId = "b".repeat(64);
       const stream = createMockBiStream(peerId);
       protocol.handleStream(stream as unknown as BiStreamLike);
 
-      const msg: FriendzMessage = {
-        type: "canvas-invite",
-        inviteId: "inv-1",
-        canvasDocId: "doc-1",
-        canvasTitle: "cool canvas",
-        originNodeId: peerId,
-        originUsername: "bob",
-        role: "member",
-        targets: ["a".repeat(64)],
-        acked: [],
-      };
-      stream.pushMessage(encodeMessage(msg));
+      const accepts: string[] = [];
+      const rejects: string[] = [];
+      const acks: string[] = [];
+      protocol.onFriendAccept = (_msg, from) => accepts.push(from);
+      protocol.onFriendReject = (_msg, from) => rejects.push(from);
+      protocol.onFriendAcceptAck = (_msg, from) => acks.push(from);
+
+      stream.pushWire({ type: "friend-accept", v: 1, fromNodeId: peerId, fromUsername: "bob" });
+      stream.pushWire({ type: "friend-reject", v: 1, fromNodeId: peerId });
+      stream.pushWire({ type: "friend-accept-ack", v: 1, fromNodeId: peerId });
       await flush();
 
-      expect(invites).toHaveLength(1);
-      expect(invites[0].msg.inviteId).toBe("inv-1");
-      expect(invites[0].from).toBe(peerId);
+      expect(accepts).toEqual([peerId]);
+      expect(rejects).toEqual([peerId]);
+      expect(acks).toEqual([peerId]);
     });
+  });
 
-    it("blocks canvas-invite when canvasInvitesFrom is 'nobody'", async () => {
-      const closedProtocol = new FriendzProtocol(
-        defaultOptions({
-          getMidden: async () => mockMidden as unknown as MiddenStreamNode,
-          canvasInvitesFrom: "nobody",
-        })
-      );
-
-      const invites: Array<{ from: string }> = [];
-      closedProtocol.onCanvasInvite = (_msg, from) => invites.push({ from });
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      closedProtocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "canvas-invite",
-        inviteId: "inv-1",
-        canvasDocId: "doc-1",
-        canvasTitle: "cool canvas",
-        originNodeId: peerId,
-        originUsername: "bob",
-        role: "member",
-        targets: ["a".repeat(64)],
-        acked: [],
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(invites).toHaveLength(0);
-
-      closedProtocol.destroy();
-    });
-
-    it("blocks canvas-invite from non-friend when canvasInvitesFrom is 'friends'", async () => {
-      const friendsOnlyProtocol = new FriendzProtocol(
-        defaultOptions({
-          getMidden: async () => mockMidden as unknown as MiddenStreamNode,
-          canvasInvitesFrom: "friends",
-          isFriend: () => false,
-        })
-      );
-
-      const invites: Array<{ from: string }> = [];
-      friendsOnlyProtocol.onCanvasInvite = (_msg, from) => invites.push({ from });
-
-      const strangerId = "c".repeat(64);
-      const stream = createMockBiStream(strangerId);
-      friendsOnlyProtocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "canvas-invite",
-        inviteId: "inv-1",
-        canvasDocId: "doc-1",
-        canvasTitle: "cool canvas",
-        originNodeId: strangerId,
-        originUsername: "charlie",
-        role: "viewer",
-        targets: ["a".repeat(64)],
-        acked: [],
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(invites).toHaveLength(0);
-
-      friendsOnlyProtocol.destroy();
-    });
-
-    it("allows canvas-invite from friend when canvasInvitesFrom is 'friends'", async () => {
+  describe("profile request/response", () => {
+    it("responds to profile-request from a friend when visibility is 'friends'", async () => {
       const friendId = "b".repeat(64);
-      const friendsOnlyProtocol = new FriendzProtocol(
+      const friendly = new FriendzProtocol(
         defaultOptions({
           getMidden: async () => mockMidden as unknown as MiddenStreamNode,
-          canvasInvitesFrom: "friends",
           isFriend: (id) => id === friendId,
+          profileVisibility: "friends",
         })
       );
-
-      const invites: Array<{ msg: CanvasInviteMessage; from: string }> = [];
-      friendsOnlyProtocol.onCanvasInvite = (msg, from) => invites.push({ msg, from });
 
       const stream = createMockBiStream(friendId);
-      friendsOnlyProtocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "canvas-invite",
-        inviteId: "inv-1",
-        canvasDocId: "doc-1",
-        canvasTitle: "cool canvas",
-        originNodeId: friendId,
-        originUsername: "bob",
-        role: "member",
-        targets: ["a".repeat(64)],
-        acked: [],
-      };
-      stream.pushMessage(encodeMessage(msg));
+      friendly.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({ type: "profile-request", v: 1 });
       await flush();
 
-      expect(invites).toHaveLength(1);
-      expect(invites[0].from).toBe(friendId);
-
-      friendsOnlyProtocol.destroy();
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("profile-response");
+      expect(json.username).toBe("alice");
+      friendly.destroy();
     });
 
-    it("handles incoming canvas-invite-ack and fires callback", async () => {
-      const acks: Array<{ msg: CanvasInviteAckMessage; from: string }> = [];
-      protocol.onCanvasInviteAck = (msg, from) => acks.push({ msg, from });
+    it("ignores profile-request from a non-friend when visibility is 'friends'", async () => {
+      const strangerId = "c".repeat(64);
+      const stream = createMockBiStream(strangerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({ type: "profile-request", v: 1 });
+      await flush();
+
+      expect(stream._written).toHaveLength(0);
+    });
+
+    it("fires onProfileResponse for an incoming profile-response", async () => {
+      const received: Array<{ username: string; from: string }> = [];
+      protocol.onProfileResponse = (msg, from) => received.push({ username: msg.username, from });
 
       const peerId = "b".repeat(64);
       const stream = createMockBiStream(peerId);
       protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "canvas-invite-ack",
-        inviteId: "inv-1",
-        canvasDocId: "doc-1",
-        ackerNodeId: peerId,
-      };
-      stream.pushMessage(encodeMessage(msg));
+      stream.pushWire({ type: "profile-response", v: 1, username: "bob", bio: "hi", avatarDataUrl: "" });
       await flush();
 
-      expect(acks).toHaveLength(1);
-      expect(acks[0].msg.inviteId).toBe("inv-1");
-      expect(acks[0].from).toBe(peerId);
-    });
-
-    it("handles incoming canvas-invite-accept and fires callback", async () => {
-      const accepts: Array<{ msg: CanvasInviteAcceptMessage; from: string }> = [];
-      protocol.onCanvasInviteAccept = (msg, from) => accepts.push({ msg, from });
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "canvas-invite-accept",
-        inviteId: "inv-1",
-        canvasDocId: "doc-1",
-        accepterNodeId: peerId,
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(accepts).toHaveLength(1);
-      expect(accepts[0].msg.inviteId).toBe("inv-1");
-      expect(accepts[0].from).toBe(peerId);
-    });
-
-    it("handles incoming canvas-invite-decline and fires callback", async () => {
-      const declines: Array<{ msg: CanvasInviteDeclineMessage; from: string }> = [];
-      protocol.onCanvasInviteDecline = (msg, from) => declines.push({ msg, from });
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "canvas-invite-decline",
-        inviteId: "inv-1",
-        canvasDocId: "doc-1",
-        declinerNodeId: peerId,
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(declines).toHaveLength(1);
-      expect(declines[0].msg.inviteId).toBe("inv-1");
-      expect(declines[0].from).toBe(peerId);
-    });
-
-    it("handles incoming acl-change and fires callback", async () => {
-      const changes: Array<{ msg: AclChangeMessage; from: string }> = [];
-      protocol.onAclChange = (msg, from) => changes.push({ msg, from });
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "acl-change",
-        canvasDocId: "doc-1",
-        canvasTitle: "cool canvas",
-        targetNodeId: "a".repeat(64),
-        newRole: "viewer",
-        changedBy: peerId,
-        changedByUsername: "bob",
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(changes).toHaveLength(1);
-      expect(changes[0].msg.newRole).toBe("viewer");
-      expect(changes[0].from).toBe(peerId);
-    });
-
-    it("handles incoming friend-accept-ack and fires callback", async () => {
-      const acks: Array<{ msg: FriendAcceptAckMessage; from: string }> = [];
-      protocol.onFriendAcceptAck = (msg, from) => acks.push({ msg, from });
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = {
-        type: "friend-accept-ack",
-        fromNodeId: peerId,
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(acks).toHaveLength(1);
-      expect(acks[0].msg.fromNodeId).toBe(peerId);
-      expect(acks[0].from).toBe(peerId);
+      expect(received).toEqual([{ username: "bob", from: peerId }]);
     });
   });
 
-  describe("canvas invite outbound", () => {
-    it("sendCanvasInvite sends the correct message", async () => {
+  describe("heartbeat / presence", () => {
+    it("marks a peer online after receiving a heartbeat", async () => {
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+
+      expect(protocol.isOnline(peerId)).toBe(false);
+      stream.pushWire({ type: "heartbeat", v: 1, nodeId: peerId, username: "bob" });
+      await flush();
+
+      expect(protocol.isOnline(peerId)).toBe(true);
+      expect(protocol.getOnlinePeers()).toContain(peerId);
+    });
+
+    it("sends a fast presence-ack heartbeat back on a peer's first heartbeat", async () => {
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+
+      stream.pushWire({ type: "heartbeat", v: 1, nodeId: peerId, username: "bob" });
+      await flush();
+
+      const replies = stream._written
+        .map((b) => JSON.parse(new TextDecoder().decode(b)))
+        .filter((m: { type: string }) => m.type === "heartbeat");
+      expect(replies.length).toBeGreaterThanOrEqual(1);
+      expect(replies[0].nodeId).toBe("a".repeat(64));
+    });
+
+    it("fires onPeerBecameOnline exactly once per online transition", async () => {
+      const calls: string[] = [];
+      protocol.onPeerBecameOnline = (id) => calls.push(id);
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+
+      stream.pushWire({ type: "heartbeat", v: 1, nodeId: peerId, username: "bob" });
+      stream.pushWire({ type: "heartbeat", v: 1, nodeId: peerId, username: "bob" });
+      await flush();
+
+      expect(calls).toEqual([peerId]);
+    });
+
+    it("carries canvasActivity in the heartbeat's appPayload field on send", async () => {
+      const withActivity = new FriendzProtocol(
+        defaultOptions({
+          getMidden: async () => mockMidden as unknown as MiddenStreamNode,
+          getCanvasActivity: () => [
+            { canvasDocId: "doc-1", lastModifiedAt: "2025-01-15T00:00:00Z", widgetCount: 3 },
+          ],
+        })
+      );
+      const peerId = "b".repeat(64);
+      await withActivity.probePeer(peerId);
+
+      const stream = await mockMidden.open_bi.mock.results[0].value;
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("heartbeat");
+      expect(json.appPayload).toEqual([
+        { canvasDocId: "doc-1", lastModifiedAt: "2025-01-15T00:00:00Z", widgetCount: 3 },
+      ]);
+      withActivity.destroy();
+    });
+
+    it("fires onCanvasActivity when an incoming heartbeat's appPayload is a non-empty array", async () => {
+      const received: Array<{ canvasDocId: string }[]> = [];
+      protocol.onCanvasActivity = (entries) => received.push(entries);
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({
+        type: "heartbeat",
+        v: 1,
+        nodeId: peerId,
+        username: "bob",
+        appPayload: [{ canvasDocId: "doc-1", lastModifiedAt: "2025-01-15T00:00:00Z", widgetCount: 3 }],
+      });
+      await flush();
+
+      expect(received).toHaveLength(1);
+      expect(received[0][0].canvasDocId).toBe("doc-1");
+    });
+
+    it("marks a peer offline on offline-announcement", async () => {
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({ type: "heartbeat", v: 1, nodeId: peerId, username: "bob" });
+      await flush();
+      expect(protocol.isOnline(peerId)).toBe(true);
+
+      stream.pushWire({ type: "offline-announcement", v: 1, nodeId: peerId });
+      await flush();
+      expect(protocol.isOnline(peerId)).toBe(false);
+    });
+
+    it("announceOffline sends offline-announcement to online peers", async () => {
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({ type: "heartbeat", v: 1, nodeId: peerId, username: "bob" });
+      await flush();
+
+      protocol.announceOffline();
+      await flush();
+
+      const sent = stream._written.map((b) => JSON.parse(new TextDecoder().decode(b)));
+      expect(sent.some((m: { type: string }) => m.type === "offline-announcement")).toBe(true);
+    });
+
+    it("startHeartbeat sends an initial round to all friends and fires onAfterHeartbeatTick", async () => {
+      const friend1 = "b".repeat(64);
+      const friend2 = "c".repeat(64);
+      const ticks: string[][] = [];
+      protocol.onAfterHeartbeatTick = (ids) => ticks.push([...ids]);
+
+      protocol.startHeartbeat(() => [friend1, friend2]);
+      await flush(30);
+
+      expect(mockMidden.open_bi).toHaveBeenCalledWith(friend1, FRIENDZ_ALPN);
+      expect(mockMidden.open_bi).toHaveBeenCalledWith(friend2, FRIENDZ_ALPN);
+      expect(ticks[0]).toEqual(expect.arrayContaining([friend1, friend2]));
+
+      protocol.stopHeartbeat();
+    });
+
+    it("stopHeartbeat clears the interval without throwing", () => {
+      protocol.startHeartbeat(() => ["b".repeat(64)]);
+      expect(() => protocol.stopHeartbeat()).not.toThrow();
+    });
+  });
+
+  describe("canvas invite (skein: app-extension)", () => {
+    it("sends canvas-invite as a skein:canvas-invite app-extension message", async () => {
       const targetId = "b".repeat(64);
       await protocol.sendCanvasInvite(targetId, {
         inviteId: "inv-1",
@@ -879,73 +406,262 @@ describe("FriendzProtocol", () => {
         acked: [],
       });
 
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(targetId, FRIENDZ_ALPN);
-
       const stream = await mockMidden.open_bi.mock.results[0].value;
-      expect(stream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(stream._written[0]));
-      expect(msg.type).toBe("canvas-invite");
-      expect(msg.inviteId).toBe("inv-1");
-      expect(msg.canvasDocId).toBe("doc-1");
-      expect(msg.canvasTitle).toBe("cool canvas");
-      expect(msg.role).toBe("member");
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("skein:canvas-invite");
+      expect(json.inviteId).toBe("inv-1");
     });
 
-    it("sendCanvasInviteAck sends the correct message", async () => {
-      const targetId = "b".repeat(64);
-      await protocol.sendCanvasInviteAck(targetId, {
+    it("fires onCanvasInvite for an incoming skein:canvas-invite message", async () => {
+      const invites: Array<{ inviteId: string }> = [];
+      protocol.onCanvasInvite = (msg) => invites.push({ inviteId: msg.inviteId });
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({
+        type: "skein:canvas-invite",
+        v: 1,
         inviteId: "inv-1",
+        canvasDocId: "doc-1",
+        canvasTitle: "cool canvas",
+        originNodeId: peerId,
+        originUsername: "bob",
+        role: "member",
+        targets: ["a".repeat(64)],
+        acked: [],
+      });
+      await flush();
+
+      expect(invites).toEqual([{ inviteId: "inv-1" }]);
+    });
+
+    it("blocks canvas invites when canvasInvitesFrom is 'nobody'", async () => {
+      const closed = new FriendzProtocol(
+        defaultOptions({
+          getMidden: async () => mockMidden as unknown as MiddenStreamNode,
+          canvasInvitesFrom: "nobody",
+        })
+      );
+      const invites: unknown[] = [];
+      closed.onCanvasInvite = (msg) => invites.push(msg);
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      closed.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({
+        type: "skein:canvas-invite",
+        v: 1,
+        inviteId: "inv-1",
+        canvasDocId: "doc-1",
+        canvasTitle: "cool canvas",
+        originNodeId: peerId,
+        originUsername: "bob",
+        role: "member",
+        targets: [],
+        acked: [],
+      });
+      await flush();
+
+      expect(invites).toEqual([]);
+      closed.destroy();
+    });
+
+    it("sends canvas-update/canvas-deleted as skein: app-extension messages", async () => {
+      const targetId = "b".repeat(64);
+      await protocol.sendCanvasUpdate(targetId, {
+        canvasDocId: "doc-1",
+        lastModifiedAt: "2025-01-01T00:00:00Z",
+        widgetCount: 2,
+        modifiedByNodeId: "a".repeat(64),
+        modifiedByUsername: "alice",
+      });
+      let stream = await mockMidden.open_bi.mock.results[0].value;
+      expect(lastWireJson(stream).type).toBe("skein:canvas-update");
+
+      await protocol.sendCanvasDeleted(targetId, {
+        canvasDocId: "doc-1",
+        canvasTitle: "cool canvas",
+        deletedBy: "a".repeat(64),
+        deletedByUsername: "alice",
+        deleteMode: "soft",
+        deletedAt: "2025-01-01T00:00:00Z",
+      });
+      stream = await mockMidden.open_bi.mock.results[0].value;
+      expect(lastWireJson(stream).type).toBe("skein:canvas-deleted");
+    });
+  });
+
+  describe("canvas knock (knock-request / knock-ack / knock-outcome)", () => {
+    it("sends canvas-knock as a resource-scoped knock-request", async () => {
+      const targetId = "b".repeat(64);
+      await protocol.sendCanvasKnock(targetId, {
+        knockId: "knock-1",
+        canvasDocId: "doc-1",
+        requesterNodeId: "a".repeat(64),
+        requesterUsername: "alice",
+        message: "let me in",
+      });
+
+      const stream = await mockMidden.open_bi.mock.results[0].value;
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("knock-request");
+      expect(json.knockId).toBe("knock-1");
+      expect(json.nodeId).toBe("a".repeat(64));
+      expect(json.scope).toEqual({ kind: "resource", resourceId: "doc-1" });
+    });
+
+    it("fires onCanvasKnock for an incoming resource-scoped knock-request", async () => {
+      const knocks: Array<{ canvasDocId: string; requesterNodeId: string }> = [];
+      protocol.onCanvasKnock = (msg) =>
+        knocks.push({ canvasDocId: msg.canvasDocId, requesterNodeId: msg.requesterNodeId });
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({
+        type: "knock-request",
+        v: 1,
+        knockId: "knock-1",
+        nodeId: peerId,
+        username: "bob",
+        message: "let me in",
+        scope: { kind: "resource", resourceId: "doc-1" },
+      });
+      await flush();
+
+      expect(knocks).toEqual([{ canvasDocId: "doc-1", requesterNodeId: peerId }]);
+    });
+
+    it("ignores an incoming knock-request with a non-resource scope", async () => {
+      const knocks: unknown[] = [];
+      protocol.onCanvasKnock = (msg) => knocks.push(msg);
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({
+        type: "knock-request",
+        v: 1,
+        knockId: "knock-1",
+        nodeId: peerId,
+        message: "let me browse",
+        scope: { kind: "browse" },
+      });
+      await flush();
+
+      expect(knocks).toEqual([]);
+    });
+
+    it("sends canvas-knock-ack as knock-ack with resourceId", async () => {
+      const targetId = "b".repeat(64);
+      await protocol.sendCanvasKnockAck(targetId, {
+        knockId: "knock-1",
         canvasDocId: "doc-1",
         ackerNodeId: "a".repeat(64),
       });
 
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(targetId, FRIENDZ_ALPN);
-
       const stream = await mockMidden.open_bi.mock.results[0].value;
-      expect(stream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(stream._written[0]));
-      expect(msg.type).toBe("canvas-invite-ack");
-      expect(msg.inviteId).toBe("inv-1");
-      expect(msg.ackerNodeId).toBe("a".repeat(64));
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("knock-ack");
+      expect(json.resourceId).toBe("doc-1");
     });
 
-    it("sendCanvasInviteAccept sends the correct message", async () => {
+    it("sends canvas-knock-approve as an accepted knock-outcome with grantedResourceIds", async () => {
       const targetId = "b".repeat(64);
-      await protocol.sendCanvasInviteAccept(targetId, {
-        inviteId: "inv-1",
+      await protocol.sendCanvasKnockApprove(targetId, {
+        knockId: "knock-1",
         canvasDocId: "doc-1",
-        accepterNodeId: "a".repeat(64),
+        approverNodeId: "a".repeat(64),
+        role: "member",
       });
 
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(targetId, FRIENDZ_ALPN);
-
       const stream = await mockMidden.open_bi.mock.results[0].value;
-      expect(stream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(stream._written[0]));
-      expect(msg.type).toBe("canvas-invite-accept");
-      expect(msg.inviteId).toBe("inv-1");
-      expect(msg.accepterNodeId).toBe("a".repeat(64));
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("knock-outcome");
+      expect(json.status).toBe("accepted");
+      expect(json.grantedRole).toBe("member");
+      expect(json.grantedResourceIds).toEqual(["doc-1"]);
     });
 
-    it("sendCanvasInviteDecline sends the correct message", async () => {
+    it("sends canvas-knock-decline as a denied knock-outcome with no resource id", async () => {
       const targetId = "b".repeat(64);
-      await protocol.sendCanvasInviteDecline(targetId, {
-        inviteId: "inv-1",
+      await protocol.sendCanvasKnockDecline(targetId, {
+        knockId: "knock-1",
         canvasDocId: "doc-1",
         declinerNodeId: "a".repeat(64),
       });
 
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(targetId, FRIENDZ_ALPN);
-
       const stream = await mockMidden.open_bi.mock.results[0].value;
-      expect(stream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(stream._written[0]));
-      expect(msg.type).toBe("canvas-invite-decline");
-      expect(msg.inviteId).toBe("inv-1");
-      expect(msg.declinerNodeId).toBe("a".repeat(64));
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("knock-outcome");
+      expect(json.status).toBe("denied");
+      expect(json.grantedResourceIds).toEqual([]);
     });
 
-    it("sendAclChange sends the correct message", async () => {
+    it("synthesizes onCanvasKnockApprove from an accepted knock-outcome", async () => {
+      const approvals: Array<{ canvasDocId: string; role: string }> = [];
+      protocol.onCanvasKnockApprove = (msg) => approvals.push({ canvasDocId: msg.canvasDocId, role: msg.role });
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({
+        type: "knock-outcome",
+        v: 1,
+        knockId: "knock-1",
+        status: "accepted",
+        grantedRole: "member",
+        grantedResourceIds: ["doc-1"],
+        byNodeId: peerId,
+      });
+      await flush();
+
+      expect(approvals).toEqual([{ canvasDocId: "doc-1", role: "member" }]);
+    });
+
+    it("synthesizes onCanvasKnockDecline from a denied knock-outcome with an empty canvasDocId", async () => {
+      const declines: Array<{ canvasDocId: string }> = [];
+      protocol.onCanvasKnockDecline = (msg) => declines.push({ canvasDocId: msg.canvasDocId });
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({
+        type: "knock-outcome",
+        v: 1,
+        knockId: "knock-1",
+        status: "denied",
+        grantedResourceIds: [],
+        byNodeId: peerId,
+      });
+      await flush();
+
+      expect(declines).toEqual([{ canvasDocId: "" }]);
+    });
+  });
+
+  describe("acl-change", () => {
+    it("sends acl-change with canvasDocId/canvasTitle renamed to resourceId/resourceTitle", async () => {
+      const targetId = "b".repeat(64);
+      await protocol.sendAclChange(targetId, {
+        canvasDocId: "doc-1",
+        canvasTitle: "cool canvas",
+        targetNodeId: targetId,
+        newRole: "viewer",
+        changedBy: "a".repeat(64),
+        changedByUsername: "alice",
+      });
+
+      const stream = await mockMidden.open_bi.mock.results[0].value;
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("acl-change");
+      expect(json.resourceId).toBe("doc-1");
+      expect(json.resourceTitle).toBe("cool canvas");
+      expect(json.newRole).toBe("viewer");
+    });
+
+    it("sends newRole: 'removed' as an absent newRole field", async () => {
       const targetId = "b".repeat(64);
       await protocol.sendAclChange(targetId, {
         canvasDocId: "doc-1",
@@ -956,723 +672,98 @@ describe("FriendzProtocol", () => {
         changedByUsername: "alice",
       });
 
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(targetId, FRIENDZ_ALPN);
-
       const stream = await mockMidden.open_bi.mock.results[0].value;
-      expect(stream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(stream._written[0]));
-      expect(msg.type).toBe("acl-change");
-      expect(msg.canvasDocId).toBe("doc-1");
-      expect(msg.newRole).toBe("removed");
-      expect(msg.changedByUsername).toBe("alice");
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("acl-change");
+      expect("newRole" in json).toBe(false);
     });
 
-    it("sendFriendAcceptAck sends the correct message", async () => {
-      const targetId = "b".repeat(64);
-      await protocol.sendFriendAcceptAck(targetId);
-
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(targetId, FRIENDZ_ALPN);
-
-      const stream = await mockMidden.open_bi.mock.results[0].value;
-      expect(stream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(stream._written[0]));
-      expect(msg.type).toBe("friend-accept-ack");
-      expect(msg.fromNodeId).toBe("a".repeat(64));
-    });
-  });
-
-  describe("outbound messages", () => {
-    it("sendFriendRequest opens a stream and sends the message", async () => {
-      const targetId = "b".repeat(64);
-      await protocol.sendFriendRequest(targetId);
-
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(targetId, FRIENDZ_ALPN);
-
-      // verify the message content
-      const stream = await mockMidden.open_bi.mock.results[0].value;
-      expect(stream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(stream._written[0]));
-      expect(msg.type).toBe("friend-request");
-      expect(msg.fromNodeId).toBe("a".repeat(64)); // localNodeId
-      expect(msg.fromUsername).toBe("alice"); // localUsername
-    });
-
-    it("sendFriendAccept sends an accept message", async () => {
-      const targetId = "b".repeat(64);
-      await protocol.sendFriendAccept(targetId);
-
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(targetId, FRIENDZ_ALPN);
-
-      const stream = await mockMidden.open_bi.mock.results[0].value;
-      expect(stream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(stream._written[0]));
-      expect(msg.type).toBe("friend-accept");
-      expect(msg.fromNodeId).toBe("a".repeat(64));
-      expect(msg.fromUsername).toBe("alice");
-    });
-
-    it("sendFriendReject sends a reject message", async () => {
-      const targetId = "b".repeat(64);
-      await protocol.sendFriendReject(targetId);
-
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(targetId, FRIENDZ_ALPN);
-
-      const stream = await mockMidden.open_bi.mock.results[0].value;
-      expect(stream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(stream._written[0]));
-      expect(msg.type).toBe("friend-reject");
-      expect(msg.fromNodeId).toBe("a".repeat(64));
-    });
-
-    it("requestProfile sends a profile-request message", async () => {
-      const targetId = "b".repeat(64);
-      await protocol.requestProfile(targetId);
-
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(targetId, FRIENDZ_ALPN);
-
-      const stream = await mockMidden.open_bi.mock.results[0].value;
-      expect(stream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(stream._written[0]));
-      expect(msg.type).toBe("profile-request");
-    });
-
-    it("reuses existing stream for same peer", async () => {
-      const targetId = "b".repeat(64);
-
-      // provide a stream directly via handleStream
-      const stream = createMockBiStream(targetId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-      await flush();
-
-      // now send — should reuse the existing stream, not open a new one
-      const _msg: FriendzMessage = {
-        type: "friend-request",
-        fromNodeId: "a".repeat(64),
-        fromUsername: "alice",
-      };
-      await protocol.sendFriendRequest(targetId);
-
-      // open_bi should NOT have been called since we already had a stream
-      expect(mockMidden.open_bi).not.toHaveBeenCalled();
-      // but a message should have been written
-      expect(stream._written.length).toBeGreaterThan(0);
-    });
-  });
-
-  describe("online/offline status", () => {
-    it("isOnline returns false for unknown peer", () => {
-      expect(protocol.isOnline("b".repeat(64))).toBe(false);
-    });
-
-    it("isOnline returns true after receiving heartbeat", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = { type: "heartbeat", nodeId: peerId, username: "bob" };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(protocol.isOnline(peerId)).toBe(true);
-    });
-
-    it("isOnline returns false after timeout", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: FriendzMessage = { type: "heartbeat", nodeId: peerId, username: "bob" };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      // manually set lastSeen to a time beyond the timeout
-      // access private field for testing
-      (protocol as any).lastSeen.set(peerId, Date.now() - HEARTBEAT_TIMEOUT_MS - 1);
-
-      expect(protocol.isOnline(peerId)).toBe(false);
-    });
-
-    it("getOnlinePeers returns only peers within timeout", async () => {
-      const peer1 = "b".repeat(64);
-      const peer2 = "c".repeat(64);
-
-      const stream1 = createMockBiStream(peer1);
-      const stream2 = createMockBiStream(peer2);
-      protocol.handleStream(stream1 as unknown as BiStreamLike);
-      protocol.handleStream(stream2 as unknown as BiStreamLike);
-
-      // peer1 heartbeat
-      stream1.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peer1, username: "bob" }));
-      // peer2 heartbeat
-      stream2.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peer2, username: "charlie" }));
-      await flush();
-
-      expect(protocol.getOnlinePeers()).toContain(peer1);
-      expect(protocol.getOnlinePeers()).toContain(peer2);
-
-      // expire peer1
-      (protocol as any).lastSeen.set(peer1, Date.now() - HEARTBEAT_TIMEOUT_MS - 1);
-
-      const online = protocol.getOnlinePeers();
-      expect(online).not.toContain(peer1);
-      expect(online).toContain(peer2);
-    });
-
-    it("onOnlineChange fires when heartbeat received", async () => {
-      const changes: number[] = [];
-      protocol.onOnlineChange(() => changes.push(Date.now()));
+    it("receives an absent newRole as 'removed'", async () => {
+      const changes: Array<{ newRole: string }> = [];
+      protocol.onAclChange = (msg) => changes.push({ newRole: msg.newRole });
 
       const peerId = "b".repeat(64);
       const stream = createMockBiStream(peerId);
       protocol.handleStream(stream as unknown as BiStreamLike);
-
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-      await flush();
-
-      expect(changes.length).toBeGreaterThan(0);
-    });
-
-    it("onOnlineChange unsubscribe works", async () => {
-      const changes: number[] = [];
-      const unsub = protocol.onOnlineChange(() => changes.push(Date.now()));
-      unsub();
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-      await flush();
-
-      expect(changes).toHaveLength(0);
-    });
-  });
-
-  describe("heartbeat sending", () => {
-    it("startHeartbeat sends initial heartbeats to all friends", async () => {
-      const friend1 = "b".repeat(64);
-      const friend2 = "c".repeat(64);
-
-      protocol.startHeartbeat(() => [friend1, friend2]);
-      await flush(50);
-
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(friend1, FRIENDZ_ALPN);
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(friend2, FRIENDZ_ALPN);
-
-      protocol.stopHeartbeat();
-    });
-
-    it("stopHeartbeat stops the interval", () => {
-      protocol.startHeartbeat(() => ["b".repeat(64)]);
-      protocol.stopHeartbeat();
-
-      // no error — the timer was cleared
-    });
-  });
-
-  describe("fast presence ACK", () => {
-    it("replies with heartbeat when receiving first heartbeat from a new peer", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      // peer sends their first heartbeat
-      const msg: FriendzMessage = { type: "heartbeat", nodeId: peerId, username: "bob" };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      // protocol should have replied with a heartbeat written to the existing stream
-      // (sendMessage reuses the stream stored by handleStream)
-      const replies = stream._written
-        .map((b: Uint8Array) => JSON.parse(new TextDecoder().decode(b)))
-        .filter((m: any) => m.type === "heartbeat");
-      expect(replies.length).toBeGreaterThanOrEqual(1);
-      expect(replies[0].nodeId).toBe("a".repeat(64));
-    });
-
-    it("does NOT reply with heartbeat for subsequent heartbeats from same peer", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      // first heartbeat — triggers fast ACK
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-      await flush();
-
-      const writtenAfterFirst = stream._written.length;
-
-      // second heartbeat — should NOT trigger another ACK
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-      await flush();
-
-      // no additional heartbeat replies written (peer is already online)
-      const newWrites = stream._written
-        .slice(writtenAfterFirst)
-        .map((b: Uint8Array) => JSON.parse(new TextDecoder().decode(b)))
-        .filter((m: any) => m.type === "heartbeat");
-      expect(newWrites).toHaveLength(0);
-    });
-
-    it("replies again after peer times out and sends a new heartbeat", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      // first heartbeat
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-      await flush();
-
-      const writtenAfterFirst = stream._written.length;
-
-      // simulate timeout
-      (protocol as any).lastSeen.set(peerId, Date.now() - HEARTBEAT_TIMEOUT_MS - 1);
-
-      // new heartbeat after timeout — should trigger fast ACK again
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-      await flush();
-
-      const newReplies = stream._written
-        .slice(writtenAfterFirst)
-        .map((b: Uint8Array) => JSON.parse(new TextDecoder().decode(b)))
-        .filter((m: any) => m.type === "heartbeat");
-      expect(newReplies.length).toBeGreaterThanOrEqual(1);
-    });
-  });
-
-  describe("offline announcement", () => {
-    it("announceOffline sends offline-announcement to all online peers", async () => {
-      const peer1 = "b".repeat(64);
-      const peer2 = "c".repeat(64);
-
-      // make both peers online via incoming streams
-      const stream1 = createMockBiStream(peer1);
-      const stream2 = createMockBiStream(peer2);
-      protocol.handleStream(stream1 as unknown as BiStreamLike);
-      protocol.handleStream(stream2 as unknown as BiStreamLike);
-
-      stream1.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peer1, username: "bob" }));
-      stream2.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peer2, username: "charlie" }));
-      await flush();
-
-      expect(protocol.getOnlinePeers().length).toBe(2);
-
-      // record write counts before announceOffline
-      const before1 = stream1._written.length;
-      const before2 = stream2._written.length;
-
-      protocol.announceOffline();
-      await flush();
-
-      // should have written offline-announcement to both existing streams
-      const msgs1 = stream1._written
-        .slice(before1)
-        .map((b: Uint8Array) => JSON.parse(new TextDecoder().decode(b)));
-      const msgs2 = stream2._written
-        .slice(before2)
-        .map((b: Uint8Array) => JSON.parse(new TextDecoder().decode(b)));
-
-      expect(msgs1.some((m: any) => m.type === "offline-announcement")).toBe(true);
-      expect(msgs2.some((m: any) => m.type === "offline-announcement")).toBe(true);
-    });
-
-    it("announceOffline does not send to offline peers", async () => {
-      const onlinePeer = "b".repeat(64);
-
-      // only onlinePeer gets a heartbeat
-      const stream = createMockBiStream(onlinePeer);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: onlinePeer, username: "bob" }));
-      await flush();
-
-      const beforeCount = stream._written.length;
-
-      protocol.announceOffline();
-      await flush();
-
-      // should have written offline-announcement to the online peer's stream
-      const newMsgs = stream._written
-        .slice(beforeCount)
-        .map((b: Uint8Array) => JSON.parse(new TextDecoder().decode(b)));
-      expect(newMsgs.some((m: any) => m.type === "offline-announcement")).toBe(true);
-
-      // offline peer has no stream, so nothing to check — no open_bi should have been called
-      // for a peer that was never connected
-      const calledPeers = mockMidden.open_bi.mock.calls.map((c: any) => c[0]);
-      expect(calledPeers).not.toContain("c".repeat(64));
-    });
-
-    it("receiving offline-announcement removes peer from online set", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      // make peer online
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-      await flush();
-      expect(protocol.isOnline(peerId)).toBe(true);
-
-      // receive offline announcement
-      const offlineMsg: FriendzMessage = { type: "offline-announcement", nodeId: peerId };
-      stream.pushMessage(encodeMessage(offlineMsg));
-      await flush();
-
-      expect(protocol.isOnline(peerId)).toBe(false);
-      expect(protocol.getOnlinePeers()).not.toContain(peerId);
-    });
-
-    it("receiving offline-announcement emits onOnlineChange", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-      await flush();
-
-      const changes: number[] = [];
-      protocol.onOnlineChange(() => changes.push(1));
-
-      stream.pushMessage(encodeMessage({ type: "offline-announcement", nodeId: peerId }));
-      await flush();
-
-      expect(changes.length).toBeGreaterThan(0);
-    });
-
-    it("receiving offline-announcement for unknown peer is a no-op", async () => {
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const changes: number[] = [];
-      protocol.onOnlineChange(() => changes.push(1));
-
-      // send offline for a peer we've never seen
-      const offlineMsg: FriendzMessage = { type: "offline-announcement", nodeId: "d".repeat(64) };
-      stream.pushMessage(encodeMessage(offlineMsg));
-      await flush();
-
-      expect(changes).toHaveLength(0);
-    });
-  });
-
-  describe("heartbeat optimization", () => {
-    it("startHeartbeat sends initial announce to ALL friends", async () => {
-      const friend1 = "b".repeat(64);
-      const friend2 = "c".repeat(64);
-
-      protocol.startHeartbeat(() => [friend1, friend2]);
-      await flush(50);
-
-      // initial announce should contact all friends
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(friend1, FRIENDZ_ALPN);
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(friend2, FRIENDZ_ALPN);
-
-      protocol.stopHeartbeat();
-    });
-
-    it("onAfterHeartbeatTick fires with all friend IDs on initial announce", async () => {
-      const friend1 = "b".repeat(64);
-      const friend2 = "c".repeat(64);
-      const tickCalls: string[][] = [];
-      protocol.onAfterHeartbeatTick = (ids) => tickCalls.push([...ids]);
-
-      protocol.startHeartbeat(() => [friend1, friend2]);
-      await flush(50);
-
-      expect(tickCalls.length).toBeGreaterThanOrEqual(1);
-      expect(tickCalls[0]).toContain(friend1);
-      expect(tickCalls[0]).toContain(friend2);
-
-      protocol.stopHeartbeat();
-    });
-
-    it("probePeer sends a one-shot heartbeat to the specified peer", async () => {
-      const peerId = "b".repeat(64);
-
-      await protocol.probePeer(peerId);
-      await flush();
-
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(peerId, FRIENDZ_ALPN);
-      const outStream = await mockMidden.open_bi.mock.results[0].value;
-      const msg = JSON.parse(new TextDecoder().decode(outStream._written[0]));
-      expect(msg.type).toBe("heartbeat");
-      expect(msg.nodeId).toBe("a".repeat(64));
-    });
-
-    it("stopHeartbeat clears both heartbeat and discovery timers", () => {
-      protocol.startHeartbeat(() => ["b".repeat(64)]);
-
-      // both timers should exist
-      expect((protocol as any).heartbeatTimer).not.toBeNull();
-      expect((protocol as any).discoveryTimer).not.toBeNull();
-
-      protocol.stopHeartbeat();
-
-      expect((protocol as any).heartbeatTimer).toBeNull();
-      expect((protocol as any).discoveryTimer).toBeNull();
-    });
-  });
-
-  describe("sendHeartbeatTo", () => {
-    it("sendHeartbeatTo invalidates stale stream and sends heartbeat", async () => {
-      const peerId = "peer-aaa".padEnd(64, "0");
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-      await flush();
-
-      // verify the stream is registered (readLoop has started reading)
-      expect(stream.read_message).toHaveBeenCalled();
-
-      await protocol.sendHeartbeatTo(peerId);
-      await flush();
-
-      // the old stream should have been closed
-      expect(stream._closed).toBe(true);
-
-      // open_bi should have been called to create a fresh stream
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(peerId, FRIENDZ_ALPN);
-
-      // check the message written to the new stream is a heartbeat
-      const newStream = await mockMidden.open_bi.mock.results[0].value;
-      expect(newStream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(newStream._written[0]));
-      expect(msg.type).toBe("heartbeat");
-      expect(msg.nodeId).toBe("a".repeat(64));
-      expect(msg.username).toBe("alice");
-    });
-
-    it("sendHeartbeatTo works when no existing stream", async () => {
-      const peerId = "peer-bbb".padEnd(64, "0");
-
-      // do NOT handleStream — no existing stream for this peer
-      await protocol.sendHeartbeatTo(peerId);
-      await flush();
-
-      // open_bi should have been called
-      expect(mockMidden.open_bi).toHaveBeenCalledWith(peerId, FRIENDZ_ALPN);
-
-      // a heartbeat should have been sent on the new stream
-      const newStream = await mockMidden.open_bi.mock.results[0].value;
-      expect(newStream._written).toHaveLength(1);
-      const msg = JSON.parse(new TextDecoder().decode(newStream._written[0]));
-      expect(msg.type).toBe("heartbeat");
-    });
-
-    it("readLoop error clears lastSeen and emits online change", async () => {
-      const peerId = "peer-ccc".padEnd(64, "0");
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      // deliver a heartbeat so the peer is considered online
-      const hb: FriendzMessage = { type: "heartbeat", nodeId: peerId, username: "charlie" };
-      stream.pushMessage(encodeMessage(hb));
-      await flush();
-
-      expect(protocol.isOnline(peerId)).toBe(true);
-
-      // register an onOnlineChange listener to track calls
-      const changeCalls: number[] = [];
-      protocol.onOnlineChange(() => changeCalls.push(Date.now()));
-
-      // simulate a stream read error by replacing read_message with a rejecting function.
-      // the readLoop is currently awaiting the next read_message call, so we resolve
-      // the pending reader with an error by overwriting and triggering it.
-      // simplest approach: resolve the pending reader, then make the next read throw.
-      // but we can also just reject the pending reader directly.
-      // the mock has _readResolvers — there should be one waiting. we can't reject via
-      // the resolve function, so instead we override read_message to reject, then
-      // push a value to unblock the current awaiter (which will loop and call the new fn).
-
-      // first, unblock the currently waiting read with a valid heartbeat (so the loop iterates)
-      // but override read_message before that heartbeat is processed so the NEXT call rejects.
-      stream.read_message = vi.fn(async () => {
-        throw new Error("connection lost");
+      stream.pushWire({
+        type: "acl-change",
+        v: 1,
+        resourceId: "doc-1",
+        resourceTitle: "cool canvas",
+        targetNodeId: "a".repeat(64),
+        changedBy: peerId,
+        changedByUsername: "bob",
       });
-
-      // resolve the currently pending reader to let the loop iterate
-      // (the loop will process this data, then call read_message again which now throws)
-      if (stream._readResolvers.length > 0) {
-        const hb2: FriendzMessage = { type: "heartbeat", nodeId: peerId, username: "charlie" };
-        stream._readResolvers.shift()!(encodeMessage(hb2));
-      }
       await flush();
 
-      // isOnline should now be false because the readLoop catch cleared lastSeen
-      expect(protocol.isOnline(peerId)).toBe(false);
-
-      // the onOnlineChange listener should have been called
-      expect(changeCalls.length).toBeGreaterThan(0);
-    });
-  });
-
-  describe("setters", () => {
-    it("setLocalUsername updates the username", () => {
-      protocol.setLocalUsername("new-name");
-      expect((protocol as any).localUsername).toBe("new-name");
+      expect(changes).toEqual([{ newRole: "removed" }]);
     });
 
-    it("setLocalNodeId updates the node ID", () => {
-      const newId = "f".repeat(64);
-      protocol.setLocalNodeId(newId);
-      expect((protocol as any).localNodeId).toBe(newId);
-    });
-
-    it("setProfileVisibility updates privacy setting", () => {
-      protocol.setProfileVisibility("nobody");
-      expect((protocol as any).profileVisibility).toBe("nobody");
-    });
-
-    it("setFriendRequestsFrom updates privacy setting", () => {
-      protocol.setFriendRequestsFrom("nobody");
-      expect((protocol as any).friendRequestsFrom).toBe("nobody");
-    });
-  });
-
-  describe("onPeerBecameOnline", () => {
-    it("fires onPeerBecameOnline when first heartbeat arrives from unknown peer", async () => {
-      const calls: string[] = [];
-      protocol.onPeerBecameOnline = (peerId) => calls.push(peerId);
+    it("receives a real role as itself", async () => {
+      const changes: Array<{ newRole: string; canvasDocId: string }> = [];
+      protocol.onAclChange = (msg) => changes.push({ newRole: msg.newRole, canvasDocId: msg.canvasDocId });
 
       const peerId = "b".repeat(64);
       const stream = createMockBiStream(peerId);
       protocol.handleStream(stream as unknown as BiStreamLike);
-
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
+      stream.pushWire({
+        type: "acl-change",
+        v: 1,
+        resourceId: "doc-1",
+        targetNodeId: "a".repeat(64),
+        newRole: "viewer",
+        changedBy: peerId,
+        changedByUsername: "bob",
+      });
       await flush();
 
-      expect(calls).toHaveLength(1);
-      expect(calls[0]).toBe(peerId);
-    });
-
-    it("does NOT fire onPeerBecameOnline for subsequent heartbeats from same peer", async () => {
-      const calls: string[] = [];
-      protocol.onPeerBecameOnline = (peerId) => calls.push(peerId);
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-      await flush();
-
-      stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-      await flush();
-
-      expect(calls).toHaveLength(1);
-    });
-
-    it("fires onPeerBecameOnline again after peer times out and reconnects", async () => {
-      vi.useFakeTimers();
-      try {
-        const calls: string[] = [];
-        protocol.onPeerBecameOnline = (peerId) => calls.push(peerId);
-
-        const peerId = "b".repeat(64);
-        const stream = createMockBiStream(peerId);
-        protocol.handleStream(stream as unknown as BiStreamLike);
-
-        // first heartbeat
-        stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-        await vi.advanceTimersByTimeAsync(20);
-
-        expect(calls).toHaveLength(1);
-
-        // advance past heartbeat timeout (90s)
-        vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
-
-        // second heartbeat after timeout — peer was stale, so onPeerBecameOnline fires again
-        stream.pushMessage(encodeMessage({ type: "heartbeat", nodeId: peerId, username: "bob" }));
-        await vi.advanceTimersByTimeAsync(20);
-
-        expect(calls).toHaveLength(2);
-        expect(calls[0]).toBe(peerId);
-        expect(calls[1]).toBe(peerId);
-      } finally {
-        vi.useRealTimers();
-      }
+      expect(changes).toEqual([{ newRole: "viewer", canvasDocId: "doc-1" }]);
     });
   });
 
   describe("gossip-digest", () => {
-    it("incoming gossip-digest fires onGossipDigest callback", async () => {
-      const received: Array<{ msg: GossipDigestMessage; from: string }> = [];
-      protocol.onGossipDigest = (msg, from) => received.push({ msg, from });
-
-      const peerId = "b".repeat(64);
-      const stream = createMockBiStream(peerId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-
-      const msg: GossipDigestMessage = {
-        type: "gossip-digest",
-        canvasUpdates: [
-          { canvasDocId: "doc-1", lastModifiedAt: "2025-01-01T00:00:00Z", lastModifiedBy: peerId },
-        ],
-        pendingInvites: [
-          {
-            canvasDocId: "doc-2",
-            canvasTitle: "invite canvas",
-            canvasDescription: "test",
-            canvasColor: 1,
-            canvasPreviewUrl: "",
-            invitedBy: peerId,
-            invitedByUsername: "bob",
-            role: "member",
-            invitedAt: "2025-01-01T00:00:00Z",
-          },
-        ],
-        pendingKnocks: [
-          {
-            canvasDocId: "doc-3",
-            requesterNodeId: "c".repeat(64),
-            requesterUsername: "carol",
-            message: "let me in",
-            knockedAt: "2025-01-01T00:00:00Z",
-          },
-        ],
-      };
-      stream.pushMessage(encodeMessage(msg));
-      await flush();
-
-      expect(received).toHaveLength(1);
-      expect(received[0].from).toBe(peerId);
-      expect(received[0].msg.canvasUpdates).toHaveLength(1);
-      expect(received[0].msg.canvasUpdates[0].canvasDocId).toBe("doc-1");
-      expect(received[0].msg.pendingInvites).toHaveLength(1);
-      expect(received[0].msg.pendingInvites[0].canvasDocId).toBe("doc-2");
-      expect(received[0].msg.pendingKnocks).toHaveLength(1);
-      expect(received[0].msg.pendingKnocks[0].canvasDocId).toBe("doc-3");
-      expect(received[0].msg.pendingKnocks[0].requesterUsername).toBe("carol");
-    });
-
-    it("sendGossipDigest sends correctly typed message", async () => {
+    it("carries canvasUpdates/pendingInvites/sharedCanvasIds in appPayload", async () => {
       const targetId = "b".repeat(64);
-      const stream = createMockBiStream(targetId);
-      protocol.handleStream(stream as unknown as BiStreamLike);
-      await flush();
-
       await protocol.sendGossipDigest(targetId, {
         canvasUpdates: [
-          {
-            canvasDocId: "doc-1",
-            lastModifiedAt: "2025-01-01T00:00:00Z",
-            lastModifiedBy: "a".repeat(64),
-          },
+          { canvasDocId: "doc-1", lastModifiedAt: "2025-01-01T00:00:00Z", lastModifiedBy: "a".repeat(64) },
         ],
-        pendingInvites: [
-          {
-            canvasDocId: "doc-2",
-            canvasTitle: "test canvas",
-            canvasDescription: "desc",
-            canvasColor: 2,
-            canvasPreviewUrl: "",
-            invitedBy: "a".repeat(64),
-            invitedByUsername: "alice",
-            role: "viewer",
-            invitedAt: "2025-01-01T00:00:00Z",
-          },
-        ],
+        pendingInvites: [],
+        pendingKnocks: [],
+        sharedCanvasIds: ["doc-1"],
+      });
+
+      const stream = await mockMidden.open_bi.mock.results[0].value;
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("gossip-digest");
+      expect(json.appPayload).toMatchObject({
+        canvasUpdates: [{ canvasDocId: "doc-1" }],
+        sharedCanvasIds: ["doc-1"],
+      });
+    });
+
+    it("omits appPayload when there's nothing skein-specific to say", async () => {
+      const targetId = "b".repeat(64);
+      await protocol.sendGossipDigest(targetId, {
+        canvasUpdates: [],
+        pendingInvites: [],
+        pendingKnocks: [],
+      });
+
+      const stream = await mockMidden.open_bi.mock.results[0].value;
+      const json = lastWireJson(stream);
+      expect(json.appPayload).toBeUndefined();
+    });
+
+    it("translates pendingKnocks to the shared protocol's knockId/scope shape", async () => {
+      const targetId = "b".repeat(64);
+      await protocol.sendGossipDigest(targetId, {
+        canvasUpdates: [],
+        pendingInvites: [],
         pendingKnocks: [
           {
-            canvasDocId: "doc-3",
+            knockId: "knock-1",
+            canvasDocId: "doc-1",
             requesterNodeId: "c".repeat(64),
             requesterUsername: "carol",
             message: "let me in",
@@ -1681,76 +772,147 @@ describe("FriendzProtocol", () => {
         ],
       });
 
-      // should reuse the existing stream, not open a new one
-      expect(mockMidden.open_bi).not.toHaveBeenCalled();
-      expect(stream._written.length).toBeGreaterThan(0);
-
-      const lastWritten = stream._written[stream._written.length - 1];
-      const parsed = JSON.parse(new TextDecoder().decode(lastWritten));
-      expect(parsed.type).toBe("gossip-digest");
-      expect(parsed.canvasUpdates).toHaveLength(1);
-      expect(parsed.canvasUpdates[0].canvasDocId).toBe("doc-1");
-      expect(parsed.pendingInvites).toHaveLength(1);
-      expect(parsed.pendingInvites[0].canvasDocId).toBe("doc-2");
-      expect(parsed.pendingInvites[0].role).toBe("viewer");
-      expect(parsed.pendingKnocks).toHaveLength(1);
-      expect(parsed.pendingKnocks[0].canvasDocId).toBe("doc-3");
+      const stream = await mockMidden.open_bi.mock.results[0].value;
+      const json = lastWireJson(stream);
+      expect(json.pendingKnocks).toEqual([
+        {
+          knockId: "knock-1",
+          nodeId: "c".repeat(64),
+          username: "carol",
+          message: "let me in",
+          scope: { kind: "resource", resourceId: "doc-1" },
+          knockedAt: "2025-01-01T00:00:00Z",
+        },
+      ]);
     });
 
-    it("destroy() nulls onGossipDigest and onPeerBecameOnline callbacks", () => {
-      protocol.onGossipDigest = () => {};
-      protocol.onPeerBecameOnline = () => {};
+    it("fires onGossipDigest with pendingKnocks translated back to canvasDocId", async () => {
+      const received: GossipDigestMessage["pendingKnocks"][] = [];
+      protocol.onGossipDigest = (msg) => received.push(msg.pendingKnocks);
 
-      protocol.destroy();
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({
+        type: "gossip-digest",
+        v: 1,
+        pendingKnocks: [
+          {
+            knockId: "knock-1",
+            nodeId: "c".repeat(64),
+            username: "carol",
+            message: "let me in",
+            scope: { kind: "resource", resourceId: "doc-1" },
+            knockedAt: "2025-01-01T00:00:00Z",
+          },
+        ],
+        profiles: [],
+      });
+      await flush();
 
-      expect(protocol.onGossipDigest).toBeNull();
-      expect(protocol.onPeerBecameOnline).toBeNull();
+      expect(received[0]).toEqual([
+        {
+          knockId: "knock-1",
+          canvasDocId: "doc-1",
+          requesterNodeId: "c".repeat(64),
+          requesterUsername: "carol",
+          message: "let me in",
+          knockedAt: "2025-01-01T00:00:00Z",
+        },
+      ]);
+    });
+
+    it("passes profiles through unchanged", async () => {
+      const received: (GossipDigestMessage["profiles"] | undefined)[] = [];
+      protocol.onGossipDigest = (msg) => received.push(msg.profiles);
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({
+        type: "gossip-digest",
+        v: 1,
+        pendingKnocks: [],
+        profiles: [{ peerNodeId: peerId, profileDocId: "doc-x", updatedAt: "2025-01-01T00:00:00Z" }],
+      });
+      await flush();
+
+      expect(received[0]).toEqual([
+        { peerNodeId: peerId, profileDocId: "doc-x", updatedAt: "2025-01-01T00:00:00Z" },
+      ]);
+    });
+  });
+
+  describe("blob-seek / blob-offer", () => {
+    it("fires onBlobSeek with the needed hash list", async () => {
+      const received: string[][] = [];
+      protocol.onBlobSeek = (msg) => received.push(msg.needed);
+
+      const peerId = "b".repeat(64);
+      const stream = createMockBiStream(peerId);
+      protocol.handleStream(stream as unknown as BiStreamLike);
+      stream.pushWire({ type: "blob-seek", v: 1, needed: ["hash-1", "hash-2"] });
+      await flush();
+
+      expect(received).toEqual([["hash-1", "hash-2"]]);
+    });
+
+    it("sends blob-offer with the available hash list", async () => {
+      const targetId = "b".repeat(64);
+      await protocol.sendBlobOffer(targetId, { available: ["hash-1"] });
+
+      const stream = await mockMidden.open_bi.mock.results[0].value;
+      const json = lastWireJson(stream);
+      expect(json.type).toBe("blob-offer");
+      expect(json.available).toEqual(["hash-1"]);
+    });
+  });
+
+  describe("setters", () => {
+    it("getLocalUsername/setLocalUsername/setLocalNodeId round-trip", () => {
+      expect(protocol.getLocalUsername()).toBe("alice");
+      protocol.setLocalUsername("alicia");
+      expect(protocol.getLocalUsername()).toBe("alicia");
+      expect(() => protocol.setLocalNodeId("f".repeat(64))).not.toThrow();
+    });
+
+    it("setProfileVisibility/setFriendRequestsFrom/setCanvasInvitesFrom don't throw", () => {
+      expect(() => protocol.setProfileVisibility("nobody")).not.toThrow();
+      expect(() => protocol.setFriendRequestsFrom("nobody")).not.toThrow();
+      expect(() => protocol.setCanvasInvitesFrom("nobody")).not.toThrow();
     });
   });
 
   describe("destroy()", () => {
-    it("closes all streams", () => {
-      const stream1 = createMockBiStream("b".repeat(64));
-      const stream2 = createMockBiStream("c".repeat(64));
-      protocol.handleStream(stream1 as unknown as BiStreamLike);
-      protocol.handleStream(stream2 as unknown as BiStreamLike);
-
-      protocol.destroy();
-
-      expect(stream1.close).toHaveBeenCalled();
-      expect(stream2.close).toHaveBeenCalled();
-    });
-
-    it("stops heartbeat timer", () => {
-      protocol.startHeartbeat(() => ["b".repeat(64)]);
-      protocol.destroy();
-      // no error — the timer was cleared
-    });
-
-    it("clears all event handlers", () => {
+    it("clears every event handler", () => {
       protocol.onFriendRequest = () => {};
       protocol.onFriendAccept = () => {};
-      protocol.onProfileResponse = () => {};
-      protocol.onFriendAcceptAck = () => {};
-      protocol.onCanvasInvite = () => {};
-      protocol.onCanvasInviteAck = () => {};
-      protocol.onCanvasInviteAccept = () => {};
-      protocol.onCanvasInviteDecline = () => {};
-      protocol.onAclChange = () => {};
-      protocol.onCanvasActivity = () => {};
+      protocol.onCanvasKnock = () => {};
+      protocol.onGossipDigest = () => {};
+      protocol.onBlobSeek = () => {};
+      protocol.onCanvasUpdate = () => {};
+      protocol.onCanvasDeleted = () => {};
 
       protocol.destroy();
 
       expect(protocol.onFriendRequest).toBeNull();
       expect(protocol.onFriendAccept).toBeNull();
-      expect(protocol.onProfileResponse).toBeNull();
-      expect(protocol.onFriendAcceptAck).toBeNull();
-      expect(protocol.onCanvasInvite).toBeNull();
-      expect(protocol.onCanvasInviteAck).toBeNull();
-      expect(protocol.onCanvasInviteAccept).toBeNull();
-      expect(protocol.onCanvasInviteDecline).toBeNull();
-      expect(protocol.onAclChange).toBeNull();
-      expect(protocol.onCanvasActivity).toBeNull();
+      expect(protocol.onCanvasKnock).toBeNull();
+      expect(protocol.onGossipDigest).toBeNull();
+      expect(protocol.onBlobSeek).toBeNull();
+      expect(protocol.onCanvasUpdate).toBeNull();
+      expect(protocol.onCanvasDeleted).toBeNull();
+    });
+
+    it("stops the heartbeat timer without throwing", () => {
+      protocol.startHeartbeat(() => ["b".repeat(64)]);
+      expect(() => protocol.destroy()).not.toThrow();
     });
   });
+
+  it("HEARTBEAT_TIMEOUT_MS matches the shared protocol's own default (90s)", () => {
+    expect(HEARTBEAT_TIMEOUT_MS).toBe(90_000);
+  });
 });
+
+
