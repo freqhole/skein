@@ -187,18 +187,18 @@ describe("GroupStore", () => {
       const alice = "a".repeat(64);
       groups.addMember(id, alice);
 
-      groups.shareCanvasWithGroup(canvas, id, "viewer");
-      expect(canvas.getRole(alice)).toBe("viewer");
+      groups.shareCanvasWithGroup(canvas, id, "member");
+      expect(canvas.getRole(alice)).toBe("member");
 
       // add a new member to the group AFTER the canvas was already shared
       const lateJoiner = "b".repeat(64);
       groups.addMember(id, lateJoiner);
 
       // the late joiner was never individually invited, so they get the
-      // default "member" fallback (see CanvasStore.getRole()), not the
-      // "viewer" role the group was shared with — no retroactive grant.
-      expect(canvas.getRole(lateJoiner)).toBe("member");
-      expect(canvas.getRole(lateJoiner)).not.toBe("viewer");
+      // default "viewer" fallback (see CanvasStore.getRole()), not the
+      // "member" role the group was shared with — no retroactive grant.
+      expect(canvas.getRole(lateJoiner)).toBe("viewer");
+      expect(canvas.getRole(lateJoiner)).not.toBe("member");
     });
 
     it("removing a member from a group after sharing does NOT revoke their already-granted access", () => {

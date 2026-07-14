@@ -221,7 +221,7 @@ class SkeinRouter {
     // same pattern as src/dev/acl-test-bootstrap.ts.
     const repoBox: { repo?: Repo } = {};
     const roleResolver: RoleResolver = (documentId, senderId) => {
-      if (!repoBox.repo) return "member";
+      if (!repoBox.repo) return "viewer";
       return createRepoRoleResolver(repoBox.repo)(documentId, senderId);
     };
 

@@ -8,7 +8,8 @@
 // lives in the package; this module only owns skein's own role
 // vocabulary: a canvas's `.acl` maps node id to "admin" | "member" |
 // "viewer", "viewer" is the one read-only role, and a peer with no
-// recorded (or an invalid) role defaults to "member".
+// recorded (or an invalid) role defaults to "viewer", the safe read-only
+// floor.
 //
 // usage:
 //   const roleResolver = createRepoRoleResolver(repo);
@@ -50,14 +51,14 @@ export function isReadOnlyCanvasRole(role: CanvasRole): boolean {
  * reads a peer's canvas role out of a document's `.acl` field, validating
  * through `canvasRoleSchema.safeParse()` before trusting it - `.acl` is
  * regular automerge doc data, synced from other peers with no
- * server-side validation. defaults to `"member"` for a missing or
+ * server-side validation. defaults to `"viewer"` for a missing or
  * invalid entry, matching `CanvasStore.getRole()`'s default for the same
  * case.
  */
 export function readCanvasRole(doc: unknown, senderId: PeerId): CanvasRole {
   const acl = (doc as { acl?: Record<string, { role?: unknown }> } | undefined)?.acl;
   const parsed = canvasRoleSchema.safeParse(acl?.[senderId]?.role);
-  return parsed.success ? parsed.data : "member";
+  return parsed.success ? parsed.data : "viewer";
 }
 
 /**
@@ -71,10 +72,10 @@ export function readCanvasRole(doc: unknown, senderId: PeerId): CanvasRole {
  * (creating a new handle, marking it as requested from peers) that have
  * no place in a message-filtering hot path. if the repo has never seen
  * this document, or the cached handle isn't ready yet, there's nothing
- * to check against, so this defaults to `"member"`.
+ * to check against, so this defaults to `"viewer"`.
  */
 export function createRepoRoleResolver(repo: Repo): RoleResolver {
-  return createHandleBasedRoleResolver(repo, readCanvasRole, "member");
+  return createHandleBasedRoleResolver(repo, readCanvasRole, "viewer");
 }
 
 /**

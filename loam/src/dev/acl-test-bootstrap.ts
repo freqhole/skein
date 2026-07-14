@@ -38,7 +38,7 @@ async function initSkeinForTest(options: AclTestInitOptions = {}): Promise<AclTe
   // can possibly flow.
   const repoBox: { repo?: Repo } = {};
   const roleResolver: RoleResolver = (documentId, senderId) => {
-    if (!repoBox.repo) return "member";
+    if (!repoBox.repo) return "viewer";
     return createRepoRoleResolver(repoBox.repo)(documentId, senderId);
   };
 
@@ -53,6 +53,20 @@ async function initSkeinForTest(options: AclTestInitOptions = {}): Promise<AclTe
     canvasDocId: options.canvasDocId ?? null,
   });
   repoBox.repo = harness.repo;
+
+  // the harness's CanvasStore.create()/open() never sets a local node id or
+  // stamps an admin the way production's real canvas-creation flow does
+  // (see standalone/boot.ts) — without this, a freshly created canvas has
+  // an empty `.acl`, so its own creator resolves to the same "no recorded
+  // role" default as any other peer once its changes reach someone else's
+  // network adapter. only the peer that actually creates the canvas
+  // (rather than joining one via `options.canvasDocId`) self-stamps here —
+  // a peer joining an existing canvas shouldn't claim admin before the
+  // real admin's `.acl` entry has synced over.
+  harness.store.setLocalNodeId(harness.repo.peerId);
+  if (!options.canvasDocId) {
+    harness.store.stampAdmin(harness.repo.peerId);
+  }
 
   (window as any).__skein = {
     store: harness.store,

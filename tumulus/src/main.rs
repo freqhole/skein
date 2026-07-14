@@ -244,7 +244,7 @@ async fn friend(data_dir: PathBuf, cmd: FriendCommand) -> anyhow::Result<()> {
     // rejecting me" confusion.
     eprintln!("data_dir = {}", data_dir.display());
     let pool = db::open(&data_dir).await?;
-    let haruspex_pool = tumulus::haruspex_bridge::open(&data_dir, &pool).await?;
+    let haruspex_pool = db::open_haruspex(&data_dir).await?;
     let users = userz::Directory::new(haruspex_pool.clone());
     let store = friendz::Store::new(haruspex_pool, pool);
 

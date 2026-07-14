@@ -126,25 +126,20 @@ export function emptyProfileDoc(): ProfileDocument {
  * the same shape means a friend syncing this doc is already prevented from
  * writing to it, with no changes needed to that file.
  *
- * **important asymmetry vs. `CanvasStore.getRole()`**: that method defaults
- * a *missing* `.acl` entry to `"member"` (backward-compat for canvases
- * predating ACL roles). a profile doc has no such legacy, and "member"
- * (read/write) is the wrong default here — nobody but the owner should
- * ever be able to write. `createRepoRoleResolver()` is generic/shared code
- * (out of scope to change here — it also gates real canvas ACL) and keeps
- * its `"member"` default regardless of doc type. **this means an absent
- * `.acl` entry for a peer is NOT safe for a profile doc** — every peer this
- * doc is ever shared with must get an explicit `{ role: "viewer" }` entry
- * (see `grantViewerRole()`), never left unset expecting a safe default.
- * `ProfileStore.getRole()` below defaults missing entries to `"viewer"` for
- * its own local reads (the correct default for *this* doc type), but that
- * local default has no bearing on the network-level resolver's behavior —
- * documented here so a future gossip/sharing implementer (section 8 step 5)
- * doesn't assume the two defaults match.
+ * access control mirrors `CanvasStore.getRole()`'s convention: a *missing*
+ * `.acl` entry defaults to `"viewer"`, the safe read-only floor, both for
+ * `ProfileStore.getRole()`'s own local reads below and for the
+ * network-level `createRepoRoleResolver()` (generic/shared code that reads
+ * `.acl` off whatever doc a `documentId` resolves to, not just canvas
+ * docs). `grantViewerRole()` still always writes an explicit
+ * `{ role: "viewer" }` entry when a profile is shared with a peer, so the
+ * doc's `.acl` map stays an accurate record of who it's been shared with,
+ * even though an absent entry already resolves to the same read-only
+ * outcome.
  *
  * admin/member distinctions are simply never used on this doc — only
- * `"viewer"` (granted) or "no entry" (should mean no access, but doesn't
- * enforce that at the network boundary per the above) are meaningful here.
+ * `"viewer"` (granted or defaulted) is meaningful here; nobody but the
+ * owner should ever be able to write to their own profile doc.
  */
 export class ProfileStore {
   /** the underlying automerge document handle. */
@@ -326,10 +321,9 @@ export class ProfileStore {
 
   /**
    * grant `nodeId` read access to this profile doc. always writes an
-   * explicit `"viewer"` entry — see this class's doc comment for why an
-   * absent entry is NOT a safe substitute for this doc type (unlike
-   * `CanvasStore`, whose missing-entry default is a deliberate
-   * backward-compat convenience for pre-ACL canvases).
+   * explicit `"viewer"` entry, so the doc's `.acl` map stays an accurate
+   * record of who it's been shared with (see this class's doc comment for
+   * why an absent entry already resolves to the same read-only default).
    */
   grantViewerRole(nodeId: string): void {
     this.handle.change((doc) => {
@@ -350,11 +344,9 @@ export class ProfileStore {
   /**
    * effective role for a node id on this profile doc, for local
    * UI-gating purposes only (e.g. "should i show this peer a write
-   * control"). defaults a missing entry to `"viewer"` — the safe default
-   * for this doc type (see the class doc comment for why this
-   * intentionally differs from `CanvasStore.getRole()`'s `"member"`
-   * default, and why that local default alone does not enforce anything
-   * at the network boundary).
+   * control"). defaults a missing entry to `"viewer"`, the same safe
+   * default `CanvasStore.getRole()` and the network-level
+   * `createRepoRoleResolver()` use for an unrecorded node.
    *
    * validates the raw value through `canvasRoleSchema` before trusting it,
    * same reasoning as `CanvasStore.getRole()` — `.acl` is untrusted synced

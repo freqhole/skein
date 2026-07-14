@@ -159,7 +159,7 @@ impl Friend {
 #[derive(Clone)]
 pub struct Store {
     /// haruspex's own sqlite db (a sibling file to this crate's own,
-    /// opened via `haruspex_bridge::open`) - every method below except the
+    /// opened via `db::open_haruspex`) - every method below except the
     /// narthex-doc-id side table goes through this pool.
     haruspex_pool: SqlitePool,
     /// this crate's own sqlite db, used only for `friend_docz`.

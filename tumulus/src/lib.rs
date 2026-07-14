@@ -15,7 +15,6 @@ pub mod db;
 pub mod documents;
 pub mod friendz;
 pub mod groupz;
-pub mod haruspex_bridge;
 pub mod hub;
 pub mod hub_repo;
 

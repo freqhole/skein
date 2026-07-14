@@ -79,7 +79,7 @@ async fn build_state() -> anyhow::Result<AppState> {
     tokio::fs::create_dir_all(&data_dir).await?;
 
     let pool = db::open(&data_dir).await?;
-    let haruspex_pool = tumulus::haruspex_bridge::open(&data_dir, &pool).await?;
+    let haruspex_pool = db::open_haruspex(&data_dir).await?;
     let username = std::env::var("SKEIN_USERNAME").unwrap_or_else(|_| "skein".to_string());
     let blobz_store: std::sync::Arc<dyn freqhole_reliquary::blobz::BlobStore> =
         std::sync::Arc::new(freqhole_reliquary::blobz::SqliteBlobStore::new(

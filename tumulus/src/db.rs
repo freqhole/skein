@@ -42,6 +42,15 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool, DbError> {
     Ok(pool)
 }
 
+/// open (creating if needed) haruspex's own sqlite db under `data_dir` - a
+/// sibling file to this crate's own `skein-hub.db`, owned by haruspex's
+/// friend-store/peer-directory. re-exported here so callers that already
+/// depend on this crate's `db` module (the tauri app included) don't need
+/// their own direct dependency on haruspex just to open its db handle.
+pub async fn open_haruspex(data_dir: &Path) -> Result<SqlitePool, haruspex::sqlite::OpenError> {
+    haruspex::sqlite::open(data_dir).await
+}
+
 #[cfg(test)]
 pub(crate) async fn open_in_memory() -> SqlitePool {
     // each :memory: connection is a separate database — share-cache + a single
@@ -93,14 +102,7 @@ mod tests {
         // expect every migrated table to be queryable.
         // table name is interpolated at runtime, so this can't be a query_as!
         // macro call (the macro requires a literal SQL string).
-        for table in [
-            "blobz",
-            "userz",
-            "friendz",
-            "friend_docz",
-            "docz",
-            "doc_deltaz",
-        ] {
+        for table in ["blobz", "friend_docz", "docz", "doc_deltaz"] {
             let q = format!("SELECT COUNT(*) FROM {table}");
             let (c,): (i64,) = sqlx::query_as(&q)
                 .fetch_one(&pool)

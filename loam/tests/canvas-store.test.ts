@@ -436,11 +436,11 @@ test("pendingInvites returns empty object on a fresh canvas", async ({ canvasPag
 // access control (ACL)
 // ---------------------------------------------------------------------------
 
-test("getRole defaults to member when no acl entry exists", async ({ canvasPage }) => {
+test("getRole defaults to viewer when no acl entry exists", async ({ canvasPage }) => {
   const { page } = await canvasPage();
 
   const role = await page.evaluate(() => (window as any).__skein.store.getRole("unknown-node"));
-  expect(role).toBe("member");
+  expect(role).toBe("viewer");
 });
 
 test("stampAdmin records the admin role", async ({ canvasPage }) => {
@@ -463,7 +463,7 @@ test("stampAdmin is a no-op if an admin is already recorded", async ({ canvasPag
     return { first: store.getRole("first-admin"), second: store.getRole("second-admin") };
   });
   expect(roles.first).toBe("admin");
-  expect(roles.second).toBe("member"); // unaffected — default, no acl entry written
+  expect(roles.second).toBe("viewer"); // unaffected — default, no acl entry written
 });
 
 test("setRole assigns member or viewer to a peer", async ({ canvasPage }) => {
@@ -513,7 +513,7 @@ test("isViewer reflects the viewer role", async ({ canvasPage }) => {
     };
   });
   expect(results.viewer).toBe(true);
-  expect(results.unknown).toBe(false); // defaults to member, not viewer
+  expect(results.unknown).toBe(true); // defaults to viewer
 });
 
 test("isAdmin reflects the admin role", async ({ canvasPage }) => {
@@ -529,7 +529,7 @@ test("isAdmin reflects the admin role", async ({ canvasPage }) => {
     };
   });
   expect(results.admin).toBe(true);
-  expect(results.unknown).toBe(false); // defaults to member, not admin
+  expect(results.unknown).toBe(false); // defaults to viewer, not admin
 });
 
 test("localRole/isLocalViewer/isLocalAdmin reflect the local peer's role", async ({
@@ -570,7 +570,7 @@ test("localRole/isLocalViewer/isLocalAdmin reflect the local peer's role", async
   expect(asViewer).toEqual({ role: "viewer", isViewer: true, isAdmin: false });
 });
 
-test("getRole safely falls back to member for an invalid/corrupted role value", async ({
+test("getRole safely falls back to viewer for an invalid/corrupted role value", async ({
   canvasPage,
 }) => {
   const { page } = await canvasPage();
@@ -586,7 +586,7 @@ test("getRole safely falls back to member for an invalid/corrupted role value", 
   });
 
   const role = await page.evaluate(() => (window as any).__skein.store.getRole("bad-node"));
-  expect(role).toBe("member");
+  expect(role).toBe("viewer");
 });
 
 // ---------------------------------------------------------------------------

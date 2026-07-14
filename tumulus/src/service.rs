@@ -56,8 +56,8 @@ pub enum ServiceError {
     #[error("blobz error: {0}")]
     Blobz(#[from] freqhole_reliquary::blobz::BlobStoreError),
 
-    #[error("haruspex bridge: {0}")]
-    HaruspexBridge(String),
+    #[error("opening haruspex db: {0}")]
+    HaruspexOpen(String),
 
     #[error("fs store: {0}")]
     FsStore(String),
@@ -185,9 +185,9 @@ impl Service {
         let node_id_str = node_id.to_string();
 
         // record ourselves in userz
-        let haruspex_pool = crate::haruspex_bridge::open(&config.data_dir, &pool)
+        let haruspex_pool = crate::db::open_haruspex(&config.data_dir)
             .await
-            .map_err(|e| ServiceError::HaruspexBridge(format!("{e}")))?;
+            .map_err(|e| ServiceError::HaruspexOpen(format!("{e}")))?;
         let userz = userz::Directory::new(haruspex_pool.clone());
         userz
             .upsert_self(&node_id_str, Some(&config.username), None, None)
@@ -564,9 +564,9 @@ pub async fn start_hub(
 
     let node_id_str = endpoint.id().to_string();
 
-    let haruspex_pool = crate::haruspex_bridge::open(&config.data_dir, &pool)
+    let haruspex_pool = crate::db::open_haruspex(&config.data_dir)
         .await
-        .map_err(|e| ServiceError::HaruspexBridge(format!("{e}")))?;
+        .map_err(|e| ServiceError::HaruspexOpen(format!("{e}")))?;
     let userz = userz::Directory::new(haruspex_pool.clone());
     let blobz: Arc<dyn BlobStore> = Arc::new(SqliteBlobStore::new(pool.clone(), &config.data_dir));
     let friendz_store = friendz::Store::new(haruspex_pool, pool.clone());

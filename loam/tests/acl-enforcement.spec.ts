@@ -76,7 +76,7 @@ test("a viewer's direct store mutation never reaches other peers", async ({ brow
   await addWidget(peerA.page, "admin-widget-1");
   await expect.poll(() => widgetCount(peerB.page), { timeout: 5000 }).toBe(1);
 
-  // peerA (still a "member" by default) demotes peerB to viewer.
+  // peerA (stamped as canvas admin on creation) demotes peerB to viewer.
   await peerA.page.evaluate((viewerPeerId) => {
     (window as any).__skein.store.setRole(viewerPeerId, "viewer");
   }, peerB.peerId);
@@ -101,16 +101,28 @@ test("a viewer's direct store mutation never reaches other peers", async ({ brow
   expect(await widgetCount(peerA.page)).toBe(2);
 });
 
-test("a member's direct store mutation still syncs normally", async ({ browser }) => {
+test("an unassigned peer's direct store mutation never reaches other peers either (default-deny)", async ({
+  browser,
+}) => {
   const context = await browser.newContext();
 
   const peerA = await openAclPeer(context);
   const peerB = await openAclPeer(context, peerA.canvasDocId);
 
-  // peerB is never assigned a role, so it defaults to "member" — its
-  // changes should sync to peerA exactly as if ACL filtering didn't exist.
-  await addWidget(peerB.page, "member-widget-1");
+  // peerB is never assigned a role at all, so it defaults to "viewer" - its
+  // changes should be stripped exactly like an explicitly demoted viewer's,
+  // proving the default itself denies write access rather than only an
+  // explicit "viewer" role doing so.
+  await addWidget(peerB.page, "unassigned-widget-1");
+  expect(await hasWidget(peerB.page, "unassigned-widget-1")).toBe(true);
 
-  await expect.poll(() => widgetCount(peerA.page), { timeout: 5000 }).toBe(1);
-  expect(await hasWidget(peerA.page, "member-widget-1")).toBe(true);
+  // a legitimate widget from peerA (the stamped admin) still reaches peerB,
+  // proving the sync channel itself is fine and this is role-based
+  // filtering, not a broken channel.
+  await addWidget(peerA.page, "admin-widget-3");
+  await expect.poll(() => widgetCount(peerB.page), { timeout: 5000 }).toBe(2);
+
+  // peerB's unassigned-role write must never have reached peerA.
+  expect(await hasWidget(peerA.page, "unassigned-widget-1")).toBe(false);
+  expect(await widgetCount(peerA.page)).toBe(1);
 });

@@ -59,7 +59,7 @@ pub struct PeerRecord {
 #[derive(Clone)]
 pub struct Directory {
     /// haruspex's own sqlite db (a sibling file to this crate's own,
-    /// opened via `haruspex_bridge::open`) - this directory carries no
+    /// opened via `db::open_haruspex`) - this directory carries no
     /// skein-specific side data of its own, so it needs nothing else.
     haruspex_pool: SqlitePool,
 }

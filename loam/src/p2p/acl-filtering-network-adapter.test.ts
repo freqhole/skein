@@ -50,22 +50,22 @@ describe("readCanvasRole", () => {
     expect(readCanvasRole(doc, MEMBER_ID)).toBe("member");
   });
 
-  it("defaults to member for a peer with no acl entry", () => {
+  it("defaults to viewer for a peer with no acl entry", () => {
     const doc = { acl: { [VIEWER_ID]: { role: "viewer" } } };
-    expect(readCanvasRole(doc, MEMBER_ID)).toBe("member");
+    expect(readCanvasRole(doc, MEMBER_ID)).toBe("viewer");
   });
 
-  it("defaults to member for an invalid/garbage role value", () => {
+  it("defaults to viewer for an invalid/garbage role value", () => {
     const doc = { acl: { [MEMBER_ID]: { role: "super-admin" } } };
-    expect(readCanvasRole(doc, MEMBER_ID)).toBe("member");
+    expect(readCanvasRole(doc, MEMBER_ID)).toBe("viewer");
   });
 
-  it("defaults to member when the doc has no acl field at all", () => {
-    expect(readCanvasRole({}, MEMBER_ID)).toBe("member");
+  it("defaults to viewer when the doc has no acl field at all", () => {
+    expect(readCanvasRole({}, MEMBER_ID)).toBe("viewer");
   });
 
-  it("defaults to member when the doc itself is undefined", () => {
-    expect(readCanvasRole(undefined, MEMBER_ID)).toBe("member");
+  it("defaults to viewer when the doc itself is undefined", () => {
+    expect(readCanvasRole(undefined, MEMBER_ID)).toBe("viewer");
   });
 });
 
@@ -74,20 +74,20 @@ describe("createRepoRoleResolver", () => {
     return { handles } as unknown as import("@automerge/automerge-repo").Repo;
   }
 
-  it("defaults to member when the repo has no cached handle for the document", () => {
+  it("defaults to viewer when the repo has no cached handle for the document", () => {
     const repo = makeFakeRepo({});
     const resolver = createRepoRoleResolver(repo);
 
-    expect(resolver(DOC_ID, MEMBER_ID)).toBe("member");
+    expect(resolver(DOC_ID, MEMBER_ID)).toBe("viewer");
   });
 
-  it("defaults to member when the cached handle isn't ready yet", () => {
+  it("defaults to viewer when the cached handle isn't ready yet", () => {
     const repo = makeFakeRepo({
       [DOC_ID]: { isReady: () => false, doc: () => ({}) },
     });
     const resolver = createRepoRoleResolver(repo);
 
-    expect(resolver(DOC_ID, MEMBER_ID)).toBe("member");
+    expect(resolver(DOC_ID, MEMBER_ID)).toBe("viewer");
   });
 
   it("reads the role out of the cached doc's acl once the handle is ready", () => {
@@ -102,7 +102,7 @@ describe("createRepoRoleResolver", () => {
     expect(resolver(DOC_ID, VIEWER_ID)).toBe("viewer");
   });
 
-  it("defaults to member for a peer with no acl entry on the cached doc", () => {
+  it("defaults to viewer for a peer with no acl entry on the cached doc", () => {
     const repo = makeFakeRepo({
       [DOC_ID]: {
         isReady: () => true,
@@ -111,10 +111,10 @@ describe("createRepoRoleResolver", () => {
     });
     const resolver = createRepoRoleResolver(repo);
 
-    expect(resolver(DOC_ID, MEMBER_ID)).toBe("member");
+    expect(resolver(DOC_ID, MEMBER_ID)).toBe("viewer");
   });
 
-  it("defaults to member for an invalid/garbage role value on the cached doc", () => {
+  it("defaults to viewer for an invalid/garbage role value on the cached doc", () => {
     const repo = makeFakeRepo({
       [DOC_ID]: {
         isReady: () => true,
@@ -123,6 +123,6 @@ describe("createRepoRoleResolver", () => {
     });
     const resolver = createRepoRoleResolver(repo);
 
-    expect(resolver(DOC_ID, MEMBER_ID)).toBe("member");
+    expect(resolver(DOC_ID, MEMBER_ID)).toBe("viewer");
   });
 });
