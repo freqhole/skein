@@ -1,20 +1,15 @@
 [package]
-name = "reliquary"
-# pinned independently of the workspace version (rather than
-# `version.workspace = true`) so it never collides with the freqhole/reliquary
-# path dependency below, which is also named "reliquary" at version 0.1.0 in
-# its own repo - cargo refuses to resolve two different-source packages that
-# share both name and version in one lockfile.
+name = "tumulus"
 version = "0.1.1"
 edition.workspace = true
 description = "headless hub peer for skein canvas P2P ecosystem"
 
 [lib]
-name = "reliquary"
+name = "tumulus"
 path = "src/lib.rs"
 
 [[bin]]
-name = "reliquary"
+name = "tumulus"
 path = "src/main.rs"
 
 [dependencies]

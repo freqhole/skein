@@ -3108,9 +3108,9 @@ dependencies = [
 
 [[package]]
 name = "iroh"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2e38557969901f8b356d1ebd882253bab98cc81500d53e7bcbf33f56082303"
+checksum = "5fca9b4b462c343ff88fc0af4096c186f939b602a0bc08723536ef2c31c93971"
 dependencies = [
  "backon",
  "blake3",
@@ -3159,9 +3159,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61cdf012298adc13f5c2c821ad87214fecc9ac54c751301d45bf62b229a85da1"
+checksum = "830a582cd54410dc1aa71d4786a82c3297d7b0165accd8b6dbbb3b240b48140d"
 dependencies = [
  "curve25519-dalek 5.0.0-rc.0",
  "data-encoding",
@@ -3219,9 +3219,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c24b83aae5ed4eced1c3724204c083c28c84c5d225a88e277eceeccce3dc3bd"
+checksum = "516e4eedc38e33ab69a6bd325520332dc3d67b25454e2d590ebb84a25240dd9a"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -3283,9 +3283,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f16a5505939f9250297ff2f1210b5142d13618f496eab03ce3f964fc47e2e2b"
+checksum = "8149bb6a57126225a07d6928846d82dcedfd24ea0f863ef7b2eb475e1d726354"
 dependencies = [
  "blake3",
  "bytes",
@@ -5622,41 +5622,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reliquary"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "automerge",
- "base64 0.22.1",
- "blake3",
- "bytes",
- "ciborium",
- "clap",
- "futures",
- "getrandom 0.2.17",
- "haruspex",
- "image",
- "indexmap 2.14.0",
- "iroh",
- "iroh-blobs",
- "libc",
- "reliquary 0.1.0",
- "serde",
- "serde_bytes",
- "serde_json",
- "sqlx",
- "thiserror 1.0.69",
- "time",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "webp",
-]
-
-[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6480,8 +6445,7 @@ dependencies = [
  "iroh",
  "iroh-blobs",
  "n0-future",
- "reliquary 0.1.0",
- "reliquary 0.1.1",
+ "reliquary",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -6498,6 +6462,7 @@ dependencies = [
  "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
+ "tumulus",
 ]
 
 [[package]]
@@ -7891,6 +7856,41 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tumulus"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "automerge",
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "ciborium",
+ "clap",
+ "futures",
+ "getrandom 0.2.17",
+ "haruspex",
+ "image",
+ "indexmap 2.14.0",
+ "iroh",
+ "iroh-blobs",
+ "libc",
+ "reliquary",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "webp",
+]
 
 [[package]]
 name = "typeid"

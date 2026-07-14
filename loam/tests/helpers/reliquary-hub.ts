@@ -7,12 +7,12 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
-// spawns a real `reliquary serve` process for e2e tests against the actual
+// spawns a real `tumulus serve` process for e2e tests against the actual
 // hub-peer binary (as opposed to browser-to-browser p2p, which is all the
 // existing p2p fixtures cover).
 //
 // readiness detection: we scan the child's stdout for the
-// `"iroh router started"` tracing line (see reliquary/src/hub/mod.rs,
+// `"iroh router started"` tracing line (see tumulus/src/hub/mod.rs,
 // logged right after `Router::builder(...).accept(...).spawn()` returns).
 // this was chosen over polling for the `reliquary-identity.key` file because
 // the key file is written *before* the iroh router is registered — a test
@@ -25,16 +25,16 @@ import { fileURLToPath } from "node:url";
 //
 // the node id is parsed from the earlier "reliquary starting" log line
 // (which includes `node_id=...`) rather than shelling out to a separate
-// `reliquary node-id` invocation — one less process spawn per test, and the
+// `tumulus node-id` invocation — one less process spawn per test, and the
 // log line is already guaranteed to appear before the router-ready line we
 // wait for anyway.
 // ---------------------------------------------------------------------------
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-/** path to the compiled reliquary binary, `target/debug/reliquary` at the skein workspace root. */
+/** path to the compiled tumulus binary, `target/debug/tumulus` at the skein workspace root. */
 const RELIQUARY_BIN =
-  process.env.RELIQUARY_BIN ?? join(HERE, "../../../target/debug/reliquary");
+  process.env.RELIQUARY_BIN ?? join(HERE, "../../../target/debug/tumulus");
 
 const READY_LOG_MARKER = "iroh router started";
 const NODE_ID_LOG_PATTERN = /reliquary starting.*node_id=([0-9a-f]{64})/;
@@ -62,9 +62,9 @@ export interface ReliquaryHubHandle {
   dataDir: string;
   /**
    * pre-approve a peer so the hub auto-accepts an inbound friend request
-   * from them (`reliquary friend allow <node_id>`). safe to call before or
+   * from them (`tumulus friend allow <node_id>`). safe to call before or
    * after the hub process has started, since it runs as its own short-lived
-   * `reliquary` invocation against the same data dir (sqlite handles
+   * `tumulus` invocation against the same data dir (sqlite handles
    * concurrent access from a second short-lived process fine).
    *
    * deliberately kept CLI-based rather than switched over to the real
@@ -83,7 +83,7 @@ export interface ReliquaryHubHandle {
    *   "admin" peer in each of them (bootstrapped via `adminAllow()`'s CLI
    *   call anyway, since the protocol has no self-service way to grant
    *   admin rights), purely to relay a call that itself still bottoms out
-   *   in the same `reliquary admin allow` CLI invocation one layer up. that
+   *   in the same `tumulus admin allow` CLI invocation one layer up. that
    *   doesn't remove any CLI dependency, it just adds an extra live
    *   iroh dial + CBOR round trip (with its own relay-discovery-lag retry
    *   needs, see `hubAdminRequestWithRetry` in hub-admin.spec.ts) on the
@@ -110,7 +110,7 @@ export interface ReliquaryHubHandle {
   friendAllow: (peerNodeId: string) => Promise<void>;
   /**
    * grant a peer admin rights over this hub's friendz allow-list
-   * (`reliquary admin allow <node_id>`), so that peer can subsequently call
+   * (`tumulus admin allow <node_id>`), so that peer can subsequently call
    * the real remote `iroh/skein-hub-admin/1` protocol (see
    * `SkeinP2PBridge.hubAdminRequest` in `src/dev/test-bridge.ts`) to manage
    * friendz over the network instead of via local CLI. this bootstrapping
@@ -134,7 +134,7 @@ export interface ReliquaryHubHandle {
 }
 
 /**
- * spawn a `reliquary serve` process against a fresh temp data dir (or an
+ * spawn a `tumulus serve` process against a fresh temp data dir (or an
  * existing one, via `options.dataDir` — e.g. to restart a hub against the
  * same identity/sqlite state after a previous handle's `stop({
  * preserveDataDir: true })`, proving in-flight work resumes correctly
@@ -147,8 +147,8 @@ export async function startReliquaryHub(options?: {
 }): Promise<ReliquaryHubHandle> {
   if (!existsSync(RELIQUARY_BIN)) {
     throw new Error(
-      `reliquary binary not found at ${RELIQUARY_BIN} — build it first with ` +
-        `"cargo build -p reliquary@0.1.1" from the skein workspace root (or set RELIQUARY_BIN).`
+      `tumulus binary not found at ${RELIQUARY_BIN} — build it first with ` +
+        `"cargo build -p tumulus" from the skein workspace root (or set RELIQUARY_BIN).`
     );
   }
 
@@ -156,7 +156,7 @@ export async function startReliquaryHub(options?: {
   const readyTimeoutMs = options?.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
 
   const child = spawn(RELIQUARY_BIN, ["--data-dir", dataDir, "--port", "0", "serve"], {
-    env: { ...process.env, RUST_LOG: "reliquary=debug" },
+    env: { ...process.env, RUST_LOG: "tumulus=debug" },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -191,7 +191,7 @@ export async function startReliquaryHub(options?: {
       cleanup();
       reject(
         new Error(
-          `reliquary serve exited before becoming ready (code=${code}). output:\n${output}`
+          `tumulus serve exited before becoming ready (code=${code}). output:\n${output}`
         )
       );
     };
@@ -200,7 +200,7 @@ export async function startReliquaryHub(options?: {
       cleanup();
       reject(
         new Error(
-          `reliquary serve did not become ready within ${readyTimeoutMs}ms. output:\n${output}`
+          `tumulus serve did not become ready within ${readyTimeoutMs}ms. output:\n${output}`
         )
       );
     }, readyTimeoutMs);
@@ -228,7 +228,7 @@ export async function startReliquaryHub(options?: {
   if (!nodeId) {
     await killChild(child);
     rmSync(dataDir, { recursive: true, force: true });
-    throw new Error(`reliquary serve became ready but no node_id was parsed from its log:\n${output}`);
+    throw new Error(`tumulus serve became ready but no node_id was parsed from its log:\n${output}`);
   }
 
   const resolvedNodeId: string = nodeId;
@@ -245,11 +245,11 @@ export async function startReliquaryHub(options?: {
   };
 
   const friendAllow = async (peerNodeId: string): Promise<void> => {
-    await runReliquary(["--data-dir", dataDir, "friend", "allow", peerNodeId]);
+    await runTumulus(["--data-dir", dataDir, "friend", "allow", peerNodeId]);
   };
 
   const adminAllow = async (peerNodeId: string): Promise<void> => {
-    await runReliquary(["--data-dir", dataDir, "admin", "allow", peerNodeId]);
+    await runTumulus(["--data-dir", dataDir, "admin", "allow", peerNodeId]);
   };
 
   return {
@@ -262,8 +262,8 @@ export async function startReliquaryHub(options?: {
   };
 }
 
-/** run a one-off `reliquary <args>` invocation and wait for it to exit, rejecting on non-zero exit. */
-function runReliquary(args: string[]): Promise<string> {
+/** run a one-off `tumulus <args>` invocation and wait for it to exit, rejecting on non-zero exit. */
+function runTumulus(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(RELIQUARY_BIN, args, {
       env: { ...process.env, RUST_LOG: "info" },
@@ -278,7 +278,7 @@ function runReliquary(args: string[]): Promise<string> {
       if (code === 0) {
         resolve(output);
       } else {
-        reject(new Error(`reliquary ${args.join(" ")} exited with code ${code}:\n${output}`));
+        reject(new Error(`tumulus ${args.join(" ")} exited with code ${code}:\n${output}`));
       }
     });
     child.on("error", reject);

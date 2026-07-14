@@ -18,7 +18,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use iroh::Endpoint;
 use freqhole_reliquary::blobz::{BlobRecord, NewBlobMeta};
 use freqhole_reliquary::identity;
-use reliquary::{friendz, service, userz};
+use tumulus::{friendz, service, userz};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;

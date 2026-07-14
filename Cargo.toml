@@ -1,5 +1,5 @@
 [workspace]
-members = ["reliquary"]
+members = ["tumulus"]
 # tauri/ added explicitly once icons + gen/ are populated; keeping
 # it excluded for now so `cargo check` at the workspace root stays green
 # without a working `cargo tauri` bootstrap.

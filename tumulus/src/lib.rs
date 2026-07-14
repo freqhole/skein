@@ -1,6 +1,6 @@
-//! reliquary: headless hub peer for the skein canvas p2p ecosystem.
+//! tumulus: headless hub peer for the skein canvas p2p ecosystem.
 //!
-//! this crate is primarily a binary (`reliquary serve`), but its modules are
+//! this crate is primarily a binary (`tumulus serve`), but its modules are
 //! also exposed as a library so the skein tauri app can optionally run a hub
 //! in-process and share its iroh identity.
 //!

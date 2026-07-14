@@ -41,7 +41,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 
-reliquary = { path = "../reliquary" }
+tumulus = { path = "../tumulus" }
 freqhole-reliquary = { package = "reliquary", path = "../../reliquary/rust" }
 
 [dev-dependencies]

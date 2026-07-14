@@ -6,8 +6,8 @@
 // exercises against a real reliquary hub, into a real, importable,
 // production-callable client — see docs/hub-and-profile-plan.md section 5.
 //
-// wire shapes mirror `reliquary::protocol::hub_admin::AdminRequest` /
-// `AdminResponse` (`reliquary/src/protocol/hub_admin.rs`), including the
+// wire shapes mirror `tumulus::protocol::hub_admin::AdminRequest` /
+// `AdminResponse` (`tumulus/src/protocol/hub_admin.rs`), including the
 // `ListPendingKnocks` / `PendingKnocks` variants that `test-bridge.ts`'s
 // copy doesn't cover yet — this module is the complete, canonical TS
 // mirror of the current Rust enum shapes.

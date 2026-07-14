@@ -1,4 +1,4 @@
-//! reliquary hub peer cli entrypoint.
+//! tumulus hub peer cli entrypoint.
 
 use std::path::PathBuf;
 
@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use freqhole_reliquary::blobz::{BlobStore, SqliteBlobStore};
 use freqhole_reliquary::identity;
 use iroh::SecretKey;
-use reliquary::{adminz, db, friendz, userz};
+use tumulus::{adminz, db, friendz, userz};
 
 #[derive(Parser, Debug)]
 #[command(name = "reliquary", version, about = "skein hub peer")]
@@ -210,14 +210,14 @@ async fn serve(data_dir: PathBuf, port: u16) -> anyhow::Result<()> {
     };
     let endpoint = builder.bind().await?;
 
-    let config = reliquary::service::ServiceConfig {
+    let config = tumulus::service::ServiceConfig {
         data_dir: data_dir.clone(),
         username: std::env::var("SKEIN_USERNAME").unwrap_or_else(|_| "reliquary".to_string()),
         bio: std::env::var("SKEIN_BIO").unwrap_or_default(),
         avatar_path: std::env::var("SKEIN_AVATAR_PATH").ok(),
     };
 
-    let service = reliquary::service::start_hub(endpoint, pool, config).await?;
+    let service = tumulus::service::start_hub(endpoint, pool, config).await?;
 
     let cancel = tokio_util::sync::CancellationToken::new();
     let ctrlc_cancel = cancel.clone();
@@ -244,7 +244,7 @@ async fn friend(data_dir: PathBuf, cmd: FriendCommand) -> anyhow::Result<()> {
     // rejecting me" confusion.
     eprintln!("data_dir = {}", data_dir.display());
     let pool = db::open(&data_dir).await?;
-    let haruspex_pool = reliquary::haruspex_bridge::open(&data_dir, &pool).await?;
+    let haruspex_pool = tumulus::haruspex_bridge::open(&data_dir, &pool).await?;
     let users = userz::Directory::new(haruspex_pool.clone());
     let store = friendz::Store::new(haruspex_pool, pool);
 
@@ -365,14 +365,14 @@ async fn maintenance(data_dir: PathBuf, cmd: MaintenanceCommand) -> anyhow::Resu
     eprintln!("data_dir = {}", data_dir.display());
 
     let docs_db_path = data_dir.join("skein-docs.db");
-    let storage = reliquary::hub_repo::HubDocStorage::new(&docs_db_path).await?;
+    let storage = tumulus::hub_repo::HubDocStorage::new(&docs_db_path).await?;
     let pool = db::open(&data_dir).await?;
     let blobz_store: std::sync::Arc<dyn BlobStore> =
         std::sync::Arc::new(SqliteBlobStore::new(pool, &data_dir));
 
     match cmd {
         MaintenanceCommand::List { limit, offset } => {
-            let removed = reliquary::maintenance::list_removed(&storage, limit, offset).await;
+            let removed = tumulus::maintenance::list_removed(&storage, limit, offset).await;
             if removed.is_empty() {
                 println!("(no soft-deleted canvases)");
                 return Ok(());
@@ -395,7 +395,7 @@ async fn maintenance(data_dir: PathBuf, cmd: MaintenanceCommand) -> anyhow::Resu
             if canvas_doc_id.is_empty() {
                 anyhow::bail!("canvas_doc_id cannot be empty");
             }
-            if reliquary::maintenance::restore(&storage, canvas_doc_id).await {
+            if tumulus::maintenance::restore(&storage, canvas_doc_id).await {
                 println!("restored {canvas_doc_id}");
             } else {
                 println!("{canvas_doc_id} was not soft-deleted — nothing to restore");
@@ -420,7 +420,7 @@ async fn maintenance(data_dir: PathBuf, cmd: MaintenanceCommand) -> anyhow::Resu
                     return Ok(());
                 }
             }
-            match reliquary::maintenance::purge(&storage, &blobz_store, canvas_doc_id).await {
+            match tumulus::maintenance::purge(&storage, &blobz_store, canvas_doc_id).await {
                 Ok(report) => {
                     println!("purged canvas {canvas_doc_id}");
                     println!(

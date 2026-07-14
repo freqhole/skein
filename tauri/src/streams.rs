@@ -39,7 +39,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
-use reliquary::{blob_acl, friendz};
+use tumulus::{blob_acl, friendz};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
@@ -135,7 +135,7 @@ impl StreamRegistry {
     /// been ensured into the FsStore (see the `blob_iroh_ensure` dispatch
     /// action in `commands.rs`).
     ///
-    /// gated by `blob_acl`'s friend-only mode (same as `reliquary::service::
+    /// gated by `blob_acl`'s friend-only mode (same as `tumulus::service::
     /// Service`, the other peer variant with no canvas tracking) — a peer
     /// must be a friend of this tauri instance's own identity to fetch any
     /// blob.
