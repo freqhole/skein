@@ -120,7 +120,9 @@ jobs:
 
   e2e:
     name: web (playwright e2e)
-    if: github.head_ref != 'changeset-release/main'
+    # unlike the other jobs, this one still runs for the changesets "Version
+    # Packages" PR - it's a pre-release smoke test that gets the full/heavy
+    # suite instead of the light one every other PR gets (see below).
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -150,7 +152,17 @@ jobs:
         working-directory: loam
         run: npx playwright install --with-deps chromium
 
-      - name: run e2e tests
+      # every regular PR gets the light e2e project - the heavy specs
+      # (multi-page meshes, real hub/iroh processes) are slow and serialized
+      # to a single worker, so they only run as a pre-release smoke test
+      # against the changesets "Version Packages" PR (below).
+      - name: run e2e tests (light)
+        if: github.head_ref != 'changeset-release/main'
+        working-directory: loam
+        run: npm run test:e2e:ci:light
+
+      - name: run e2e tests (full, incl. heavy)
+        if: github.head_ref == 'changeset-release/main'
         working-directory: loam
         run: npm run test:e2e:ci
 
