@@ -10,3 +10,4 @@
 # the same dir as reliquary/dev-data, so a hub and `make tauri-dev` can run
 # at the same time without sharing an iroh identity/sqlite files.
 /reliquary/hub-dev-data/
+node_modules
