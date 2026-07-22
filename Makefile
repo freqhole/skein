@@ -116,7 +116,7 @@ TAURI_DIR := tauri
 # android tauri build env (override via env or .env)
 ANDROID_SDK_ROOT ?= $(HOME)/Library/Android/sdk
 ANDROID_BUILD_TOOLS_VERSION ?= 34.0.0
-ANDROID_KEYSTORE ?= $(HOME)/Documents/freqhole-cert/android/skein-release-key.keystore
+ANDROID_KEYSTORE ?= $(HOME)/Documents/freqhole-cert/skein/skein-release-key.keystore
 ANDROID_KEY_ALIAS ?= my-key-alias
 ANDROID_APKSIGNER := $(ANDROID_SDK_ROOT)/build-tools/$(ANDROID_BUILD_TOOLS_VERSION)/apksigner
 JAVA_HOME ?= /Applications/Android Studio.app/Contents/jbr/Contents/Home
