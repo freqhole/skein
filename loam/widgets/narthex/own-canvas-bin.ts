@@ -5,11 +5,8 @@
 // read-only) mode. see docs/narthex-widgets-and-file-transfer-plan.md
 // section 1.
 //
-// unlike widgets/narthex/friend-canvas-bin.ts (a friend-PICKER widget for
-// browsing one specific FRIEND's read-only bin — a real, correct, already-
-// working feature for a different use case), this widget has nothing to
-// pick — it's always "my own bin" — so it hands off directly to the same
-// shared `createProfileCanvasBinWidget()` renderer
+// this widget has nothing to pick — it's always "my own bin" — so it hands
+// off directly to the same shared `createProfileCanvasBinWidget()` renderer
 // (widgets/narthex/social/canvas-bin.ts) that profile-tab.ts already
 // hand-mounts internally, but as a real registered `WidgetFactory`, in
 // non-read-only mode (the owner can drag/organize into folders directly
@@ -24,9 +21,7 @@
 // for ordinary palette-placed widgets. so this widget resolves the local
 // peer's own profile + canvas-bin docs itself, via `ctx.canvasStore.repo`
 // + the same `ensureMyProfileDoc()`/`ensureMyCanvasBinDoc()` singleton-doc
-// helpers boot.ts/profile-tab.ts already use — same pattern
-// friend-canvas-bin.ts already established for reaching the repo from a
-// plain `WidgetFactory` context.
+// helpers boot.ts/profile-tab.ts already use.
 //
 // ## singleton
 //
@@ -34,8 +29,12 @@
 // `metadata.singleton`/`singletonId` below. `profile-tab.ts`'s
 // `addCurrentCanvasToProfile()` auto-adds one the first time a canvas is
 // ever added to the profile; removing it via the frame close button is
-// purely local (doesn't un-publish anything from the profile), and the
-// palette can always re-add it since it isn't `hidden`.
+// purely local (doesn't un-publish anything from the profile). visible in
+// the "+" add-widget palette like any other widget (not `hidden`) —
+// `metadata.singletonId` already keeps the palette from offering a second
+// one once an instance exists, so showing it there just lets someone
+// re-add it manually after closing it, without needing to add a canvas to
+// their profile first.
 // ---------------------------------------------------------------------------
 
 import { Container, Graphics, Text } from "pixi.js";
@@ -66,7 +65,7 @@ export const OWN_CANVAS_BIN_WIDGET_TYPE = "own-canvas-bin";
 export const OWN_CANVAS_BIN_WIDGET_ID = "skein-own-canvas-bin";
 
 // ---------------------------------------------------------------------------
-// visual constants (matches friend-canvas-bin.ts's palette)
+// visual constants
 // ---------------------------------------------------------------------------
 
 const BG = 0x1a1a24;
@@ -90,16 +89,13 @@ export const ownCanvasBinWidget: WidgetFactory<typeof ownCanvasBinSchema> = {
     description: "your own curated canvases, shown to peers on your profile",
     version: "0.1.0",
     category: "narthex",
-    // hidden from the "+" add-widget palette — this widget is only ever
-    // auto-added by profile-tab.ts's addCurrentCanvasToProfile() (first
-    // canvas ever added to the profile) or already present from a prior
-    // session, never manually placed. same precedent as canvas-info.ts
-    // (a real on-canvas singleton widget, auto-seeded, also hidden) and
-    // messagez/social (auto-managed, hidden). `hidden` only affects the
-    // palette — the generic WidgetFrame close (x) button still works
-    // regardless (see widget-manager.ts's onClose/closeWidget, which has
-    // no singleton/hidden check at all), so removal stays fully available.
-    hidden: true,
+    // visible in the "+" add-widget palette (unlike canvas-info.ts/messagez/
+    // social, which stay hidden/auto-managed) — `profile-tab.ts`'s
+    // addCurrentCanvasToProfile() still auto-adds one the first time a
+    // canvas is added to the profile, but a peer can also re-add it
+    // manually from the palette after closing it, without needing to go
+    // add-a-canvas-to-profile again first. `singletonId` below still keeps
+    // the palette from offering a second instance once one exists.
     singleton: true,
     singletonId: OWN_CANVAS_BIN_WIDGET_ID,
     defaultWidth: 280,

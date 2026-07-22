@@ -16,7 +16,7 @@ help: ## show this help message
 DEV_DB := $(CURDIR)/tumulus/dev-data/skein-hub.db
 HUB_DEV_DB := $(CURDIR)/tumulus/hub-dev-data/skein-hub.db
 
-.PHONY: dev-data db-migrate tauri-dev tauri-build hub-dev hub-friend-allow hub-admin-allow deps-local deps-npm
+.PHONY: dev-data db-migrate tauri-dev tauri-build hub-dev hub-friend-allow hub-admin-allow deps-local deps-pub bump-tomb-deps
 
 # (re)creates the sqlite dev db tumulus's sqlx macros need. requires sqlx-cli
 # (`cargo install sqlx-cli --no-default-features --features sqlite,rustls`).
@@ -95,10 +95,24 @@ deps-local: ## switch loam + cargo haruspex/reliquary deps to local sibling repo
 # published npm versions, and tumulus/tauri's cargo deps on haruspex +
 # reliquary to the tagged git dependency on tomb - the default for ci and
 # normal builds.
-deps-npm: ## switch loam + cargo haruspex/reliquary deps to published npm/git-tag versions
+deps-pub: ## switch loam + cargo haruspex/reliquary deps to published npm/git-tag versions
 	cd loam && npm run deps:npm
 	node scripts/toggle-cargo-deps.mjs git
 	cargo check --workspace
+
+# bumps every place skein pins a tomb/lib version in one go: the git tag
+# rust crates track (scripts/toggle-cargo-deps.mjs's GIT_TAG constant, plus
+# tumulus/Cargo.toml + tauri/Cargo.toml if currently in git mode) and the
+# npm version range loam's @freqhole/{haruspex,midden,reliquary} deps track.
+# run this once the new tomb/lib version is actually published (tagged +
+# npm-published), then re-run `make deps-pub` (or `npm install`/`cargo
+# check` directly) to pull it in.
+bump-tomb-deps: ## bump skein's pinned tomb/lib versions, npm + cargo git tag (NEW_VERSION=x.y.z, or prompts)
+	@current=$$(grep -o 'GIT_TAG = "v[^"]*"' scripts/toggle-cargo-deps.mjs | sed 's/GIT_TAG = "v//;s/"//'); \
+	ver="$(NEW_VERSION)"; \
+	if [ -z "$$ver" ]; then read -p "new tomb/lib version (current: $$current): " ver; fi; \
+	if [ -z "$$ver" ]; then echo "no version given, aborting"; exit 1; fi; \
+	node scripts/bump-tomb-deps.mjs "$$ver"
 
 # ---------------------------------------------------------------------------
 # release builds

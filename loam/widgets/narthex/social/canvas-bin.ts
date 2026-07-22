@@ -91,18 +91,17 @@ export interface ProfileCanvasBinContext {
   height: number;
   /** render in read-only mode: no drag-to-move, no "+ folder" button — only
    *  navigate-into-folder and open-canvas stay active. used for viewing a
-   *  FRIEND's bin (friends-tab.ts's friend-detail view, and the
-   *  `friend-canvas-bin` narthex widget) — the owner's own embed
-   *  (profile-tab.ts) omits this (defaults to `false`, fully editable). */
+   *  FRIEND's bin (friends-tab.ts's friend-detail view) — the owner's own
+   *  embed (profile-tab.ts) omits this (defaults to `false`, fully
+   *  editable). */
   isReadOnly?: boolean;
   /**
    * override how this instance's test hooks get exposed. defaults to
    * `registerSocialBridge({ canvasBin: hooks })` — the owner's own
    * profile-tab embed, which is a permanent per-session singleton. any
    * OTHER concurrent mount of this widget (a friend's read-only bin in
-   * friends-tab.ts, or an instance of the `friend-canvas-bin` narthex
-   * widget) must supply its own registration target here, or it would
-   * silently clobber the owner's own hooks under the same
+   * friends-tab.ts) must supply its own registration target here, or it
+   * would silently clobber the owner's own hooks under the same
    * `window.__skeinTest.social.canvasBin` key.
    */
   registerTestHooks?: (hooks: ProfileCanvasBinTestHooks) => void;

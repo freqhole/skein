@@ -995,9 +995,8 @@ export function createProfileTab(ctx: TabContext): TabController {
   // duplicate UI (a real user-reported issue, 2026-07-02). the underlying
   // `CanvasBinStore` doc still gets created/stamped below regardless,
   // since that's what makes a FRIEND able to discover and view this
-  // profile's bin (friends-tab.ts's read-only detail view, and the
-  // `friend-canvas-bin` narthex widget) — only the local rendering of it
-  // was removed.
+  // profile's bin (friends-tab.ts's read-only detail view) — only the
+  // local rendering of it was removed.
   // -------------------------------------------------------------------------
 
   if (ctx.profileStore) {

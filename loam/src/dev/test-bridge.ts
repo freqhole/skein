@@ -534,38 +534,6 @@ export interface SkeinTestBridge {
   widgets?: Record<string, unknown>;
 }
 
-/**
- * test hooks for the "friend canvas bin" narthex widget (a real,
- * palette-placeable `WidgetFactory` — see
- * widgets/narthex/friend-canvas-bin.ts). registered per widget instance via
- * `registerWidgetBridge(widgetId, hooks)` under
- * `window.__skeinTest.widgets[widgetId]`, since (unlike the social overlay's
- * singleton tabs) more than one instance of this widget can exist on the
- * narthex at once.
- */
-export interface FriendCanvasBinTestHooks {
-  /** the currently-configured friend selection, or null if the widget is
-   *  still in its unconfigured "pick a friend" state. */
-  getSelection(): { nodeId: string; profileDocId: string; displayName: string } | null;
-  /** select a friend as if their row in the picker had been tapped —
-   *  same precedent as other widgets' "drive the real internal handler
-   *  directly" test hooks (no infra for simulated pixi pointer taps). */
-  selectFriend(nodeId: string, profileDocId: string, displayName: string): void;
-  /** clear the current selection, returning to the "pick a friend" state,
-   *  as if the "change friend" link had been tapped. */
-  clearSelection(): void;
-  /** the picker's current candidate list (best-effort read of the local
-   *  peer's own friend list — see friend-directory.ts). */
-  getPickerCandidates(): Array<{ nodeId: string; profileDocId: string; displayName: string }>;
-  /** high-level resolution status, for asserting the "friend has no
-   *  canvas-bin doc yet" / "doc unreachable" best-effort cases without an
-   *  error UI. */
-  getStatus(): "unconfigured" | "resolving" | "no-canvas-bin" | "ready";
-  /** the mounted read-only bin's own test hooks, once `getStatus()` is
-   *  `"ready"` — null otherwise. */
-  getBinHooks(): ProfileCanvasBinTestHooks | null;
-}
-
 // ---------------------------------------------------------------------------
 // builder
 // ---------------------------------------------------------------------------

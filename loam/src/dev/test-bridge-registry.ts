@@ -57,9 +57,8 @@ export function registerSocialBridge(partial: Partial<SkeinTestBridgeSocial>): v
  * register test hooks for one instance of a real, palette-placeable
  * `WidgetFactory` widget, keyed by its widget id — for widgets that don't
  * go through the social overlay's single hand-mounted-tab pattern (which
- * uses `registerSocialBridge()` above) and where more than one instance can
- * exist at once (e.g. several `friend-canvas-bin` widgets pinned to
- * different friends on the same narthex).
+ * uses `registerSocialBridge()` above) and where more than one instance of
+ * the same widget type can exist at once on the same narthex.
  *
  * no-op outside DEV builds, same guard as `registerSocialBridge()`.
  */

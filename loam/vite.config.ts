@@ -3,8 +3,27 @@ import path from "path";
 import { defineConfig, type Plugin } from "vite";
 
 import wasm from "vite-plugin-wasm";
+import istanbul from "vite-plugin-istanbul";
 
 const isTauriBuild = !!process.env.VITE_TAURI;
+
+// instruments src/ + widgets/ with istanbul counters (adds a `window.__coverage__`
+// global) when running e2e specs under `COVERAGE_E2E=1` (see `npm run
+// test:e2e:coverage` and `tests/fixtures/p2p-page.ts`, which dumps that global
+// to disk per test). off by default — instrumentation slows the dev server
+// and isn't wanted for a normal `npm run dev` or `npm run test:e2e`.
+const coverageE2E = process.env.COVERAGE_E2E === "1";
+function istanbulPlugins(): Plugin[] {
+  if (!coverageE2E) return [];
+  return [
+    istanbul({
+      include: ["src/**/*.ts", "widgets/**/*.ts"],
+      exclude: ["node_modules", "**/*.test.ts", "**/*.d.ts"],
+      extension: [".ts"],
+      requireEnv: false,
+    }) as Plugin,
+  ];
+}
 
 // resolves the bare "midden" specifier that reliquary's blob worker
 // dynamically imports (see @freqhole/reliquary/worker's midden-blake3.ts).
@@ -27,11 +46,14 @@ function middenBareSpecifierPlugin(target: string): Plugin {
 const middenTarget = isTauriBuild ? path.resolve(__dirname, "src/stubs/midden-stub.ts") : "@freqhole/midden";
 
 export default defineConfig({
-  plugins: [wasm(), middenBareSpecifierPlugin(middenTarget)],
+  plugins: [wasm(), middenBareSpecifierPlugin(middenTarget), ...istanbulPlugins()],
   // worker bundles need wasm too — the blob worker pulls in @freqhole/midden (wasm) for blake3.
+  // istanbul is instrumented here too since blob-worker.ts (hashing/OPFS) and
+  // midden-worker.ts run their real logic inside this worker graph, not the
+  // main thread — omitting it would silently under-report the blob pipeline.
   worker: {
     format: "es",
-    plugins: () => [wasm(), middenBareSpecifierPlugin(middenTarget)],
+    plugins: () => [wasm(), middenBareSpecifierPlugin(middenTarget), ...istanbulPlugins()],
   },
   // target esnext — the app requires modern browsers (wasm, top-level await, etc.)
   // this removes the need for vite-plugin-top-level-await.

@@ -17,6 +17,13 @@ type CanvasPageFactory = (options?: {
    * needed. window.__skein.store is still available for assertions.
    */
   syncOnly?: boolean;
+  /**
+   * skip the harness's automatic admin-stamp for a freshly created canvas
+   * (see `dev/test-bootstrap.ts`) — use for tests that exercise
+   * `store.stampAdmin()`'s own bootstrap-from-empty-acl behavior and need
+   * a canvas that genuinely starts with no admin recorded.
+   */
+  skipAutoAdmin?: boolean;
 }) => Promise<CanvasTestHandle>;
 
 /**
@@ -63,10 +70,14 @@ export const test = base.extend<{
 
       // initialize skein inside the browser page.
       // only pass serializable fields — the context object can't cross into the browser.
-      const initOpts = { canvasDocId: options?.canvasDocId ?? null };
+      const initOpts = {
+        canvasDocId: options?.canvasDocId ?? null,
+        skipAutoAdmin: options?.skipAutoAdmin ?? false,
+      };
       const result = await page.evaluate(async (opts) => {
         return (window as any).__initSkeinForTest({
           canvasDocId: opts?.canvasDocId ?? null,
+          skipAutoAdmin: opts?.skipAutoAdmin ?? false,
         });
       }, initOpts);
 

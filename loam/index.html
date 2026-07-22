@@ -78,6 +78,36 @@
         width: 100vw;
         height: 100vh;
         touch-action: none;
+        position: relative;
+      }
+      /* shown immediately at first paint (pure css, no js needed) while
+         the midden p2p node/worker + first canvas doc load - removed by
+         src/canvas/init.ts once the real pixi canvas is actually mounted.
+         see docs/... boot-spinner note in init.ts for the removal site. */
+      #boot-spinner {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        color: #666678;
+        font-family: system-ui, sans-serif;
+        font-size: 13px;
+      }
+      #boot-spinner .spinner-ring {
+        width: 32px;
+        height: 32px;
+        border: 3px solid #2a2a3e;
+        border-top-color: #d946ef;
+        border-radius: 50%;
+        animation: boot-spin 0.8s linear infinite;
+      }
+      @keyframes boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
       }
       .boot-error {
         display: flex;
@@ -102,7 +132,12 @@
     </style>
   </head>
   <body>
-    <div id="canvas-root"></div>
+    <div id="canvas-root">
+      <div id="boot-spinner">
+        <div class="spinner-ring"></div>
+        <div>loading skein…</div>
+      </div>
+    </div>
     <noscript>skein requires javascript to run.</noscript>
     <script type="module" src="/src/standalone/boot.ts"></script>
   </body>

@@ -15,6 +15,7 @@ const packageJsonPath = path.resolve(dirname, "..", "package.json");
 
 // npm version ranges are the checked-in default; local paths are relative
 // to loam/, matching the sibling repos' ts/wasm-pack build output dirs.
+// midden lives under tomb/lib/midden (not its own top-level sibling repo).
 const packages = {
     "@freqhole/haruspex": {
         npm: "^0.2.1",
@@ -22,7 +23,7 @@ const packages = {
     },
     "@freqhole/midden": {
         npm: "^0.2.1",
-        local: "file:../../midden/pkg",
+        local: "file:../../tomb/lib/midden/pkg",
     },
     "@freqhole/reliquary": {
         npm: "^0.2.1",

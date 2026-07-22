@@ -38,6 +38,10 @@ const files = {
             local: `freqhole-reliquary = { package = "reliquary", path = "../../reliquary/rust" }`,
             git: `freqhole-reliquary = { package = "reliquary", ${GIT_SOURCE} }`,
         },
+        {
+            local: `freqhole-reliquary = { package = "reliquary", path = "../../reliquary/rust", features = [\n    "test-utils",\n] }`,
+            git: `freqhole-reliquary = { package = "reliquary", ${GIT_SOURCE}, features = [\n    "test-utils",\n] }`,
+        },
     ],
 };
 

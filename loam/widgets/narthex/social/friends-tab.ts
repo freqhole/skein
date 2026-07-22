@@ -12,6 +12,7 @@ import {
   isOnline as bridgeIsOnline,
   isProtocolReady as bridgeIsProtocolReady,
   onOnlineChange,
+  requestProfile,
   sendFriendRequest,
 } from "../../../src/p2p/friendz-bridge";
 import { createHubAdminClient } from "../../../src/p2p/hub-admin-client";
@@ -132,6 +133,18 @@ export function createFriendsTab(ctx: TabContext): TabController {
   // rebuildDetailView() below) — best-effort, mounted asynchronously once
   // the friend's profile+bin docs are reachable.
   let friendCanvasBinController: ProfileCanvasBinController | null = null;
+
+  // live profile refresh (username/bio/avatar) for the currently-viewed
+  // friend — see rebuildDetailView()'s "live profile refresh" section.
+  // `profileRefreshRequestedFor` guards against re-sending a profile-request
+  // on every incidental re-render while the detail view stays open (doc
+  // changes elsewhere, online-status flips, resize, etc) — cleared by
+  // layout() whenever the view leaves "detail", so re-opening the same
+  // friend later fetches again. `profileRefreshPendingFor` drives the small
+  // "refreshing profile..." indicator and is cleared once the request
+  // settles (success or failure) or a different friend is opened.
+  let profileRefreshRequestedFor: string | null = null;
+  let profileRefreshPendingFor: string | null = null;
 
   // scroll state for the list view
   let scrollY = 0;
@@ -1288,6 +1301,54 @@ export function createFriendsTab(ctx: TabContext): TabController {
     dy += DETAIL_NAME_SIZE + 6;
 
     // -----------------------------------------------------------------------
+    // live profile refresh — the friend-detail view otherwise only shows
+    // whatever username/bio/avatar/isHub snapshot was last learned via
+    // gossip relay or a prior profile-response (see friendz-wiring.ts's
+    // onProfileResponse), which can go stale. if the friend is currently
+    // online, ask them directly for their latest profile; the response
+    // writes back into ctx.doc (onProfileResponse) and this view re-renders
+    // through the existing doc-change subscription — never blocks this
+    // (already-rendered) frame. fires at most once per detail-view visit
+    // (profileRefreshRequestedFor, cleared by layout() on leaving "detail"),
+    // and shows a small, minimal "refreshing..." indicator for the
+    // duration — best-effort, no error UI if the request fails or times
+    // out (matches this file's existing conventions elsewhere).
+    // -----------------------------------------------------------------------
+
+    if (profileRefreshRequestedFor !== friend.id) {
+      profileRefreshRequestedFor = friend.id;
+      const onlineNodeId = friend.nodeIds.find((n) => bridgeIsOnline(n.nodeId))?.nodeId;
+      if (onlineNodeId) {
+        profileRefreshPendingFor = friend.id;
+        requestProfile(onlineNodeId)
+          .catch((err) => {
+            log.warn("social.friends", "live profile refresh failed for", onlineNodeId.slice(0, 16) + "...", err);
+          })
+          .finally(() => {
+            if (profileRefreshPendingFor !== friend.id) return;
+            profileRefreshPendingFor = null;
+            if (detailInner.destroyed) return;
+            if (selectedFriendId === friend.id && viewMode === "detail") {
+              layout(currentWidth, currentHeight);
+            }
+          });
+      }
+    }
+
+    if (profileRefreshPendingFor === friend.id) {
+      const refreshingText = new Text({
+        text: "refreshing profile\u2026",
+        style: { fontFamily: FONT, fontSize: 10, fill: MUTED_TEXT },
+        resolution: RESOLUTION,
+      });
+      refreshingText.eventMode = "none";
+      refreshingText.x = Math.max(0, (contentW - refreshingText.width) / 2);
+      refreshingText.y = dy;
+      detailInner.addChild(refreshingText);
+      dy += refreshingText.height + 6;
+    }
+
+    // -----------------------------------------------------------------------
     // manage hub — only shown for friends flagged as a reliquary hub
     // (docs/hub-and-profile-plan.md section 5/8 step 7).
     // -----------------------------------------------------------------------
@@ -2229,6 +2290,13 @@ export function createFriendsTab(ctx: TabContext): TabController {
     addBtn.visible = false;
     emptyText.visible = false;
     dropZoneBar.visible = false;
+
+    // leaving the detail view — forget which friend we already sent a
+    // live profile-refresh request for, so re-opening a detail view later
+    // (same friend or not) fetches fresh again.
+    if (viewMode !== "detail") {
+      profileRefreshRequestedFor = null;
+    }
 
     switch (viewMode) {
       case "list": {

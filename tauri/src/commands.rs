@@ -226,6 +226,7 @@ fn is_social_mutation(action: &str) -> bool {
             | "social_delete_request"
             | "social_set_friend_alias"
             | "social_update_friend"
+            | "social_mark_friend_as_hub"
             | "social_update_node_profile"
             | "social_update_profile"
             | "social_update_settings"
@@ -429,6 +430,9 @@ async fn dispatch(
         }
         "social_delete_request" => {
             social_delete_request(decode("social_delete_request", payload)?, state).await
+        }
+        "social_mark_friend_as_hub" => {
+            social_mark_friend_as_hub(decode("social_mark_friend_as_hub", payload)?, state).await
         }
         "social_set_friend_alias" => {
             social_set_friend_alias(decode("social_set_friend_alias", payload)?, state).await
@@ -841,6 +845,27 @@ async fn social_remove_friend(
     state: &AppState,
 ) -> Result<Value, DispatchError> {
     state.friendz_store.delete(&args.id).await?;
+    Ok(Value::Null)
+}
+
+#[derive(Debug, Deserialize)]
+struct SocialMarkFriendAsHubArgs {
+    node_id: String,
+}
+
+/// records that a peer identified itself as a hub via the isHub flag on an
+/// incoming friendz protocol message (docs/hub-and-profile-plan.md section
+/// 3). the tauri build parses that message in JS
+/// (`loam/src/p2p/friends-protocol.ts`, same code path the browser build
+/// uses) rather than natively in rust, so `userz::mark_as_hub` needs an
+/// explicit IPC action here rather than only being reachable from
+/// `tumulus::service::Service`'s own native message handling (which only
+/// runs while this instance's hub toggle is on).
+async fn social_mark_friend_as_hub(
+    args: SocialMarkFriendAsHubArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    state.userz.mark_as_hub(&args.node_id).await?;
     Ok(Value::Null)
 }
 
@@ -1267,9 +1292,37 @@ struct BlobInsertFromPathArgs {
 /// large file simply staying rust-only is fine.
 const MIRROR_DATA_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
+/// thin tauri-facing wrapper around [`blob_insert_from_path_impl`]: its only
+/// job is turning `app`/`upload_id` into an `on_progress` closure that emits
+/// `blob-insert-progress` events. all the actual upload logic (validation,
+/// streaming hash, cancel registry, blobz insert, mirror-data decision) lives
+/// in the impl function, which knows nothing about tauri and is exercised
+/// directly in tests below with a plain closure instead of a real `AppHandle`.
 async fn blob_insert_from_path(
     args: BlobInsertFromPathArgs,
     app: &AppHandle,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    let upload_id = args.upload_id.clone();
+    let progress_cb = upload_id.map(|id| {
+        let app = app.clone();
+        move |bytes_read: u64, total: u64| {
+            let _ = app.emit(
+                "blob-insert-progress",
+                json!({ "uploadId": id, "bytesRead": bytes_read, "total": total }),
+            );
+        }
+    });
+    let on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)> = progress_cb
+        .as_ref()
+        .map(|f| f as &(dyn Fn(u64, u64) + Send + Sync));
+
+    blob_insert_from_path_impl(args, on_progress, state).await
+}
+
+async fn blob_insert_from_path_impl(
+    args: BlobInsertFromPathArgs,
+    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
     state: &AppState,
 ) -> Result<Value, DispatchError> {
     let path = std::path::PathBuf::from(&args.local_path);
@@ -1298,19 +1351,6 @@ async fn blob_insert_from_path(
     // blob-files dir) so a multi-gigabyte upload costs one streaming read
     // pass, not a read + a full-file copy + a full-file base64 round-trip.
     let upload_id = args.upload_id.clone();
-    let progress_cb = upload_id.as_ref().map(|id| {
-        let app = app.clone();
-        let id = id.clone();
-        move |bytes_read: u64, total: u64| {
-            let _ = app.emit(
-                "blob-insert-progress",
-                json!({ "uploadId": id, "bytesRead": bytes_read, "total": total }),
-            );
-        }
-    });
-    let on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)> = progress_cb
-        .as_ref()
-        .map(|f| f as &(dyn Fn(u64, u64) + Send + Sync));
 
     // register a cancel flag so `blob_insert_cancel` can abort the hashing pass.
     // the guard removes the entry from the registry on ALL exit paths.
@@ -1410,6 +1450,28 @@ struct BlobIrohDownloadArgs {
     size: Option<u64>,
 }
 
+/// thin tauri-facing wrapper around [`blob_iroh_download_impl`]: its only job
+/// is turning `app` into an `on_progress` closure that emits
+/// `blob-download-progress` events (used both for in-flight progress and the
+/// final 100% completion event). all the actual download/ingest logic lives
+/// in the impl function, which knows nothing about tauri and is exercised
+/// directly in tests below with a plain closure instead of a real `AppHandle`.
+async fn blob_iroh_download(
+    args: BlobIrohDownloadArgs,
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    let blake3 = args.blake3.clone();
+    let app = app.clone();
+    let on_progress = move |bytes_done: u64, total_size: u64| {
+        let _ = app.emit(
+            "blob-download-progress",
+            json!({ "blake3": blake3, "bytesDone": bytes_done, "totalSize": total_size }),
+        );
+    };
+    blob_iroh_download_impl(args, &on_progress, state).await
+}
+
 /// download a blob from a peer over iroh-blobs verified transfer, ingest
 /// it into the local `blobz` store (and FsStore via prewarm), and return
 /// the blob row + base64 bytes so the JS caller can mirror it into OPFS /
@@ -1417,9 +1479,9 @@ struct BlobIrohDownloadArgs {
 ///
 /// mirrors tomb's `reliquary::snatch::BlobSnatcher::download_blob` — the
 /// canonical native-rust impl of the iroh-blobs consumer side.
-async fn blob_iroh_download(
+async fn blob_iroh_download_impl(
     args: BlobIrohDownloadArgs,
-    app: &AppHandle,
+    on_progress: &(dyn Fn(u64, u64) + Send + Sync),
     state: &AppState,
 ) -> Result<Value, DispatchError> {
     use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
@@ -1510,14 +1572,7 @@ async fn blob_iroh_download(
                 // blob_insert_from_path's "blob-insert-progress").
                 if last_emit.elapsed() >= std::time::Duration::from_millis(250) {
                     last_emit = std::time::Instant::now();
-                    let _ = app.emit(
-                        "blob-download-progress",
-                        json!({
-                            "blake3": args.blake3,
-                            "bytesDone": bytes_done,
-                            "totalSize": total_size,
-                        }),
-                    );
+                    on_progress(bytes_done, total_size);
                 }
                 if last_log.elapsed() >= std::time::Duration::from_secs(2) {
                     tracing::info!(
@@ -1604,14 +1659,7 @@ async fn blob_iroh_download(
     );
 
     // final 100% progress event so listeners always see completion
-    let _ = app.emit(
-        "blob-download-progress",
-        json!({
-            "blake3": args.blake3,
-            "bytesDone": blob.size,
-            "totalSize": blob.size,
-        }),
-    );
+    on_progress(blob.size, blob.size);
 
     // meta only — the bytes live in blobz, reachable via blob_get_path /
     // asset:// for playback. no base64 payload over IPC.
@@ -1981,4 +2029,360 @@ async fn pdf_render_pages(
     }
 
     Ok(Value::Array(out))
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freqhole_reliquary::testing::make_local_storage_node;
+
+    /// builds a real, fully offline `AppState` backed by a fresh tempdir —
+    /// no iroh endpoint, no tauri runtime. mirrors `lib.rs`'s `build_state()`
+    /// construction, minus the network/identity restore step: none of the
+    /// blob dispatch handlers under test touch `state.network`.
+    async fn make_test_state() -> (AppState, tempfile::TempDir) {
+        let (storage, tmp) = make_local_storage_node().await;
+        let data_dir = tmp.path().to_path_buf();
+
+        let pool = tumulus::db::open(&data_dir).await.expect("open skein db");
+        let haruspex_pool = tumulus::db::open_haruspex(&data_dir)
+            .await
+            .expect("open haruspex db");
+        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
+        let userz_dir = userz::Directory::new(haruspex_pool);
+
+        let state = AppState {
+            network: Arc::new(Mutex::new(None)),
+            pool,
+            data_dir: data_dir.clone(),
+            username: "test-user".to_string(),
+            storage: Arc::new(storage),
+            downloader_cell: Arc::new(std::sync::RwLock::new(None)),
+            friendz_store,
+            userz: userz_dir,
+            process_started_at: Instant::now(),
+            app_config_path: data_dir.join("skein-app.toml"),
+            hub: Arc::new(Mutex::new(None)),
+        };
+
+        (state, tmp)
+    }
+
+    #[tokio::test]
+    async fn blob_insert_then_get_roundtrips_bytes() {
+        let (state, _tmp) = make_test_state().await;
+        let original = b"hello from commands.rs test suite";
+
+        let inserted = blob_insert(
+            BlobInsertArgs {
+                filename: Some("greeting.txt".to_string()),
+                mime: Some("text/plain".to_string()),
+                data: B64.encode(original),
+            },
+            &state,
+        )
+        .await
+        .expect("blob_insert");
+
+        let blake3 = inserted["blake3"]
+            .as_str()
+            .expect("blake3 field")
+            .to_string();
+        assert_eq!(blake3.len(), 64);
+        assert_eq!(inserted["filename"].as_str().unwrap(), "greeting.txt");
+        assert_eq!(inserted["size"].as_u64().unwrap(), original.len() as u64);
+
+        let got = blob_get(
+            BlobGetArgs {
+                blake3: blake3.clone(),
+            },
+            &state,
+        )
+        .await
+        .expect("blob_get");
+        let decoded = B64
+            .decode(got["data"].as_str().expect("data field"))
+            .expect("base64 decode");
+        assert_eq!(decoded, original);
+        assert_eq!(got["meta"]["blake3"].as_str().unwrap(), blake3);
+    }
+
+    #[tokio::test]
+    async fn blob_get_path_points_at_a_real_file_with_matching_bytes() {
+        let (state, _tmp) = make_test_state().await;
+        let original = b"blob_get_path should return a real on-disk file";
+
+        let inserted = blob_insert(
+            BlobInsertArgs {
+                filename: Some("video.bin".to_string()),
+                mime: Some("application/octet-stream".to_string()),
+                data: B64.encode(original),
+            },
+            &state,
+        )
+        .await
+        .expect("blob_insert");
+        let blake3 = inserted["blake3"].as_str().unwrap().to_string();
+
+        let resolved = blob_get_path(BlobGetArgs { blake3 }, &state)
+            .await
+            .expect("blob_get_path");
+        let path = std::path::PathBuf::from(resolved["path"].as_str().expect("path field"));
+        assert!(path.exists(), "resolved path should exist on disk");
+        let on_disk = tokio::fs::read(&path).await.expect("read resolved path");
+        assert_eq!(on_disk, original);
+        assert_eq!(
+            resolved["mime"].as_str().unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(resolved["size"].as_u64().unwrap(), original.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn blob_list_reflects_inserted_blobs() {
+        let (state, _tmp) = make_test_state().await;
+        let a = blob_insert(
+            BlobInsertArgs {
+                filename: Some("a.txt".into()),
+                mime: None,
+                data: B64.encode(b"aaa"),
+            },
+            &state,
+        )
+        .await
+        .expect("insert a");
+        let b = blob_insert(
+            BlobInsertArgs {
+                filename: Some("b.txt".into()),
+                mime: None,
+                data: B64.encode(b"bbb"),
+            },
+            &state,
+        )
+        .await
+        .expect("insert b");
+
+        let listed = blob_list(BlobListArgs::default(), &state)
+            .await
+            .expect("blob_list");
+        let listed = listed.as_array().expect("list is array");
+        let blake3s: Vec<&str> = listed
+            .iter()
+            .map(|v| v["blake3"].as_str().unwrap())
+            .collect();
+        assert!(blake3s.contains(&a["blake3"].as_str().unwrap()));
+        assert!(blake3s.contains(&b["blake3"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn blob_get_unknown_blake3_returns_not_found() {
+        let (state, _tmp) = make_test_state().await;
+        let fake_blake3 = "0".repeat(64);
+        let err = blob_get(
+            BlobGetArgs {
+                blake3: fake_blake3,
+            },
+            &state,
+        )
+        .await
+        .expect_err("unknown blake3 should error");
+        assert!(matches!(err, DispatchError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn blob_iroh_ensure_rejects_wrong_length_blake3() {
+        let (state, _tmp) = make_test_state().await;
+        let result = blob_iroh_ensure(
+            BlobGetArgs {
+                blake3: "not-a-real-hash".to_string(),
+            },
+            &state,
+        )
+        .await
+        .expect("blob_iroh_ensure should not error, only report unavailable");
+        assert!(!result["available"].as_bool().unwrap());
+        assert!(result["reason"].as_str().unwrap().contains("64-char"));
+    }
+
+    #[tokio::test]
+    async fn blob_iroh_ensure_reports_unknown_blake3() {
+        let (state, _tmp) = make_test_state().await;
+        let fake_blake3 = "1".repeat(64);
+        let result = blob_iroh_ensure(
+            BlobGetArgs {
+                blake3: fake_blake3,
+            },
+            &state,
+        )
+        .await
+        .expect("blob_iroh_ensure");
+        assert!(!result["available"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "unknown blake3");
+    }
+
+    #[tokio::test]
+    async fn blob_iroh_ensure_succeeds_after_insert() {
+        let (state, _tmp) = make_test_state().await;
+        let inserted = blob_insert(
+            BlobInsertArgs {
+                filename: Some("ensure-me.bin".to_string()),
+                mime: None,
+                data: B64.encode(b"ensure this blob is importable into the FsStore"),
+            },
+            &state,
+        )
+        .await
+        .expect("blob_insert");
+        let blake3 = inserted["blake3"].as_str().unwrap().to_string();
+
+        let result = blob_iroh_ensure(BlobGetArgs { blake3 }, &state)
+            .await
+            .expect("blob_iroh_ensure");
+        assert!(
+            result["available"].as_bool().unwrap(),
+            "a freshly inserted blob should be ensurable: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // blob_insert_from_path_impl / blob_iroh_download_impl
+    //
+    // both real dispatch handlers only touch `AppHandle` to build an
+    // `on_progress` closure that emits a tauri event — the `_impl`
+    // functions take that closure directly, so these tests exercise the
+    // real upload/download logic with a plain in-memory recorder instead
+    // of a tauri runtime.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn blob_insert_from_path_impl_roundtrips_bytes() {
+        let (state, tmp) = make_test_state().await;
+        let original = b"blob_insert_from_path_impl should stream-hash this file";
+        let source_path = tmp.path().join("upload-source.bin");
+        tokio::fs::write(&source_path, original)
+            .await
+            .expect("write source file");
+
+        let progress_calls: Arc<StdMutex<Vec<(u64, u64)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorder = {
+            let calls = Arc::clone(&progress_calls);
+            move |bytes_read: u64, total: u64| {
+                calls.lock().unwrap().push((bytes_read, total));
+            }
+        };
+        let on_progress: &(dyn Fn(u64, u64) + Send + Sync) = &recorder;
+
+        let result = blob_insert_from_path_impl(
+            BlobInsertFromPathArgs {
+                local_path: source_path.to_string_lossy().to_string(),
+                filename: None,
+                mime: Some("application/octet-stream".to_string()),
+                upload_id: Some("test-upload-1".to_string()),
+            },
+            Some(on_progress),
+            &state,
+        )
+        .await
+        .expect("blob_insert_from_path_impl");
+
+        // filename derived from the path tail since none was passed.
+        assert_eq!(
+            result["meta"]["filename"].as_str().unwrap(),
+            "upload-source.bin"
+        );
+        assert_eq!(
+            result["meta"]["size"].as_u64().unwrap(),
+            original.len() as u64
+        );
+        let decoded = B64
+            .decode(
+                result["data"]
+                    .as_str()
+                    .expect("small file should mirror data"),
+            )
+            .expect("base64 decode");
+        assert_eq!(decoded, original);
+
+        // any progress calls reported should end at the file's real size.
+        let calls = progress_calls.lock().unwrap();
+        if let Some(&(_, last_total)) = calls.last() {
+            assert_eq!(last_total, original.len() as u64);
+        }
+
+        // the upload's cancel-flag guard should have cleaned up on completion.
+        assert!(UPLOAD_CANCELS
+            .lock()
+            .unwrap()
+            .get("test-upload-1")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn blob_insert_from_path_impl_rejects_relative_path() {
+        let (state, _tmp) = make_test_state().await;
+
+        let err = blob_insert_from_path_impl(
+            BlobInsertFromPathArgs {
+                local_path: "relative/path.bin".to_string(),
+                filename: None,
+                mime: None,
+                upload_id: None,
+            },
+            None,
+            &state,
+        )
+        .await
+        .expect_err("relative local_path should be rejected");
+
+        assert!(matches!(err, DispatchError::InvalidPayload { .. }));
+        assert!(err.to_string().contains("must be absolute"));
+    }
+
+    #[tokio::test]
+    async fn blob_iroh_download_impl_rejects_wrong_length_blake3() {
+        let (state, _tmp) = make_test_state().await;
+        let no_op: &(dyn Fn(u64, u64) + Send + Sync) = &|_, _| {};
+
+        let err = blob_iroh_download_impl(
+            BlobIrohDownloadArgs {
+                peer_addr: "0".repeat(64),
+                blake3: "not-a-real-hash".to_string(),
+                filename: None,
+                mime: None,
+                size: None,
+            },
+            no_op,
+            &state,
+        )
+        .await
+        .expect_err("wrong-length blake3 should be rejected before any network use");
+
+        assert!(err.to_string().contains("64-char"));
+    }
+
+    #[tokio::test]
+    async fn blob_iroh_download_impl_rejects_unparseable_peer_addr() {
+        let (state, _tmp) = make_test_state().await;
+        let no_op: &(dyn Fn(u64, u64) + Send + Sync) = &|_, _| {};
+
+        let err = blob_iroh_download_impl(
+            BlobIrohDownloadArgs {
+                peer_addr: "not-a-valid-node-id".to_string(),
+                blake3: "1".repeat(64),
+                filename: None,
+                mime: None,
+                size: None,
+            },
+            no_op,
+            &state,
+        )
+        .await
+        .expect_err("unparseable peer_addr should be rejected before any network use");
+
+        assert!(err.to_string().contains("parse peer_addr"));
+    }
 }

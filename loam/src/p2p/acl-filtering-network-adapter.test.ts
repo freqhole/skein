@@ -125,4 +125,103 @@ describe("createRepoRoleResolver", () => {
 
     expect(resolver(DOC_ID, MEMBER_ID)).toBe("viewer");
   });
+
+  it("treats a peer as \"member\" (not read-only) on a document's very first, never-before-seen sync", () => {
+    // "requesting" means storage was checked and came up empty - genuine
+    // first contact. this is the bypass that lets a brand-new document
+    // (canvas OR per-widget) sync in at all; see this module's doc comment.
+    const repo = makeFakeRepo({
+      [DOC_ID]: { isReady: () => false, doc: () => undefined, state: "requesting" } as any,
+    });
+    const resolver = createRepoRoleResolver(repo);
+
+    expect(resolver(DOC_ID, MEMBER_ID)).toBe("member");
+  });
+
+  // -- per-widget documents (no `.acl` of their own, only `ownerCanvasId`) ---
+  //
+  // regression coverage for a real bug: an already-synced widget document
+  // (e.g. a file widget after its initial empty placeholder synced fine)
+  // resolved to "viewer" for EVERY subsequent write, no matter the
+  // sender's real canvas role, because the doc itself has no `.acl` -
+  // silently stripping things like an uploaded file's blobId before the
+  // other peer's automerge-repo ever saw the change. the widget doc must
+  // defer to its owning canvas's `.acl` instead, exactly like
+  // canvas-scoped-share-policy.ts's rule 2 does at the sync-eligibility
+  // layer.
+
+  const WIDGET_DOC_ID = "widget-doc-1" as DocumentId;
+  const CANVAS_DOC_ID = "canvas-doc-1" as DocumentId;
+
+  it("defers to the owning canvas's acl for a per-widget document with no acl of its own", () => {
+    const repo = makeFakeRepo({
+      [WIDGET_DOC_ID]: {
+        isReady: () => true,
+        doc: () => ({ ownerCanvasId: CANVAS_DOC_ID, blobId: "abc" }),
+      },
+      [CANVAS_DOC_ID]: {
+        isReady: () => true,
+        doc: () => ({ acl: { [ADMIN_ID]: { role: "admin" } } }),
+      },
+    });
+    const resolver = createRepoRoleResolver(repo);
+
+    // an admin's write to the widget doc must NOT resolve to "viewer" -
+    // that's exactly the bug: it would previously get stripped.
+    expect(resolver(WIDGET_DOC_ID, ADMIN_ID)).toBe("admin");
+  });
+
+  it("still resolves a real viewer as read-only on a per-widget document via the owning canvas's acl", () => {
+    const repo = makeFakeRepo({
+      [WIDGET_DOC_ID]: {
+        isReady: () => true,
+        doc: () => ({ ownerCanvasId: CANVAS_DOC_ID }),
+      },
+      [CANVAS_DOC_ID]: {
+        isReady: () => true,
+        doc: () => ({ acl: { [VIEWER_ID]: { role: "viewer" } } }),
+      },
+    });
+    const resolver = createRepoRoleResolver(repo);
+
+    expect(resolver(WIDGET_DOC_ID, VIEWER_ID)).toBe("viewer");
+  });
+
+  it("defaults to viewer for a per-widget document whose owning canvas isn't resolvable locally yet", () => {
+    const repo = makeFakeRepo({
+      [WIDGET_DOC_ID]: {
+        isReady: () => true,
+        doc: () => ({ ownerCanvasId: CANVAS_DOC_ID }),
+      },
+      // no CANVAS_DOC_ID entry at all - owning canvas not locally known yet.
+    });
+    const resolver = createRepoRoleResolver(repo);
+
+    expect(resolver(WIDGET_DOC_ID, ADMIN_ID)).toBe("viewer");
+  });
+
+  it("defaults to viewer for a per-widget document whose owning canvas has no acl either", () => {
+    const repo = makeFakeRepo({
+      [WIDGET_DOC_ID]: {
+        isReady: () => true,
+        doc: () => ({ ownerCanvasId: CANVAS_DOC_ID }),
+      },
+      [CANVAS_DOC_ID]: {
+        isReady: () => true,
+        doc: () => ({}),
+      },
+    });
+    const resolver = createRepoRoleResolver(repo);
+
+    expect(resolver(WIDGET_DOC_ID, ADMIN_ID)).toBe("viewer");
+  });
+
+  it("defaults to viewer for a ready document with neither acl nor ownerCanvasId", () => {
+    const repo = makeFakeRepo({
+      [DOC_ID]: { isReady: () => true, doc: () => ({}) },
+    });
+    const resolver = createRepoRoleResolver(repo);
+
+    expect(resolver(DOC_ID, ADMIN_ID)).toBe("viewer");
+  });
 });

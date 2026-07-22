@@ -253,6 +253,24 @@ test.describe("narthex navigation", () => {
     await page.reload();
     await waitForNarthex(page);
 
+    // `waitForNarthex()` only guarantees *some* widget is live (e.g. the
+    // always-present narthex label seed) — canvas-card widgets mount
+    // asynchronously as the narthex doc hydrates from IndexedDB, so a
+    // fresh reload can still have zero of them live at this point. poll
+    // for the canvas-card specifically instead of asserting immediately.
+    await page.waitForFunction(
+      () => {
+        const skein = (window as any).__skein;
+        const live = skein?.widgetManager?.getLiveWidgets();
+        if (!live) return false;
+        for (const widget of live.values()) {
+          if ((widget as any).entry?.type === "canvas-card") return true;
+        }
+        return false;
+      },
+      { timeout: 10_000 }
+    );
+
     // the canvas-card should still be present and not crashed
     const cards = await getCanvasCards(page);
     expect(cards.length).toBeGreaterThanOrEqual(1);

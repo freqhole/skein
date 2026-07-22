@@ -73,6 +73,7 @@ export interface ProfileResponseMessage {
   accentColor?: number;
   profileDocId?: string;
   profileUpdatedAt?: string;
+  isHub?: boolean;
 }
 
 export interface FriendRequestMessage {
@@ -349,6 +350,7 @@ export interface FriendzProtocolOptions {
     accentColor?: number;
     profileDocId?: string;
     profileUpdatedAt?: string;
+    isHub?: boolean;
   };
   isFriend: (nodeId: string) => boolean;
   profileVisibility?: "friends" | "everyone" | "nobody";
@@ -502,6 +504,7 @@ export class FriendzProtocol {
             ...(msg.accentColor !== undefined ? { accentColor: msg.accentColor } : {}),
             ...(msg.profileDocId ? { profileDocId: msg.profileDocId } : {}),
             ...(msg.profileUpdatedAt ? { profileUpdatedAt: msg.profileUpdatedAt } : {}),
+            ...(msg.isHub !== undefined ? { isHub: msg.isHub } : {}),
           },
           fromNodeId
         );
@@ -760,6 +763,7 @@ export class FriendzProtocol {
       ...(profile.accentColor !== undefined ? { accentColor: profile.accentColor } : {}),
       ...(profile.profileDocId ? { profileDocId: profile.profileDocId } : {}),
       ...(profile.profileUpdatedAt ? { profileUpdatedAt: profile.profileUpdatedAt } : {}),
+      ...(profile.isHub !== undefined ? { isHub: profile.isHub } : {}),
     });
     this.client.sendMessage(fromNodeId, response).catch((err) => {
       log.warn(TAG, "failed to send profile response:", err);

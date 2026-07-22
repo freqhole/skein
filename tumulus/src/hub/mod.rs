@@ -231,6 +231,10 @@ impl HubPeerService {
                 accent_color: Some(0),
                 profile_doc_id: None,
                 profile_updated_at: None,
+                // this router is a hub's friendz handler — always flag
+                // ourselves as a hub node (see docs/hub-and-profile-plan.md
+                // section 3.2).
+                is_hub: Some(true),
             })
             .await;
         let friendz = FriendzProtocolHandler::new(Arc::new(friendz_service));
@@ -463,6 +467,7 @@ impl HubPeerService {
                         accent_color: Some(p.accent_color),
                         profile_doc_id: None,
                         profile_updated_at: None,
+                        is_hub: Some(true),
                     });
                     let local_profile = LocalProfile {
                         username: p.username.clone(),
@@ -471,6 +476,7 @@ impl HubPeerService {
                         accent_color: Some(p.accent_color),
                         profile_doc_id: None,
                         profile_updated_at: None,
+                        is_hub: Some(true),
                     };
                     (msg, local_profile)
                 };

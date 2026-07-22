@@ -444,7 +444,7 @@ test("getRole defaults to viewer when no acl entry exists", async ({ canvasPage 
 });
 
 test("stampAdmin records the admin role", async ({ canvasPage }) => {
-  const { page } = await canvasPage();
+  const { page } = await canvasPage({ skipAutoAdmin: true });
 
   await page.evaluate(() => (window as any).__skein.store.stampAdmin("admin-node"));
 
@@ -453,7 +453,7 @@ test("stampAdmin records the admin role", async ({ canvasPage }) => {
 });
 
 test("stampAdmin is a no-op if an admin is already recorded", async ({ canvasPage }) => {
-  const { page } = await canvasPage();
+  const { page } = await canvasPage({ skipAutoAdmin: true });
 
   await page.evaluate(() => (window as any).__skein.store.stampAdmin("first-admin"));
   await page.evaluate(() => (window as any).__skein.store.stampAdmin("second-admin"));
@@ -491,7 +491,7 @@ test("setRole can change an already-assigned peer's role", async ({ canvasPage }
 });
 
 test("setRole cannot demote an admin", async ({ canvasPage }) => {
-  const { page } = await canvasPage();
+  const { page } = await canvasPage({ skipAutoAdmin: true });
 
   await page.evaluate(() => (window as any).__skein.store.stampAdmin("admin-node"));
   await page.evaluate(() => (window as any).__skein.store.setRole("admin-node", "viewer"));
@@ -517,7 +517,7 @@ test("isViewer reflects the viewer role", async ({ canvasPage }) => {
 });
 
 test("isAdmin reflects the admin role", async ({ canvasPage }) => {
-  const { page } = await canvasPage();
+  const { page } = await canvasPage({ skipAutoAdmin: true });
 
   await page.evaluate(() => (window as any).__skein.store.stampAdmin("admin-node"));
 
@@ -535,7 +535,7 @@ test("isAdmin reflects the admin role", async ({ canvasPage }) => {
 test("localRole/isLocalViewer/isLocalAdmin reflect the local peer's role", async ({
   canvasPage,
 }) => {
-  const { page } = await canvasPage();
+  const { page } = await canvasPage({ skipAutoAdmin: true });
 
   await page.evaluate(() => {
     const store = (window as any).__skein.store;

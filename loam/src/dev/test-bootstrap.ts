@@ -21,6 +21,16 @@ const testWidgetSchema = z.object({
 
 interface TestInitOptions {
   canvasDocId?: string | null;
+  /**
+   * skip the automatic admin-stamp below for a freshly created canvas.
+   * for tests that specifically exercise `CanvasStore.stampAdmin()`'s own
+   * bootstrap-from-empty-acl behavior — without this, every fresh canvas
+   * already has the harness's own peer id stamped as admin, so a test
+   * calling `stampAdmin()` with a different node id observes it as a
+   * (correct, idempotent) no-op rather than the empty-acl case it means
+   * to test.
+   */
+  skipAutoAdmin?: boolean;
 }
 
 interface TestInitResult {
@@ -54,7 +64,7 @@ async function initSkeinForTest(options: TestInitOptions = {}): Promise<TestInit
   // to true until a node id is set, so skipping this leaves every test
   // using this bootstrap permanently in read-only/viewer mode.
   canvas.store.setLocalNodeId(harness.repo.peerId);
-  if (isNewCanvas) {
+  if (isNewCanvas && !options.skipAutoAdmin) {
     canvas.store.stampAdmin(harness.repo.peerId);
   }
   canvas.toolbar.refreshRoleGating();

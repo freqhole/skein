@@ -301,6 +301,12 @@ export async function initFriendzWiring(
         if (matched && msg.username) {
           friend.username = msg.username;
         }
+        // sticky hub flag (section 3.3): a fresh profile fetch can also be
+        // how a missed/stale hub flag gets corrected - only ever set true,
+        // never reset to false/undefined on a response that omits it.
+        if (matched && msg.isHub === true && friend.isHub !== true) {
+          friend.isHub = true;
+        }
       }
     });
   };

@@ -19,7 +19,7 @@
 //   });
 // ---------------------------------------------------------------------------
 
-import type { NetworkAdapter, PeerId, Repo } from "@automerge/automerge-repo";
+import type { DocumentId, NetworkAdapter, PeerId, Repo } from "@automerge/automerge-repo";
 import {
   createAclFilteringAdapter as createGenericAclFilteringAdapter,
   type AclFilteringNetworkAdapter as GenericAclFilteringNetworkAdapter,
@@ -60,6 +60,17 @@ export function readCanvasRole(doc: unknown, senderId: PeerId): CanvasRole {
   return parsed.success ? parsed.data : "viewer";
 }
 
+/** true if `doc` has its own `.acl` object - a real canvas document, as
+ *  opposed to a per-widget document (which only ever carries
+ *  `ownerCanvasId`, never its own `.acl`). mirrors
+ *  `canvas-scoped-share-policy.ts`'s identically-named helper - kept as a
+ *  separate copy rather than a shared import since the two modules
+ *  already tolerate slightly different doc shapes and this predicate is a
+ *  one-liner. */
+function hasAclField(doc: unknown): doc is { acl: Record<string, { role?: unknown }> } {
+  return !!doc && typeof doc === "object" && "acl" in doc && typeof (doc as { acl: unknown }).acl === "object";
+}
+
 /**
  * build a `RoleResolver` backed by a `Repo` instance's already-cached
  * document handles.
@@ -94,12 +105,41 @@ export function readCanvasRole(doc: unknown, senderId: PeerId): CanvasRole {
  * immediately, well before any peer's sync traffic could arrive, so the
  * window this bypass opens never applies to a document the device has
  * already seen. once ready, the real `.acl`-based check governs, always.
+ *
+ * a per-widget document (file, audio-recording, etc.) never carries its
+ * own `.acl` - only its owning canvas does. without the `ownerCanvasId`
+ * fallback below, EVERY write to an already-ready widget document would
+ * resolve to `"viewer"` (the safe default for "no `.acl` found") and get
+ * silently stripped, no matter the sender's real canvas role - only that
+ * document's very first, one-time "requesting" sync ever bypassed the
+ * filter. this is why an uploaded file's `blobId`/metadata could
+ * disappear into the void on a peer that already had the (still-empty)
+ * widget document from an earlier canvas sync: the upload writes arrived
+ * as ordinary "ready"-state sync messages and were stripped before
+ * automerge-repo ever saw them. mirrors
+ * `canvas-scoped-share-policy.ts`'s rule 2 - same reasoning, same
+ * `ownerCanvasId` field, applied here at the write-filtering boundary
+ * instead of the sync-eligibility gate.
  */
 export function createRepoRoleResolver(repo: Repo): RoleResolver {
   return (documentId, senderId) => {
     const handle = repo.handles[documentId];
     if (handle?.isReady()) {
-      return readCanvasRole(handle.doc(), senderId);
+      const doc = handle.doc();
+      if (hasAclField(doc)) {
+        return readCanvasRole(doc, senderId);
+      }
+      const ownerCanvasId = (doc as { ownerCanvasId?: unknown } | undefined)?.ownerCanvasId;
+      if (typeof ownerCanvasId === "string" && ownerCanvasId) {
+        const ownerHandle = repo.handles[ownerCanvasId as DocumentId];
+        if (ownerHandle?.isReady()) {
+          const ownerDoc = ownerHandle.doc();
+          if (hasAclField(ownerDoc)) {
+            return readCanvasRole(ownerDoc, senderId);
+          }
+        }
+      }
+      return "viewer";
     }
     if (handle?.state === "requesting") {
       // storage was checked and came up empty - this device has never

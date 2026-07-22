@@ -218,6 +218,10 @@ impl Service {
                 accent_color: None,
                 profile_doc_id: None,
                 profile_updated_at: None,
+                // this router is the tauri-desktop outbound-only peer, NOT
+                // a hub (see docs/hub-and-profile-plan.md section 3.2) -
+                // never set the hub flag here, matching an ordinary browser peer.
+                is_hub: None,
             })
             .await;
         let friendz_handler = FriendzProtocolHandler::new(Arc::new(friendz_service));
@@ -408,12 +412,21 @@ impl Service {
                 // auto-answered by FriendzService::dispatch from the local
                 // profile configured in Service::start - nothing to do here.
             }
-            CoreMessage::ProfileResponse { username, .. } => {
+            CoreMessage::ProfileResponse {
+                username, is_hub, ..
+            } => {
                 // phase-1: ignore avatar_data_url; userz.avatar_blake3 takes a
                 // blake3 hash, not a data url. avatar transfer comes back later.
                 self.userz
                     .upsert_profile(from, Some(&username), None, None)
                     .await?;
+                // sticky: only ever set true, never reset to false when a
+                // later message omits the flag (docs/hub-and-profile-plan.md
+                // section 3.3) - a profile fetch is also how a missed or
+                // stale hub flag gets corrected.
+                if is_hub == Some(true) {
+                    self.userz.mark_as_hub(from).await?;
+                }
             }
             CoreMessage::FriendRequest {
                 from_username,

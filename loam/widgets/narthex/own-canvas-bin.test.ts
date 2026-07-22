@@ -29,7 +29,7 @@ describe("ownCanvasBinWidget", () => {
     expect(ownCanvasBinWidget.metadata.singletonId).toBe("skein-own-canvas-bin");
   });
 
-  it("is hidden from the add-widget palette (auto-managed, never manually placed)", () => {
-    expect(ownCanvasBinWidget.metadata.hidden).toBe(true);
+  it("is visible in the add-widget palette (singletonId hides it once already placed)", () => {
+    expect(ownCanvasBinWidget.metadata.hidden).toBeFalsy();
   });
 });

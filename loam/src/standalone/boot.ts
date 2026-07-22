@@ -89,9 +89,8 @@ const NARTHEX_DOC_KEY = "skein-narthex-doc-id";
 const MESSAGEZ_DOC_KEY = "skein-messagez-doc-id";
 /** meta-db key for the standalone (browser-mode) social doc id — exported so
  *  other modules that need best-effort, read-only access to the local
- *  peer's own friend list (e.g. src/canvas/friend-directory.ts's friend
- *  picker for the "friend canvas bin" narthex widget) can look it up
- *  without duplicating the key string or depending on this whole class. */
+ *  peer's own friend list can look it up without duplicating the key
+ *  string or depending on this whole class. */
 export const SOCIAL_DOC_KEY = "skein-social-doc-id"; // browser mode only
 const TAG = "skein.boot";
 

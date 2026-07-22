@@ -98,6 +98,7 @@ impl HubPeerService {
                 username,
                 bio,
                 avatar_data_url,
+                is_hub,
                 ..
             } => {
                 // update the remote peer's profile in userz.
@@ -137,6 +138,19 @@ impl HubPeerService {
                         error = %e,
                         "failed to update remote peer profile in userz"
                     );
+                }
+                // sticky: only ever set true, never reset to false when a
+                // later message omits the flag (docs/hub-and-profile-plan.md
+                // section 3.3) - a profile fetch is also how a missed or
+                // stale hub flag gets corrected.
+                if is_hub == Some(true) {
+                    if let Err(e) = self.userz.mark_as_hub(from_node_id).await {
+                        tracing::debug!(
+                            peer = %from_node_id,
+                            error = %e,
+                            "failed to mark peer as hub"
+                        );
+                    }
                 }
             }
             CoreMessage::FriendRequest { from_username, .. } => {
@@ -260,6 +274,7 @@ impl HubPeerService {
                     accent_color: Some(hub_accent_color),
                     profile_doc_id: None,
                     profile_updated_at: None,
+                    is_hub: Some(true),
                 });
                 match self.send_friendz_message(from_node_id, &profile_resp).await {
                     Ok(()) => {

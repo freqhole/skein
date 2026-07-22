@@ -176,6 +176,15 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
   // step 5: mount canvas into DOM
   mountElement.appendChild(app.canvas);
 
+  // step 5a: the real canvas is now actually painting — remove the
+  // css-only boot spinner (index.html) that's been covering the initial
+  // blank screen since page load, while the midden p2p node/worker and
+  // this canvas's document were still coming up. safe to call unconditionally
+  // (every render path — narthex or a specific canvas — funnels through this
+  // one function before anything else is visible), and a no-op past the
+  // first call since the element is gone after the first removal.
+  document.getElementById("boot-spinner")?.remove();
+
   // step 5b: create keyboard driver (the one hidden HTML element — a <textarea>
   // used as a proxy for text input, IME composition, and clipboard)
   const keyboard = new KeyboardDriver(app.canvas as HTMLCanvasElement);
