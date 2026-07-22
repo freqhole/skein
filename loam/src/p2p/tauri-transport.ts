@@ -15,7 +15,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { BiStreamLike, MiddenStreamNode } from "./iroh-network-adapter";
+import type { BiStreamLike, MiddenStreamNode } from "@freqhole/reliquary/automerge";
 import { log } from "@freqhole/reliquary/utils";
 
 declare global {

@@ -40,8 +40,8 @@ import { getFriendsForPicker, type FriendPickerCandidate } from "../../src/canva
 import {
   createProfileCanvasBinWidget,
   type ProfileCanvasBinController,
-  type ProfileCanvasBinTestHooks,
 } from "./social/canvas-bin";
+import type { ProfileCanvasBinTestHooks } from "../../src/dev/test-bridge";
 import { registerWidgetBridge, unregisterWidgetBridge } from "../../src/dev/test-bridge-registry";
 
 // ---------------------------------------------------------------------------

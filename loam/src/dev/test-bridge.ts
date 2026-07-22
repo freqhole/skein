@@ -19,7 +19,7 @@ import type { SocialDoc } from "../../widgets/narthex/social/types";
 import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { HubProfilePanelState } from "../../widgets/narthex/social/hub-profile-panel";
 import type { HubAdminHubProfile, HubAdminBlobUsageSummary } from "../p2p/hub-admin-client";
-import type { ProfileCanvasBinTestHooks } from "../../widgets/narthex/social/canvas-bin";
+import type { CanvasBinNode } from "../canvas/canvas-bin-doc";
 import type { ProfileCanvasEntry, ProfileStore } from "../canvas/profile-doc";
 import type { FriendInfo } from "../canvas/share-dialog";
 import { storeBlob, classifyDomain } from "../storage/blob-store";
@@ -418,6 +418,62 @@ export interface SkeinTestBridgeSocial {
    *  friends-tab.ts). absent/undefined whenever no friend-bin section is
    *  currently mounted (no selected friend, no resolvable docs yet, etc). */
   friendCanvasBin?: ProfileCanvasBinTestHooks;
+}
+
+/**
+ * test hooks for the profile canvas-bin widget (`canvas-bin.ts`) - see
+ * `ProfileCanvasBinContext.registerTestHooks` there for how/where an
+ * instance's hooks get exposed on `window.__skeinTest`. `getVisibleNodes()`
+ * reads the folder currently being viewed (root or a sub-folder) directly
+ * off `CanvasBinStore` - proves the tree, not just pixi render state (and
+ * is NOT paginated - pagination only affects which of these are actually
+ * drawn on the current page, see `getCurrentPage()`/`getTotalPages()`).
+ * `enterFolder`/`goBack`/`addFolder`/`moveNode`/`activateNode` call the
+ * widget's real internal handlers directly, same precedent as
+ * `FriendsTabTestHooks` (no infra in this repo for simulated pixi pointer
+ * drags).
+ */
+export interface ProfileCanvasBinTestHooks {
+  /** child nodes of the currently-viewed folder (or root). */
+  getVisibleNodes(): CanvasBinNode[];
+  /** the currently-viewed folder's id, or null at root. */
+  getCurrentFolderId(): string | null;
+  /** enter a folder (as if its card were tapped) or navigate to a canvas
+   *  (as if a canvas card were tapped) - dispatches on the node's kind. */
+  enterFolder(nodeId: string): void;
+  /** return to the parent folder, as if the "‹ back" button were tapped. */
+  goBack(): void;
+  /** create a new folder under the currently-viewed folder. returns the new
+   *  folder's id, or "" if it couldn't be created (also "" in read-only
+   *  mode - see `isReadOnly()`). */
+  addFolder(title: string): string;
+  /** move a node (folder or canvas reference) to a new parent folder id, or
+   *  to root when null - as if it had been dragged and dropped there.
+   *  returns whether the move succeeded (always `false` in read-only mode -
+   *  see `isReadOnly()`; see `CanvasBinStore.moveNode()` for the other
+   *  cases it refuses). */
+  moveNode(nodeId: string, newParentId: string | null): boolean;
+  /** whether this instance is rendering in read-only mode (no drag/add-
+   *  folder wiring - see `ProfileCanvasBinContext.isReadOnly`). */
+  isReadOnly(): boolean;
+  /** the current page (0-based) within the currently-viewed folder. */
+  getCurrentPage(): number;
+  /** total page count for the currently-viewed folder (at least 1). */
+  getTotalPages(): number;
+  /** advance to the next page, as if the "next" button were tapped.
+   *  no-op if already on the last page. */
+  nextPage(): void;
+  /** go back to the previous page, as if the "prev" button were tapped.
+   *  no-op if already on the first page. */
+  prevPage(): void;
+  /** activate a node by id exactly as a real tap would (enter folder /
+   *  navigate to canvas), regardless of which folder is currently visible. */
+  activateNode(nodeId: string): void;
+  /** node ids on the current page whose preview-image `Sprite` has actually
+   *  finished loading and attached (not just that the entry has a
+   *  `previewUrl` set) - lets a test (or live debugging) prove an image
+   *  genuinely rendered. */
+  getLoadedPreviewNodeIds(): string[];
 }
 
 /**

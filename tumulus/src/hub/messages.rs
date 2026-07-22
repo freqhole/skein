@@ -139,11 +139,7 @@ impl HubPeerService {
                     );
                 }
             }
-            CoreMessage::FriendRequest {
-                from_username,
-                is_hub: _,
-                ..
-            } => {
+            CoreMessage::FriendRequest { from_username, .. } => {
                 // policy: auto-accept only if the peer was pre-approved by the
                 // operator (status = Allowed) or already accepted. unknown peers
                 // are recorded as Pending so the operator can promote them later
@@ -296,11 +292,7 @@ impl HubPeerService {
                 // NOTE: no outbound sync dial — see PeerOnline handler comment.
                 // the JS side will establish sync when it needs to.
             }
-            CoreMessage::FriendAccept {
-                from_username,
-                is_hub: _,
-                ..
-            } => {
+            CoreMessage::FriendAccept { from_username, .. } => {
                 // a peer accepted our friend request (or is confirming mutual friendship).
                 // honor only if we already have a row for them — either Allowed
                 // (operator pre-approved), Pending (we initiated the request),
