@@ -15,7 +15,7 @@ help: ## show this help message
 # needs the same value for its own sqlx macros too.
 DEV_DB := $(CURDIR)/tumulus/dev-data/skein-hub.db
 
-.PHONY: dev-data db-migrate tauri-dev tauri-build hub-dev hub-friend-allow hub-admin-allow
+.PHONY: dev-data db-migrate tauri-dev tauri-build hub-dev hub-friend-allow hub-admin-allow deps-local deps-npm
 
 # (re)creates the sqlite dev db tumulus's sqlx macros need, by running a
 # side-effect-free tumulus CLI subcommand (applies migrations, nothing else).
@@ -69,3 +69,22 @@ hub-admin-allow: ## grant a peer hub-admin rights on the dev hub (NODE_ID=<hex n
 	if [ -z "$$node_id" ]; then read -p "node id to grant admin: " node_id; fi; \
 	if [ -z "$$node_id" ]; then echo "no node id given, aborting"; exit 1; fi; \
 	cargo run -p tumulus -- --data-dir tumulus/hub-dev-data admin allow "$$node_id"
+
+# points loam's @freqhole/{haruspex,midden,reliquary} deps at the sibling
+# repos on disk (file: links) and tumulus/tauri's cargo deps on haruspex +
+# reliquary at local path deps on those same sibling repos, instead of
+# published npm versions / the tagged tomb git dependency - for developing
+# against unreleased changes in those repos.
+deps-local: ## switch loam + cargo haruspex/reliquary deps to local sibling repos
+	cd loam && npm run deps:local
+	node scripts/toggle-cargo-deps.mjs local
+	cargo check --workspace
+
+# restores loam's @freqhole/{haruspex,midden,reliquary} deps to the
+# published npm versions, and tumulus/tauri's cargo deps on haruspex +
+# reliquary to the tagged git dependency on tomb - the default for ci and
+# normal builds.
+deps-npm: ## switch loam + cargo haruspex/reliquary deps to published npm/git-tag versions
+	cd loam && npm run deps:npm
+	node scripts/toggle-cargo-deps.mjs git
+	cargo check --workspace

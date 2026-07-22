@@ -1554,7 +1554,8 @@ dependencies = [
 
 [[package]]
 name = "haruspex"
-version = "0.1.0"
+version = "0.2.1"
+source = "git+https://github.com/freqhole/tomb?tag=v0.2.1#1a923d743cf0b80824be600d9c68f768ea9cd04b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3771,7 +3772,8 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reliquary"
-version = "0.1.0"
+version = "0.2.1"
+source = "git+https://github.com/freqhole/tomb?tag=v0.2.1#1a923d743cf0b80824be600d9c68f768ea9cd04b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5164,6 +5166,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
