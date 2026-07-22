@@ -14,22 +14,33 @@ help: ## show this help message
 # from CARGO_MANIFEST_DIR regardless of invocation cwd), but the tauri crate
 # needs the same value for its own sqlx macros too.
 DEV_DB := $(CURDIR)/tumulus/dev-data/skein-hub.db
+HUB_DEV_DB := $(CURDIR)/tumulus/hub-dev-data/skein-hub.db
 
 .PHONY: dev-data db-migrate tauri-dev tauri-build hub-dev hub-friend-allow hub-admin-allow deps-local deps-npm
 
-# (re)creates the sqlite dev db tumulus's sqlx macros need, by running a
-# side-effect-free tumulus CLI subcommand (applies migrations, nothing else).
+# (re)creates the sqlite dev db tumulus's sqlx macros need. requires sqlx-cli
+# (`cargo install sqlx-cli --no-default-features --features sqlite,rustls`).
+#
+# deliberately NOT `cargo run -p tumulus` (the previous approach): tumulus
+# itself contains the sqlx::query!/query_as! macros this db is FOR, so
+# compiling it to run it is circular on a completely fresh checkout (no
+# dev-data yet at all, e.g. a fresh clone or CI) - `cargo run` would try to
+# compile tumulus first, which fails with "unable to open database file"
+# since DEV_DB doesn't exist yet. touching the file first, then applying
+# migrations with the standalone sqlx-cli binary (which never compiles
+# tumulus's own source), breaks that cycle.
 dev-data: ## (re)create the sqlx compile-time-check dev db
-	cargo run -p tumulus -- --data-dir tumulus/dev-data friend list
+	mkdir -p tumulus/dev-data
+	touch $(DEV_DB)
+	DATABASE_URL=sqlite:$(DEV_DB) sqlx migrate run --source tumulus/migrationz
 
-# tumulus applies sqlx migrations (tumulus/migrationz/) automatically on
-# every startup via sqlx::migrate! (see tumulus/src/db.rs), so "running
-# migrations" = booting tumulus against the target data dir. this applies
-# them to BOTH dev data dirs (sqlx compile-check db + the hub-dev hub's db)
-# so a new migration lands everywhere without waiting for the next
-# tauri-dev/hub-dev boot.
+# applies the same migrations to the separate hub-dev-data db (used by
+# `make hub-dev`, kept apart from dev-data so `tauri-dev` and `hub-dev` can
+# run concurrently without fighting over one sqlite file/iroh identity).
 db-migrate: dev-data ## apply sqlx migrations to the dev dbs (dev-data + hub-dev-data)
-	cargo run -p tumulus -- --data-dir tumulus/hub-dev-data friend list
+	mkdir -p tumulus/hub-dev-data
+	touch $(HUB_DEV_DB)
+	DATABASE_URL=sqlite:$(HUB_DEV_DB) sqlx migrate run --source tumulus/migrationz
 
 tauri-dev: dev-data ## run the tauri desktop app in dev mode
 	cd tauri && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri dev
@@ -134,7 +145,7 @@ build-all: ## build tumulus cli + tauri app for the current platform (mac arm64 
 
 .PHONY: build-mac-arm build-mac-intel build-linux build-linux-arm64
 
-build-mac-arm: ## build tumulus cli for macOS arm64 (signs if APPLE_SIGNING_IDENTITY set)
+build-mac-arm: dev-data ## build tumulus cli for macOS arm64 (signs if APPLE_SIGNING_IDENTITY set)
 	@echo "building tumulus cli for macOS arm64..."
 	cargo build --package tumulus --release --target $(MAC_ARM_TARGET)
 	@mkdir -p $(BUILD_DIR)/$(VERSION)
@@ -149,7 +160,7 @@ build-mac-arm: ## build tumulus cli for macOS arm64 (signs if APPLE_SIGNING_IDEN
 		echo "skipping signing (APPLE_SIGNING_IDENTITY not set)"; \
 	fi
 
-build-mac-intel: ## build tumulus cli for macOS x86_64 (signs if APPLE_SIGNING_IDENTITY set)
+build-mac-intel: dev-data ## build tumulus cli for macOS x86_64 (signs if APPLE_SIGNING_IDENTITY set)
 	@echo "building tumulus cli for macOS x86_64..."
 	cargo build --package tumulus --release --target $(MAC_INTEL_TARGET)
 	@mkdir -p $(BUILD_DIR)/$(VERSION)
@@ -164,14 +175,14 @@ build-mac-intel: ## build tumulus cli for macOS x86_64 (signs if APPLE_SIGNING_I
 		echo "skipping signing (APPLE_SIGNING_IDENTITY not set)"; \
 	fi
 
-build-linux: ## build tumulus cli for linux x86_64 (native, no docker)
+build-linux: dev-data ## build tumulus cli for linux x86_64 (native, no docker)
 	@echo "building tumulus cli for linux x86_64..."
 	cargo build --package tumulus --release --target $(LINUX_TARGET)
 	@mkdir -p $(BUILD_DIR)/$(VERSION)
 	cp target/$(LINUX_TARGET)/release/tumulus $(BUILD_DIR)/$(VERSION)/tumulus_$(VERSION)_linux-x86_64
 	@echo "built: $(BUILD_DIR)/$(VERSION)/tumulus_$(VERSION)_linux-x86_64"
 
-build-linux-arm64: ## build tumulus cli for linux aarch64 (native, no docker - run on an arm64 runner)
+build-linux-arm64: dev-data ## build tumulus cli for linux aarch64 (native, no docker - run on an arm64 runner)
 	@echo "building tumulus cli for linux aarch64..."
 	cargo build --package tumulus --release --target $(LINUX_ARM64_TARGET)
 	@mkdir -p $(BUILD_DIR)/$(VERSION)

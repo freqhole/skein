@@ -19,8 +19,9 @@ env:
   CARGO_TERM_COLOR: always
   # tumulus/build.rs resolves its own DATABASE_URL via CARGO_MANIFEST_DIR, but
   # tauri/build.rs has no such logic, so this must be set explicitly for the
-  # whole workspace. tumulus/dev-data/skein-hub.db is committed to git
-  # (already migrated), so no sqlx-cli/migration bootstrap step is needed.
+  # whole workspace. tumulus/dev-data/ is gitignored, so every job that
+  # compiles tumulus installs sqlx-cli and runs `make dev-data` first to
+  # (re)create this db - see the steps below.
   DATABASE_URL: sqlite:tumulus/dev-data/skein-hub.db
 
 jobs:
@@ -51,6 +52,18 @@ jobs:
           sudo apt-get install -y \
             sqlite3 libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev
+
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+
+      - name: set up sqlite dev db (for sqlx compile-time query macros)
+        # tumulus/src/{adminz,groupz,settingz,...}.rs use sqlx::query!/
+        # query_as!, which check queries against a REAL db at compile time
+        # via DATABASE_URL (set workflow-wide, above) - the file doesn't
+        # exist on a fresh checkout (tumulus/dev-data/ is gitignored, see
+        # skein's .gitignore), so it must be created + migrated before any
+        # step that compiles tumulus. mirrors `make dev-data`.
+        run: make dev-data
 
       - name: cargo fmt (workspace)
         run: cargo fmt --all --check
@@ -125,6 +138,14 @@ jobs:
 
       - name: cache cargo + target
         uses: Swatinem/rust-cache@v2
+
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+
+      - name: set up sqlite dev db (for sqlx compile-time query macros)
+        # see the identical step in the rust-check job above - required
+        # before compiling tumulus, which this job does directly below.
+        run: make dev-data
 
       # the heavy e2e specs (hub-admin, blob-sync, friendz-hub, etc.) spawn
       # real `tumulus serve` child processes against target/debug/tumulus -

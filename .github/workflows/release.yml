@@ -52,8 +52,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # tumulus/dev-data/skein-hub.db is committed to git (already migrated), so
-  # no sqlx-cli/migration bootstrap step is needed in any of these jobs.
+  # tumulus/dev-data/ is gitignored, so every job that builds tumulus (all of
+  # them) installs sqlx-cli and runs `make dev-data` to (re)create this db
+  # before compiling - see the "install sqlx-cli" / "set up sqlite dev db"
+  # steps below.
   DATABASE_URL: sqlite:tumulus/dev-data/skein-hub.db
 
 jobs:
@@ -124,6 +126,8 @@ jobs:
           node-version: 24
       - name: install tauri-cli
         run: cargo install tauri-cli --version "^2.0" --locked
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
       - name: install loam deps
         run: npm ci
         working-directory: loam
@@ -140,6 +144,8 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain
           rm -f cert.p12
+      # `make build-mac-arm` depends on `dev-data`, which (re)creates the
+      # sqlite dev db tumulus's sqlx compile-time query macros need.
       - name: build tumulus cli (arm64)
         run: make build-mac-arm
       - name: build skein dmg (arm64)
@@ -183,6 +189,8 @@ jobs:
           node-version: 24
       - name: install tauri-cli
         run: cargo install tauri-cli --version "^2.0" --locked
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
       - name: install loam deps
         run: npm ci
         working-directory: loam
@@ -199,6 +207,8 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain
           rm -f cert.p12
+      # `make build-mac-intel` depends on `dev-data`, which (re)creates the
+      # sqlite dev db tumulus's sqlx compile-time query macros need.
       - name: build tumulus cli (x86_64)
         run: make build-mac-intel
       - name: build skein dmg (x86_64)
@@ -235,9 +245,13 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev
       - name: install tauri-cli
         run: cargo install tauri-cli --version "^2.0" --locked
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
       - name: install loam deps
         run: npm ci
         working-directory: loam
+      # `make build-linux` depends on `dev-data`, which (re)creates the
+      # sqlite dev db tumulus's sqlx compile-time query macros need.
       - name: build tumulus cli (linux x86_64)
         run: make build-linux
       - name: build skein deb/rpm (linux x86_64)
@@ -275,9 +289,13 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev
       - name: install tauri-cli
         run: cargo install tauri-cli --version "^2.0" --locked
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
       - name: install loam deps
         run: npm ci
         working-directory: loam
+      # `make build-linux-arm64` depends on `dev-data`, which (re)creates
+      # the sqlite dev db tumulus's sqlx compile-time query macros need.
       - name: build tumulus cli (linux aarch64)
         run: make build-linux-arm64
       - name: build skein deb/rpm (linux aarch64)
@@ -330,9 +348,17 @@ jobs:
         run: echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
       - name: install tauri-cli
         run: cargo install tauri-cli --version "^2.0" --locked
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
       - name: install loam deps
         run: npm ci
         working-directory: loam
+      # `cargo tauri android init` compiles the tauri crate (which depends
+      # on tumulus), so the sqlite dev db must exist before this step too -
+      # `make build-tauri-android`/`-arm64` further down also depend on
+      # `dev-data`, but running it explicitly here covers this earlier step.
+      - name: set up sqlite dev db (for sqlx compile-time query macros)
+        run: make dev-data
       - name: init tauri android project (if not committed)
         run: |
           if [ ! -d tauri/gen/android ]; then
