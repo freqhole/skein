@@ -38,6 +38,7 @@ interface TestInitResult {
 async function initSkeinForTest(options: TestInitOptions = {}): Promise<TestInitResult> {
   // build the repo + canvas doc via the harness instead of hand-rolling a
   // BroadcastChannelNetworkAdapter + Repo here.
+  const isNewCanvas = !options.canvasDocId;
   const harness = await createSkeinHarness({ canvasDocId: options.canvasDocId ?? null });
 
   const canvas: SkeinCanvas = await initCanvas({
@@ -46,6 +47,17 @@ async function initSkeinForTest(options: TestInitOptions = {}): Promise<TestInit
     registry: createTestRegistry(),
     repo: harness.repo,
   });
+
+  // stamp the local peer's node id (and, for a freshly created canvas, admin
+  // role) the same way boot.ts does after initCanvas() — the toolbar/widget
+  // manager gate widget mutation on `store.isLocalViewer()`, which defaults
+  // to true until a node id is set, so skipping this leaves every test
+  // using this bootstrap permanently in read-only/viewer mode.
+  canvas.store.setLocalNodeId(harness.repo.peerId);
+  if (isNewCanvas) {
+    canvas.store.stampAdmin(harness.repo.peerId);
+  }
+  canvas.toolbar.refreshRoleGating();
 
   (window as any).__skein = canvas;
   (window as any).__skeinTest = { canvas, p2p: null } satisfies SkeinTestBridge;

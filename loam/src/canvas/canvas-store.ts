@@ -358,6 +358,25 @@ export class CanvasStore {
   }
 
   /**
+   * move this canvas's admin stamp from one node id to another.
+   *
+   * used when a peer that was admin-stamped under a temporary local id
+   * (see `p2p/anon-device-id.ts` — used before a real p2p identity
+   * exists) later establishes a real identity, so they don't lose
+   * ownership of canvases they created before that. a no-op if
+   * `oldNodeId` isn't the recorded admin — e.g. already migrated, or the
+   * admin is someone else entirely.
+   */
+  migrateAdminId(oldNodeId: string, newNodeId: string): void {
+    if (oldNodeId === newNodeId) return;
+    this.handle.change((doc) => {
+      if (!doc.acl || doc.acl[oldNodeId]?.role !== "admin") return;
+      delete doc.acl[oldNodeId];
+      doc.acl[newNodeId] = { role: "admin" };
+    });
+  }
+
+  /**
    * set (or change) a peer's role on this canvas. used both when an invite
    * is sent (role chosen at invite time) and later, to change an
    * already-invited peer's role.
