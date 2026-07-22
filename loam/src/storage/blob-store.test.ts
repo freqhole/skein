@@ -16,7 +16,9 @@ class FakeWritable {
     this.file.bytes =
       data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer as ArrayBuffer);
   }
-  async close(): Promise<void> {}
+  async close(): Promise<void> {
+    // matches the real FileSystemWritableFileStream API - nothing to flush.
+  }
 }
 
 class FakeFileHandle {

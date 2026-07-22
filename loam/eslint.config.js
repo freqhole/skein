@@ -52,4 +52,14 @@ export default [
       "@typescript-eslint/no-explicit-any": "off",
     },
   },
+  {
+    // test files legitimately need dynamic import() to re-run a module's
+    // top-level code after vi.resetModules() (simulating a fresh page
+    // load with the same fake-storage backing data) - static imports can't
+    // be re-executed mid-test, so the blanket ban doesn't apply here.
+    files: ["**/*.test.ts"],
+    rules: {
+      "no-restricted-syntax": "off",
+    },
+  },
 ];

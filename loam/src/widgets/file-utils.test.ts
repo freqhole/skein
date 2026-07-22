@@ -94,6 +94,10 @@ import {
   getThumbnailDataUrl,
   uploadFile,
 } from "./file-utils";
+import { IrohNetworkAdapter } from "@freqhole/reliquary/automerge";
+import { createMockMidden, createMockBiStream } from "@freqhole/reliquary/testing";
+import { DEFAULT_ENSURE_ALPN } from "@freqhole/reliquary/ensure";
+import { handleSkeinStream, createSkeinEnsureBlobHandler } from "../p2p/skein-handler";
 
 // ---------------------------------------------------------------------------
 // test helpers
@@ -1600,11 +1604,6 @@ describe("getThumbnailDataUrl — tauri blob_thumbnail path", () => {
 
 describe("browser-mode blob probing — ALPN mismatch regression", () => {
   it("a stream on FREQHOLE_ALPN ('freqhole/1') - the ALPN midden's native ensure_blob actually dials - reaches a registered handler in skein's real browser-mode ALPN wiring", async () => {
-    const { IrohNetworkAdapter } = await import("@freqhole/reliquary/automerge");
-    const { createMockMidden, createMockBiStream } = await import("@freqhole/reliquary/testing");
-    const { handleSkeinStream, createSkeinEnsureBlobHandler } = await import("../p2p/skein-handler");
-    const { DEFAULT_ENSURE_ALPN } = await import("@freqhole/reliquary/ensure");
-
     const mockMidden = createMockMidden();
     const adapter = new IrohNetworkAdapter({
       getNode: vi.fn(async () => mockMidden as any),

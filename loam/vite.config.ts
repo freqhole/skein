@@ -95,6 +95,17 @@ export default defineConfig({
     setupFiles: ["src/test-setup.ts"],
     include: ["src/**/*.test.ts", "src/**/*.integration.test.ts", "widgets/**/*.test.ts"],
     exclude: ["node_modules", "dist", "tests/**"],
+    // by default vitest externalizes node_modules deps, loading them via
+    // node's own module system instead of its vite-node transform pipeline
+    // - vi.mock() only intercepts modules that go through that pipeline.
+    // @freqhole/reliquary needs to be inlined so tests can mock its deep
+    // internal imports (e.g. transfer/snatch.js importing hashBlake3 from
+    // worker/index.js) via the public @freqhole/reliquary/worker subpath.
+    server: {
+      deps: {
+        inline: ["@freqhole/reliquary"],
+      },
+    },
     coverage: {
       provider: "v8",
       reporter: ["text", "text-summary", "html", "lcov", "json"],

@@ -376,6 +376,7 @@ impl std::fmt::Debug for HubAdminHandler {
 }
 
 impl HubAdminHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         adminz: adminz::Store,
         friendz: friendz::Store,
@@ -685,7 +686,7 @@ async fn handle_request(
             let limit = clamp_limit(limit);
             let mut all = canvas_usage(&handler.inner.hub_repo, &handler.inner.blobz).await;
             // sort largest-first so page 1 shows the most storage-heavy canvases.
-            all.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+            all.sort_by_key(|b| std::cmp::Reverse(b.total_bytes));
             let total = all.len() as u64;
             let page: Vec<CanvasUsageSummary> = all
                 .into_iter()
@@ -894,7 +895,6 @@ async fn handle_request(
                     }
                 }
             };
-            let blake3_hash = blake3::hash(&webp).to_hex().to_string();
             let blob_ref = match handler
                 .inner
                 .blobz
@@ -2487,7 +2487,7 @@ mod tests {
             .await
             .unwrap();
         blobz_store
-            .soft_delete(&[blob.blake3.clone()], admin_node)
+            .soft_delete(std::slice::from_ref(&blob.blake3), admin_node)
             .await
             .unwrap();
         assert!(blobz_store.get(&blob.blake3).await.unwrap().is_none());
@@ -2528,7 +2528,7 @@ mod tests {
             .await
             .unwrap();
         blobz_store
-            .soft_delete(&[blob.blake3.clone()], admin_node)
+            .soft_delete(std::slice::from_ref(&blob.blake3), admin_node)
             .await
             .unwrap();
 
@@ -2569,7 +2569,7 @@ mod tests {
 
         // must soft-delete first
         blobz_store
-            .soft_delete(&[blob.blake3.clone()], admin_node)
+            .soft_delete(std::slice::from_ref(&blob.blake3), admin_node)
             .await
             .unwrap();
 
@@ -2651,7 +2651,7 @@ mod tests {
             .await
             .unwrap();
         blobz_store
-            .soft_delete(&[sd.blake3.clone()], admin_node)
+            .soft_delete(std::slice::from_ref(&sd.blake3), admin_node)
             .await
             .unwrap();
 
@@ -3367,7 +3367,7 @@ mod tests {
             .await
             .unwrap();
         blobz_store
-            .soft_delete(&[b.blake3.clone()], "admin")
+            .soft_delete(std::slice::from_ref(&b.blake3), "admin")
             .await
             .unwrap();
 
@@ -3493,7 +3493,7 @@ mod tests {
             ("h-pg-3", "large.txt", b"lllll"),
         ];
         let mut inserted = Vec::new();
-        for (iroh, name, data) in &blobs_in {
+        for (_iroh, name, data) in &blobs_in {
             let b = blobz_store
                 .insert(
                     data,
@@ -3544,7 +3544,7 @@ mod tests {
                     "filename",
                     b.filename.as_deref().unwrap_or(""),
                 )?;
-                tx.put(automerge::ROOT, "size", b.size as u64)?;
+                tx.put(automerge::ROOT, "size", b.size)?;
                 Ok(())
             })
             .unwrap();
