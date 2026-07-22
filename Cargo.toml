@@ -1,9 +1,5 @@
 [workspace]
-members = ["tumulus"]
-# tauri/ added explicitly once icons + gen/ are populated; keeping
-# it excluded for now so `cargo check` at the workspace root stays green
-# without a working `cargo tauri` bootstrap.
-exclude = ["tauri"]
+members = ["tumulus", "tauri"]
 resolver = "2"
 
 [workspace.package]
