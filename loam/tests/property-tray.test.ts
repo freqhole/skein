@@ -1,4 +1,5 @@
 import { expect, test } from "./fixtures/canvas-page";
+import { setLocalRole } from "./helpers/roles";
 
 test("property tray is present on the skein canvas handle", async ({ canvasPage }) => {
   const { page } = await canvasPage();
@@ -29,6 +30,7 @@ test("property tray appears when a widget with editableProps is selected", async
   canvasPage,
 }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   await page.evaluate(() => {
     const skein = (window as any).__skein;
@@ -62,6 +64,7 @@ test("property tray appears when a widget with editableProps is selected", async
 
 test("property tray hides when widget is deselected", async ({ canvasPage }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   await page.evaluate(() => {
     const skein = (window as any).__skein;
@@ -108,6 +111,7 @@ test("property tray shows only the title control for stateless widgets (canvas-i
   canvasPage,
 }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   // canvas-info is a real registered widget with no editableProps (see
   // widgets/canvas-info.test.ts: "has no editableProps"). a previous version
@@ -155,6 +159,7 @@ test("property tray shows only the title control for stateless widgets (canvas-i
 
 test("property tray is positioned to the right of the selected widget", async ({ canvasPage }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   await page.evaluate(() => {
     const skein = (window as any).__skein;
@@ -193,6 +198,7 @@ test("property tray is positioned to the right of the selected widget", async ({
 
 test("property tray repositions when widget is moved", async ({ canvasPage }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   await page.evaluate(() => {
     const skein = (window as any).__skein;
@@ -236,6 +242,7 @@ test("property tray repositions when widget is moved", async ({ canvasPage }) =>
 
 test("property tray shows the widget name in the header", async ({ canvasPage }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   await page.evaluate(() => {
     const skein = (window as any).__skein;
@@ -272,6 +279,7 @@ test("property tray shows the widget name in the header", async ({ canvasPage })
 
 test("property tray renders controls for each editable prop", async ({ canvasPage }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   // "notepad" has 5 editableProps (bgColor, textColor, borderColor, fontSize,
   // fontFamily) plus the always-shown title control and a delete button = 7 total.
@@ -324,6 +332,7 @@ test("property tray renders controls for each editable prop", async ({ canvasPag
 
 test("property tray switches when selecting a different widget", async ({ canvasPage }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   await page.evaluate(() => {
     const skein = (window as any).__skein;
@@ -383,6 +392,7 @@ test("property tray switches when selecting a different widget", async ({ canvas
 
 test("property tray hides when the selected widget is removed", async ({ canvasPage }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   await page.evaluate(() => {
     const skein = (window as any).__skein;
@@ -421,6 +431,7 @@ test("property tray hides when the selected widget is removed", async ({ canvasP
 
 test("number control +/- buttons change the widget doc value", async ({ canvasPage }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   // "notepad" is a real registered widget with a plain (non-conditional,
   // static-default) numeric editableProp ("fontSize", default 13). a previous
@@ -495,6 +506,7 @@ test("property tray has very high zIndex in the world container", async ({ canva
 
 test("property tray survives canvas destroy without errors", async ({ canvasPage }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   // add a widget and select it so the tray is visible
   await page.evaluate(() => {
@@ -534,6 +546,7 @@ test("property tray survives canvas destroy without errors", async ({ canvasPage
 
 test("property tray repositions when widget is resized", async ({ canvasPage }) => {
   const { page } = await canvasPage();
+  await setLocalRole(page, "member");
 
   await page.evaluate(() => {
     const skein = (window as any).__skein;

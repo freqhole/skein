@@ -17,6 +17,7 @@
 // run with: npx playwright test tests/viewer-role-ui.test.ts --workers=1
 
 import { expect, test, type Page } from "./fixtures/canvas-page";
+import { setLocalRole } from "./helpers/roles";
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -46,21 +47,6 @@ async function addNotepad(page: Page, id: string, x = 100, y = 100): Promise<voi
     id,
     { timeout: 5000 }
   );
-}
-
-/** set the local peer's role on the currently-open canvas — same
- *  setRole()/setLocalNodeId() pattern canvas-store.test.ts's
- *  "localRole/isLocalViewer/isLocalAdmin reflect the local peer's role"
- *  test already uses. */
-async function setLocalRole(page: Page, role: "member" | "viewer"): Promise<void> {
-  await page.evaluate((r) => {
-    const store = (window as any).__skein.store;
-    const nodeId = "test-local-peer";
-    store.setRole(nodeId, r);
-    store.setLocalNodeId(nodeId);
-  }, role);
-  // give the toolbar's store.onChange()-driven applyRoleGating() a tick to run
-  await page.waitForTimeout(100);
 }
 
 async function getWidgetPos(page: Page, id: string): Promise<{ x: number; y: number }> {

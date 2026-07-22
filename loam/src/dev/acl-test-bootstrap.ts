@@ -14,9 +14,10 @@
 // only need the automerge doc + store, not a rendered canvas.
 // ---------------------------------------------------------------------------
 
-import type { Repo } from "@automerge/automerge-repo";
+import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { BroadcastChannelNetworkAdapter } from "@automerge/automerge-repo-network-broadcastchannel";
 
+import { CanvasStore } from "../canvas/canvas-store";
 import { createSkeinHarness } from "../harness/skein-harness";
 import { createAclFilteringAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
 import type { RoleResolver } from "../p2p/acl-filtering-network-adapter";
@@ -33,9 +34,22 @@ async function initSkeinForTest(options: AclTestInitOptions = {}): Promise<AclTe
   // the roleResolver needs a `Repo` to read cached ACL data from, but the
   // `Repo` doesn't exist until after the network adapter (which needs the
   // roleResolver) is constructed. `repoBox` breaks that cycle: the
-  // resolver closure reads `repoBox.repo` lazily, and it gets filled in
-  // right after `createSkeinHarness()` returns, before any sync traffic
-  // can possibly flow.
+  // resolver closure reads `repoBox.repo` lazily.
+  //
+  // this must be populated *before* a document's own sync traffic can
+  // start flowing, not merely before `createSkeinHarness()` returns:
+  // building the harness with `skipStore: true` gets us the repo (and
+  // therefore lets us fill `repoBox.repo`) without also opening/joining a
+  // canvas doc as part of that same call. opening the doc is a separate
+  // step below, done only once the resolver already has a real repo to
+  // read from. previously this filled `repoBox.repo` only *after*
+  // `createSkeinHarness()` resolved - but for a joining peer, that
+  // resolution itself waits on `CanvasStore.open()`, which can't complete
+  // until the admin's changes actually get applied. with `repoBox.repo`
+  // still unset for that entire wait, the resolver had no choice but to
+  // return its "viewer" fallback for every inbound message, permanently
+  // stripping the admin's changes to nothing - a deadlock a joining peer
+  // could never recover from.
   const repoBox: { repo?: Repo } = {};
   const roleResolver: RoleResolver = (documentId, senderId) => {
     if (!repoBox.repo) return "viewer";
@@ -50,9 +64,13 @@ async function initSkeinForTest(options: AclTestInitOptions = {}): Promise<AclTe
     // always fetch the doc from another peer over BroadcastChannel rather
     // than needing their own IndexedDB copy.
     ephemeralStorage: true,
-    canvasDocId: options.canvasDocId ?? null,
+    skipStore: true,
   });
   repoBox.repo = harness.repo;
+
+  const store = options.canvasDocId
+    ? await CanvasStore.open(harness.repo, options.canvasDocId as DocumentId)
+    : CanvasStore.create(harness.repo);
 
   // the harness's CanvasStore.create()/open() never sets a local node id or
   // stamps an admin the way production's real canvas-creation flow does
@@ -63,20 +81,20 @@ async function initSkeinForTest(options: AclTestInitOptions = {}): Promise<AclTe
   // (rather than joining one via `options.canvasDocId`) self-stamps here —
   // a peer joining an existing canvas shouldn't claim admin before the
   // real admin's `.acl` entry has synced over.
-  harness.store.setLocalNodeId(harness.repo.peerId);
+  store.setLocalNodeId(harness.repo.peerId);
   if (!options.canvasDocId) {
-    harness.store.stampAdmin(harness.repo.peerId);
+    store.stampAdmin(harness.repo.peerId);
   }
 
   (window as any).__skein = {
-    store: harness.store,
+    store,
     repo: harness.repo,
     peerId: harness.repo.peerId,
     widgetManager: null,
     app: null,
   };
 
-  return { canvasDocId: harness.store.handle.documentId };
+  return { canvasDocId: store.handle.documentId };
 }
 
 (window as any).__initSkeinForTest = initSkeinForTest;

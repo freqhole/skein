@@ -22,7 +22,6 @@
 import type { NetworkAdapter, PeerId, Repo } from "@automerge/automerge-repo";
 import {
   createAclFilteringAdapter as createGenericAclFilteringAdapter,
-  createHandleBasedRoleResolver,
   type AclFilteringNetworkAdapter as GenericAclFilteringNetworkAdapter,
   type RoleResolver as GenericRoleResolver,
 } from "@freqhole/reliquary/automerge";
@@ -70,12 +69,49 @@ export function readCanvasRole(doc: unknown, senderId: PeerId): CanvasRole {
  * role via `readCanvasRole` above - this deliberately avoids
  * `repo.find()`, which can trigger a network fetch and has side effects
  * (creating a new handle, marking it as requested from peers) that have
- * no place in a message-filtering hot path. if the repo has never seen
- * this document, or the cached handle isn't ready yet, there's nothing
- * to check against, so this defaults to `"viewer"`.
+ * no place in a message-filtering hot path.
+ *
+ * a peer receiving a canvas doc for the very first time can never have a
+ * ready local copy to check `.acl` against - that's exactly what's being
+ * negotiated (the same bootstrap problem canvas-scoped-share-policy.ts
+ * solves one layer up, at the sync-eligibility gate). defaulting to
+ * `"viewer"` for a not-yet-ready handle would strip the legitimate
+ * admin's very first sync payload, so the local copy could never become
+ * ready - a permanent deadlock, not just a transient race.
+ *
+ * automerge-repo's own `DocHandle.state` machine already answers this for
+ * free, synchronously: the `"requesting"` state is only ever entered once
+ * local storage has been checked and confirmed NOT to have this document
+ * (automerge-repo's `DocHandle` fires its `REQUEST` transition "when the
+ * document is not found in storage"). so `"requesting"` means this device
+ * has never had this document, ever - genuine first contact, safe to let
+ * the bootstrap sync through unfiltered. any other not-ready state
+ * (`"loading"` - still checking local storage for a document this device
+ * may already know from a past session; `"idle"`/`"unloaded"`/
+ * `"unavailable"`) keeps the strict `"viewer"` default, so a page reload
+ * of an already-known (possibly viewer-downgraded) canvas can't exploit
+ * this bootstrap window - local storage resolves to `"ready"` almost
+ * immediately, well before any peer's sync traffic could arrive, so the
+ * window this bypass opens never applies to a document the device has
+ * already seen. once ready, the real `.acl`-based check governs, always.
  */
 export function createRepoRoleResolver(repo: Repo): RoleResolver {
-  return createHandleBasedRoleResolver(repo, readCanvasRole, "viewer");
+  return (documentId, senderId) => {
+    const handle = repo.handles[documentId];
+    if (handle?.isReady()) {
+      return readCanvasRole(handle.doc(), senderId);
+    }
+    if (handle?.state === "requesting") {
+      // storage was checked and came up empty - this device has never
+      // synced this document before, so there's no prior "downgraded to
+      // viewer" state a bypass could be exploiting. "member" (not
+      // "admin") is used here only as "not read-only" - this resolver's
+      // return value only ever feeds `isReadOnlyCanvasRole()` below, it
+      // never grants admin-only authority (share/invite) anywhere else.
+      return "member";
+    }
+    return "viewer";
+  };
 }
 
 /**

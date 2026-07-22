@@ -10,6 +10,12 @@ import { defineConfig, devices } from "@playwright/test";
 // run in isolation. keeping them in their own project with a hard worker
 // cap of 1 means at most one of these ever runs at a time, regardless of
 // how many workers the rest of the suite is using.
+//
+// every file here carries (or should carry) a matching doc comment of its
+// own — `run with: npx playwright test tests/<file> --workers=1` — since
+// that's also the right way to run just this one file in isolation. if a
+// spec's header says --workers=1, it belongs in this list; keep both in
+// sync.
 const HEAVY_TEST_FILES = [
   "multi-peer-mesh.spec.ts",
   "p2p-sync.spec.ts",
@@ -18,13 +24,21 @@ const HEAVY_TEST_FILES = [
   "blob-acl.spec.ts",
   "blob-acl-gate-prototype.spec.ts",
   "blob-acl-cross-canvas.spec.ts",
+  "blob-acl-live-sync.spec.ts",
   "blob-proxy-friend-gate.spec.ts",
   "blob-stream-import.spec.ts",
+  "canvas-first-open-crash.spec.ts",
+  "canvas-share-hub.spec.ts",
+  "friend-canvas-bin.test.ts",
   "friendz-hub.spec.ts",
   "hub-admin.spec.ts",
   "hub-profile-panel.spec.ts",
   "friends-tab-hub-profile.spec.ts",
+  "knock-flow.spec.ts",
+  "knock-ui.test.ts",
   "profile-gossip.spec.ts",
+  "share-dialog.test.ts",
+  "viewer-role-ui.test.ts",
 ];
 
 const chromiumUse = {
@@ -47,12 +61,14 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 1,
   // overall worker pool cap for the whole run. per-project `workers` below
   // further restricts how much of this pool the heavy project may use at
-  // once — it doesn't add extra workers on top of this. locally, unlimited
-  // workers (one per core) causes contention flakes in app-boot-heavy specs;
-  // since the midden worker migration every page/reload also spawns a
-  // dedicated worker that fetches + compiles the ~19MB wasm, so the cap sits
-  // at 3 (reload-persistence specs flaked at 4).
-  workers: process.env.CI ? 1 : 3,
+  // once — it doesn't add extra workers on top of this. unlimited workers
+  // (one per core) causes contention flakes in app-boot-heavy specs; since
+  // the midden worker migration every page/reload also spawns a dedicated
+  // worker that fetches + compiles the ~19MB wasm, so the cap sits at 3
+  // (reload-persistence specs flaked at 4) both locally and in ci - ci
+  // runners (ubuntu-24.04, 4 vcpu) have the same headroom as the local cap
+  // was tuned against.
+  workers: 3,
   reporter: [["html", { outputFolder: "playwright-report" }], ["list"]],
   use: {
     baseURL: "http://localhost:5897",

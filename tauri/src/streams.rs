@@ -125,6 +125,10 @@ impl StreamRegistry {
     /// [`StreamRegistry::start_with_blobs`] so browser peers can pull blobs
     /// over `iroh-blobs/4` directly (chunked / verified) instead of falling
     /// back to the size-capped `skein/1` proxy_request envelope.
+    ///
+    /// only exercised by this module's tests today; production call sites
+    /// all use [`StreamRegistry::start_with_blobs`].
+    #[allow(dead_code)]
     pub async fn start(endpoint: Endpoint) -> anyhow::Result<Arc<Self>> {
         Self::start_inner(endpoint, None).await
     }
