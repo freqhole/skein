@@ -19,12 +19,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tumulus::{db, friendz, userz};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::Listener;
 use tauri::Manager;
 use tauri::WindowEvent;
 use tokio::sync::Mutex;
+use tumulus::{db, friendz, userz};
 
 use commands::{AppConfig, AppState};
 
@@ -46,7 +46,9 @@ fn default_data_dir() -> PathBuf {
             return PathBuf::from(xdg).join(APP_IDENTIFIER);
         }
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".local/share").join(APP_IDENTIFIER);
+            return PathBuf::from(home)
+                .join(".local/share")
+                .join(APP_IDENTIFIER);
         }
     }
     #[cfg(target_os = "windows")]
@@ -81,11 +83,9 @@ async fn build_state() -> anyhow::Result<AppState> {
     let pool = db::open(&data_dir).await?;
     let haruspex_pool = db::open_haruspex(&data_dir).await?;
     let username = std::env::var("SKEIN_USERNAME").unwrap_or_else(|_| "skein".to_string());
-    let blobz_store: std::sync::Arc<dyn freqhole_reliquary::blobz::BlobStore> =
-        std::sync::Arc::new(freqhole_reliquary::blobz::SqliteBlobStore::new(
-            pool.clone(),
-            &data_dir,
-        ));
+    let blobz_store: std::sync::Arc<dyn freqhole_reliquary::blobz::BlobStore> = std::sync::Arc::new(
+        freqhole_reliquary::blobz::SqliteBlobStore::new(pool.clone(), &data_dir),
+    );
     let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
     let userz_dir = userz::Directory::new(haruspex_pool);
     let app_config_path = data_dir.join(APP_CONFIG_FILENAME);

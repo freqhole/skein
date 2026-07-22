@@ -15,16 +15,16 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use iroh::Endpoint;
 use freqhole_reliquary::blobz::{BlobRecord, NewBlobMeta};
 use freqhole_reliquary::identity;
-use tumulus::{friendz, service, userz};
+use iroh::Endpoint;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use tumulus::{friendz, service, userz};
 
 // ---------------------------------------------------------------------------
 // cancel registry for in-flight blob downloads
@@ -111,8 +111,7 @@ pub struct AppState {
     /// anything holding this cell (a future snatch engine, e.g.) always
     /// agrees with the storage node about the current downloader. kept in
     /// sync exclusively through `attach_network_endpoint`.
-    pub downloader_cell:
-        Arc<std::sync::RwLock<Option<iroh_blobs::api::downloader::Downloader>>>,
+    pub downloader_cell: Arc<std::sync::RwLock<Option<iroh_blobs::api::downloader::Downloader>>>,
     pub friendz_store: friendz::Store,
     pub userz: userz::Directory,
 
@@ -366,12 +365,20 @@ async fn ensure_network(
 ) -> Result<(Endpoint, String, Arc<crate::streams::StreamRegistry>), DispatchError> {
     let mut guard = state.network.lock().await;
     if let Some(net) = guard.as_ref() {
-        return Ok((net.endpoint.clone(), net.node_id.clone(), net.streams.clone()));
+        return Ok((
+            net.endpoint.clone(),
+            net.node_id.clone(),
+            net.streams.clone(),
+        ));
     }
     let net = build_network_state(state)
         .await
         .map_err(|e| DispatchError::Identity(e.to_string()))?;
-    let result = (net.endpoint.clone(), net.node_id.clone(), net.streams.clone());
+    let result = (
+        net.endpoint.clone(),
+        net.node_id.clone(),
+        net.streams.clone(),
+    );
     *guard = Some(net);
     Ok(result)
 }
@@ -452,32 +459,22 @@ async fn dispatch(
         "blob_insert_from_path" => {
             blob_insert_from_path(decode("blob_insert_from_path", payload)?, app, state).await
         }
-        "blob_insert_cancel" => {
-            blob_insert_cancel(decode("blob_insert_cancel", payload)?).await
-        }
-        "blob_iroh_ensure" => {
-            blob_iroh_ensure(decode("blob_iroh_ensure", payload)?, state).await
-        }
+        "blob_insert_cancel" => blob_insert_cancel(decode("blob_insert_cancel", payload)?).await,
+        "blob_iroh_ensure" => blob_iroh_ensure(decode("blob_iroh_ensure", payload)?, state).await,
         "blob_iroh_download" => {
             blob_iroh_download(decode("blob_iroh_download", payload)?, app, state).await
         }
         "blob_iroh_download_cancel" => {
             blob_iroh_download_cancel(decode("blob_iroh_download_cancel", payload)?).await
         }
-        "blob_iroh_probe" => {
-            blob_iroh_probe(decode("blob_iroh_probe", payload)?, state).await
-        }
+        "blob_iroh_probe" => blob_iroh_probe(decode("blob_iroh_probe", payload)?, state).await,
 
         // pdf page rendering (peedeeeff widget)
-        "pdf_render_pages" => {
-            pdf_render_pages(decode("pdf_render_pages", payload)?, state).await
-        }
+        "pdf_render_pages" => pdf_render_pages(decode("pdf_render_pages", payload)?, state).await,
 
         // generate a thumbnail for a stored blob. supports image/*, application/pdf,
         // and video/* source types. returns { data: <base64>, mime } or { data: null }.
-        "blob_thumbnail" => {
-            blob_thumbnail(decode("blob_thumbnail", payload)?, state).await
-        }
+        "blob_thumbnail" => blob_thumbnail(decode("blob_thumbnail", payload)?, state).await,
 
         // link widget unfurl — fetch a URL server-side (no CORS restriction,
         // unlike the browser-mode fallback in loam/src/widgets/link-unfurl.ts)
@@ -499,7 +496,9 @@ async fn dispatch(
         }
         "accept_stream" => {
             let (_, _, streams) = ensure_network(state).await?;
-            crate::streams::accept_stream(&streams).await.map_err(stream_err)
+            crate::streams::accept_stream(&streams)
+                .await
+                .map_err(stream_err)
         }
         "write_message" => {
             let (_, _, streams) = ensure_network(state).await?;
@@ -521,12 +520,9 @@ async fn dispatch(
         }
         "write_raw_and_finish" => {
             let (_, _, streams) = ensure_network(state).await?;
-            crate::streams::write_raw_and_finish(
-                decode("write_raw_and_finish", payload)?,
-                &streams,
-            )
-            .await
-            .map_err(stream_err)
+            crate::streams::write_raw_and_finish(decode("write_raw_and_finish", payload)?, &streams)
+                .await
+                .map_err(stream_err)
         }
         "read_to_end" => {
             let (_, _, streams) = ensure_network(state).await?;
@@ -668,10 +664,7 @@ struct FriendRemoveArgs {
     node_id: String,
 }
 
-async fn friend_remove(
-    args: FriendRemoveArgs,
-    state: &AppState,
-) -> Result<Value, DispatchError> {
+async fn friend_remove(args: FriendRemoveArgs, state: &AppState) -> Result<Value, DispatchError> {
     state.friendz_store.delete(&args.node_id).await?;
     Ok(Value::Null)
 }
@@ -1191,10 +1184,7 @@ async fn prewarm_fs_store(state: &AppState, blob: &BlobRecord) {
 /// when the blob is unknown / missing on disk / fails to import. mirrors the
 /// same lookup-and-stage shape as `freqhole_reliquary::ensure::EnsureBlobHandler`'s
 /// own request handling.
-async fn blob_iroh_ensure(
-    args: BlobGetArgs,
-    state: &AppState,
-) -> Result<Value, DispatchError> {
+async fn blob_iroh_ensure(args: BlobGetArgs, state: &AppState) -> Result<Value, DispatchError> {
     if args.blake3.len() != 64 {
         return Ok(json!({
             "available": false,
@@ -1229,16 +1219,13 @@ struct BlobInsertArgs {
     data: String,
 }
 
-async fn blob_insert(
-    args: BlobInsertArgs,
-    state: &AppState,
-) -> Result<Value, DispatchError> {
-    let bytes = B64.decode(args.data.as_bytes()).map_err(|e| {
-        DispatchError::InvalidPayload {
+async fn blob_insert(args: BlobInsertArgs, state: &AppState) -> Result<Value, DispatchError> {
+    let bytes = B64
+        .decode(args.data.as_bytes())
+        .map_err(|e| DispatchError::InvalidPayload {
             action: "blob_insert",
             source: serde::de::Error::custom(format!("base64 decode: {e}")),
-        }
-    })?;
+        })?;
     let blob = state
         .storage
         .blobz
@@ -1321,8 +1308,9 @@ async fn blob_insert_from_path(
             );
         }
     });
-    let on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)> =
-        progress_cb.as_ref().map(|f| f as &(dyn Fn(u64, u64) + Send + Sync));
+    let on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)> = progress_cb
+        .as_ref()
+        .map(|f| f as &(dyn Fn(u64, u64) + Send + Sync));
 
     // register a cancel flag so `blob_insert_cancel` can abort the hashing pass.
     // the guard removes the entry from the registry on ALL exit paths.
@@ -1451,12 +1439,9 @@ async fn blob_iroh_download(
         .parse()
         .map_err(|e| DispatchError::Stream(format!("parse blake3: {e}")))?;
 
-    let node_id: iroh::PublicKey = args
-        .peer_addr
-        .parse()
-        .map_err(|e: iroh::KeyParsingError| {
-            DispatchError::Stream(format!("parse peer_addr (node id): {e}"))
-        })?;
+    let node_id: iroh::PublicKey = args.peer_addr.parse().map_err(|e: iroh::KeyParsingError| {
+        DispatchError::Stream(format!("parse peer_addr (node id): {e}"))
+    })?;
 
     tracing::info!(
         blake3 = %args.blake3,
@@ -1692,11 +1677,9 @@ async fn blob_iroh_probe(
         )));
     }
 
-    let node_id: iroh::PublicKey = args.peer_addr.parse().map_err(
-        |e: iroh::KeyParsingError| {
-            DispatchError::Stream(format!("parse peer_addr (node id): {e}"))
-        },
-    )?;
+    let node_id: iroh::PublicKey = args.peer_addr.parse().map_err(|e: iroh::KeyParsingError| {
+        DispatchError::Stream(format!("parse peer_addr (node id): {e}"))
+    })?;
 
     let id = REQ_ID.fetch_add(1, Ordering::Relaxed);
     let req = json!({
@@ -1892,10 +1875,7 @@ struct BlobThumbnailArgs {
     size: Option<u32>,
 }
 
-async fn blob_thumbnail(
-    args: BlobThumbnailArgs,
-    state: &AppState,
-) -> Result<Value, DispatchError> {
+async fn blob_thumbnail(args: BlobThumbnailArgs, state: &AppState) -> Result<Value, DispatchError> {
     let size = args.size.unwrap_or(200);
 
     let blob = state
@@ -1941,14 +1921,12 @@ async fn pdf_render_pages(
         .await?
         .ok_or_else(|| DispatchError::InvalidPayload {
             action: "pdf_render_pages",
-            source: serde::de::Error::custom(format!(
-                "no blob with blake3 {}",
-                args.blake3
-            )),
+            source: serde::de::Error::custom(format!("no blob with blake3 {}", args.blake3)),
         })?;
 
-    let pdf_bytes =
-        tokio::fs::read(state.storage.blobz.path_for(&source_blob)).await.map_err(|e| {
+    let pdf_bytes = tokio::fs::read(state.storage.blobz.path_for(&source_blob))
+        .await
+        .map_err(|e| {
             DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(format!(
                 "read pdf bytes: {e}"
             )))
@@ -1965,7 +1943,11 @@ async fn pdf_render_pages(
     let stem = source_blob
         .filename
         .as_deref()
-        .map(|n| n.trim_end_matches(".pdf").trim_end_matches(".PDF").to_string())
+        .map(|n| {
+            n.trim_end_matches(".pdf")
+                .trim_end_matches(".PDF")
+                .to_string()
+        })
         .unwrap_or_else(|| "document".to_string());
 
     let mut out = Vec::with_capacity(pages.len());
@@ -2000,4 +1982,3 @@ async fn pdf_render_pages(
 
     Ok(Value::Array(out))
 }
-

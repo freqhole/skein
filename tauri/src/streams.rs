@@ -39,10 +39,10 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
-use tumulus::{blob_acl, friendz};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
+use tumulus::{blob_acl, friendz};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
@@ -601,13 +601,10 @@ mod tests {
         .expect("write");
 
         // inbound: listener should see the same stream tagged with the alpn.
-        let accept_resp = tokio::time::timeout(
-            Duration::from_secs(15),
-            accept_stream(&registry),
-        )
-        .await
-        .expect("accept_stream timed out")
-        .expect("accept_stream");
+        let accept_resp = tokio::time::timeout(Duration::from_secs(15), accept_stream(&registry))
+            .await
+            .expect("accept_stream timed out")
+            .expect("accept_stream");
         let listener_handle = accept_resp["handle"].as_u64().expect("acc handle");
         assert_eq!(accept_resp["alpn"].as_str().unwrap(), "freqhole-friendz/1");
         assert_eq!(
@@ -616,9 +613,14 @@ mod tests {
         );
 
         // round-trip a payload dialer -> listener.
-        let read_resp = read_message(HandleArgs { handle: listener_handle }, &registry)
-            .await
-            .expect("read");
+        let read_resp = read_message(
+            HandleArgs {
+                handle: listener_handle,
+            },
+            &registry,
+        )
+        .await
+        .expect("read");
         let echoed = B64
             .decode(read_resp["data"].as_str().expect("data str"))
             .expect("b64");
@@ -635,21 +637,35 @@ mod tests {
         )
         .await
         .expect("reply write");
-        let dialer_read =
-            read_message(HandleArgs { handle: dialer_handle }, &dialer_registry)
-                .await
-                .expect("reply read");
+        let dialer_read = read_message(
+            HandleArgs {
+                handle: dialer_handle,
+            },
+            &dialer_registry,
+        )
+        .await
+        .expect("reply read");
         assert_eq!(
             B64.decode(dialer_read["data"].as_str().unwrap()).unwrap(),
             reply
         );
 
-        close_stream(HandleArgs { handle: dialer_handle }, &dialer_registry)
-            .await
-            .ok();
-        close_stream(HandleArgs { handle: listener_handle }, &registry)
-            .await
-            .ok();
+        close_stream(
+            HandleArgs {
+                handle: dialer_handle,
+            },
+            &dialer_registry,
+        )
+        .await
+        .ok();
+        close_stream(
+            HandleArgs {
+                handle: listener_handle,
+            },
+            &registry,
+        )
+        .await
+        .ok();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -666,14 +682,10 @@ mod tests {
 
         for alpn in FRONTEND_ALPNS {
             let alpn_str = std::str::from_utf8(alpn).unwrap();
-            let resp = open_bi_with_addr(
-                target_addr(&listener),
-                alpn_str,
-                &dialer,
-                &dialer_registry,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("open_bi {alpn_str}: {e}"));
+            let resp =
+                open_bi_with_addr(target_addr(&listener), alpn_str, &dialer, &dialer_registry)
+                    .await
+                    .unwrap_or_else(|e| panic!("open_bi {alpn_str}: {e}"));
             let dialer_handle = resp["handle"].as_u64().unwrap();
 
             // kick the bi-stream so the listener's `accept_bi` resolves.
@@ -687,18 +699,20 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("write {alpn_str}: {e}"));
 
-            let accept = tokio::time::timeout(
-                Duration::from_secs(15),
-                accept_stream(&registry),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("accept timeout on {alpn_str}"))
-            .unwrap_or_else(|e| panic!("accept_stream {alpn_str}: {e}"));
+            let accept = tokio::time::timeout(Duration::from_secs(15), accept_stream(&registry))
+                .await
+                .unwrap_or_else(|_| panic!("accept timeout on {alpn_str}"))
+                .unwrap_or_else(|e| panic!("accept_stream {alpn_str}: {e}"));
             assert_eq!(accept["alpn"].as_str().unwrap(), alpn_str);
 
-            close_stream(HandleArgs { handle: dialer_handle }, &dialer_registry)
-                .await
-                .ok();
+            close_stream(
+                HandleArgs {
+                    handle: dialer_handle,
+                },
+                &dialer_registry,
+            )
+            .await
+            .ok();
             close_stream(
                 HandleArgs {
                     handle: accept["handle"].as_u64().unwrap(),
@@ -750,18 +764,33 @@ mod tests {
         let listener_handle = accept["handle"].as_u64().unwrap();
 
         // drain the kick payload so the next read after close sees true eof.
-        let _ = read_message(HandleArgs { handle: listener_handle }, &registry)
-            .await
-            .expect("drain read");
+        let _ = read_message(
+            HandleArgs {
+                handle: listener_handle,
+            },
+            &registry,
+        )
+        .await
+        .expect("drain read");
 
         // close the dialer side cleanly; listener's read should return null.
-        close_stream(HandleArgs { handle: dialer_handle }, &dialer_registry)
-            .await
-            .ok();
+        close_stream(
+            HandleArgs {
+                handle: dialer_handle,
+            },
+            &dialer_registry,
+        )
+        .await
+        .ok();
 
         let resp = tokio::time::timeout(
             Duration::from_secs(5),
-            read_message(HandleArgs { handle: listener_handle }, &registry),
+            read_message(
+                HandleArgs {
+                    handle: listener_handle,
+                },
+                &registry,
+            ),
         )
         .await
         .expect("read timeout")
@@ -814,9 +843,14 @@ mod tests {
             .expect("accept");
         let listener_handle = acc["handle"].as_u64().unwrap();
         // drain the initial "hello" so listener's recv buffer is empty.
-        let drain = read_message(HandleArgs { handle: listener_handle }, &listener_registry)
-            .await
-            .expect("drain");
+        let drain = read_message(
+            HandleArgs {
+                handle: listener_handle,
+            },
+            &listener_registry,
+        )
+        .await
+        .expect("drain");
         assert_eq!(
             drain["data"].as_str().unwrap(),
             B64.encode(b"hello"),
@@ -830,7 +864,9 @@ mod tests {
         let read_dialer_registry = dialer_registry.clone();
         let parked_read = tokio::spawn(async move {
             read_message(
-                HandleArgs { handle: dialer_handle },
+                HandleArgs {
+                    handle: dialer_handle,
+                },
                 &read_dialer_registry,
             )
             .await
@@ -854,12 +890,19 @@ mod tests {
             write_result.is_ok(),
             "write_message timed out while a read was parked on the same handle - global lock deadlock regression",
         );
-        write_result.unwrap().expect("concurrent write should succeed");
+        write_result
+            .unwrap()
+            .expect("concurrent write should succeed");
 
         // listener should now see the second write.
         let resp = tokio::time::timeout(
             Duration::from_secs(5),
-            read_message(HandleArgs { handle: listener_handle }, &listener_registry),
+            read_message(
+                HandleArgs {
+                    handle: listener_handle,
+                },
+                &listener_registry,
+            ),
         )
         .await
         .expect("listener read timeout")
