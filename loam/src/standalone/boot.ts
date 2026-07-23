@@ -43,7 +43,7 @@ import type { RoleResolver } from "../p2p/acl-filtering-network-adapter";
 import { createCanvasScopedSharePolicy } from "../p2p/canvas-scoped-share-policy";
 import { decodeShareString, encodeShareString } from "../p2p/share-string";
 import { resolveFriendDisplay, SqliteSocialDoc } from "../p2p/sqlite-social-doc";
-import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
+import { dispatch, isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
 import { createSkeinHarness, type SkeinHarnessNoStore } from "../harness/skein-harness";
 import { syncCanvasMetadataToCards, watchCanvasDocsForUpdates } from "./canvas-watchers";
@@ -59,6 +59,7 @@ import { socialSchema } from "../../widgets/narthex/social/schema";
 import { messagezWidget, messagezSchema } from "../../widgets/narthex/messagez-widget";
 import type { MessagezState } from "../../widgets/narthex/messagez-widget";
 import { canvasInfoWidget, canvasInfoSchema } from "../../widgets/canvas-info";
+import { peedeeeffWidget } from "../../widgets/peedeeeff/index";
 import {
   WidgetOverlay,
   SOCIAL_OVERLAY_W,
@@ -269,6 +270,23 @@ class SkeinRouter {
       }
     }
     this.anonDeviceId = await getOrCreateAnonDeviceId();
+
+    // peedeeeff (pdf viewer) needs the rust-side `magick` binary to render
+    // pages — hide it from the flyout entirely when it's missing, rather
+    // than letting users add a widget that can never render anything. only
+    // relevant in tauri mode (browser mode already hides it via
+    // `tauriOnly`). best-effort: a dispatch failure here must not block
+    // boot, so peedeeeff just stays visible and fails per-widget instead.
+    if (isTauriMode()) {
+      try {
+        const result = await dispatch("pdf_check_available");
+        if (!result?.available) {
+          peedeeeffWidget.metadata.hidden = true;
+        }
+      } catch (err) {
+        log.debug(TAG, "pdf_check_available dispatch failed (non-fatal):", err);
+      }
+    }
 
     // resolve or create the narthex document id
     this.narthexDocId = await getMetaValue(NARTHEX_DOC_KEY);
