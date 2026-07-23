@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(desktop)]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::Listener;
 use tauri::Manager;
@@ -163,74 +164,82 @@ pub fn run() {
     // arc-clone the hub slot so the close-requested handler can shut it down.
     let hub_slot = app_state.hub.clone();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_shell::init());
+
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
+
+    builder
         .manage(app_state)
         .manage(runtime)
         .invoke_handler(tauri::generate_handler![commands::skein_dispatch])
         .setup(move |app| {
             // -- app menu with settings shortcut (cmd+, / ctrl+,) ----------
-            let settings_item = MenuItemBuilder::with_id("open_settings", "Settings...")
-                .accelerator("CmdOrCtrl+,")
-                .build(app)?;
-            let about = PredefinedMenuItem::about(app, Some("About skein"), None)?;
-            let services = PredefinedMenuItem::services(app, None)?;
-            let hide = PredefinedMenuItem::hide(app, None)?;
-            let hide_others = PredefinedMenuItem::hide_others(app, None)?;
-            let show_all = PredefinedMenuItem::show_all(app, None)?;
-            let separator1 = PredefinedMenuItem::separator(app)?;
-            let separator2 = PredefinedMenuItem::separator(app)?;
-            let separator3 = PredefinedMenuItem::separator(app)?;
-            let separator4 = PredefinedMenuItem::separator(app)?;
-            let quit = PredefinedMenuItem::quit(app, None)?;
+            // (desktop only: mobile has no window menu bar / menu events)
+            #[cfg(desktop)]
+            {
+                let settings_item = MenuItemBuilder::with_id("open_settings", "Settings...")
+                    .accelerator("CmdOrCtrl+,")
+                    .build(app)?;
+                let about = PredefinedMenuItem::about(app, Some("About skein"), None)?;
+                let services = PredefinedMenuItem::services(app, None)?;
+                let hide = PredefinedMenuItem::hide(app, None)?;
+                let hide_others = PredefinedMenuItem::hide_others(app, None)?;
+                let show_all = PredefinedMenuItem::show_all(app, None)?;
+                let separator1 = PredefinedMenuItem::separator(app)?;
+                let separator2 = PredefinedMenuItem::separator(app)?;
+                let separator3 = PredefinedMenuItem::separator(app)?;
+                let separator4 = PredefinedMenuItem::separator(app)?;
+                let quit = PredefinedMenuItem::quit(app, None)?;
 
-            let app_submenu = SubmenuBuilder::new(app, "skein")
-                .item(&about)
-                .item(&separator1)
-                .item(&settings_item)
-                .item(&separator2)
-                .item(&services)
-                .item(&separator3)
-                .item(&hide)
-                .item(&hide_others)
-                .item(&show_all)
-                .item(&separator4)
-                .item(&quit)
-                .build()?;
+                let app_submenu = SubmenuBuilder::new(app, "skein")
+                    .item(&about)
+                    .item(&separator1)
+                    .item(&settings_item)
+                    .item(&separator2)
+                    .item(&services)
+                    .item(&separator3)
+                    .item(&hide)
+                    .item(&hide_others)
+                    .item(&show_all)
+                    .item(&separator4)
+                    .item(&quit)
+                    .build()?;
 
-            // edit submenu — required for cmd+c/v/x/a accelerators to reach
-            // the webview text inputs on macos.
-            let undo = PredefinedMenuItem::undo(app, None)?;
-            let redo = PredefinedMenuItem::redo(app, None)?;
-            let edit_sep = PredefinedMenuItem::separator(app)?;
-            let cut = PredefinedMenuItem::cut(app, None)?;
-            let copy = PredefinedMenuItem::copy(app, None)?;
-            let paste = PredefinedMenuItem::paste(app, None)?;
-            let select_all = PredefinedMenuItem::select_all(app, None)?;
-            let edit_submenu = SubmenuBuilder::new(app, "Edit")
-                .item(&undo)
-                .item(&redo)
-                .item(&edit_sep)
-                .item(&cut)
-                .item(&copy)
-                .item(&paste)
-                .item(&select_all)
-                .build()?;
+                // edit submenu — required for cmd+c/v/x/a accelerators to reach
+                // the webview text inputs on macos.
+                let undo = PredefinedMenuItem::undo(app, None)?;
+                let redo = PredefinedMenuItem::redo(app, None)?;
+                let edit_sep = PredefinedMenuItem::separator(app)?;
+                let cut = PredefinedMenuItem::cut(app, None)?;
+                let copy = PredefinedMenuItem::copy(app, None)?;
+                let paste = PredefinedMenuItem::paste(app, None)?;
+                let select_all = PredefinedMenuItem::select_all(app, None)?;
+                let edit_submenu = SubmenuBuilder::new(app, "Edit")
+                    .item(&undo)
+                    .item(&redo)
+                    .item(&edit_sep)
+                    .item(&cut)
+                    .item(&copy)
+                    .item(&paste)
+                    .item(&select_all)
+                    .build()?;
 
-            let menu = MenuBuilder::new(app)
-                .item(&app_submenu)
-                .item(&edit_submenu)
-                .build()?;
-            app.set_menu(menu)?;
+                let menu = MenuBuilder::new(app)
+                    .item(&app_submenu)
+                    .item(&edit_submenu)
+                    .build()?;
+                app.set_menu(menu)?;
 
-            app.on_menu_event(|app, event| {
-                if event.id().as_ref() == "open_settings" {
-                    show_settings_window(app);
-                }
-            });
+                app.on_menu_event(|app, event| {
+                    if event.id().as_ref() == "open_settings" {
+                        show_settings_window(app);
+                    }
+                });
+            }
 
             // intercept close on the settings window: hide instead of destroy
             // so the menu/shortcut can re-show it without recreating state.
@@ -266,6 +275,8 @@ pub fn run() {
 
 /// show + focus the pre-declared settings window. logs on failure but never
 /// panics — the menu shortcut should always feel responsive.
+/// (desktop only: only ever called from the desktop-only menu-event handler.)
+#[cfg(desktop)]
 fn show_settings_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     match app.get_webview_window("settings") {
         Some(win) => {

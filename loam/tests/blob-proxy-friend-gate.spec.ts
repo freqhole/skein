@@ -1,45 +1,41 @@
 /**
- * skein/1 friend-gate e2e coverage.
+ * `freqhole/1` (ensure_blob) access-gate e2e coverage.
  *
- * background: reliquary's `skein/1` ALPN (blob-proxy / `ensure_blob`,
- * `reliquary/src/protocol/blob_proxy.rs`) used to have **zero access
- * control of any kind** — any peer who could dial it could probe for a
- * blake3 hash's existence and trigger a local `FsStore` import-by-reference
- * (an existence-leak + import-trigger, though it never leaked actual bytes
- * on its own — that's the separately-gated `iroh-blobs/*` ALPN, see
- * `blob_acl.rs`). `BlobProxyHandler::accept()` now rejects a non-friend
- * peer up front, before the bidirectional stream loop even starts (see
- * `docs/widget-blob-acl-plan.md` section 3.5).
+ * background: reliquary's shared `ensure_blob` protocol handler
+ * (`freqhole_reliquary::ensure::EnsureBlobHandler`, wired up as the
+ * `freqhole/1` ALPN in `tumulus/src/protocol/blob_proxy.rs`) accepts every
+ * connection unconditionally — access control is gated per-request instead,
+ * inside `ensure()`, via an injected `AccessGate` (skein's `FriendGate`,
+ * gating on hub-friend status). a non-friend peer can still open the QUIC
+ * connection; every individual `ensure_blob` request over it is still
+ * checked and denied before any blob lookup happens.
  *
  * `blob-sync.spec.ts` already proves the *positive* case end-to-end (a
- * friended peer's hub successfully snatches a blob over `skein/1` via the
- * real `BlobSnatcher` pipeline) — every hub e2e test always calls
+ * friended peer's hub successfully snatches a blob over `freqhole/1` via
+ * the real `BlobSnatcher` pipeline) — every hub e2e test always calls
  * `hub.friendAllow(peer.nodeId)` before doing anything, so none of them
  * exercise the *rejection* path. this file is specifically about that gap.
  *
- * approach chosen (direct dial, not hub-initiates-a-snatch): dial `skein/1`
- * directly via midden's `download_verified_with_ensure` (already exposed
- * as `bridge.p2p.fetchBlob()`, the same test-only bridge method
- * `blob-acl.spec.ts` uses) rather than reproducing the full
+ * approach chosen (direct dial, not hub-initiates-a-snatch): dial
+ * `freqhole/1` directly via midden's `download_verified_with_ensure`
+ * (already exposed as `bridge.p2p.fetchBlob()`, the same test-only bridge
+ * method `blob-acl.spec.ts` uses) rather than reproducing the full
  * "hub-initiates-a-snatch" pipeline (real canvas, real widget, waiting out
  * `BlobSnatcher`'s poll interval). `download_verified_with_ensure` always
- * calls `ensure_blob()` internally, which dials the target peer's `skein/1`
- * ALPN directly (`connect_to_peer` in `midden/src/lib.rs` always connects
- * with `SKEIN_ALPN`) — completely independent of automerge-repo sync or
- * canvas membership. investigated both angles; this one is simpler, more
- * reliable (no polling interval to wait out, no canvas/widget setup at
- * all), and needed zero new production or test-bridge code, since
- * `fetchBlob()` already dials exactly the ALPN under test.
+ * calls `ensure_blob()` internally, which dials the target peer's
+ * `freqhole/1` ALPN directly — completely independent of automerge-repo
+ * sync or canvas membership. investigated both angles; this one is
+ * simpler, more reliable (no polling interval to wait out, no
+ * canvas/widget setup at all), and needed zero new production or
+ * test-bridge code, since `fetchBlob()` already dials exactly the ALPN
+ * under test.
  *
  * the blake3 hash used below is a fake, non-existent one on purpose — the
- * friend gate rejects the connection *before* any blob lookup happens, so
- * a real blob isn't needed to prove rejection. for the companion "friended
- * peer" case, the same fake hash lets us prove the request genuinely
- * reached the hub's `ensure_blob` handler (a real, deterministic
- * "blob ... not available on peer" application-level error) rather than
- * being rejected at the connection level — a clean way to distinguish "got
- * past the friend gate" from "actually has the blob", without needing a
- * full blob-transfer round trip (already covered by blob-sync.spec.ts).
+ * client-visible error message can't distinguish "denied by the access
+ * gate" from "genuinely doesn't have this blob" (midden collapses both
+ * into the same "blob ... not available on peer" message), so both tests
+ * below assert on the hub's own log output (`ensure: denied by access
+ * gate`) rather than the client error text to tell the two cases apart.
  *
  * tag: @hub
  * run with: npx playwright test tests/blob-proxy-friend-gate.spec.ts --workers=1
@@ -53,16 +49,16 @@ import { startReliquaryHub, type ReliquaryHubHandle } from "./helpers/reliquary-
 const FAKE_BLAKE3_HASH = "0".repeat(64);
 
 /**
- * dial `peerNodeId`'s `skein/1` ALPN directly (via midden's
+ * dial `peerNodeId`'s `freqhole/1` ALPN directly (via midden's
  * `download_verified_with_ensure`, exposed as `bridge.p2p.fetchBlob()`) and
  * return the final caught error's message. retries a handful of times to
  * absorb the same cold-dial relay-discovery lag documented on
  * `IrohNetworkAdapter.openBiWithRetry()` / `blob-acl.spec.ts`'s
- * `fetchBlobWithRetry` — `ensure_blob`'s own `connect_to_peer` has no retry
- * of its own. throws if the call unexpectedly succeeds (it never should in
- * either test below — the fake hash doesn't exist, so a friended peer
- * still gets an application-level "not available" error, and a non-friend
- * gets rejected before any lookup happens).
+ * `fetchBlobWithRetry` — `ensure_blob`'s own connect has no retry of its
+ * own. throws if the call unexpectedly succeeds (it never should in either
+ * test below — the fake hash doesn't exist, so both a friended and a
+ * non-friend peer always get an error, just for different reasons that
+ * only the hub's own log can tell apart).
  */
 async function dialSkeinAlpn(
   page: Page,
@@ -95,7 +91,7 @@ async function dialSkeinAlpn(
   return lastMessage ?? "";
 }
 
-test.describe("reliquary skein/1 friend gate @hub", () => {
+test.describe("reliquary freqhole/1 ensure_blob access gate @hub", () => {
   let hub: ReliquaryHubHandle | undefined;
 
   test.afterEach(async () => {
@@ -103,7 +99,7 @@ test.describe("reliquary skein/1 friend gate @hub", () => {
     hub = undefined;
   });
 
-  test("hub rejects a non-friend peer's skein/1 request before any blob lookup @hub", async ({
+  test("hub rejects a non-friend peer's ensure_blob request before any blob lookup @hub", async ({
     p2pPage,
   }) => {
     test.setTimeout(90_000);
@@ -114,20 +110,17 @@ test.describe("reliquary skein/1 friend gate @hub", () => {
     // deliberately skip hub.friendAllow() — this peer is unknown to the hub.
     const errorMessage = await dialSkeinAlpn(peer.page, hub.nodeId, FAKE_BLAKE3_HASH);
 
-    // rejected at the connection level, not the "blob not found"
-    // application-level error a friended peer gets (see the companion test
-    // below) — proves the gate fires before any blob lookup.
+    // some error either way (the fake hash doesn't exist regardless of
+    // friend status) — the hub's own log is what actually proves the gate
+    // fired, since the client-visible message is identical either way.
     expect(errorMessage.length).toBeGreaterThan(0);
-    expect(errorMessage).not.toMatch(/not available on peer/);
 
-    // the deterministic, server-side signal.
     await expect
       .poll(() => hub!.getLog(), { timeout: 15_000 })
-      .toContain("skein/1: rejecting non-friend peer");
-    expect(hub.getLog()).not.toContain("skein/1: accepted connection");
+      .toContain("ensure: denied by access gate");
   });
 
-  test("hub accepts a friended peer's skein/1 connection (still real access control, not a bypass) @hub", async ({
+  test("hub accepts a friended peer's ensure_blob request past the access gate (still real access control, not a bypass) @hub", async ({
     p2pPage,
   }) => {
     test.setTimeout(90_000);
@@ -137,16 +130,14 @@ test.describe("reliquary skein/1 friend gate @hub", () => {
 
     await hub.friendAllow(peer.nodeId);
 
-    // the request genuinely reaches the hub's `ensure_blob` handler this
-    // time — it fails only because the (fake) hash doesn't exist, a
-    // completely different, application-level error from the non-friend
-    // case above.
+    // the request genuinely reaches the blob lookup this time — it fails
+    // only because the (fake) hash doesn't exist, a completely different,
+    // application-level outcome from the non-friend case above (proven via
+    // the hub log below, since the client-visible error text is identical
+    // either way).
     const errorMessage = await dialSkeinAlpn(peer.page, hub.nodeId, FAKE_BLAKE3_HASH);
     expect(errorMessage).toMatch(/not available on peer/);
 
-    await expect
-      .poll(() => hub!.getLog(), { timeout: 15_000 })
-      .toContain("skein/1: accepted connection");
-    expect(hub.getLog()).not.toContain("skein/1: rejecting non-friend peer");
+    expect(hub.getLog()).not.toContain("ensure: denied by access gate");
   });
 });
