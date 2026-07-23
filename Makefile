@@ -103,10 +103,14 @@ deps-pub: ## switch loam + cargo haruspex/reliquary deps to published npm/git-ta
 # bumps every place skein pins a tomb/lib version in one go: the git tag
 # rust crates track (scripts/toggle-cargo-deps.mjs's GIT_TAG constant, plus
 # tumulus/Cargo.toml + tauri/Cargo.toml if currently in git mode) and the
-# npm version range loam's @freqhole/{haruspex,midden,reliquary} deps track.
-# run this once the new tomb/lib version is actually published (tagged +
-# npm-published), then re-run `make deps-pub` (or `npm install`/`cargo
-# check` directly) to pull it in.
+# npm version range loam's @freqhole/{haruspex,midden,reliquary} deps track
+# (loam/package.json + loam/scripts/toggle-deps.mjs's own npm constants,
+# kept in lockstep so a later local->npm toggle doesn't regress the
+# version). scripts/bump-tomb-deps.mjs runs `npm install` in loam/ itself,
+# so package-lock.json is already refreshed by the time this returns - run
+# this once the new tomb/lib version is actually published (tagged +
+# npm-published). if any cargo deps are currently in git mode, run `cargo
+# check` (or the usual build) afterward to refresh Cargo.lock too.
 bump-tomb-deps: ## bump skein's pinned tomb/lib versions, npm + cargo git tag (NEW_VERSION=x.y.z, or prompts)
 	@current=$$(grep -o 'GIT_TAG = "v[^"]*"' scripts/toggle-cargo-deps.mjs | sed 's/GIT_TAG = "v//;s/"//'); \
 	ver="$(NEW_VERSION)"; \

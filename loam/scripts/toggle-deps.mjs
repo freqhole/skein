@@ -18,15 +18,15 @@ const packageJsonPath = path.resolve(dirname, "..", "package.json");
 // midden lives under tomb/lib/midden (not its own top-level sibling repo).
 const packages = {
     "@freqhole/haruspex": {
-        npm: "^0.2.1",
+        npm: "^0.2.2",
         local: "file:../../haruspex/ts",
     },
     "@freqhole/midden": {
-        npm: "^0.2.1",
+        npm: "^0.2.2",
         local: "file:../../tomb/lib/midden/pkg",
     },
     "@freqhole/reliquary": {
-        npm: "^0.2.1",
+        npm: "^0.2.2",
         local: "file:../../reliquary/ts",
     },
 };
