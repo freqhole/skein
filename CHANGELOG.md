@@ -1,5 +1,13 @@
 # skein
 
+## 0.1.3
+
+### Patch Changes
+
+- a171601: `x` to close dismissible widgetz; check friend online status again on profile view; disable manage hub btn if hub is offline;
+- 7fc12f0: add hyperlinkz to markdown parser
+- e476b23: fix audio+voice recordingz tauri blob storage bugz; fix peedeeeff magick path issuez
+
 ## 0.1.2
 
 ### Patch Changes
