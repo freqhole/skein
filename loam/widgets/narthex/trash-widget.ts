@@ -90,6 +90,7 @@ export const trashWidget: WidgetFactory<typeof trashSchema> = {
     defaultHeight: 240,
     unique: true, // only one trash widget per canvas — hidden from flyout when present
     preserveChildren: true, // closing the trash un-parents cards back to the narthex
+    closable: true, // shows a header "x" button for quick dismissal
   },
 
   schema: trashSchema,

@@ -95,6 +95,8 @@ export class WidgetFrame {
   private _layerTotal = 0;
   private readonly collapseBtn: Container;
   private readonly maximizeBtn: Container;
+  private readonly closeBtn: Container;
+  private _closable = false;
   private readonly contentMask: Graphics;
   private readonly editOverlay: Graphics;
   private readonly resizeHandles: Map<HandlePosition, Graphics> = new Map();
@@ -245,6 +247,12 @@ export class WidgetFrame {
     this.maximizeBtn = this.createHeaderButton("\u2922", theme);
     this.header.addChild(this.maximizeBtn);
 
+    // close button — only shown for "dismissable" widgets (metadata.closable),
+    // see setClosable(). sits between maximize and the hamburger flyout.
+    this.closeBtn = this.createHeaderButton("\u00d7", theme);
+    this.closeBtn.visible = false;
+    this.header.addChild(this.closeBtn);
+
     // hamburger button — opens a flyout with z-order controls and overflow actions
     this.hamburgerBtn = this.createHeaderButton("\u2261", theme);
     this.header.addChild(this.hamburgerBtn);
@@ -384,6 +392,14 @@ export class WidgetFrame {
     this.updateCollapseButton();
     this.updateVisualState();
     this.draw();
+  }
+
+  /** show or hide the header close ("x") button for "dismissable" widgets
+   *  (metadata.closable). set once at mount time by the widget manager. */
+  setClosable(closable: boolean): void {
+    this._closable = closable;
+    this.updateVisualState();
+    this.positionButtons();
   }
 
   /** enter or leave maximized state. when maximized, chrome (header, border,
@@ -577,8 +593,9 @@ export class WidgetFrame {
     const btnSize = this.theme.frameHeaderHeight - 8;
     const btnSlot = btnSize + 4; // width of one system button slot
 
-    // position system buttons from right to left, skipping hidden ones
-    const systemButtons = [this.hamburgerBtn, this.maximizeBtn, this.collapseBtn];
+    // position system buttons from right to left, skipping hidden ones.
+    // closeBtn sits between the hamburger flyout and the maximize button.
+    const systemButtons = [this.hamburgerBtn, this.closeBtn, this.maximizeBtn, this.collapseBtn];
     let btnX = w;
     let visibleSystemCount = 0;
     for (const btn of systemButtons) {
@@ -900,6 +917,10 @@ export class WidgetFrame {
   private startDrag(e: FederatedPointerEvent): void {
     if (this._destroyed) return;
     if (this.callbacks.isReadOnly?.()) return;
+    // the flyout is reparented onto the world container while open (see
+    // showHamburgerFlyout()) so it renders above the property tray - it
+    // won't track this widget's position during a drag, so just close it.
+    this.hideHamburgerFlyout();
     this.dragging = true;
     this.dragStartGlobal = { x: e.global.x, y: e.global.y };
     this.dragStartLocal = { x: this.root.x, y: this.root.y };
@@ -979,6 +1000,15 @@ export class WidgetFrame {
       } else {
         this.callbacks.onMaximize?.();
       }
+    });
+
+    // close button
+    const closeBg = this.closeBtn.getChildAt(0) as Graphics;
+    closeBg.eventMode = "static";
+    closeBg.cursor = "pointer";
+    closeBg.on("pointertap", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      this.callbacks.onClose();
     });
   }
 
@@ -1146,7 +1176,10 @@ export class WidgetFrame {
     const hasOverflow = this.overflowActions.length > 0;
 
     const flyout = new Container();
-    flyout.zIndex = 1000;
+    // rendered above PropertyTray (world.zIndex 99999, see property-tray.ts)
+    // so the flyout is never hidden behind the selected widget's property
+    // sidebar - see the reparenting onto `world` at the end of this method.
+    flyout.zIndex = 100010;
 
     // large invisible blocker to dismiss on outside click
     const blocker = new Graphics();
@@ -1351,13 +1384,30 @@ export class WidgetFrame {
     panel.addChild(statusText);
 
     this.hamburgerFlyout = flyout;
-    this.root.addChild(flyout);
+
+    // reparent onto the same container as this widget's root (`world`)
+    // instead of adding as a child of `root` itself. `root`'s zIndex is
+    // this widget's own layer position among *other widgets*, which can
+    // be far below PropertyTray's zIndex (99999, always on top of
+    // widgets) - nesting the flyout inside `root` would cap it at that
+    // same low zIndex no matter what zIndex the flyout itself has. as a
+    // sibling of `root` under `world`, the flyout's own (much higher)
+    // zIndex is what determines its stacking, so it renders above the
+    // property tray. falls back to `root` if not yet mounted (e.g. tests).
+    const flyoutParent = this.root.parent;
+    if (flyoutParent) {
+      flyout.x = this.root.x;
+      flyout.y = this.root.y;
+      flyoutParent.addChild(flyout);
+    } else {
+      this.root.addChild(flyout);
+    }
   }
 
   /** hide and destroy the hamburger flyout */
   private hideHamburgerFlyout(): void {
     if (!this.hamburgerFlyout) return;
-    this.root.removeChild(this.hamburgerFlyout);
+    this.hamburgerFlyout.parent?.removeChild(this.hamburgerFlyout);
     this.hamburgerFlyout.destroy({ children: true });
     this.hamburgerFlyout = null;
   }
@@ -1402,6 +1452,7 @@ export class WidgetFrame {
       this.hamburgerBtn.visible = showHeader;
       this.collapseBtn.visible = false; // collapse doesn't make sense when maximized
       this.maximizeBtn.visible = showHeader && !!this.callbacks.onMaximize;
+      this.closeBtn.visible = showHeader && this._closable;
 
       // custom actions follow header
       for (const c of this.customActionContainers) {
@@ -1455,6 +1506,7 @@ export class WidgetFrame {
     this.hamburgerBtn.visible = showChrome;
     this.collapseBtn.visible = showChrome;
     this.maximizeBtn.visible = showChrome && !!this.callbacks.onMaximize;
+    this.closeBtn.visible = showChrome && this._closable;
 
     // custom action containers follow chrome visibility (positionButtons handles overflow)
     for (const c of this.customActionContainers) {

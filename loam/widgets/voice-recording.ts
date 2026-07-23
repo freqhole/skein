@@ -26,13 +26,7 @@
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { z } from "zod";
 import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
-import {
-  classifyDomain,
-  getBlobData,
-  getBlobRecord,
-  storeBlob,
-  storeBlobFromFile,
-} from "../src/storage/blob-store";
+import { getBlobData, storeBlobFromFile } from "../src/storage/blob-store";
 import { base64Encode } from "@freqhole/reliquary/worker";
 import {
   checkBlobLocality,
@@ -621,7 +615,11 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
 
         if (isTauriMode()) {
           // tauri: route through rust for real blake3 + iroh-blobs pre-warming.
-          // mirrors audio-recording's tauri branch and file-utils.ts uploadFile().
+          // mirrors audio-recording's tauri branch. no OPFS/IndexedDB mirror —
+          // tauri never reads blobs back through the browser blob-store, and a
+          // mirror write here was keyed under a bogus hash (the browser blake3
+          // hasher degrades to an empty string in a tauri build), which OPFS
+          // rejects outright — see audio-recording.ts's module doc comment.
           const buffer = await recordedBlob.arrayBuffer();
           const base64Data = await base64Encode(buffer);
           const response = (await dispatch("blob_insert", {
@@ -636,17 +634,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
             size: number;
           };
           const resolvedMime = response.mime || recMime;
-          // best-effort mirror into OPFS/IndexedDB so local getBlobData() reads keep working
-          const existingRecord = await getBlobRecord(response.blake3);
-          if (!existingRecord) {
-            await storeBlob(buffer, {
-              filename: response.filename || filename,
-              mime: resolvedMime,
-              blob_type: "original",
-              parent_blob_id: null,
-              metadata: { domain: classifyDomain(resolvedMime) },
-            });
-          }
           record = {
             blob_id: response.blake3,
             sha256: "",

@@ -21,13 +21,16 @@
 //   has no midden module bundled to hash with and always returns "" — so
 //   tauri recordings are routed through the rust `blob_insert` dispatch
 //   instead (real blake3 computed in rust, and the bytes get pre-warmed
-//   into the FsStore so iroh-blobs can actually serve them to peers), then
-//   best-effort mirrored into OPFS/IndexedDB via storeBlob() so local
-//   getBlobData() reads keep working — this exactly mirrors
-//   file-utils.ts's uploadFile() tauri branch. a real, user-reported bug:
-//   before this fix, a tauri-recorded clip's `d.blake3` was always empty,
-//   so a browser peer's snatch probe always reported "peer does not have
-//   the blob" (an empty-hash lookup can never match).
+//   into the FsStore so iroh-blobs can actually serve them to peers). no
+//   OPFS/IndexedDB mirror here — tauri never reads blobs back through the
+//   browser blob-store (media playback, locality checks, and preview data
+//   all go through rust dispatch calls like `blob_get_path`/`blob_get`),
+//   and a mirror write here was keyed under a bogus hash (the browser
+//   blake3 hasher degrades to an empty string in a tauri build), which
+//   OPFS rejects outright — that threw past the doc-metadata update below,
+//   so the recording succeeded in rust but the widget's document never
+//   recorded blobId/blake3/etc, exactly the file-utils.ts uploadFile() bug
+//   this mirrors the fix for.
 //   immediate post-record playback uses URL.createObjectURL() on the in-memory blob.
 //   restore-from-doc playback uses getBlobData() which reads OPFS first, then
 //   falls back to the rust-side blob_get dispatch in tauri mode.
@@ -48,13 +51,7 @@
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { z } from "zod";
 import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
-import {
-  classifyDomain,
-  getBlobData,
-  getBlobRecord,
-  storeBlob,
-  storeBlobFromFile,
-} from "../src/storage/blob-store";
+import { getBlobData, storeBlobFromFile } from "../src/storage/blob-store";
 import { base64Encode } from "@freqhole/reliquary/worker";
 import {
   checkBlobLocality,
@@ -909,8 +906,8 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         // tauri mode: route through rust so a real blake3 gets computed and
         // the bytes are pre-warmed into iroh-blobs' FsStore (servable to
         // peers) — see the module doc comment above for why the browser-
-        // mode storeBlobFromFile() path can't be used here. mirrors
-        // file-utils.ts's uploadFile() tauri branch.
+        // mode storeBlobFromFile() path can't be used here, and why there's
+        // no OPFS/IndexedDB mirror.
         let record: { blob_id: string; sha256: string; blake3: string; size: number; mime: string };
         if (isTauriMode()) {
           const buffer = await recordedBlob.arrayBuffer();
@@ -928,20 +925,6 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           };
 
           const resolvedMime = response.mime || recMime;
-
-          // best-effort mirror into OPFS/IndexedDB so local getBlobData()
-          // reads (restoring playback after a reload, without a round trip
-          // through rust) keep working — dedup on blake3, same as uploadFile().
-          const existingRecord = await getBlobRecord(response.blake3);
-          if (!existingRecord) {
-            await storeBlob(buffer, {
-              filename: response.filename || filename,
-              mime: resolvedMime,
-              blob_type: "original",
-              parent_blob_id: null,
-              metadata: { domain: classifyDomain(resolvedMime) },
-            });
-          }
 
           record = {
             blob_id: response.blake3,

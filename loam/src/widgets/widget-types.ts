@@ -318,6 +318,12 @@ export interface WidgetMetadata {
    *  defaults to true when omitted. set to false for widgets that should
    *  never fill the canvas (e.g. canvas cards). */
   maximizable?: boolean;
+  /** "dismissable" widgets show an "x" close button in the frame header
+   *  (between maximize and the layer flyout) that closes them directly,
+   *  without going through the property tray's delete action. use for
+   *  small utility panels the user expects to be able to quickly dismiss
+   *  (e.g. the trash can). defaults to false when omitted. */
+  closable?: boolean;
 }
 
 /**

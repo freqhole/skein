@@ -13,6 +13,7 @@ import {
   isProtocolReady,
   onBridgeReady,
   onOnlineChange,
+  probePeer,
   rejectFriendRequest,
   requestProfile,
   sendFriendRequest,
@@ -34,6 +35,7 @@ function createMockProtocol() {
     sendFriendAccept: vi.fn(async (_peerNodeId: string) => {}),
     sendFriendReject: vi.fn(async (_peerNodeId: string) => {}),
     requestProfile: vi.fn(async (_peerNodeId: string) => {}),
+    probePeer: vi.fn(async (_peerNodeId: string) => {}),
     setProfileVisibility: vi.fn((_v: string) => {}),
     setFriendRequestsFrom: vi.fn((_f: string) => {}),
   };
@@ -143,6 +145,10 @@ describe("friendz-bridge", () => {
     it("requestProfile() throws", async () => {
       await expect(requestProfile("peer-1")).rejects.toThrow("friendz bridge not initialized");
     });
+
+    it("probePeer() throws", async () => {
+      await expect(probePeer("peer-1")).rejects.toThrow("friendz bridge not initialized");
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -180,6 +186,14 @@ describe("friendz-bridge", () => {
 
       await requestProfile("peer-11");
       expect(mock.requestProfile).toHaveBeenCalledWith("peer-11");
+    });
+
+    it("probePeer() delegates to protocol.probePeer()", async () => {
+      const mock = createMockProtocol();
+      initBridge(asFriendzProtocol(mock));
+
+      await probePeer("peer-22");
+      expect(mock.probePeer).toHaveBeenCalledWith("peer-22");
     });
   });
 

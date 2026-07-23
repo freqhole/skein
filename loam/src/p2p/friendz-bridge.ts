@@ -230,6 +230,18 @@ export async function requestProfile(peerNodeId: string): Promise<void> {
   return protocol.requestProfile(peerNodeId);
 }
 
+/**
+ * send a one-shot heartbeat to a peer to actively re-check their online
+ * status (e.g. when opening their profile in the friends widget), rather
+ * than waiting for the next periodic heartbeat tick. if the peer is
+ * actually online it replies with its own heartbeat, which updates
+ * presence state and fires `onOnlineChange` subscribers.
+ */
+export async function probePeer(peerNodeId: string): Promise<void> {
+  if (!protocol) throw new Error("friendz bridge not initialized");
+  return protocol.probePeer(peerNodeId);
+}
+
 // ---------------------------------------------------------------------------
 // canvas invite actions (require bridge to be ready)
 // ---------------------------------------------------------------------------
