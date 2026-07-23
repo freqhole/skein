@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 // ---------------------------------------------------------------------------
-// friend sub-schemas (ported from friends-widget.ts)
+// friend sub-schemas
 // ---------------------------------------------------------------------------
 
 export const friendNodeIdSchema = z.object({
@@ -103,7 +103,7 @@ export const outboundFriendRequestSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
-// profile sub-schema (ported from profile-widget.ts)
+// profile sub-schema
 // ---------------------------------------------------------------------------
 
 export const profileSchema = z.object({

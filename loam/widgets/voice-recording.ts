@@ -17,7 +17,7 @@
 // animation loop lifecycle:
 //   recording  (mouthRafId)    — runs while recState === "recording"; reads mic AnalyserNode RMS
 //   playing    (playRafId)     — runs while recState === "playing"; reads playback AnalyserNode RMS
-//   idle twitch (idleRafId)    — rAF only during a 320ms pulse window; scheduled via idleTimeoutId
+//   at rest (idle/ready/error) — the mouth stays still; no animation runs.
 //
 // storage mirrors audio-recording exactly (same tauri/browser branches, same snatchedBy flow).
 // reused exports from audio-recording: resolveAudioBytes, addSnatcher, AudioBlobRef, ResolvedAudioBytes.
@@ -32,8 +32,8 @@ import {
   getBlobRecord,
   storeBlob,
   storeBlobFromFile,
-} from "../src/storage/skein-blob-store";
-import { base64Encode } from "../src/workers/blob-worker-client";
+} from "../src/storage/blob-store";
+import { base64Encode } from "@freqhole/reliquary/worker";
 import {
   checkBlobLocality,
   getLocalNodeId,
@@ -60,6 +60,8 @@ import {
   volumeToRawOpenness,
   computeRmsEnvelope,
   ENVELOPE_HZ,
+  type Mood,
+  type TeethStyle,
 } from "./voice-recording-mouth";
 
 // re-export pure helpers so tests can import from a single module
@@ -85,7 +87,7 @@ export const voiceRecordingSchema = z.object({
   /** recording duration in seconds */
   duration: z.number().default(0),
   /** widget background color; -1 = transparent */
-  bgColor: z.number().default(0x1e1e2e),
+  bgColor: z.number().default(-1),
   /** border color; -1 = transparent */
   borderColor: z.number().default(-1),
   /** border width in pixels; 0 = no border */
@@ -96,6 +98,15 @@ export const voiceRecordingSchema = z.object({
   lipsColor: z.number().default(0xc2455a),
   /** lip thickness, 1 (thin) .. 10 (plump). scales the lip band height. */
   lipThickness: z.number().default(5),
+  /** resting/animating mouth curvature: frown, neutral (default), or smile */
+  mouthMood: z.enum(["frown", "neutral", "smile"]).default("neutral"),
+  /** teeth row shape: a flat row (default) or one that hugs the mood curve */
+  teethStyle: z.enum(["straight", "curved"]).default("straight"),
+  /** cupid's bow prominence on the top lip, 0 (plain arc) .. 10 (fully pronounced) */
+  cupidBowAmount: z.number().default(4),
+  /** true once lipsColor/lipThickness have been randomized on first mount —
+   *  prevents re-randomizing on every later mount/reconnect */
+  lipsSeeded: z.boolean().default(false),
 });
 
 export type VoiceRecordingState = z.infer<typeof voiceRecordingSchema>;
@@ -139,6 +150,20 @@ function mimeToExt(mime: string): string {
   return "webm";
 }
 
+/** pick a random vivid lip color on init — mirrors doodle.ts's randomDoodleColor approach */
+function randomLipColor(): number {
+  const palette = [
+    0xc2455a, 0xdb2777, 0xe11d48, 0xf43f5e, 0xec4899, 0xd946ef, 0xef4444, 0xf97316, 0xfb7185,
+    0xbe185d, 0x9d174d, 0xa21caf, 0xc026d3, 0xe879f9, 0xfb923c,
+  ];
+  return palette[Math.floor(Math.random() * palette.length)];
+}
+
+/** pick a random lip thickness (1..10) on init */
+function randomLipThickness(): number {
+  return 1 + Math.floor(Math.random() * 10);
+}
+
 // ---------------------------------------------------------------------------
 // widget
 // ---------------------------------------------------------------------------
@@ -166,7 +191,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
   schema: voiceRecordingSchema,
   editableProps: [
     { key: "lipsColor", label: "lips color", type: "color" as const, default: 0xc2455a },
-    { key: "bgColor", label: "background", type: "color" as const, default: 0x1e1e2e },
+    { key: "bgColor", label: "background", type: "color" as const, default: -1 },
     { key: "borderColor", label: "border", type: "color" as const, default: -1 },
     { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
   ],
@@ -212,8 +237,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     // -- animation frame IDs --
     let mouthRafId: number | null = null;
     let playRafId: number | null = null;
-    let idleRafId: number | null = null;
-    let idleTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
     // -- mouth openness smooth value --
     let smoothOpenness = 0;
@@ -247,6 +270,16 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
 
     void enumerateDevices();
 
+    // randomize lip color/thickness once, the first time this widget is ever
+    // mounted — subsequent mounts (reload, reconnect) keep whatever was seeded.
+    if (!ctx.doc.current.lipsSeeded) {
+      ctx.doc.change((d) => {
+        d.lipsColor = randomLipColor();
+        d.lipThickness = randomLipThickness();
+        d.lipsSeeded = true;
+      });
+    }
+
     // -- pixi containers --
     const container = new Container();
     container.eventMode = "static";
@@ -265,7 +298,10 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       cw,
       ch,
       ctx.doc.current.lipsColor,
-      ctx.doc.current.lipThickness
+      ctx.doc.current.lipThickness,
+      ctx.doc.current.mouthMood as Mood,
+      ctx.doc.current.teethStyle as TeethStyle,
+      ctx.doc.current.cupidBowAmount
     );
 
     // pill button (hidden after first recording)
@@ -436,48 +472,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
 
     refresh();
 
-    // -- idle twitch animation --
-    // scheduled every 4-7s; runs a rAF loop only during the 320ms pulse window.
-    const scheduleIdleTwitch = (): void => {
-      if (destroyed) return;
-      const delay = 4000 + Math.random() * 3000;
-      idleTimeoutId = setTimeout(() => {
-        idleTimeoutId = null;
-        if (recState !== "idle" && recState !== "ready") return;
-        const start = performance.now();
-        const DURATION = 320;
-        const tick = (now: number): void => {
-          if (recState !== "idle" && recState !== "ready") {
-            idleRafId = null;
-            return;
-          }
-          const t = Math.min(1, (now - start) / DURATION);
-          smoothOpenness = Math.sin(t * Math.PI) * 0.065;
-          mouth.setOpenness(smoothOpenness);
-          if (t < 1) {
-            idleRafId = requestAnimationFrame(tick);
-          } else {
-            smoothOpenness = 0;
-            mouth.setOpenness(0);
-            idleRafId = null;
-            scheduleIdleTwitch();
-          }
-        };
-        idleRafId = requestAnimationFrame(tick);
-      }, delay);
-    };
-
-    const stopIdleAnim = (): void => {
-      if (idleTimeoutId !== null) {
-        clearTimeout(idleTimeoutId);
-        idleTimeoutId = null;
-      }
-      if (idleRafId !== null) {
-        cancelAnimationFrame(idleRafId);
-        idleRafId = null;
-      }
-    };
-
     // -- recording mouth animation --
     // reads RMS from mic AnalyserNode, smooths it, drives mouth openness + pulsing dot.
     const startRecordingAnim = (): void => {
@@ -575,7 +569,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       mediaRecorder.onstart = () => {
         recState = "recording";
         recStartTime = Date.now();
-        stopIdleAnim();
         startRecordingAnim();
         refresh();
         ctx.setHeaderActions?.(makeHeaderActions());
@@ -615,6 +608,13 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
 
       if (playbackUrl) URL.revokeObjectURL(playbackUrl);
       playbackUrl = URL.createObjectURL(recordedBlob);
+      // keep a copy of the raw bytes so ensurePlaybackEnvelope can decode
+      // them for the lip-sync envelope — without this, playing back a
+      // just-recorded (own) clip skips envelope computation entirely and
+      // the mouth never animates, since getPlaybackUrl() (which is where
+      // playbackBytes is normally set) short-circuits once playbackUrl is
+      // already populated.
+      playbackBytes = recordedBlob;
 
       try {
         let record: { blob_id: string; sha256: string; blake3: string; size: number; mime: string };
@@ -639,17 +639,12 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           // best-effort mirror into OPFS/IndexedDB so local getBlobData() reads keep working
           const existingRecord = await getBlobRecord(response.blake3);
           if (!existingRecord) {
-            await storeBlob(response.blake3, buffer, {
-              blob_id: response.blake3,
-              sha256: "",
-              blake3: response.blake3,
+            await storeBlob(buffer, {
               filename: response.filename || filename,
               mime: resolvedMime,
-              size: response.size,
-              domain: classifyDomain(resolvedMime),
               blob_type: "original",
               parent_blob_id: null,
-              metadata: {},
+              metadata: { domain: classifyDomain(resolvedMime) },
             });
           }
           record = {
@@ -661,7 +656,14 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           };
         } else {
           const file = new File([recordedBlob], filename, { type: recMime });
-          record = await storeBlobFromFile(file, "audio");
+          const fileRecord = await storeBlobFromFile(file, { metadata: { domain: "audio" } });
+          record = {
+            blob_id: fileRecord.blob_id,
+            sha256: fileRecord.sha256 ?? "",
+            blake3: fileRecord.blake3 || fileRecord.blob_id,
+            size: fileRecord.size,
+            mime: fileRecord.mime,
+          };
         }
 
         // recorder has the blob locally — register it as a snatcher immediately
@@ -685,7 +687,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
 
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
-      if (recState === "ready") scheduleIdleTwitch();
     };
 
     // -- playback logic --
@@ -796,7 +797,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           stopPlayAnim();
           refresh();
           ctx.setHeaderActions?.(makeHeaderActions());
-          scheduleIdleTwitch();
         };
       }
 
@@ -817,7 +817,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       }
 
       recState = "playing";
-      stopIdleAnim();
       startPlayAnim();
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
@@ -831,7 +830,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       stopPlayAnim();
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
-      scheduleIdleTwitch();
     };
 
     const deleteRecording = (): void => {
@@ -839,7 +837,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         audioEl?.pause();
         stopPlayAnim();
       }
-      stopIdleAnim();
       if (audioEl) {
         audioEl.src = "";
         audioEl = null;
@@ -865,7 +862,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       });
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
-      scheduleIdleTwitch();
     };
 
     // -- event handlers --
@@ -900,17 +896,19 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
 
     // -- doc subscription --
     const unsub = ctx.doc.on("change", () => {
-      const { blobId, lipsColor, lipThickness } = ctx.doc.current;
+      const { blobId, lipsColor, lipThickness, mouthMood, teethStyle, cupidBowAmount } = ctx.doc.current;
 
-      // live lip color/thickness sync — peers see changes immediately
+      // live lip color/thickness/mood/teeth-style sync — peers see changes immediately
       mouth.setLipsColor(lipsColor);
       mouth.setLipThickness(lipThickness);
+      mouth.setMood(mouthMood as Mood);
+      mouth.setTeethStyle(teethStyle as TeethStyle);
+      mouth.setCupidBowAmount(cupidBowAmount);
 
       if ((recState === "idle" || recState === "error") && blobId) {
         recState = "ready";
         refresh();
         ctx.setHeaderActions?.(makeHeaderActions());
-        scheduleIdleTwitch();
         return;
       }
 
@@ -919,13 +917,11 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           audioEl?.pause();
           stopPlayAnim();
         }
-        stopIdleAnim();
         smoothOpenness = 0;
         mouth.setOpenness(0);
         recState = "idle";
         refresh();
         ctx.setHeaderActions?.(makeHeaderActions());
-        scheduleIdleTwitch();
         return;
       }
 
@@ -937,9 +933,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     const widgetActions: WidgetAction[] = [
       { id: "delete-recording", label: "delete recording", onClick: deleteRecording },
     ];
-
-    // start idle twitches immediately on mount
-    if (recState === "idle" || recState === "ready") scheduleIdleTwitch();
 
     return {
       container,
@@ -955,9 +948,31 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           min: 1,
           max: 10,
         },
-        { key: "bgColor", label: "background", type: "color" as const, default: 0x1e1e2e },
+        { key: "bgColor", label: "background", type: "color" as const, default: -1 },
         { key: "borderColor", label: "border", type: "color" as const, default: -1 },
         { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
+        {
+          key: "mouthMood",
+          label: "mouth mood",
+          type: "select" as const,
+          options: ["frown", "neutral", "smile"],
+          default: "neutral",
+        },
+        {
+          key: "teethStyle",
+          label: "teeth style",
+          type: "select" as const,
+          options: ["straight", "curved"],
+          default: "straight",
+        },
+        {
+          key: "cupidBowAmount",
+          label: "cupid's bow",
+          type: "number" as const,
+          default: 4,
+          min: 0,
+          max: 10,
+        },
         {
           key: "deviceLabel",
           label: "input device",
@@ -970,7 +985,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         destroyed = true;
         stopRecordingAnim();
         stopPlayAnim();
-        stopIdleAnim();
         mediaRecorder?.stop();
         mediaStream?.getTracks().forEach((t) => t.stop());
         void audioCtx?.close();

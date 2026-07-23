@@ -8,15 +8,15 @@
  *
  * usage:
  *   const node = await TauriStreamNode.create();
- *   const stream = await node.open_bi(peerId, "skein-friendz/1");
+ *   const stream = await node.open_bi(peerId, "freqhole-friendz/1");
  *   await stream.write_message(data);
  *   const msg = await stream.read_message();
  */
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { BiStreamLike, MiddenStreamNode } from "./iroh-network-adapter";
-import { log } from "../utils/log";
+import type { BiStreamLike, MiddenStreamNode } from "@freqhole/reliquary/automerge";
+import { log } from "@freqhole/reliquary/utils";
 
 declare global {
   interface Window {
@@ -244,12 +244,11 @@ export class TauriStreamNode implements MiddenStreamNode {
   }
 
   /**
-   * skein/1 ensure_blob exchange — mirrors midden's `MiddenNode::ensure_blob`.
+   * skein/1 ensure_blob exchange: probe a peer to check if they have a blob.
    * dispatches to rust-side `blob_iroh_probe` which performs the whole
-   * open_bi + write + finish + read_to_end in a single native call. mirrors
-   * tomb's `p2p_probe_blob` / `PeerConnection::ensure_blob`. doing the
-   * exchange atomically in rust avoids the 4-IPC-round-trip race the
-   * previous JS-side fallback hit when the connection flapped mid-handshake.
+   * open_bi + write + finish + read_to_end in a single native call. doing the
+   * exchange atomically in rust avoids a multi-IPC-round-trip race when the
+   * connection flaps mid-handshake.
    */
   async ensure_blob(peer_addr: string, blake3_hash: string): Promise<boolean> {
     const resp = (await dispatch("blob_iroh_probe", {
@@ -263,11 +262,10 @@ export class TauriStreamNode implements MiddenStreamNode {
    * iroh-blobs verified download INTO THE NATIVE STORE — dispatches the
    * rust-side `blob_iroh_download`, which streams the blob into the local
    * FsStore and exports it straight to blobz's content-addressed layout.
-   * the bytes NEVER cross the IPC boundary (previously this returned the
-   * whole payload as base64: three full in-memory copies + 1.33x IPC).
+   * the bytes never cross the IPC boundary (all streaming happens native).
    * playback/serving read the file natively via blob_get_path / asset://.
    *
-   * real progress: the rust side emits throttled `blob-download-progress`
+   * progress reporting: the rust side emits throttled `blob-download-progress`
    * events ({ blake3, bytesDone, totalSize }) which map onto the
    * `on_progress(fraction)` callback here.
    *
@@ -340,8 +338,8 @@ export class TauriStreamNode implements MiddenStreamNode {
   }
 
   /**
-   * skein/1 proxy_request exchange — mirrors midden's `MiddenNode::proxy_request`.
-   * returns the `{status, body}` envelope where `body` is the raw response
+   * skein/1 proxy_request exchange: forward an HTTP-style request to a peer
+   * and return the `{status, body}` envelope where `body` is the raw response
    * string the peer's handler produced (typically JSON).
    */
   async proxy_request(

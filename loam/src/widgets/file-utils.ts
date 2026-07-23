@@ -8,7 +8,9 @@
  *
  * thumbnail fetching has a P2P fallback: when the blob isn't available
  * locally (e.g. a peer uploaded it), we proxy the thumbnail request
- * through connected canvas peers via p2p_proxy_request.
+ * through connected canvas peers via the node's proxy_request method (a
+ * skein/1 stream exchange, real for a tauri node - see tauri-transport.ts -
+ * and a no-op for a browser node, which has no working skein/1 sender).
  *
  * snatch: download a full blob from a canvas peer via iroh-blobs verified
  * transfer, then ingest it into the local grimoire (creating a media_blobz
@@ -26,7 +28,7 @@
  */
 
 import { dispatch, isTauriMode } from "../p2p/tauri-transport";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import { getStoredIdentity, getMiddenNode } from "../p2p/identity";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -37,31 +39,28 @@ import {
   getBlobRecord,
   getBlobObjectURL,
   storeBlob,
-  computeSha256,
   storeBlobFromFile,
   resolveBlob,
   getBlobData,
+  getBlobDomain,
   classifyDomain,
   deleteBlob,
-} from "../storage/skein-blob-store";
+} from "../storage/blob-store";
+import { generateThumbnailDataUrl as generateThumbnailDataUrlWorker } from "@freqhole/reliquary/worker";
 import {
-  base64Decode,
-  generateThumbnailDataUrl as generateThumbnailDataUrlWorker,
-  hashBlake3,
-} from "../workers/blob-worker-client";
+  discardPausedDownload as transferDiscardPausedDownload,
+  pauseSnatchDownload as transferPauseSnatchDownload,
+  snatchBlob as transferSnatchBlob,
+  snatchBlobToDisk as transferSnatchBlobToDisk,
+  type BlobCapableNode,
+  type SnatchInfo as TransferSnatchInfo,
+  type SnatchOptions as TransferSnatchOptions,
+} from "@freqhole/reliquary/transfer";
+import { ensureBlobOverAlpn } from "@freqhole/reliquary/ensure";
 
 const TAG = "file-utils";
 
 const PEER_TIMEOUT_MS = 8000;
-
-/** timeout for an actual blob transfer (strategies 2 + 3 of
- *  downloadBlobBytesFromPeer) — matches strategy 1's 10-minute allowance.
- *  these strategies previously used a bare 30s timeout, which is fine for
- *  small blobs but was too short for large files (multi-hundred-MB+),
- *  especially strategy 3's single-shot base64 JSON proxy_request fallback
- *  (used whenever the peer is a tauri app, since its rust backend doesn't
- *  accept the iroh-blobs ALPN that strategies 1/2 rely on). */
-const PEER_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 
 /** minimal extension -> mime guesser used when the tauri native file picker
  *  hands us only a path (no mime). intentionally tiny: just covers the file
@@ -241,43 +240,41 @@ export function isDownloadCancelled(err: unknown): boolean {
  * persistent store, pinned against gc — resume by calling snatchBlob again
  * with the same blake3 (only missing ranges transfer).
  *
- * browser mode pauses by downloadId (registered with the midden worker);
- * tauri mode pauses by blake3 (the native download registry key).
- * returns true when an in-flight download was actually flagged.
+ * browser mode pauses by downloadId, delegating to the transport package's
+ * own `pauseSnatchDownload` against the midden node. tauri mode pauses by
+ * blake3 (the native download registry key) — that path has no equivalent
+ * in the package (its contract is browser-only) and stays exactly as
+ * skein's own tauri IPC call. returns true when an in-flight download was
+ * actually flagged.
  */
 export async function pauseSnatchDownload(opts: {
   downloadId?: string;
   blake3?: string | null;
 }): Promise<boolean> {
-  const node = (await getMiddenNode()) as any;
   if (isTauriMode()) {
+    const node = (await getMiddenNode()) as any;
     if (opts.blake3 && typeof node.cancel_native_download === "function") {
       return (await node.cancel_native_download(opts.blake3)) === true;
     }
     return false;
   }
-  if (opts.downloadId && typeof node.download_cancel === "function") {
-    return (await node.download_cancel(opts.downloadId)) === true;
-  }
-  return false;
+  if (!opts.downloadId) return false;
+  const node = (await getMiddenNode()) as unknown as BlobCapableNode;
+  return transferPauseSnatchDownload(node, opts.downloadId);
 }
 
 /**
  * discard a paused partial: releases the gc pin that a paused download left
  * behind so the store can reclaim the partial data. browser mode only
  * (tauri's FsStore keeps partials on disk; harmless). call when the user
- * cancels for good rather than pausing.
+ * cancels for good rather than pausing. delegates to the transport
+ * package's own `discardPausedDownload`, which is already best-effort
+ * (failures are logged, never thrown).
  */
 export async function discardPausedDownload(blake3: string | null | undefined): Promise<void> {
   if (!blake3 || isTauriMode()) return;
-  try {
-    const node = (await getMiddenNode()) as any;
-    if (typeof node.unprotect_blob === "function") {
-      await node.unprotect_blob(blake3);
-    }
-  } catch (err) {
-    log.debug(TAG, "discardPausedDownload failed (non-fatal):", err);
-  }
+  const node = (await getMiddenNode()) as unknown as BlobCapableNode;
+  await transferDiscardPausedDownload(node, blake3);
 }
 
 /** options for file upload */
@@ -338,6 +335,39 @@ async function getPeerNodeIds(
   return Object.values(peers)
     .map((p) => String(p.nodeId))
     .filter((id): id is string => Boolean(id) && id !== localNodeId);
+}
+
+// ---------------------------------------------------------------------------
+// @freqhole/reliquary/transfer adapter glue
+// ---------------------------------------------------------------------------
+
+/** translate a widget-shaped blob descriptor into the transport package's
+ *  own shape: `blobId` becomes the optional, app-addressable `id` (used
+ *  only to build the strategy-3 proxy path), everything else carries over
+ *  unchanged. */
+function toTransferSnatchInfo(info: SnatchBlobInfo): TransferSnatchInfo {
+  return { id: info.blobId, blake3: info.blake3, size: info.size, mime: info.mime };
+}
+
+/** translate widget-facing snatch options into the transport package's own
+ *  option shape, wiring the skein/1 proxy fallback (strategy 3, used for
+ *  tauri peers whose rust backend only accepts the skein/1 ALPN) to the
+ *  exact envelope skein-handler sends: `{ success, data: { data, mime } }`. */
+function toTransferOptions(options?: SnatchOptions): TransferSnatchOptions {
+  return {
+    onProgress: options?.onProgress,
+    signal: options?.signal,
+    downloadId: options?.downloadId,
+    proxyPath: (id) => `/api/blobs/${id}/data`,
+    parseProxyResponse: (body) => {
+      const parsed = JSON.parse(body) as {
+        success?: boolean;
+        data?: { data?: string; mime?: string };
+      };
+      if (!parsed.success || typeof parsed.data?.data !== "string") return null;
+      return { data: parsed.data.data, mime: parsed.data.mime };
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -589,12 +619,6 @@ async function snatchBlobUncached(
     throw new Error("no peers available for snatch");
   }
 
-  // phase 1: find the best peer via parallel probing.
-  // phase 2: download from the winner.
-  // if download fails, exclude that peer and repeat.
-  let remaining = [...allPeerAddrs];
-  let lastError: unknown;
-
   // tauri: short-circuit if the blob already exists in the local rust
   // blobz store under the same blake3 — no need to round-trip P2P. the
   // freqhole-era `api_call("/api/blob_metadata_by_blake3")` path doesn't
@@ -628,46 +652,30 @@ async function snatchBlobUncached(
     }
   }
 
-  while (remaining.length > 0) {
-    if (options?.signal?.aborted) {
-      throw new DOMException("snatch cancelled", "AbortError");
-    }
-
-    // --- phase 1: parallel probe to find a responsive peer with the blob ---
-    const bestPeer = await probePeersForBlob(info, remaining, options);
-
-    if (!bestPeer) {
-      throw new Error("no peer has the blob (all probes failed)");
-    }
-
-    // --- phase 2: download from the best peer ---
-    const peerIndex = allPeerAddrs.indexOf(bestPeer);
-    const isOnline = options?.isPeerOnline?.(bestPeer) ?? false;
-    options?.onPeerAttempt?.(peerIndex, allPeerAddrs.length, isOnline);
-
-    log.debug(
-      TAG,
-      `probe winner: ${bestPeer.slice(0, 16)}... (${isOnline ? "connected" : "responded to probe"}), starting download`
-    );
-
-    try {
-      // both browser midden and TauriStreamNode satisfy the snatch contract
-      // (download_verified_* on midden, proxy_request fallback on tauri).
-      // the freqhole-era `snatchFromTauriPeer` referenced commands that do
-      // not exist in skein's tauri shell.
-      const result = await snatchFromBrowserPeer(info, bestPeer, options);
-      return result;
-    } catch (err) {
-      // a deliberate pause propagates immediately — never next-peer retry
-      if (isDownloadCancelled(err)) throw err;
-      lastError = err;
-      log.debug(TAG, `download from probed peer ${bestPeer.slice(0, 16)}... failed:`, err);
-      remaining = remaining.filter((p) => p !== bestPeer);
-      continue;
-    }
+  if (options?.signal?.aborted) {
+    throw new DOMException("snatch cancelled", "AbortError");
   }
 
-  throw lastError ?? new Error("snatch failed: all peers exhausted");
+  // probe every peer once up front (parallel), then hand the whole
+  // available/ordered list to the transport package in a single call — its
+  // own per-peer retry loop already tries each peer's full download in
+  // order, falling through to the next on a non-cancelled failure.
+  const availablePeers = await probeAllPeersForBlob(info, allPeerAddrs, options);
+  if (availablePeers.length === 0) {
+    throw new Error("no peer has the blob (all probes failed)");
+  }
+
+  const winner = availablePeers[0]!;
+  const winnerOnline = options?.isPeerOnline?.(winner) ?? false;
+  options?.onPeerAttempt?.(allPeerAddrs.indexOf(winner), allPeerAddrs.length, winnerOnline);
+  log.debug(
+    TAG,
+    `probe winner: ${winner.slice(0, 16)}... (${winnerOnline ? "connected" : "responded to probe"}), starting download`
+  );
+
+  // both browser midden and TauriStreamNode satisfy the snatch contract
+  // (download_verified_* on midden, proxy_request fallback on tauri).
+  return snatchFromBrowserPeer(info, availablePeers, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +684,49 @@ async function snatchBlobUncached(
 
 /** timeout for individual peer probes (short — probes should be fast) */
 const PROBE_TIMEOUT_MS = 8000;
+
+/**
+ * probe all candidate peers in parallel and return every peer that reports
+ * having the blob, in probe order (see `sortPeersByConnectivity` — connected
+ * peers first). unlike `probePeersForBlob` (a single Promise.any winner,
+ * used by the batch "probe once, download many" flow below),
+ * `snatchBlob`/`snatchBlobToDisk` hand this whole ordered list to
+ * `@freqhole/reliquary/transfer` in one call so its own per-peer retry loop
+ * — which correctly does not retry a disk-write failure against another
+ * peer, only a download failure — stays intact.
+ */
+async function probeAllPeersForBlob(
+  info: SnatchBlobInfo,
+  peerAddrs: string[],
+  options?: SnatchOptions
+): Promise<string[]> {
+  if (peerAddrs.length === 0) return [];
+
+  const sorted = sortPeersByConnectivity(peerAddrs, options?.isPeerOnline);
+
+  log.debug(
+    TAG,
+    `probing ${sorted.length} peer(s) for blob ${info.blobId.slice(0, 8)}... blake3=${info.blake3?.slice(0, 16) ?? "<none>"}`
+  );
+
+  const settled = await Promise.allSettled(
+    sorted.map((peerAddr) => probeSinglePeer(info, peerAddr, options))
+  );
+  const available = sorted.filter((_, i) => settled[i]!.status === "fulfilled");
+
+  if (available.length === 0) {
+    const errs = settled
+      .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+      .map((r) => r.reason);
+    log.warn(
+      TAG,
+      `all ${sorted.length} peer probe(s) failed for blob ${info.blobId.slice(0, 8)}...`,
+      errs.map((e: unknown) => (e instanceof Error ? e.message : String(e)))
+    );
+  }
+
+  return available;
+}
 
 /**
  * probe all candidate peers in parallel to find one that has the blob.
@@ -731,14 +782,10 @@ async function probeSinglePeer(
     throw new DOMException("snatch cancelled", "AbortError");
   }
 
-  // both browser midden and TauriStreamNode expose the same `ensure_blob`
-  // shape (skein/1 protocol). the previous `invoke("p2p_probe_blob")`
-  // path referenced a freqhole-era command that doesn't exist in skein.
   const node = await getMiddenNode();
-  const nodeAny = node as any;
 
-  if (typeof nodeAny.ensure_blob !== "function") {
-    throw new Error("p2p node does not support ensure_blob");
+  if (typeof (node as any).open_bi !== "function") {
+    throw new Error("p2p node does not support open_bi (required for ensure-blob protocol)");
   }
 
   log.debug(
@@ -748,7 +795,7 @@ async function probeSinglePeer(
 
   const attempt = async (label: string): Promise<boolean> => {
     return await withPeerTimeout(
-      nodeAny.ensure_blob(peerAddr, info.blake3) as Promise<boolean>,
+      ensureBlobOverAlpn(node as any, peerAddr, info.blake3),
       PROBE_TIMEOUT_MS
     ).catch((err) => {
       log.warn(
@@ -819,244 +866,32 @@ function sortPeersByConnectivity(
 // ---------------------------------------------------------------------------
 
 /**
- * download a blob's raw bytes from a single browser peer via midden WASM.
- * shared by snatchFromBrowserPeer (persists the result into OPFS + IndexedDB)
- * and snatchBlobToDisk's buffered fallback (writes the result straight to a
- * user-chosen disk location, skipping OPFS/IndexedDB entirely).
+ * download and ingest a blob from an ordered list of candidate browser
+ * peers, persisting the result into OPFS + IndexedDB via storeBlob.
  *
- * NOTE: this always returns the complete, fully-buffered payload. for the
- * chunk-streamed variant (bounded memory, used by snatch-to-disk when the
- * blake3 hash is known), see downloadBlobToWritableFromPeer below.
- */
-async function downloadBlobBytesFromPeer(
-  info: SnatchBlobInfo,
-  peerAddr: string,
-  options?: SnatchOptions
-): Promise<{ bytes: Uint8Array; blake3: string | null; mime: string }> {
-  const node = await getMiddenNode();
-
-  log.debug(
-    TAG,
-    `downloading blob ${info.blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
-  );
-
-  let bytes: Uint8Array | undefined;
-  let blake3Hash = info.blake3;
-  let mime = info.mime;
-
-  const nodeAny = node as any;
-  const onProgress = options?.onProgress;
-  let downloaded = false;
-  // true only when strategy 3 (the unverified proxy_request JSON fallback)
-  // is what actually produced `bytes` — used below to decide whether an
-  // explicit blake3 check is needed (strategies 1/2 are already
-  // cryptographically verified by iroh-blobs itself).
-  let downloadedViaUnverifiedFallback = false;
-  const progressFn = onProgress
-    ? (fraction: number) => {
-        onProgress(fraction);
-      }
-    : () => {};
-
-  // log capability matrix up-front so we never wonder again why a strategy
-  // was skipped. critical for diagnosing tauri-side snatch where the local
-  // node is `TauriStreamNode`, which has no `download_verified_*` methods
-  // \u2014 strategies 1+2 always silently no-op there and we always end up on
-  // the proxy_request fallback.
-  log.debug(TAG, "snatch capabilities:", {
-    have_blake3_in_doc: !!blake3Hash,
-    download_verified_with_ensure_progress:
-      typeof nodeAny.download_verified_with_ensure_progress === "function",
-    download_verified_by_id_progress:
-      typeof nodeAny.download_verified_by_id_progress === "function",
-    proxy_request: typeof nodeAny.proxy_request === "function",
-    declared_size: info.size || 0,
-  });
-
-  // strategy 1: iroh-blobs verified download when blake3 is known from doc.
-  // timeout is generous (10 min) because the responding peer may need to
-  // import the blob into its iroh-blobs FsStore on first request, which
-  // includes computing the BAO tree (proportional to file size). tauri
-  // peers pre-warm the FsStore at insert time so this only matters for
-  // blobs that arrived via paths that bypass the pre-warm.
-  if (
-    !downloaded &&
-    blake3Hash &&
-    typeof nodeAny.download_verified_with_ensure_progress === "function"
-  ) {
-    try {
-      log.debug(TAG, `trying iroh-blobs verified (blake3 known) from ${peerAddr.slice(0, 16)}...`);
-      bytes = await withPeerTimeout(
-        nodeAny.download_verified_with_ensure_progress(
-          peerAddr,
-          blake3Hash,
-          info.size || 0,
-          progressFn,
-          options?.downloadId
-        ) as Promise<Uint8Array>,
-        10 * 60_000
-      );
-      downloaded = true;
-    } catch (err) {
-      // a deliberate pause must not fall through to the unverified fallbacks
-      if (isDownloadCancelled(err)) throw err;
-      log.warn(TAG, `strategy 1 (verified, blake3 known) failed:`, err);
-    }
-  } else if (!downloaded) {
-    log.debug(
-      TAG,
-      `strategy 1 skipped — ${
-        !blake3Hash
-          ? "no blake3 in doc"
-          : "node has no download_verified_with_ensure_progress (likely tauri TauriStreamNode)"
-      }`
-    );
-  }
-
-  // strategy 2: iroh-blobs verified download with on-demand blake3 compute
-  if (!downloaded && typeof nodeAny.download_verified_by_id_progress === "function") {
-    try {
-      log.debug(
-        TAG,
-        `trying iroh-blobs verified (compute blake3) from ${peerAddr.slice(0, 16)}...`
-      );
-      const result: any = await withPeerTimeout(
-        nodeAny.download_verified_by_id_progress(
-          peerAddr,
-          info.blobId,
-          info.size || 0,
-          progressFn
-        ) as Promise<any>,
-        PEER_DOWNLOAD_TIMEOUT_MS
-      );
-      bytes = result[0] as Uint8Array;
-      blake3Hash = (result[1] as string) || blake3Hash;
-      downloaded = true;
-    } catch (err) {
-      log.warn(TAG, `strategy 2 (verified, compute blake3) failed:`, err);
-    }
-  } else if (!downloaded) {
-    log.debug(
-      TAG,
-      "strategy 2 skipped — node has no download_verified_by_id_progress (likely tauri TauriStreamNode)"
-    );
-  }
-
-  if (!bytes) {
-    // strategy 3: skein/1 proxy_request fallback. needed when the peer is
-    // a tauri app — its rust backend doesn't accept the iroh-blobs ALPN, so
-    // strategies 1+2 always fail. proxy_request runs over skein/1 which
-    // tauri's frontend ALPN router does accept.
-    if (typeof nodeAny.proxy_request === "function") {
-      try {
-        log.debug(TAG, `trying skein/1 proxy_request fallback from ${peerAddr.slice(0, 16)}...`);
-        const resp = await withPeerTimeout(
-          nodeAny.proxy_request(
-            peerAddr,
-            "GET",
-            `/api/blobs/${info.blobId}/data`,
-            null
-          ) as Promise<{ status: number; body: string }>,
-          PEER_DOWNLOAD_TIMEOUT_MS
-        );
-        // proxy_request returns { status, body }; body is the JSON envelope
-        // sent by skein-handler: { success, data: { data, mime } }
-        if (resp?.status !== 200) {
-          log.debug(TAG, `proxy_request returned status ${resp?.status}`);
-        } else {
-          const parsed = JSON.parse(resp.body) as {
-            success?: boolean;
-            data?: { data?: string; mime?: string };
-            message?: string;
-          };
-          const b64 = parsed?.data?.data;
-          if (parsed?.success && typeof b64 === "string") {
-            // base64 decode is delegated to the blob worker for large
-            // payloads (snatched blobs are routinely megabytes).
-            bytes = await base64Decode(b64);
-            // mime may have been refined by the responder
-            if (typeof parsed.data?.mime === "string" && !mime) {
-              mime = parsed.data.mime;
-            }
-            // diagnostic: the proxy_request fallback has no incremental
-            // transport-level integrity checking (see the explicit
-            // post-decode blake3 check below) — logging the decoded size
-            // against the declared size up-front makes a silent truncation
-            // (e.g. a peer-side write/read error, or a body that got cut
-            // off) visible in logs instead of only surfacing later as a
-            // confusing hash-mismatch or a 0-byte-payload rejection.
-            if (info.size && bytes.length !== info.size) {
-              log.warn(
-                TAG,
-                `proxy_request fallback: decoded ${bytes.length} bytes but declared size was ${info.size} — possible truncation`
-              );
-            }
-            progressFn(1);
-            downloaded = true;
-            downloadedViaUnverifiedFallback = true;
-          } else {
-            log.debug(TAG, "proxy_request not successful:", parsed?.message);
-          }
-        }
-      } catch (err) {
-        log.debug(TAG, "skein/1 proxy_request fallback failed:", err);
-      }
-    }
-  }
-
-  if (!bytes) {
-    throw new Error("iroh-blobs download failed — no fallback available");
-  }
-
-  // refuse empty payloads. a 0-byte file would hash to the well-known
-  // empty-bytes blake3 / sha256 (e3b0c442... / af1349b9...), which would
-  // poison a persisted record (OPFS/IDB) or a saved disk file with
-  // something that points at nothing — fail loudly instead so the caller
-  // can retry / show an error.
-  if (bytes.length === 0) {
-    throw new Error("snatch returned 0 bytes — refusing empty payload");
-  }
-
-  // strategies 1/2 get real cryptographic verification for free — iroh-blobs'
-  // own verified-transfer machinery checks each chunk against the requested
-  // hash's BAO tree during the download itself, so a mismatching response
-  // never makes it back as `bytes` in the first place. the skein/1
-  // proxy_request fallback (strategy 3, used when the peer is a tauri app
-  // whose rust backend doesn't accept the iroh-blobs ALPN) has no such
-  // guarantee: it's a plain base64 JSON response with zero transfer-level
-  // integrity checking. verify explicitly here so a corrupted or malicious
-  // response is rejected instead of being silently accepted and persisted
-  // under the wrong hash.
-  if (downloadedViaUnverifiedFallback && info.blake3) {
-    const actualHash = await hashBlake3(bytes);
-    if (actualHash && actualHash !== info.blake3) {
-      throw new Error(
-        `snatch hash mismatch: expected blake3 ${info.blake3.slice(0, 16)}... but downloaded bytes hash to ${actualHash.slice(0, 16)}... (proxy_request fallback path is not cryptographically verified in transit)`
-      );
-    }
-  }
-
-  log.debug(TAG, `downloaded ${formatFileSize(bytes.length)} from ${peerAddr.slice(0, 16)}...`);
-
-  return { bytes, blake3: blake3Hash || null, mime };
-}
-
-/**
- * download and ingest a blob from a single browser peer via midden WASM.
- * persists the result into OPFS + IndexedDB via storeBlob.
+ * in tauri mode, prefers the native download path against the first
+ * candidate: the rust side streams the blob into the FsStore and exports
+ * it straight into blobz — the payload never crosses the IPC boundary and
+ * never exists in JS memory. progress arrives via real
+ * `blob-download-progress` events. this path has no equivalent in the
+ * transport package (its contract is browser-only) and stays exactly as
+ * skein's own tauri IPC call.
  *
- * in tauri mode, prefers the native download path: the rust side streams
- * the blob into the FsStore and exports it straight into blobz — the
- * payload never crosses the IPC boundary and never exists in JS memory
- * (previously: whole blob as base64 over IPC + OPFS re-write). progress
- * arrives via real `blob-download-progress` events.
+ * the browser path hands the whole peer list to
+ * `@freqhole/reliquary/transfer`'s `snatchBlob`, which owns the actual
+ * download mechanics: per-peer retry, the bulk/streamed/proxy strategy
+ * fallthrough, the tail-chunk wait, and the proxy fallback's explicit
+ * hash check. this function then persists the result into OPFS +
+ * IndexedDB via storeBlob (widget-specific concern, not part of the
+ * package's contract).
  */
 async function snatchFromBrowserPeer(
   info: SnatchBlobInfo,
-  peerAddr: string,
+  peerAddrs: string[],
   options?: SnatchOptions
 ): Promise<FileUploadResult> {
   if (isTauriMode() && info.blake3) {
+    const peerAddr = peerAddrs[0]!;
     const node = (await getMiddenNode()) as any;
     if (typeof node.download_to_native_store === "function") {
       const meta = await withPeerTimeout(
@@ -1092,41 +927,39 @@ async function snatchFromBrowserPeer(
     }
   }
 
-  const { bytes, blake3: blake3Hash, mime } = await downloadBlobBytesFromPeer(
-    info,
-    peerAddr,
-    options
+  const node = (await getMiddenNode()) as unknown as BlobCapableNode;
+  const downloaded = await transferSnatchBlob(
+    node,
+    peerAddrs,
+    toTransferSnatchInfo(info),
+    toTransferOptions(options)
   );
 
-  if (mime && mime !== info.mime) {
-    info = { ...info, mime };
+  if (downloaded.mime && downloaded.mime !== info.mime) {
+    info = { ...info, mime: downloaded.mime };
   }
 
   if (options?.signal?.aborted) {
     throw new DOMException("snatch cancelled", "AbortError");
   }
 
-  log.debug(TAG, `browser snatch: storing ${formatFileSize(bytes.length)} in OPFS...`);
+  log.debug(TAG, `browser snatch: storing ${formatFileSize(downloaded.bytes.length)} in OPFS...`);
 
-  // store in OPFS + IDB under the blake3 hash — the canonical blob id
-  // (matches iroh-blobs and tauri's rust store). strategies 1/2 hand back
-  // the verified blake3; the unverified fallback may not, so compute it
-  // then. sha256 is still computed as legacy metadata so old doc
-  // references keep resolving via the sha256 index.
-  const blake3Id = blake3Hash || (await hashBlake3(bytes));
-  const sha256 = await computeSha256(bytes.buffer as ArrayBuffer);
-  await storeBlob(blake3Id, bytes.buffer as ArrayBuffer, {
-    blob_id: blake3Id,
-    sha256: sha256,
-    blake3: blake3Id,
+  // store the bytes — the store computes its own blake3/sha256 from the
+  // data (and a legacy-metadata sha256), but the package already handed
+  // back a cryptographically verified blake3 for this content, so that
+  // known-good hash stays authoritative for the returned/cached id rather
+  // than trusting a freshly recomputed one. widget-level domain
+  // classification has no field on the shared record, so it goes into
+  // metadata instead.
+  const record = await storeBlob(downloaded.bytes.buffer as ArrayBuffer, {
     filename: info.filename,
     mime: info.mime,
-    size: info.size || bytes.length,
-    domain: info.domain,
     blob_type: "original",
     parent_blob_id: null,
-    metadata: { source: "snatch" },
+    metadata: { domain: info.domain, source: "snatch" },
   });
+  const blake3Id = downloaded.blake3 || record.blob_id;
 
   // clear thumbnail cache for this blob
   const key200 = cacheKey(info.blobId, 200);
@@ -1146,9 +979,9 @@ async function snatchFromBrowserPeer(
     blobId: blake3Id,
     domain: info.domain,
     jobId: null,
-    sha256: sha256,
+    sha256: record.sha256 ?? "",
     blake3: blake3Id,
-    size: info.size || bytes.length,
+    size: info.size || record.size,
     mime: info.mime,
     existing: false,
   };
@@ -1182,107 +1015,19 @@ export function canSnatchToDisk(): boolean {
 }
 
 /**
- * chunk-streamed download from one peer straight into a writable stream.
- * wraps midden's `download_verified_streaming_with_ensure`: each verified
- * 256KB chunk arrives via a synchronous wasm callback and is queued onto a
- * sequential write chain (the File System Access API requires ordered,
- * awaited writes; the wasm side doesn't await the callback). the chain is
- * drained before returning, and any write failure is rethrown.
- *
- * returns the total number of bytes streamed. does NOT close the writable —
- * the caller decides (close on success, truncate+retry on failure).
- */
-async function downloadBlobToWritableFromPeer(
-  node: any,
-  info: SnatchBlobInfo,
-  peerAddr: string,
-  writable: FileSystemWritableFileStream,
-  options?: SnatchOptions
-): Promise<number> {
-  log.debug(
-    TAG,
-    `streaming blob ${info.blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}... to disk`
-  );
-
-  // sequential write chain — on_chunk is called synchronously from wasm and
-  // must not await, so writes are chained and drained afterwards.
-  let writeChain: Promise<void> = Promise.resolve();
-  let writeError: unknown = null;
-  let bytesReceived = 0;
-
-  // wasm-bindgen delivers each chunk as a fresh, plain-ArrayBuffer-backed
-  // Uint8Array (never a SharedArrayBuffer view), so the narrower type is safe
-  const onChunk = (chunk: Uint8Array<ArrayBuffer>, offset: number) => {
-    bytesReceived += chunk.length;
-    if (writeError) return; // stop queueing after the first failure
-    writeChain = writeChain.then(async () => {
-      if (writeError) return;
-      try {
-        await writable.write({ type: "write", position: offset, data: chunk });
-      } catch (err) {
-        writeError = err;
-      }
-    });
-  };
-
-  const onProgress = options?.onProgress
-    ? (fraction: number) => options.onProgress!(fraction)
-    : () => {};
-
-  // same generous timeout as strategy 1: the responding peer may need to
-  // import the blob into its store (BAO tree computation) on first request.
-  const total = (await withPeerTimeout(
-    node.download_verified_streaming_with_ensure(
-      peerAddr,
-      info.blake3,
-      info.size || 0,
-      onChunk,
-      onProgress,
-      options?.downloadId
-    ) as Promise<number>,
-    10 * 60_000
-  )) as number;
-
-  // when the node lives in a worker, on_chunk arrives as fire-and-forget
-  // comlink proxy messages on a DIFFERENT message channel than the download
-  // RPC's return value — the promise above can resolve while the last few
-  // chunk messages are still in flight. wait until every byte has actually
-  // landed before draining the write chain (found by the pause/resume e2e:
-  // the tail ~350KB of a 24MiB transfer lost this race).
-  const deadline = Date.now() + 30_000;
-  while (bytesReceived < total && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  if (bytesReceived < total) {
-    throw new Error(`chunk stream incomplete: received ${bytesReceived} of ${total} bytes`);
-  }
-
-  // drain any writes still in flight, then surface the first write error
-  await writeChain;
-  if (writeError) throw writeError;
-
-  return total;
-}
-
-
-/**
  * download a blob straight from a canvas peer to a user-chosen disk
  * location, without ever writing it into OPFS/IndexedDB.
  *
- * when the blake3 hash is known and midden exposes
- * `download_verified_streaming_with_ensure`, the transfer is chunk-streamed:
- * each verified 256KB chunk is written to the caller's writable at its
- * explicit offset as it is read out of the wasm store, so JS never holds
- * the whole payload. (the network side still buffers inside midden's
- * MemStore until the opfs store lands — this eliminates the wasm->JS and
- * JS-side full copies.) otherwise it falls back to the fully-buffered
- * download + single write.
- *
- * peer probing/retry mirrors snatchBlob: if a peer's download fails, the
- * next peer is tried. on a mid-stream failure the writable is truncated
- * back to zero before retrying, so a retry never appends onto partial
- * data. once bytes are fully written, a failure closing the stream is NOT
- * retried against another peer — it's surfaced directly to the caller.
+ * probes every candidate peer once up front, then hands the whole ordered
+ * list of peers that reported having the blob to
+ * `@freqhole/reliquary/transfer`'s `snatchBlobToDisk` in a single call —
+ * its own per-peer retry loop owns the actual transfer mechanics (chunk-
+ * streamed direct-to-`writable` when the node supports it, buffered
+ * download + single write otherwise, the tail-chunk wait, and the
+ * truncate-on-failure/no-truncate-on-cancel semantics), including the
+ * important distinction between a download failure (retried against the
+ * next peer) and a disk-write failure (surfaced immediately, never
+ * retried — retrying would re-download the whole payload for nothing).
  *
  * browser-only; throws in tauri mode.
  */
@@ -1312,97 +1057,36 @@ export async function snatchBlobToDisk(
     throw new Error("no peers available for snatch");
   }
 
-  let remaining = [...allPeerAddrs];
-  let lastError: unknown;
-
-  const node = (await getMiddenNode()) as any;
-  const canStream =
-    !!info.blake3 && typeof node.download_verified_streaming_with_ensure === "function";
-
-  while (remaining.length > 0) {
-    if (options?.signal?.aborted) {
-      throw new DOMException("snatch cancelled", "AbortError");
-    }
-
-    const bestPeer = await probePeersForBlob(info, remaining, options);
-    if (!bestPeer) {
-      throw new Error("no peer has the blob (all probes failed)");
-    }
-
-    const peerIndex = allPeerAddrs.indexOf(bestPeer);
-    const isOnline = options?.isPeerOnline?.(bestPeer) ?? false;
-    options?.onPeerAttempt?.(peerIndex, allPeerAddrs.length, isOnline);
-
-    // chunk-streamed path: verified chunks land on disk as they are read
-    // out of the wasm store — no full payload in JS memory, ever.
-    if (canStream) {
-      try {
-        const size = await downloadBlobToWritableFromPeer(node, info, bestPeer, writable, options);
-        if (size === 0) {
-          throw new Error("snatch returned 0 bytes — refusing empty payload");
-        }
-        await writable.close();
-        log.debug(
-          TAG,
-          `snatch-to-disk complete (streamed): ${formatFileSize(size)} written to disk (OPFS/IndexedDB skipped)`
-        );
-        return { size, mime: info.mime, blake3: info.blake3 || null };
-      } catch (err) {
-        // a deliberate pause propagates immediately — no truncate (chunk
-        // offsets are explicit, a resume rewrites the same positions) and
-        // no next-peer retry
-        if (isDownloadCancelled(err)) throw err;
-        lastError = err;
-        log.warn(
-          TAG,
-          `streamed snatch-to-disk from peer ${bestPeer.slice(0, 16)}... failed:`,
-          err
-        );
-        // wipe any partially-written chunks so the next peer starts clean
-        await writable.truncate(0);
-        remaining = remaining.filter((p) => p !== bestPeer);
-        continue;
-      }
-    }
-
-    // buffered fallback (no blake3 in doc, or midden without the streaming api)
-    let bytes: Uint8Array;
-    let blake3: string | null;
-    let mime: string;
-    try {
-      const downloaded = await downloadBlobBytesFromPeer(info, bestPeer, options);
-      bytes = downloaded.bytes;
-      blake3 = downloaded.blake3;
-      mime = downloaded.mime;
-    } catch (err) {
-      // a deliberate pause propagates immediately — no next-peer retry
-      if (isDownloadCancelled(err)) throw err;
-      lastError = err;
-      log.warn(TAG, `snatch-to-disk from probed peer ${bestPeer.slice(0, 16)}... failed:`, err);
-      remaining = remaining.filter((p) => p !== bestPeer);
-      continue;
-    }
-
-    if (options?.signal?.aborted) {
-      throw new DOMException("snatch cancelled", "AbortError");
-    }
-
-    // write phase — a failure here is a real disk-write error, not a peer
-    // problem, so it isn't retried against another peer. `.slice()` copies
-    // into a fresh, exactly-sized ArrayBuffer (not the wasm-bindgen
-    // Uint8Array's own possibly-oversized/shared backing buffer).
-    await writable.write(bytes.slice());
-    await writable.close();
-
-    log.debug(
-      TAG,
-      `snatch-to-disk complete: ${formatFileSize(bytes.length)} written to disk (OPFS/IndexedDB skipped)`
-    );
-
-    return { size: bytes.length, mime: mime || info.mime, blake3 };
+  if (options?.signal?.aborted) {
+    throw new DOMException("snatch cancelled", "AbortError");
   }
 
-  throw lastError ?? new Error("snatch failed: all peers exhausted");
+  const availablePeers = await probeAllPeersForBlob(info, allPeerAddrs, options);
+  if (availablePeers.length === 0) {
+    throw new Error("no peer has the blob (all probes failed)");
+  }
+
+  const winner = availablePeers[0]!;
+  const winnerOnline = options?.isPeerOnline?.(winner) ?? false;
+  options?.onPeerAttempt?.(allPeerAddrs.indexOf(winner), allPeerAddrs.length, winnerOnline);
+
+  const node = (await getMiddenNode()) as unknown as BlobCapableNode;
+  const result = await transferSnatchBlobToDisk(
+    node,
+    availablePeers,
+    toTransferSnatchInfo(info),
+    writable,
+    toTransferOptions(options)
+  );
+  log.debug(
+    TAG,
+    `snatch-to-disk complete: ${formatFileSize(result.size)} written to disk (OPFS/IndexedDB skipped)`
+  );
+  return {
+    size: result.size,
+    mime: result.mime || info.mime,
+    blake3: result.blake3 || info.blake3 || null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,7 +1151,7 @@ export async function snatchBlobBatch(
     domain: coerceStr(b.domain),
   }));
 
-  // --- phase 1: skip already-local blobs ---
+  // --- skip already-local blobs ---
   const pending: number[] = [];
 
   for (let i = 0; i < coercedBlobs.length; i++) {
@@ -1621,7 +1305,7 @@ export async function snatchBlobBatch(
       };
 
       try {
-        const result = await snatchFromBrowserPeer(info, bestPeer, snatchOpts);
+        const result = await snatchFromBrowserPeer(info, [bestPeer], snatchOpts);
         results[idx] = result;
         completedCount++;
         options?.onBlobComplete?.(idx, result);
@@ -1872,24 +1556,6 @@ async function fetchFullBlobFromPeers(blobId: string, peers: PeersMap): Promise<
             );
             return URL.createObjectURL(blob);
           }
-
-          // fallback: proxy_request for blob data
-          if (!bytes && typeof nodeAny.proxy_request === "function") {
-            try {
-              const proxyResult = await withPeerTimeout<any>(
-                nodeAny.proxy_request(peerAddr, "GET", `/api/blobs/${blobId}/data`, null),
-                30000
-              );
-              if (proxyResult.status === 200) {
-                const parsed = JSON.parse(proxyResult.body);
-                if (parsed.success && parsed.data?.data && parsed.data?.mime) {
-                  return `data:${parsed.data.mime};base64,${parsed.data.data}`;
-                }
-              }
-            } catch {
-              // fall through to next peer
-            }
-          }
         } catch (err) {
           log.debug(
             TAG,
@@ -1905,45 +1571,10 @@ async function fetchFullBlobFromPeers(blobId: string, peers: PeersMap): Promise<
     return null;
   }
 
-  for (const peerAddr of peerAddrs) {
-    try {
-      const result = await withPeerTimeout(
-        invoke<any>("p2p_proxy_request", {
-          path: `/api/blobs/${blobId}/data`,
-          body: null,
-        }),
-        30000
-      );
-
-      if (result.status !== 200) {
-        continue;
-      }
-
-      const parsed = JSON.parse(result.body);
-      if (!parsed.success || !parsed.data) {
-        continue;
-      }
-
-      const { data, mime } = parsed.data;
-      if (!data || !mime) {
-        continue;
-      }
-
-      log.debug(
-        TAG,
-        `fetched full blob ${blobId.slice(0, 8)}... from peer ${peerAddr.slice(0, 16)}...`
-      );
-      return `data:${mime};base64,${data}`;
-    } catch (err) {
-      log.debug(
-        TAG,
-        `peer ${peerAddr.slice(0, 16)}... failed for full blob ${blobId.slice(0, 8)}...:`,
-        err
-      );
-      continue;
-    }
-  }
-
+  // tauri mode has no working P2P full-blob-data fallback here — blob
+  // transfer between tauri peers goes through the native iroh-blobs/skein/1
+  // download paths (see snatchFromBrowserPeer's download_to_native_store
+  // branch), not this preview-data-URL path.
   return null;
 }
 
@@ -1980,7 +1611,7 @@ export async function getBlobLocalPath(blobId: string): Promise<string | null> {
  * resolve a blob ID to a locally-available URL — no peer fallback.
  * - Tauri: tries getBlobLocalPath → convertToAssetUrl (asset:// URL)
  *   falls back to base64 data URL via IPC
- * - browser: tries OPFS blob: URL via skein-blob-store
+ * - browser: tries OPFS blob: URL via the blob store
  * returns null if the blob is not available locally.
  */
 export async function getLocalBlobUrl(blobId: string, blake3?: string): Promise<string | null> {
@@ -2339,10 +1970,15 @@ export async function uploadFile(
       throw new Error("no File object available in browser mode");
     }
 
-    const record = await storeBlobFromFile(picked.file, undefined, {
-      onProgress: options?.onProgress,
-      signal: options?.signal,
-    });
+    const domain = classifyDomain(picked.file.type || "application/octet-stream");
+    const record = await storeBlobFromFile(
+      picked.file,
+      { metadata: { domain } },
+      {
+        onProgress: options?.onProgress,
+        signal: options?.signal,
+      }
+    );
 
     if (options?.signal?.aborted) {
       throw new DOMException("upload cancelled", "AbortError");
@@ -2356,9 +1992,9 @@ export async function uploadFile(
 
     return {
       blobId: record.blob_id,
-      domain: record.domain,
+      domain: getBlobDomain(record),
       jobId: null,
-      sha256: record.sha256,
+      sha256: record.sha256 ?? "",
       blake3: record.blake3 || "",
       size: record.size,
       mime: record.mime,
@@ -2471,17 +2107,12 @@ export async function uploadFile(
     existing = !!existingRecord;
 
     if (!existingRecord) {
-      await storeBlob(meta.blake3, buffer, {
-        blob_id: meta.blake3,
-        sha256: "",
-        blake3: meta.blake3,
+      await storeBlob(buffer, {
         filename: meta.filename || picked.filename,
         mime: resolvedMime,
-        size: meta.size,
-        domain,
         blob_type: "original",
         parent_blob_id: null,
-        metadata: {},
+        metadata: { domain },
       });
     }
 
@@ -2613,7 +2244,9 @@ async function fetchThumbnailLocal(blobId: string, size: number): Promise<string
  * try fetching thumbnail data by proxying the request through canvas peers.
  * iterates connected peers and tries each one until one succeeds.
  * uses the same /api/blobs/thumbnail_data endpoint on the remote side
- * via p2p_proxy_request, so the peer does all the thumbnail chain walking.
+ * via the node's proxy_request method, so the peer does all the thumbnail
+ * chain walking. only a tauri node's proxy_request (skein/1) actually
+ * reaches a peer - a browser node's proxy_request has no working sender.
  */
 async function fetchThumbnailFromPeers(
   blobId: string,

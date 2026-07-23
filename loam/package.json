@@ -1,6 +1,6 @@
 {
   "name": "skein",
-  "version": "0.0.1",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -16,14 +16,19 @@
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test",
     "test:e2e:ci": "playwright test --reporter=line",
+    "test:e2e:ci:light": "playwright test --reporter=line --project=chromium",
     "test:e2e:ui": "playwright test --ui",
+    "test:e2e:coverage": "rm -rf coverage-e2e && COVERAGE_E2E=1 playwright test tests/blob-*.spec.ts tests/p2p-sync.spec.ts --reporter=line && node scripts/merge-e2e-coverage.mjs",
     "test:all": "npm run test:coverage && npm run test:e2e",
     "test:report": "open coverage/html/index.html",
+    "test:e2e:coverage:report": "open coverage-e2e/html/index.html",
     "lint": "eslint src widgets --ext .ts",
     "lint:fix": "eslint src widgets --ext .ts --fix",
     "lint:circular": "npx madge --circular --extensions ts src/ widgets/",
     "ts-prune": "ts-prune",
-    "check": "npm run typecheck && npm run lint && npm run lint:circular && npm run test:all"
+    "check": "npm run typecheck && npm run lint && npm run lint:circular && npm run test:all",
+    "deps:local": "node scripts/toggle-deps.mjs local && npm install",
+    "deps:npm": "node scripts/toggle-deps.mjs npm && npm install"
   },
   "dependencies": {
     "@automerge/automerge": "^3.2.6",
@@ -32,7 +37,9 @@
     "@automerge/automerge-repo-storage-indexeddb": "^2.5.6",
     "@pixi/ui": "^2.3.2",
     "comlink": "^4.4.2",
-    "midden": "file:../midden/pkg",
+    "@freqhole/haruspex": "^0.2.2",
+    "@freqhole/midden": "^0.2.2",
+    "@freqhole/reliquary": "^0.2.2",
     "pixi.js": "^8.19.0",
     "zod": "^4.4.3"
   },
@@ -48,6 +55,7 @@
     "@vitest/coverage-v8": "^4.1.9",
     "@vitest/ui": "^4.1.9",
     "eslint": "^10.6.0",
+    "fake-indexeddb": "^6.0.0",
     "istanbul-lib-coverage": "^3.2.2",
     "istanbul-lib-report": "^3.0.1",
     "istanbul-reports": "^3.2.0",

@@ -1,0 +1,627 @@
+//! reliquary peer service — the minimal phase-1 orchestrator.
+//!
+//! wires an [`iroh::Endpoint`] into four protocol handlers:
+//!
+//! - `iroh/automerge-repo/1` — automerge sync via [`IrohRepo`] + [`hub_repo::HubRepo`]
+//! - `freqhole-friendz/1`    — presence/heartbeat/message dispatch via haruspex's
+//!   `FriendzService`/[`FriendzProtocolHandler`]
+//! - `freqhole/1`            — blob proxy (ensure-by-blake3) via [`freqhole_reliquary::ensure::EnsureBlobHandler`]
+//! - `iroh-blobs/4`          — iroh-blobs [`BlobsProtocol`] for verified transfer
+//!
+//! phase-1 scope intentionally excludes canvas invite flows, gossip digests,
+//! acl changes, and the blob snatcher — those layer back on in phase-2 once the
+//! browser+reliquary flow is validated end-to-end.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use iroh::protocol::Router;
+use iroh::Endpoint;
+use iroh_blobs::api::downloader::Downloader;
+use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::BlobsProtocol;
+use sqlx::SqlitePool;
+use tokio_util::sync::CancellationToken;
+
+use crate::friendz;
+use crate::hub_repo::HubRepo;
+use crate::protocol::blob_proxy::ENSURE_ALPN;
+use crate::sync::{IrohRepo, AUTOMERGE_REPO_ALPN};
+use crate::userz;
+use freqhole_reliquary::blobz::{BlobStore, SqliteBlobStore};
+use freqhole_reliquary::node::StorageNode;
+use haruspex::protocol::{
+    CoreMessage, FriendzEvent, FriendzMessage, FriendzProtocolHandler, FriendzService,
+    FriendzTransportError, LocalProfile, FRIENDZ_ALPN,
+};
+
+// ---------------------------------------------------------------------------
+// errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceError {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("sqlx error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+
+    #[error("userz error: {0}")]
+    Userz(#[from] userz::UserError),
+
+    #[error("friendz store error: {0}")]
+    Friendz(#[from] friendz::FriendError),
+
+    #[error("blobz error: {0}")]
+    Blobz(#[from] freqhole_reliquary::blobz::BlobStoreError),
+
+    #[error("opening haruspex db: {0}")]
+    HaruspexOpen(String),
+
+    #[error("fs store: {0}")]
+    FsStore(String),
+
+    #[error("hub_repo: {0}")]
+    HubRepo(String),
+}
+
+// ---------------------------------------------------------------------------
+// config
+// ---------------------------------------------------------------------------
+
+/// configuration for the reliquary peer service.
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    /// base data directory (used for automerge sqlite + iroh-blobs FsStore).
+    pub data_dir: PathBuf,
+    /// display name advertised in heartbeat/profile messages.
+    pub username: String,
+    /// short bio served with profile responses (used by the hub variant).
+    pub bio: String,
+    /// optional path to an avatar image file. processed into a 128px webp
+    /// thumbnail and stored in `blobz` on boot. relative paths resolve
+    /// against `data_dir`.
+    pub avatar_path: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// iroh-blobs storage
+//
+// the FsStore + gc-protect + downloader bundle lives in
+// `freqhole_reliquary::node::StorageNode` rather than a process-wide
+// singleton owned by this module. `start_hub` (the standalone `reliquary`
+// binary's entry point) builds one directly, since it always has a bound
+// endpoint before constructing anything else. the tauri desktop app's
+// deferred-identity boot path can't do the same - its FsStore must exist
+// before any endpoint/identity does, so it never has an endpoint to hand a
+// `StorageNode::init` call at boot time. `Service::start` (the entry point
+// the desktop app's in-app hub toggle uses) instead takes the already-open
+// fs store as a plain parameter, sourced from whatever the tauri app state
+// already built at boot - see docs/xl-refactor/CUTOVER_BACKLOG.md for the
+// full rationale.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// service
+// ---------------------------------------------------------------------------
+
+/// cheaply-cloneable accessor bundle. hand this out to callers (tauri IPC,
+/// embedders, tests) that only need to read from / send messages into the
+/// running service — the heavyweight drive loop is owned exclusively by the
+/// [`Service`] passed to [`Service::run`].
+#[derive(Clone)]
+pub struct ServiceHandle {
+    endpoint: Endpoint,
+    friendz_handler: FriendzProtocolHandler,
+    iroh_repo: IrohRepo,
+    blobz: Arc<dyn BlobStore>,
+    friendz_store: friendz::Store,
+    userz: userz::Directory,
+    node_id_str: String,
+}
+
+impl ServiceHandle {
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+    pub fn friendz(&self) -> &FriendzProtocolHandler {
+        &self.friendz_handler
+    }
+    pub fn iroh_repo(&self) -> &IrohRepo {
+        &self.iroh_repo
+    }
+    pub fn blobz(&self) -> &Arc<dyn BlobStore> {
+        &self.blobz
+    }
+    pub fn friendz_store(&self) -> &friendz::Store {
+        &self.friendz_store
+    }
+    pub fn userz(&self) -> &userz::Directory {
+        &self.userz
+    }
+    pub fn node_id(&self) -> &str {
+        &self.node_id_str
+    }
+}
+
+/// the running peer service. hold on to it for the lifetime of the process;
+/// call [`Service::run`] to drive event processing and [`Service::shutdown`]
+/// to tear everything down.
+pub struct Service {
+    endpoint: Endpoint,
+    router: Router,
+    friendz_handler: FriendzProtocolHandler,
+    friendz_events: tokio::sync::mpsc::UnboundedReceiver<FriendzEvent>,
+    iroh_repo: IrohRepo,
+    blobz: Arc<dyn BlobStore>,
+    friendz_store: friendz::Store,
+    userz: userz::Directory,
+    #[allow(dead_code)]
+    blobs_downloader: Downloader,
+    node_id_str: String,
+    local_username: String,
+}
+
+impl Service {
+    /// start the service: wire up hub_repo + all protocol handlers around an
+    /// already-open iroh-blobs store, and spawn the iroh router.
+    ///
+    /// `fs_store` is caller-supplied rather than built here: the tauri
+    /// desktop app (the only caller of this entry point) opens its FsStore
+    /// once at boot, before any iroh identity/endpoint exists, and must
+    /// reuse that same store here rather than opening a second one at the
+    /// same path (redb allows only one open handle per file within a
+    /// process). the standalone `reliquary` binary uses [`start_hub`]
+    /// instead, which builds its own `StorageNode` since it always has an
+    /// endpoint up front.
+    pub async fn start(
+        endpoint: Endpoint,
+        pool: SqlitePool,
+        config: ServiceConfig,
+        fs_store: &'static FsStore,
+    ) -> Result<Self, ServiceError> {
+        let node_id = endpoint.id();
+        let node_id_str = node_id.to_string();
+
+        // record ourselves in userz
+        let haruspex_pool = crate::db::open_haruspex(&config.data_dir)
+            .await
+            .map_err(|e| ServiceError::HaruspexOpen(format!("{e}")))?;
+        let userz = userz::Directory::new(haruspex_pool.clone());
+        userz
+            .upsert_self(&node_id_str, Some(&config.username), None, None)
+            .await?;
+
+        let blobz: Arc<dyn BlobStore> =
+            Arc::new(SqliteBlobStore::new(pool.clone(), &config.data_dir));
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
+
+        // automerge sync — hub_repo owns its own sqlite db for now
+        let hub_repo = HubRepo::new(node_id_str.clone(), &config.data_dir.join("skein-docs.db"))
+            .await
+            .map_err(|e| ServiceError::HubRepo(format!("{e}")))?;
+        let iroh_repo = IrohRepo::new(endpoint.clone(), hub_repo.clone(), friendz_store.clone());
+
+        // friendz presence — `dispatch` auto-answers profile-request/hello/
+        // heartbeat directly on the inbound stream from the local profile
+        // configured below; every other message surfaces as
+        // `FriendzEvent::MessageReceived` for `handle_friendz_message` to
+        // act on.
+        let (friendz_service, friendz_events) =
+            FriendzService::new(node_id_str.clone(), config.username.clone());
+        friendz_service
+            .set_local_profile(LocalProfile {
+                username: config.username.clone(),
+                bio: String::new(),
+                avatar_data_url: String::new(),
+                accent_color: None,
+                profile_doc_id: None,
+                profile_updated_at: None,
+                // this router is the tauri-desktop outbound-only peer, NOT
+                // a hub (see docs/hub-and-profile-plan.md section 3.2) -
+                // never set the hub flag here, matching an ordinary browser peer.
+                is_hub: None,
+            })
+            .await;
+        let friendz_handler = FriendzProtocolHandler::new(Arc::new(friendz_service));
+
+        // iroh-blobs blob-proxy, backed by the caller-supplied FsStore.
+        //
+        // gated by `blob_acl`'s friend-only mode: `Service` (unlike
+        // `hub::HubPeerService`) tracks no canvases at all, so it can't
+        // check per-canvas `.acl` membership — this is a strictly weaker
+        // gate than the hub's, but still closes the "any stranger who
+        // knows a hash can fetch it" hole for this peer variant too. see
+        // `blob_acl`'s module doc comment.
+        let blobs_downloader = Downloader::new(fs_store, &endpoint);
+        let blob_acl_gate = crate::blob_acl::BlobAclGate::friend_only(friendz_store.clone());
+        let blobs_protocol = BlobsProtocol::new(
+            fs_store,
+            Some(crate::blob_acl::build_gated_blobs_events(blob_acl_gate)),
+        );
+        let blob_proxy = crate::protocol::blob_proxy::new_handler(
+            fs_store,
+            blobz.clone(),
+            friendz_store.clone(),
+        );
+
+        // router
+        let router = Router::builder(endpoint.clone())
+            .accept(AUTOMERGE_REPO_ALPN, iroh_repo.clone())
+            .accept(FRIENDZ_ALPN, friendz_handler.clone())
+            .accept(ENSURE_ALPN, blob_proxy)
+            .accept(iroh_blobs::ALPN, blobs_protocol)
+            .spawn();
+
+        tracing::info!(
+            node_id = %node_id,
+            "reliquary service running with automerge-repo, friendz, blob-proxy, and iroh-blobs"
+        );
+
+        Ok(Self {
+            endpoint,
+            router,
+            friendz_handler,
+            friendz_events,
+            iroh_repo,
+            blobz,
+            friendz_store,
+            userz,
+            blobs_downloader,
+            node_id_str,
+            local_username: config.username,
+        })
+    }
+
+    /// run until `cancel` is fired.
+    ///
+    /// drives the friendz heartbeat loop plus incoming-event processing.
+    /// on exit, tears down the router *and* closes the endpoint — suitable
+    /// for callers (like the CLI) that own the endpoint exclusively.
+    ///
+    /// use [`Service::run_keep_endpoint`] instead when the endpoint is
+    /// shared (e.g. the tauri app's always-on `Endpoint`).
+    pub async fn run(self, cancel: CancellationToken) {
+        self.run_inner(cancel, true).await
+    }
+
+    /// like [`Service::run`], but leaves the endpoint open on exit so an
+    /// embedder can keep using it.
+    pub async fn run_keep_endpoint(self, cancel: CancellationToken) {
+        self.run_inner(cancel, false).await
+    }
+
+    async fn run_inner(mut self, cancel: CancellationToken, close_endpoint: bool) {
+        tracing::info!(node_id = %self.node_id_str, "service run loop started");
+
+        // heartbeat loop — reads the accepted friend list from our friendz store
+        let heartbeat_friendz = self.friendz_handler.clone();
+        let heartbeat_endpoint = self.endpoint.clone();
+        let heartbeat_store = self.friendz_store.clone();
+        let heartbeat_cancel = cancel.clone();
+        let heartbeat_handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = heartbeat_cancel.cancelled() => {}
+                _ = heartbeat_friendz.run_heartbeat_loop(heartbeat_endpoint, move || {
+                    let store = heartbeat_store.clone();
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async move {
+                            match store.list(true).await {
+                                Ok(friends) => friends
+                                    .into_iter()
+                                    .map(|f| f.friend_node_id)
+                                    .collect::<Vec<_>>(),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "failed to load friends for heartbeat");
+                                    Vec::new()
+                                }
+                            }
+                        })
+                    })
+                }) => {}
+            }
+        });
+
+        // event loop
+        loop {
+            let event = tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!("shutdown requested");
+                    break;
+                }
+                event = self.friendz_events.recv() => match event {
+                    Some(e) => e,
+                    None => {
+                        tracing::info!("friendz event channel closed");
+                        break;
+                    }
+                },
+            };
+
+            if let Err(e) = self.handle_event(event).await {
+                tracing::warn!(error = %e, "event handler failed");
+            }
+        }
+
+        heartbeat_handle.abort();
+        if close_endpoint {
+            self.shutdown().await;
+        } else {
+            self.shutdown_keep_endpoint().await;
+        }
+    }
+
+    async fn handle_event(&self, event: FriendzEvent) -> Result<(), ServiceError> {
+        match event {
+            FriendzEvent::PeerOnline { node_id, username } => {
+                tracing::info!(peer = %node_id, username = %username, "peer online");
+                self.userz
+                    .upsert_profile(&node_id, Some(&username), None, None)
+                    .await?;
+            }
+            FriendzEvent::PeerOffline { node_id } => {
+                tracing::info!(peer = %node_id, "peer offline");
+            }
+            FriendzEvent::MessageReceived {
+                from_node_id,
+                message,
+            } => {
+                self.userz.touch(&from_node_id).await.ok();
+                self.handle_friendz_message(&from_node_id, *message).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// send a friendz protocol message to a peer by node id. see
+    /// `crate::hub`'s identically-named helper for the addressing
+    /// tradeoffs; duplicated here rather than shared since `Service` and
+    /// `hub::HubPeerService` are otherwise independent orchestrators.
+    async fn send_friendz_message(
+        &self,
+        peer_node_id: &str,
+        msg: &FriendzMessage,
+    ) -> Result<(), FriendzTransportError> {
+        let public_key: iroh::PublicKey = peer_node_id
+            .parse()
+            .map_err(|e| FriendzTransportError::InvalidNodeId(format!("{e}")))?;
+        self.friendz_handler
+            .send_message(&self.endpoint, iroh::EndpointAddr::from(public_key), msg)
+            .await
+    }
+
+    async fn handle_friendz_message(
+        &self,
+        from: &str,
+        msg: FriendzMessage,
+    ) -> Result<(), ServiceError> {
+        let core = match msg {
+            FriendzMessage::Core(core) => core,
+            FriendzMessage::AppExtension { message_type, .. } => {
+                tracing::debug!(peer = %from, message_type = %message_type, "ignoring app extension in phase-1");
+                return Ok(());
+            }
+        };
+        match core {
+            CoreMessage::Heartbeat { .. } => {
+                // already touched above; the fast presence-ack reply is
+                // handled by FriendzService::dispatch itself.
+            }
+            CoreMessage::ProfileRequest { .. } => {
+                // auto-answered by FriendzService::dispatch from the local
+                // profile configured in Service::start - nothing to do here.
+            }
+            CoreMessage::ProfileResponse {
+                username, is_hub, ..
+            } => {
+                // phase-1: ignore avatar_data_url; userz.avatar_blake3 takes a
+                // blake3 hash, not a data url. avatar transfer comes back later.
+                self.userz
+                    .upsert_profile(from, Some(&username), None, None)
+                    .await?;
+                // sticky: only ever set true, never reset to false when a
+                // later message omits the flag (docs/hub-and-profile-plan.md
+                // section 3.3) - a profile fetch is also how a missed or
+                // stale hub flag gets corrected.
+                if is_hub == Some(true) {
+                    self.userz.mark_as_hub(from).await?;
+                }
+            }
+            CoreMessage::FriendRequest {
+                from_username,
+                is_hub,
+                ..
+            } => {
+                tracing::info!(peer = %from, username = %from_username, "friend request received");
+                // auto-accept for phase-1 prototype. real ACL flow comes later.
+                self.friendz_store
+                    .upsert(from, friendz::FriendStatus::Accepted, None)
+                    .await?;
+                // sticky: only ever set true, never reset to false when a
+                // later message omits the flag (docs/hub-and-profile-plan.md
+                // section 3.3).
+                if is_hub == Some(true) {
+                    self.userz.mark_as_hub(from).await?;
+                }
+                let ack = FriendzMessage::Core(CoreMessage::FriendAccept {
+                    v: 1,
+                    from_node_id: self.node_id_str.clone(),
+                    from_username: self.local_username.clone(),
+                    // this router is the tauri-desktop outbound-only peer, NOT
+                    // a hub (see docs/hub-and-profile-plan.md section 3.2) — never
+                    // set the hub flag here, matching an ordinary browser peer.
+                    is_hub: None,
+                });
+                if let Err(e) = self.send_friendz_message(from, &ack).await {
+                    tracing::warn!(error = %e, peer = %from, "failed to send friend-accept");
+                }
+            }
+            CoreMessage::FriendAccept {
+                from_username,
+                is_hub,
+                ..
+            } => {
+                tracing::info!(peer = %from, username = %from_username, "friend accept received");
+                self.friendz_store
+                    .upsert(from, friendz::FriendStatus::Accepted, None)
+                    .await?;
+                if is_hub == Some(true) {
+                    self.userz.mark_as_hub(from).await?;
+                }
+            }
+            CoreMessage::FriendReject { .. } => {
+                self.friendz_store.delete(from).await?;
+            }
+            other => {
+                tracing::debug!(peer = %from, msg_type = %other.message_type(), "ignoring friendz message in phase-1");
+            }
+        }
+        Ok(())
+    }
+
+    /// graceful shutdown of router + endpoint.
+    pub async fn shutdown(self) {
+        tracing::info!("shutting down reliquary service");
+        let timeout = std::time::Duration::from_secs(10);
+        match tokio::time::timeout(timeout, self.router.shutdown()).await {
+            Ok(Ok(())) => tracing::debug!("router shut down cleanly"),
+            Ok(Err(e)) => tracing::warn!(error = ?e, "error shutting down router"),
+            Err(_) => tracing::warn!("router shutdown timed out after 10s"),
+        }
+        self.endpoint.close().await;
+        tracing::info!("reliquary service stopped");
+    }
+
+    /// graceful shutdown of router only — leaves the `Endpoint` open so an
+    /// embedder (e.g. the tauri app) can keep using it. used for the
+    /// start/stop hub-toggle flow where the endpoint's lifetime is tied to
+    /// the host process, not to any individual `Service` instance.
+    pub async fn shutdown_keep_endpoint(self) {
+        tracing::info!("shutting down reliquary service (keeping endpoint open)");
+        let timeout = std::time::Duration::from_secs(10);
+        match tokio::time::timeout(timeout, self.router.shutdown()).await {
+            Ok(Ok(())) => tracing::debug!("router shut down cleanly"),
+            Ok(Err(e)) => tracing::warn!(error = ?e, "error shutting down router"),
+            Err(_) => tracing::warn!("router shutdown timed out after 10s"),
+        }
+        tracing::info!("reliquary service stopped (endpoint left open)");
+    }
+
+    // accessors ---------------------------------------------------------
+
+    /// snapshot a cloneable handle with all of the accessor surfaces.
+    /// use this when handing the service to callers that don't drive the
+    /// run loop (e.g. tauri IPC commands).
+    pub fn handle(&self) -> ServiceHandle {
+        ServiceHandle {
+            endpoint: self.endpoint.clone(),
+            friendz_handler: self.friendz_handler.clone(),
+            iroh_repo: self.iroh_repo.clone(),
+            blobz: self.blobz.clone(),
+            friendz_store: self.friendz_store.clone(),
+            userz: self.userz.clone(),
+            node_id_str: self.node_id_str.clone(),
+        }
+    }
+
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    pub fn friendz(&self) -> &FriendzProtocolHandler {
+        &self.friendz_handler
+    }
+
+    pub fn iroh_repo(&self) -> &IrohRepo {
+        &self.iroh_repo
+    }
+
+    pub fn blobz(&self) -> &Arc<dyn BlobStore> {
+        &self.blobz
+    }
+
+    pub fn userz(&self) -> &userz::Directory {
+        &self.userz
+    }
+
+    pub fn friendz_store(&self) -> &friendz::Store {
+        &self.friendz_store
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id_str
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hub variant
+//
+// `start_hub` is the phase-2 entry point used by `reliquary serve`. it
+// constructs the same set of stores/handlers as `Service::start`, then hands
+// them to [`crate::hub::HubPeerService`] which adds canvas invite/gossip/
+// blob-snatch logic and runs the full event loop.
+// ---------------------------------------------------------------------------
+
+/// bootstrap a [`crate::hub::HubPeerService`] sharing the same data_dir +
+/// sqlite pool as the minimal `Service`.
+///
+/// returns a ready-to-run hub. spawn `service.run(cancel)` to drive it.
+pub async fn start_hub(
+    endpoint: Endpoint,
+    pool: SqlitePool,
+    config: ServiceConfig,
+) -> Result<crate::hub::HubPeerService, ServiceError> {
+    use crate::hub::{HubPeerConfig, HubPeerService};
+    use freqhole_reliquary::node::StorageNodeOptions;
+
+    let node_id_str = endpoint.id().to_string();
+
+    let haruspex_pool = crate::db::open_haruspex(&config.data_dir)
+        .await
+        .map_err(|e| ServiceError::HaruspexOpen(format!("{e}")))?;
+    let userz = userz::Directory::new(haruspex_pool.clone());
+    let blobz: Arc<dyn BlobStore> = Arc::new(SqliteBlobStore::new(pool.clone(), &config.data_dir));
+    let friendz_store = friendz::Store::new(haruspex_pool, pool.clone());
+    let adminz_store = crate::adminz::Store::new(pool);
+
+    // automerge sync — hub_repo owns its own sqlite db for the doc graph
+    let hub_repo = HubRepo::new(node_id_str.clone(), &config.data_dir.join("skein-docs.db"))
+        .await
+        .map_err(|e| ServiceError::HubRepo(format!("{e}")))?;
+
+    // the iroh-blobs FsStore + gc-protect + downloader bundle. leaked to
+    // `'static` (same as the old process-wide FsStore singleton it
+    // replaces) so its background gc-protect refresh task keeps running for
+    // the life of the process rather than being aborted the moment this
+    // function returns.
+    let storage: &'static StorageNode = Box::leak(Box::new(
+        StorageNode::init(
+            &config.data_dir,
+            blobz.clone(),
+            &endpoint,
+            StorageNodeOptions::default(),
+        )
+        .await
+        .map_err(|e| ServiceError::FsStore(format!("{e}")))?,
+    ));
+
+    let hub_config = HubPeerConfig {
+        data_dir: config.data_dir.clone(),
+        username: config.username,
+        bio: config.bio,
+        avatar_path: config.avatar_path,
+    };
+
+    HubPeerService::start(
+        endpoint,
+        hub_repo,
+        storage,
+        userz,
+        friendz_store,
+        adminz_store,
+        hub_config,
+    )
+    .await
+    .map_err(|e| ServiceError::HubRepo(format!("hub start: {e}")))
+}

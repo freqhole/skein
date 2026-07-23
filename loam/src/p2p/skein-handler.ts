@@ -16,11 +16,13 @@
 // ---------------------------------------------------------------------------
 
 import type { BiStreamLike } from "./iroh-network-adapter";
-import { base64Encode } from "../workers/blob-worker-client";
-import * as blobStore from "../storage/skein-blob-store";
+import { base64Encode } from "@freqhole/reliquary/worker";
+import * as blobStore from "../storage/blob-store";
+import { getBlobDomain } from "../storage/blob-store";
 import { getMiddenNode as getMiddenNodeFromIdentity } from "./identity";
 import { isTauriMode, dispatch } from "./tauri-transport";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
+import { createEnsureBlobHandler } from "@freqhole/reliquary/ensure";
 
 // ---- peer message types ---------------------------------------------------
 // these match midden's PeerMessage enum (serde tag = "type", rename_all = "snake_case")
@@ -53,26 +55,11 @@ interface ComputeBlake3Response {
   error?: string | null;
 }
 
-interface EnsureBlobRequest {
-  type: "ensure_blob_request";
-  id: number;
-  blake3_hash: string;
-}
-
-interface EnsureBlobResponse {
-  type: "ensure_blob_response";
-  id: number;
-  available: boolean;
-  error?: string | null;
-}
-
 type PeerMessage =
   | ProxyRequest
   | ProxyResponse
   | ComputeBlake3Request
   | ComputeBlake3Response
-  | EnsureBlobRequest
-  | EnsureBlobResponse
   | { type: string; [key: string]: unknown };
 
 // ---- constants ------------------------------------------------------------
@@ -313,7 +300,7 @@ async function handleBlobMetadata(
         filename: record.filename,
         size: record.size,
         blake3: record.blake3 || null,
-        domain: record.domain,
+        domain: getBlobDomain(record),
         blob_type: record.blob_type,
       },
     }),
@@ -456,14 +443,18 @@ async function handleComputeBlake3(stream: BiStreamLike, msg: ComputeBlake3Reque
   }
 }
 
-// ---- ensure_blob request --------------------------------------------------
+// ---- ensure_blob support --------------------------------------------------
+// exported for use with reliquary's createEnsureBlobHandler
 
-async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): Promise<void> {
-  const { id, blake3_hash } = msg;
-  const peerId = stream.peer_node_id().slice(0, 16);
-
-  log.debug(TAG, `ensure_blob ${blake3_hash.slice(0, 16)}... from ${peerId}...`);
-
+/**
+ * check if a blob (by blake3 hash) is available for serving to a peer.
+ * this implements the full ensure logic: tauri short-circuit, MemStore
+ * fast path, persistent-store fast path, cached-bao import, streaming
+ * import for large blobs, and buffered import with bao caching.
+ *
+ * used as the `hasBlob` callback for `createEnsureBlobHandler`.
+ */
+export async function ensureBlobAvailable(blake3Hash: string): Promise<boolean> {
   // tauri short-circuit: import the blob's bytes from rust `blobz` into
   // the iroh-blobs FsStore (rust-side, registered on the same endpoint via
   // `StreamRegistry::start_with_blobs`). once it returns `available: true`
@@ -474,21 +465,20 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
     if (isTauriMode()) {
       let available = false;
       try {
-        const result = await dispatch("blob_iroh_ensure", { blake3: blake3_hash });
+        const result = await dispatch("blob_iroh_ensure", { blake3: blake3Hash });
         available = result?.available === true;
         if (!available) {
           log.debug(
             TAG,
-            `tauri ensure_blob ${blake3_hash.slice(0, 16)}... → missing (${result?.reason ?? "unknown"})`
+            `tauri ensure_blob ${blake3Hash.slice(0, 16)}... → missing (${result?.reason ?? "unknown"})`
           );
         } else {
-          log.debug(TAG, `tauri ensure_blob ${blake3_hash.slice(0, 16)}... → loaded into FsStore`);
+          log.debug(TAG, `tauri ensure_blob ${blake3Hash.slice(0, 16)}... → loaded into FsStore`);
         }
       } catch (err) {
         log.warn(TAG, "blob_iroh_ensure dispatch failed:", err);
       }
-      await sendRawResponse(stream, { type: "ensure_blob_response", id, available });
-      return;
+      return available;
     }
   } catch (err) {
     log.warn(TAG, "tauri ensure_blob short-circuit failed, falling through:", err);
@@ -501,14 +491,13 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
       // NOTE: awaited — on the worker-hosted node this returns a Promise,
       // and a bare truthiness check on a Promise is always true (which
       // would silently skip every re-import).
-      const alreadyLoaded = await (node as any).has_active_blob(blake3_hash);
+      const alreadyLoaded = await (node as any).has_active_blob(blake3Hash);
       if (alreadyLoaded) {
         log.debug(
           TAG,
-          `blob ${blake3_hash.slice(0, 16)}... already in MemStore, skipping re-import`
+          `blob ${blake3Hash.slice(0, 16)}... already in MemStore, skipping re-import`
         );
-        await sendRawResponse(stream, { type: "ensure_blob_response", id, available: true });
-        return;
+        return true;
       }
     }
 
@@ -516,14 +505,13 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
     // imported/downloaded blob survives reloads INSIDE the store — no
     // re-import (and no bao recomputation) needed at all.
     if (typeof (node as any).has_complete_blob === "function") {
-      const inStore = await (node as any).has_complete_blob(blake3_hash);
+      const inStore = await (node as any).has_complete_blob(blake3Hash);
       if (inStore) {
         log.debug(
           TAG,
-          `blob ${blake3_hash.slice(0, 16)}... complete in persistent store, skipping re-import`
+          `blob ${blake3Hash.slice(0, 16)}... complete in persistent store, skipping re-import`
         );
-        await sendRawResponse(stream, { type: "ensure_blob_response", id, available: true });
-        return;
+        return true;
       }
     }
 
@@ -531,13 +519,12 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
     // the bao cache is populated by handleComputeBlake3 / import_blob_and_export_bao.
     const store = blobStore;
     if (typeof (node as any).import_bao === "function") {
-      const baoData = await store.getBaoData(blake3_hash);
+      const baoData = await store.getBaoData(blake3Hash);
       if (baoData) {
         try {
-          await (node as any).import_bao(blake3_hash, new Uint8Array(baoData));
-          log.debug(TAG, `ensured blob ${blake3_hash.slice(0, 16)}... via cached bao (fast path)`);
-          await sendRawResponse(stream, { type: "ensure_blob_response", id, available: true });
-          return;
+          await (node as any).import_bao(blake3Hash, new Uint8Array(baoData));
+          log.debug(TAG, `ensured blob ${blake3Hash.slice(0, 16)}... via cached bao (fast path)`);
+          return true;
         } catch (baoErr) {
           // bao import failed — fall through to full import path
           log.warn(TAG, `bao import failed, falling back to full import:`, baoErr);
@@ -546,16 +533,11 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
     }
 
     // slow path: look up raw blob data by blake3 hash, import via add_bytes
-    const record = await store.getBlobRecordByBlake3(blake3_hash);
+    const record = await store.getBlobRecordByBlake3(blake3Hash);
 
     if (!record) {
-      await sendRawResponse(stream, {
-        type: "ensure_blob_response",
-        id,
-        available: false,
-        error: "no blob with this blake3 hash found locally",
-      });
-      return;
+      log.debug(TAG, `blob ${blake3Hash.slice(0, 16)}... not found locally`);
+      return false;
     }
 
     // streaming import for large blobs: chunk the OPFS file straight into
@@ -573,16 +555,15 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
           const hash = await importBlobStreaming(node, file);
           log.debug(
             TAG,
-            `ensured blob ${blake3_hash.slice(0, 16)}... via streaming import (${file.size} bytes)`
+            `ensured blob ${blake3Hash.slice(0, 16)}... via streaming import (${file.size} bytes)`
           );
-          if (hash !== blake3_hash) {
+          if (hash !== blake3Hash) {
             log.warn(
               TAG,
-              `streaming import hash mismatch: expected ${blake3_hash.slice(0, 16)}..., got ${hash.slice(0, 16)}...`
+              `streaming import hash mismatch: expected ${blake3Hash.slice(0, 16)}..., got ${hash.slice(0, 16)}...`
             );
           }
-          await sendRawResponse(stream, { type: "ensure_blob_response", id, available: true });
-          return;
+          return true;
         } catch (err) {
           log.warn(TAG, "streaming ensure_blob import failed, falling back to buffered:", err);
         }
@@ -591,13 +572,8 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
 
     const data = await store.getBlobData(record.blob_id);
     if (!data) {
-      await sendRawResponse(stream, {
-        type: "ensure_blob_response",
-        id,
-        available: false,
-        error: "blob data not found in OPFS",
-      });
-      return;
+      log.debug(TAG, `blob ${blake3Hash.slice(0, 16)}... data not found in OPFS`);
+      return false;
     }
 
     // import into MemStore. try the bao-exporting variant so we cache the bao
@@ -606,10 +582,10 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
       try {
         const result = await (node as any).import_blob_and_export_bao(new Uint8Array(data));
         if (result && result.bao) {
-          await store.storeBaoData(blake3_hash, result.bao.buffer);
+          await store.storeBaoData(blake3Hash, result.bao.buffer);
           log.debug(
             TAG,
-            `ensured blob ${blake3_hash.slice(0, 16)}... and cached bao (${result.bao.byteLength} bytes)`
+            `ensured blob ${blake3Hash.slice(0, 16)}... and cached bao (${result.bao.byteLength} bytes)`
           );
         }
       } catch (baoErr) {
@@ -620,21 +596,11 @@ async function handleEnsureBlob(stream: BiStreamLike, msg: EnsureBlobRequest): P
       await (node as any).import_blob(new Uint8Array(data));
     }
 
-    log.debug(TAG, `ensured blob ${blake3_hash.slice(0, 16)}... in MemStore`);
-
-    await sendRawResponse(stream, {
-      type: "ensure_blob_response",
-      id,
-      available: true,
-    });
+    log.debug(TAG, `ensured blob ${blake3Hash.slice(0, 16)}... in MemStore`);
+    return true;
   } catch (err) {
     log.error(TAG, `ensure_blob failed:`, err);
-    await sendRawResponse(stream, {
-      type: "ensure_blob_response",
-      id,
-      available: false,
-      error: err instanceof Error ? err.message : "ensure_blob failed",
-    });
+    return false;
   }
 }
 
@@ -677,10 +643,6 @@ async function handleStreamAsync(stream: BiStreamLike): Promise<void> {
       await handleComputeBlake3(stream, msg as ComputeBlake3Request);
       break;
 
-    case "ensure_blob_request":
-      await handleEnsureBlob(stream, msg as EnsureBlobRequest);
-      break;
-
     default:
       log.debug(TAG, `unhandled message type "${msg.type}" from ${peerId}...`);
       // try to send a generic error response if the message has an id
@@ -717,4 +679,14 @@ export function handleSkeinStream(stream: BiStreamLike): void {
         // ignore close errors — stream may already be closed
       }
     });
+}
+
+/**
+ * create a handler for incoming freqhole/1 ensure-blob streams.
+ *
+ * this is the entry point registered with `adapter.registerAlpnHandler(DEFAULT_ENSURE_ALPN, ...)`.
+ * wraps `ensureBlobAvailable` with reliquary's protocol framing.
+ */
+export function createSkeinEnsureBlobHandler(): (stream: BiStreamLike) => void {
+  return createEnsureBlobHandler({ hasBlob: ensureBlobAvailable });
 }

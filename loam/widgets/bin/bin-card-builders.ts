@@ -2,7 +2,7 @@
 // extracted from BinRenderer to keep modules under ~300 lines.
 
 import { Container, Graphics, Sprite, Text } from "pixi.js";
-import { log } from "../../src/utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import {
   checkBlobLocality,
   revealBlobInFinder,

@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
-import { log } from "../../../src/utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import {
   acceptFriendRequest,
   rejectFriendRequest,

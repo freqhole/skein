@@ -46,7 +46,7 @@ export const canvasLinkPickerSchema = z.object({
 export type CanvasLinkPickerState = z.infer<typeof canvasLinkPickerSchema>;
 
 /** test hooks for one instance of this widget, keyed by widget id (see
- *  friend-canvas-bin.ts's identical `registerWidgetBridge` convention). */
+ *  test-bridge-registry.ts's `registerWidgetBridge()` convention). */
 export interface CanvasLinkPickerTestHooks {
   getCandidates(): CanvasPickerCandidate[];
   getFilteredCandidates(): CanvasPickerCandidate[];

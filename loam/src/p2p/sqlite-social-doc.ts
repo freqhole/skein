@@ -13,14 +13,14 @@
  *   after every IPC mutation) and refetches the full snapshot
  *
  * the diff engine handles all 17 mutation patterns used by the widget tabs
- * and friendz-wiring. see docs/peer-identity-unification-plan.md phase 4.
+ * and friendz-wiring.
  */
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { FriendEntry, FriendNodeId, SocialState } from "../../widgets/narthex/social/schema";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 
 const TAG = "sqlite-social-doc";
 
@@ -471,6 +471,13 @@ export class SqliteSocialDoc implements SocialDoc {
               alias: f.alias || f.username || undefined,
             })
           );
+          // isHub arrives pre-set on the draft pushed by friendz-wiring.ts's
+          // onFriendRequest/onFriendAccept (from the message's isHub flag) —
+          // social_add_friend has no is_hub column of its own, so persist it
+          // as a separate write, same as the sticky flip below.
+          if (f.isHub === true) {
+            promises.push(dispatch("social_mark_friend_as_hub", { node_id: nodeId }));
+          }
         }
       }
     }
@@ -497,6 +504,16 @@ export class SqliteSocialDoc implements SocialDoc {
               alias: nextF.alias,
             })
           );
+        }
+      }
+
+      // sticky hub flag (docs/hub-and-profile-plan.md section 3.3): only
+      // ever persist a false -> true flip, never unset. `userz::mark_as_hub`
+      // is itself a one-way ratchet, so this only needs to fire once.
+      if (prevF.isHub !== true && nextF.isHub === true) {
+        const nodeId = nextF.nodeIds[0]?.nodeId;
+        if (nodeId) {
+          promises.push(dispatch("social_mark_friend_as_hub", { node_id: nodeId }));
         }
       }
 

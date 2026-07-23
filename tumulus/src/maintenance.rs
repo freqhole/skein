@@ -1,0 +1,611 @@
+//! maintenance sweep for soft-deleted canvas data.
+//!
+//! `hub/messages.rs`'s ACL-removed handler and `hub/canvas.rs`'s tombstone
+//! and canvas-deleted handlers all soft-delete (see
+//! `hub_repo::HubDocStorage::soft_remove_canvas_id`'s doc comment) rather
+//! than immediately destroying anything — this module is where an operator
+//! actually reviews and destroys that data, via `reliquary maintenance`
+//! (see `main.rs`).
+//!
+//! kept as a standalone module (rather than folded into `hub_repo.rs` or
+//! `main.rs` directly) so its core logic — in particular the
+//! cross-canvas blob-reference sweep in [`purge`] — is unit-testable
+//! without needing a full CLI invocation or a live `HubRepo`/iroh endpoint.
+
+use crate::hub_repo::HubDocStorage;
+use freqhole_reliquary::blobz::BlobStore;
+use std::collections::HashSet;
+use std::sync::Arc;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum MaintenanceError {
+    #[error("canvas {0} is not soft-deleted — refusing to purge an actively-tracked canvas")]
+    NotRemoved(String),
+    #[error("blobz error: {0}")]
+    Blobz(#[from] freqhole_reliquary::blobz::BlobStoreError),
+}
+
+/// a soft-deleted canvas, with its title resolved (best-effort) for display
+/// — `reliquary maintenance list` shows this instead of a bare doc id so an
+/// operator has some chance of recognizing what they're looking at.
+#[derive(Debug, Clone)]
+pub struct RemovedCanvasSummary {
+    pub canvas_doc_id: String,
+    /// best-effort — empty if the doc's bytes are missing/unreadable (this
+    /// can legitimately happen: the canvas doc might never have synced any
+    /// content to this hub before it was removed).
+    pub title: String,
+    pub added_at: String,
+    pub removed_at: String,
+}
+
+/// report of what a [`purge`] call actually deleted, for CLI output.
+#[derive(Debug, Clone, Default)]
+pub struct PurgeReport {
+    pub canvas_doc_id: String,
+    /// per-widget automerge doc ids deleted (these are 1:1 owned by this
+    /// canvas instance — never shared with another canvas — so they're
+    /// always deleted unconditionally as part of purging their canvas).
+    pub widget_docs_deleted: Vec<String>,
+    /// blake3 hashes whose blob file+row were actually deleted (not
+    /// referenced by any other still-known canvas's widgets).
+    pub blobs_deleted: Vec<String>,
+    /// blake3 hashes this canvas's widgets referenced but which were kept,
+    /// because at least one other still-known canvas (active or
+    /// soft-deleted-but-not-yet-purged) still references them too.
+    pub blobs_kept_still_referenced: Vec<String>,
+}
+
+/// a page of soft-deleted canvases, with titles resolved best-effort — see
+/// `reliquary maintenance list` (main.rs).
+pub async fn list_removed(
+    storage: &HubDocStorage,
+    limit: i64,
+    offset: i64,
+) -> Vec<RemovedCanvasSummary> {
+    let rows = storage.load_removed_canvas_ids(limit, offset).await;
+    let mut summaries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let title = storage
+            .load_doc(&row.canvas_doc_id)
+            .await
+            .and_then(|bytes| automerge::Automerge::load(&bytes).ok())
+            .map(|doc| read_root_str(&doc, "title"))
+            .unwrap_or_default();
+        summaries.push(RemovedCanvasSummary {
+            canvas_doc_id: row.canvas_doc_id,
+            title,
+            added_at: row.added_at,
+            removed_at: row.removed_at.unwrap_or_default(),
+        });
+    }
+    summaries
+}
+
+/// restore (undelete) a soft-deleted canvas — see
+/// `HubDocStorage::restore_canvas_id`'s doc comment for the "hub process
+/// must restart to pick this up live" caveat.
+pub async fn restore(storage: &HubDocStorage, canvas_doc_id: &str) -> bool {
+    storage.restore_canvas_id(canvas_doc_id).await
+}
+
+/// soft-delete blobs that were referenced ONLY by the given canvas.
+///
+/// collects the canvas's blake3 hashes, subtracts any that are also
+/// referenced by another active (non-removed) canvas, and soft-deletes the
+/// remainder with the given actor. unlike `purge`, this does NOT require the
+/// canvas to be in the removed list and does NOT hard-delete anything — the
+/// actual byte reclaim happens later via `HardDeleteBlobs`.
+///
+/// returns the number of blobs soft-deleted.
+pub async fn sweep_canvas_blobs(
+    storage: &HubDocStorage,
+    blobz: &Arc<dyn BlobStore>,
+    canvas_doc_id: &str,
+    actor: &str,
+) -> Result<u64, MaintenanceError> {
+    // 1. collect this canvas's blake3 hashes.
+    let this_canvas_widget_docs = widget_doc_ids_for_canvas(storage, canvas_doc_id).await;
+    let mut this_canvas_blake3s: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for widget_doc_id in &this_canvas_widget_docs {
+        if let Some(hash) = blake3_for_widget_doc(storage, widget_doc_id).await {
+            this_canvas_blake3s.insert(hash);
+        }
+    }
+
+    if this_canvas_blake3s.is_empty() {
+        return Ok(0);
+    }
+
+    // 2. collect blake3s referenced by any OTHER active (non-removed) canvas.
+    let mut still_referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for other_canvas_id in storage.load_canvas_ids().await {
+        if other_canvas_id == canvas_doc_id {
+            continue;
+        }
+        for widget_doc_id in widget_doc_ids_for_canvas(storage, &other_canvas_id).await {
+            if let Some(hash) = blake3_for_widget_doc(storage, &widget_doc_id).await {
+                still_referenced.insert(hash);
+            }
+        }
+    }
+
+    // 3. soft-delete blobs unique to this canvas.
+    let to_delete: Vec<String> = this_canvas_blake3s
+        .into_iter()
+        .filter(|h| !still_referenced.contains(h))
+        .collect();
+
+    if to_delete.is_empty() {
+        return Ok(0);
+    }
+
+    let outcome = blobz
+        .soft_delete(&to_delete, actor)
+        .await
+        .map_err(MaintenanceError::Blobz)?;
+
+    if !outcome.failed.is_empty() {
+        tracing::debug!(
+            canvas_doc_id,
+            failed_count = outcome.failed.len(),
+            "sweep_canvas_blobs: some blobs were already soft-deleted or missing"
+        );
+    }
+
+    Ok(outcome.affected)
+}
+
+/// permanently purge a soft-deleted canvas: its own automerge doc, its
+/// per-widget docs, and — only if no other still-known canvas's widgets
+/// reference them — the blob files those widgets pointed at.
+///
+/// refuses (returns `Err`) if `canvas_doc_id` isn't currently soft-deleted,
+/// matching `HubDocStorage::purge_canvas_id`'s own guard (checked again
+/// here explicitly so the caller gets a specific error rather than a
+/// silent `false`).
+pub async fn purge(
+    storage: &HubDocStorage,
+    blobz: &Arc<dyn BlobStore>,
+    canvas_doc_id: &str,
+) -> Result<PurgeReport, MaintenanceError> {
+    let removed_ids = storage.load_removed_canvas_ids(i64::MAX, 0).await;
+    if !removed_ids.iter().any(|r| r.canvas_doc_id == canvas_doc_id) {
+        return Err(MaintenanceError::NotRemoved(canvas_doc_id.to_string()));
+    }
+
+    // 1. read this canvas's own widgets (doc id -> blake3, where readable)
+    //    BEFORE deleting anything.
+    let this_canvas_widget_docs = widget_doc_ids_for_canvas(storage, canvas_doc_id).await;
+    let mut this_canvas_blake3s: HashSet<String> = HashSet::new();
+    for widget_doc_id in &this_canvas_widget_docs {
+        if let Some(hash) = blake3_for_widget_doc(storage, widget_doc_id).await {
+            this_canvas_blake3s.insert(hash);
+        }
+    }
+
+    // 2. collect every blake3 hash referenced by any OTHER still-known
+    //    canvas (active or soft-deleted-but-not-yet-purged) — the "still
+    //    referenced elsewhere" set a blob must be absent from before it's
+    //    safe to delete.
+    let mut still_referenced: HashSet<String> = HashSet::new();
+    for other_canvas_id in storage.load_all_tracked_canvas_ids().await {
+        if other_canvas_id == canvas_doc_id {
+            continue;
+        }
+        for widget_doc_id in widget_doc_ids_for_canvas(storage, &other_canvas_id).await {
+            if let Some(hash) = blake3_for_widget_doc(storage, &widget_doc_id).await {
+                still_referenced.insert(hash);
+            }
+        }
+    }
+
+    // 3. delete this canvas's own widget docs unconditionally — never
+    //    shared with another canvas.
+    for widget_doc_id in &this_canvas_widget_docs {
+        storage.delete_doc(widget_doc_id).await;
+    }
+
+    // 4. delete blobs this canvas referenced, unless some other still-known
+    //    canvas also references them. the store has no direct hard-delete —
+    //    a blob must be soft-deleted first, so this stamps the maintenance
+    //    sweep itself as the actor before reclaiming the row and file.
+    const PURGE_ACTOR: &str = "system:maintenance-purge";
+    let mut blobs_deleted = Vec::new();
+    let mut blobs_kept = Vec::new();
+    for hash in &this_canvas_blake3s {
+        if still_referenced.contains(hash) {
+            blobs_kept.push(hash.clone());
+        } else {
+            let hash_slice = std::slice::from_ref(hash);
+            let _ = blobz.soft_delete(hash_slice, PURGE_ACTOR).await;
+            let _ = blobz.hard_delete_soft_deleted(Some(hash_slice)).await;
+            blobs_deleted.push(hash.clone());
+        }
+    }
+
+    // 5. finally, delete the canvas doc itself + its tracking row.
+    storage.purge_canvas_id(canvas_doc_id).await;
+
+    Ok(PurgeReport {
+        canvas_doc_id: canvas_doc_id.to_string(),
+        widget_docs_deleted: this_canvas_widget_docs,
+        blobs_deleted,
+        blobs_kept_still_referenced: blobs_kept,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// automerge doc-reading helpers
+// ---------------------------------------------------------------------------
+
+/// read a top-level string field off a loaded automerge doc. returns an
+/// empty string for anything missing/unreadable/non-string (mirrors
+/// `hub/canvas.rs`'s `read_str` helper, duplicated here rather than shared
+/// since that one is private to its module and takes a live `DocHandle`
+/// rather than a bare loaded `Automerge`).
+fn read_root_str(doc: &automerge::Automerge, key: &str) -> String {
+    use automerge::ReadDoc;
+    match doc.get(automerge::ROOT, key) {
+        Ok(Some((automerge::Value::Object(automerge::ObjType::Text), text_id))) => {
+            doc.text(&text_id).unwrap_or_default()
+        }
+        Ok(Some((v, _))) => v.to_str().map(|s| s.to_string()).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// every non-null `widgets[*].docId` on a canvas doc, best-effort (empty if
+/// the doc's bytes are missing/unreadable/have no `widgets` map).
+async fn widget_doc_ids_for_canvas(storage: &HubDocStorage, canvas_doc_id: &str) -> Vec<String> {
+    use automerge::ReadDoc;
+
+    let Some(bytes) = storage.load_doc(canvas_doc_id).await else {
+        return Vec::new();
+    };
+    let Ok(doc) = automerge::Automerge::load(&bytes) else {
+        return Vec::new();
+    };
+
+    let Ok(Some((_, widgets_obj))) = doc.get(automerge::ROOT, "widgets") else {
+        return Vec::new();
+    };
+
+    let mut doc_ids = Vec::new();
+    for widget_key in doc.keys(&widgets_obj) {
+        let Ok(Some((_, widget_obj))) = doc.get(&widgets_obj, widget_key.as_str()) else {
+            continue;
+        };
+        if let Ok(Some((v, _))) = doc.get(&widget_obj, "docId") {
+            if let Some(s) = v.to_str() {
+                if !s.is_empty() {
+                    doc_ids.push(s.to_string());
+                }
+            }
+        }
+    }
+    doc_ids
+}
+
+/// read a widget state doc's root-level `blake3` field, if present — mirrors
+/// `hub/canvas.rs`'s `send_blob_seek_to_peer`'s "widget state docs have this
+/// at root" reasoning. returns `None` if the doc is missing/unreadable or
+/// has no blake3 field (most widget types don't reference a blob at all).
+async fn blake3_for_widget_doc(storage: &HubDocStorage, widget_doc_id: &str) -> Option<String> {
+    use automerge::ReadDoc;
+
+    let bytes = storage.load_doc(widget_doc_id).await?;
+    let doc = automerge::Automerge::load(&bytes).ok()?;
+    let (v, _) = doc.get(automerge::ROOT, "blake3").ok().flatten()?;
+    let s = v.to_str()?;
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn make_storage() -> (HubDocStorage, Arc<dyn BlobStore>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let docs_db = tmp.path().join("hub-docs.db");
+        let storage = HubDocStorage::new(&docs_db).await.expect("storage");
+        let pool = crate::db::open_in_memory().await;
+        let blob_store: Arc<dyn BlobStore> = Arc::new(
+            freqhole_reliquary::blobz::SqliteBlobStore::new(pool, tmp.path()),
+        );
+        (storage, blob_store, tmp)
+    }
+
+    /// build a minimal canvas doc's raw bytes with a `widgets` map whose
+    /// entries carry the given `docId`s (title also set, for `list_removed`
+    /// coverage).
+    fn build_canvas_doc_bytes(title: &str, widget_doc_ids: &[&str]) -> Vec<u8> {
+        use automerge::transaction::Transactable;
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            tx.put(automerge::ROOT, "title", title)?;
+            let widgets_obj = tx.put_object(automerge::ROOT, "widgets", automerge::ObjType::Map)?;
+            for (i, wid) in widget_doc_ids.iter().enumerate() {
+                let widget_id = format!("widget-{i}");
+                let widget_obj =
+                    tx.put_object(&widgets_obj, widget_id.as_str(), automerge::ObjType::Map)?;
+                tx.put(&widget_obj, "docId", *wid)?;
+            }
+            Ok(())
+        })
+        .expect("transact");
+        doc.save()
+    }
+
+    /// build a minimal widget-state doc's raw bytes with a `blake3` field.
+    fn build_widget_doc_bytes(blake3: &str) -> Vec<u8> {
+        use automerge::transaction::Transactable;
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            tx.put(automerge::ROOT, "blake3", blake3)?;
+            Ok(())
+        })
+        .expect("transact");
+        doc.save()
+    }
+
+    #[tokio::test]
+    async fn list_removed_resolves_titles_and_only_returns_soft_deleted_canvases() {
+        let (storage, _blobz, _tmp) = make_storage().await;
+
+        storage.save_canvas_id("active-canvas").await;
+        storage
+            .save_doc(
+                "active-canvas",
+                &build_canvas_doc_bytes("still active", &[]),
+            )
+            .await;
+
+        storage.soft_remove_canvas_id("trashed-canvas").await;
+        storage
+            .save_doc(
+                "trashed-canvas",
+                &build_canvas_doc_bytes("in the trash", &[]),
+            )
+            .await;
+
+        let removed = list_removed(&storage, 20, 0).await;
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].canvas_doc_id, "trashed-canvas");
+        assert_eq!(removed[0].title, "in the trash");
+        assert!(!removed[0].removed_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_reactivates_a_soft_deleted_canvas() {
+        let (storage, _blobz, _tmp) = make_storage().await;
+        storage.soft_remove_canvas_id("c1").await;
+
+        assert_eq!(storage.count_removed_canvas_ids().await, 1);
+        assert!(restore(&storage, "c1").await);
+        assert_eq!(storage.count_removed_canvas_ids().await, 0);
+        assert!(storage.load_canvas_ids().await.contains(&"c1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn purge_refuses_a_canvas_that_is_not_soft_deleted() {
+        let (storage, blobz, _tmp) = make_storage().await;
+        storage.save_canvas_id("active-canvas").await;
+
+        let result = purge(&storage, &blobz, "active-canvas").await;
+        assert!(matches!(result, Err(MaintenanceError::NotRemoved(id)) if id == "active-canvas"));
+    }
+
+    #[tokio::test]
+    async fn purge_deletes_the_canvas_doc_and_its_own_widget_docs() {
+        let (storage, blobz, _tmp) = make_storage().await;
+
+        storage.soft_remove_canvas_id("c1").await;
+        storage
+            .save_doc("c1", &build_canvas_doc_bytes("gone", &["w1"]))
+            .await;
+        storage.save_doc("w1", &build_widget_doc_bytes("")).await;
+
+        let report = purge(&storage, &blobz, "c1").await.expect("purge succeeds");
+        assert_eq!(report.widget_docs_deleted, vec!["w1".to_string()]);
+        assert!(storage.load_doc("c1").await.is_none());
+        assert!(storage.load_doc("w1").await.is_none());
+        assert_eq!(storage.count_removed_canvas_ids().await, 0);
+    }
+
+    #[tokio::test]
+    async fn purge_deletes_a_blob_only_referenced_by_the_purged_canvas() {
+        let (storage, blobz_store, tmp) = make_storage().await;
+
+        let bytes = b"orphan blob content";
+        let blob = blobz_store
+            .insert(
+                bytes,
+                freqhole_reliquary::blobz::NewBlobMeta {
+                    filename: Some("f.txt".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("insert blob");
+        let hash = blob.blake3.clone();
+
+        storage.soft_remove_canvas_id("c1").await;
+        storage
+            .save_doc("c1", &build_canvas_doc_bytes("solo canvas", &["w1"]))
+            .await;
+        storage.save_doc("w1", &build_widget_doc_bytes(&hash)).await;
+
+        let report = purge(&storage, &blobz_store, "c1")
+            .await
+            .expect("purge succeeds");
+        assert_eq!(report.blobs_deleted, vec![hash.clone()]);
+        assert!(report.blobs_kept_still_referenced.is_empty());
+        assert!(blobz_store.get(&hash).await.expect("get ok").is_none());
+        let _ = tmp; // keep tempdir alive through the assertions above
+    }
+
+    #[tokio::test]
+    async fn purge_keeps_a_blob_still_referenced_by_another_canvas() {
+        let (storage, blobz_store, _tmp) = make_storage().await;
+
+        let blob = blobz_store
+            .insert(
+                b"shared content",
+                freqhole_reliquary::blobz::NewBlobMeta {
+                    filename: Some("f.txt".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("insert blob");
+        let hash = blob.blake3.clone();
+
+        // c1 (about to be purged) and c2 (still active) both reference the
+        // same blob through their own separate widget docs.
+        storage.soft_remove_canvas_id("c1").await;
+        storage
+            .save_doc("c1", &build_canvas_doc_bytes("purging this one", &["w1"]))
+            .await;
+        storage.save_doc("w1", &build_widget_doc_bytes(&hash)).await;
+
+        storage.save_canvas_id("c2").await;
+        storage
+            .save_doc("c2", &build_canvas_doc_bytes("keep this one", &["w2"]))
+            .await;
+        storage.save_doc("w2", &build_widget_doc_bytes(&hash)).await;
+
+        let report = purge(&storage, &blobz_store, "c1")
+            .await
+            .expect("purge succeeds");
+        assert!(report.blobs_deleted.is_empty());
+        assert_eq!(report.blobs_kept_still_referenced, vec![hash.clone()]);
+        assert!(blobz_store.get(&hash).await.expect("get ok").is_some());
+
+        // c1's own widget doc is still gone even though the blob survives —
+        // widget docs are never shared, only the underlying blob is.
+        assert!(storage.load_doc("w1").await.is_none());
+        assert!(storage.load_doc("c1").await.is_none());
+        // c2 and its widget doc are completely untouched.
+        assert!(storage.load_doc("c2").await.is_some());
+        assert!(storage.load_doc("w2").await.is_some());
+    }
+
+    // --- sweep_canvas_blobs tests ---
+
+    #[tokio::test]
+    async fn sweep_soft_deletes_only_blobs_unique_to_deleted_canvas() {
+        let (storage, blobz_store, _tmp) = make_storage().await;
+
+        // shared blob — also referenced by c2
+        let shared = blobz_store
+            .insert(
+                b"shared",
+                freqhole_reliquary::blobz::NewBlobMeta {
+                    filename: Some("shared.bin".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // orphan blob — only referenced by c1
+        let orphan = blobz_store
+            .insert(
+                b"orphan",
+                freqhole_reliquary::blobz::NewBlobMeta {
+                    filename: Some("orphan.bin".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // c1 references both
+        storage.save_canvas_id("c1").await;
+        storage
+            .save_doc(
+                "c1",
+                &build_canvas_doc_bytes("canvas 1", &["w-shared", "w-orphan"]),
+            )
+            .await;
+        storage
+            .save_doc("w-shared", &build_widget_doc_bytes(&shared.blake3))
+            .await;
+        storage
+            .save_doc("w-orphan", &build_widget_doc_bytes(&orphan.blake3))
+            .await;
+
+        // c2 (still active) references only the shared blob
+        storage.save_canvas_id("c2").await;
+        storage
+            .save_doc("c2", &build_canvas_doc_bytes("canvas 2", &["w-shared-2"]))
+            .await;
+        storage
+            .save_doc("w-shared-2", &build_widget_doc_bytes(&shared.blake3))
+            .await;
+
+        let affected = sweep_canvas_blobs(&storage, &blobz_store, "c1", "system:canvas-deleted")
+            .await
+            .expect("sweep ok");
+
+        // only the orphan should be soft-deleted
+        assert_eq!(affected, 1);
+        // shared blob still visible
+        assert!(blobz_store.get(&shared.blake3).await.unwrap().is_some());
+        // orphan is hidden from normal get
+        assert!(blobz_store.get(&orphan.blake3).await.unwrap().is_none());
+        // get_any still finds it (just soft-deleted, not gone)
+        assert!(blobz_store.get_any(&orphan.blake3).await.unwrap().is_some());
+
+        // actor is stamped correctly
+        let (sd, sd_total) = blobz_store.list_soft_deleted(i64::MAX, 0).await.unwrap();
+        assert_eq!(sd_total, 1);
+        assert_eq!(sd.len(), 1);
+        assert_eq!(sd[0].blake3, orphan.blake3);
+        assert_eq!(
+            sd[0].soft_deleted_by.as_deref(),
+            Some("system:canvas-deleted")
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_with_no_unique_blobs_returns_zero() {
+        let (storage, blobz_store, _tmp) = make_storage().await;
+
+        let shared = blobz_store
+            .insert(
+                b"shared2",
+                freqhole_reliquary::blobz::NewBlobMeta::default(),
+            )
+            .await
+            .unwrap();
+
+        storage.save_canvas_id("c1").await;
+        storage
+            .save_doc("c1", &build_canvas_doc_bytes("c1", &["w1"]))
+            .await;
+        storage
+            .save_doc("w1", &build_widget_doc_bytes(&shared.blake3))
+            .await;
+
+        storage.save_canvas_id("c2").await;
+        storage
+            .save_doc("c2", &build_canvas_doc_bytes("c2", &["w2"]))
+            .await;
+        storage
+            .save_doc("w2", &build_widget_doc_bytes(&shared.blake3))
+            .await;
+
+        let affected = sweep_canvas_blobs(&storage, &blobz_store, "c1", "system:test")
+            .await
+            .expect("sweep ok");
+        assert_eq!(affected, 0);
+        assert!(blobz_store.get(&shared.blake3).await.unwrap().is_some());
+    }
+}

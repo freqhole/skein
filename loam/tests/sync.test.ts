@@ -1,3 +1,10 @@
+// every test in this file opens two canvasPage() peers sharing a
+// canvasDocId — a multi-page BroadcastChannel mesh, which contends for cpu
+// with other heavy specs if run concurrently (see playwright.config.ts's
+// HEAVY_TEST_FILES doc comment).
+//
+// run with: npx playwright test tests/sync.test.ts --workers=1
+
 import { expect, test } from "./fixtures/canvas-page";
 
 test("two peers see each other's widgets via BroadcastChannel", async ({ canvasPage }) => {

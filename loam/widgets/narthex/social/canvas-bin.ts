@@ -47,6 +47,7 @@ import {
   type SlotSizeOptions,
 } from "../../bin/bin-layout";
 import { registerSocialBridge } from "../../../src/dev/test-bridge-registry";
+import type { ProfileCanvasBinTestHooks } from "../../../src/dev/test-bridge";
 import {
   ACCENT,
   BG,
@@ -90,18 +91,17 @@ export interface ProfileCanvasBinContext {
   height: number;
   /** render in read-only mode: no drag-to-move, no "+ folder" button — only
    *  navigate-into-folder and open-canvas stay active. used for viewing a
-   *  FRIEND's bin (friends-tab.ts's friend-detail view, and the
-   *  `friend-canvas-bin` narthex widget) — the owner's own embed
-   *  (profile-tab.ts) omits this (defaults to `false`, fully editable). */
+   *  FRIEND's bin (friends-tab.ts's friend-detail view) — the owner's own
+   *  embed (profile-tab.ts) omits this (defaults to `false`, fully
+   *  editable). */
   isReadOnly?: boolean;
   /**
    * override how this instance's test hooks get exposed. defaults to
    * `registerSocialBridge({ canvasBin: hooks })` — the owner's own
    * profile-tab embed, which is a permanent per-session singleton. any
    * OTHER concurrent mount of this widget (a friend's read-only bin in
-   * friends-tab.ts, or an instance of the `friend-canvas-bin` narthex
-   * widget) must supply its own registration target here, or it would
-   * silently clobber the owner's own hooks under the same
+   * friends-tab.ts) must supply its own registration target here, or it
+   * would silently clobber the owner's own hooks under the same
    * `window.__skeinTest.social.canvasBin` key.
    */
   registerTestHooks?: (hooks: ProfileCanvasBinTestHooks) => void;
@@ -111,61 +111,6 @@ export interface ProfileCanvasBinController {
   container: Container;
   layout(width: number, height?: number): void;
   destroy(): void;
-}
-
-/**
- * test hooks for this widget — see `ProfileCanvasBinContext.registerTestHooks`
- * above for how/where an instance's hooks get exposed on
- * `window.__skeinTest`. `getVisibleNodes()` reads the folder currently being
- * viewed (root or a sub-folder) directly off `CanvasBinStore` — proves the
- * tree, not just pixi render state (and is NOT paginated — pagination only
- * affects which of these are actually drawn on the current page, see
- * `getCurrentPage()`/`getTotalPages()`). `enterFolder`/`goBack`/`addFolder`/
- * `moveNode`/`activateNode` call the widget's real internal handlers
- * directly, same precedent as `FriendsTabTestHooks` (no infra in this repo
- * for simulated pixi pointer drags).
- */
-export interface ProfileCanvasBinTestHooks {
-  /** child nodes of the currently-viewed folder (or root). */
-  getVisibleNodes(): CanvasBinNode[];
-  /** the currently-viewed folder's id, or null at root. */
-  getCurrentFolderId(): string | null;
-  /** enter a folder (as if its card were tapped) or navigate to a canvas
-   *  (as if a canvas card were tapped) — dispatches on the node's kind. */
-  enterFolder(nodeId: string): void;
-  /** return to the parent folder, as if the "‹ back" button were tapped. */
-  goBack(): void;
-  /** create a new folder under the currently-viewed folder. returns the new
-   *  folder's id, or "" if it couldn't be created (also "" in read-only
-   *  mode — see `isReadOnly()`). */
-  addFolder(title: string): string;
-  /** move a node (folder or canvas reference) to a new parent folder id, or
-   *  to root when null — as if it had been dragged and dropped there.
-   *  returns whether the move succeeded (always `false` in read-only mode —
-   *  see `isReadOnly()`; see `CanvasBinStore.moveNode()` for the other
-   *  cases it refuses). */
-  moveNode(nodeId: string, newParentId: string | null): boolean;
-  /** whether this instance is rendering in read-only mode (no drag/add-
-   *  folder wiring — see `ProfileCanvasBinContext.isReadOnly`). */
-  isReadOnly(): boolean;
-  /** the current page (0-based) within the currently-viewed folder. */
-  getCurrentPage(): number;
-  /** total page count for the currently-viewed folder (at least 1). */
-  getTotalPages(): number;
-  /** advance to the next page, as if the "next" button were tapped.
-   *  no-op if already on the last page. */
-  nextPage(): void;
-  /** go back to the previous page, as if the "prev" button were tapped.
-   *  no-op if already on the first page. */
-  prevPage(): void;
-  /** activate a node by id exactly as a real tap would (enter folder /
-   *  navigate to canvas), regardless of which folder is currently visible. */
-  activateNode(nodeId: string): void;
-  /** node ids on the current page whose preview-image `Sprite` has actually
-   *  finished loading and attached (not just that the entry has a
-   *  `previewUrl` set) — lets a test (or live debugging) prove an image
-   *  genuinely rendered. */
-  getLoadedPreviewNodeIds(): string[];
 }
 
 /** find the next available "new folder"/"new folder 2"/... name among
@@ -813,7 +758,7 @@ export function createProfileCanvasBinWidget(ctx: ProfileCanvasBinContext): Prof
   const binUnsub = canvasBinStore.onChange(() => render());
 
   // -- test hooks ---------------------------------------------------------------
-  // see ProfileCanvasBinTestHooks above / ProfileCanvasBinContext.registerTestHooks
+  // see ProfileCanvasBinTestHooks (dev/test-bridge.ts) / ProfileCanvasBinContext.registerTestHooks
   // for how this gets exposed for different concurrent mounts — mirrors the
   // established "call the widget's real internal handlers directly, since
   // this repo has no infra for simulated pixi pointer drags" precedent

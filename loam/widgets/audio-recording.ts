@@ -16,18 +16,18 @@
 //   any error → error → (click) → requesting → ...
 //
 // storage:
-//   storeBlobFromFile() via blob worker writes OPFS bytes + IndexedDB metadata
-//   (browser mode). in tauri mode, the blob worker's blake3 hasher is a stub
-//   (midden WASM is aliased away for tauri builds — see blob-worker.ts's own
-//   doc comment) and always returns "" — so tauri recordings are routed
-//   through the rust `blob_insert` dispatch instead (real blake3 computed in
-//   rust, and the bytes get pre-warmed into the FsStore so iroh-blobs can
-//   actually serve them to peers), then best-effort mirrored into OPFS/
-//   IndexedDB via storeBlob() so local getBlobData() reads keep working —
-//   this exactly mirrors file-utils.ts's uploadFile() tauri branch. a real,
-//   user-reported bug: before this fix, a tauri-recorded clip's `d.blake3`
-//   was always empty, so a browser peer's snatch probe always reported
-//   "peer does not have the blob" (an empty-hash lookup can never match).
+//   storeBlobFromFile() via the blob worker writes OPFS bytes + IndexedDB
+//   metadata (browser mode). in tauri mode, the blob worker's blake3 hasher
+//   has no midden module bundled to hash with and always returns "" — so
+//   tauri recordings are routed through the rust `blob_insert` dispatch
+//   instead (real blake3 computed in rust, and the bytes get pre-warmed
+//   into the FsStore so iroh-blobs can actually serve them to peers), then
+//   best-effort mirrored into OPFS/IndexedDB via storeBlob() so local
+//   getBlobData() reads keep working — this exactly mirrors
+//   file-utils.ts's uploadFile() tauri branch. a real, user-reported bug:
+//   before this fix, a tauri-recorded clip's `d.blake3` was always empty,
+//   so a browser peer's snatch probe always reported "peer does not have
+//   the blob" (an empty-hash lookup can never match).
 //   immediate post-record playback uses URL.createObjectURL() on the in-memory blob.
 //   restore-from-doc playback uses getBlobData() which reads OPFS first, then
 //   falls back to the rust-side blob_get dispatch in tauri mode.
@@ -54,8 +54,8 @@ import {
   getBlobRecord,
   storeBlob,
   storeBlobFromFile,
-} from "../src/storage/skein-blob-store";
-import { base64Encode } from "../src/workers/blob-worker-client";
+} from "../src/storage/blob-store";
+import { base64Encode } from "@freqhole/reliquary/worker";
 import {
   checkBlobLocality,
   getLocalNodeId,
@@ -198,7 +198,7 @@ export interface AudioBlobRef {
 
 /** injectable dependencies — lets the resolution algorithm be unit-tested
  *  without OPFS/IndexedDB/P2P plumbing. the widget wires in the real
- *  implementations from skein-blob-store / file-utils. */
+ *  implementations from the blob store / file-utils. */
 export interface ResolveAudioBytesDeps {
   getBlobData: (blobId: string) => Promise<ArrayBuffer | null>;
   checkBlobLocality: (blobId: string, blake3?: string) => Promise<BlobLocalityInfo>;
@@ -934,17 +934,12 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           // through rust) keep working — dedup on blake3, same as uploadFile().
           const existingRecord = await getBlobRecord(response.blake3);
           if (!existingRecord) {
-            await storeBlob(response.blake3, buffer, {
-              blob_id: response.blake3,
-              sha256: "",
-              blake3: response.blake3,
+            await storeBlob(buffer, {
               filename: response.filename || filename,
               mime: resolvedMime,
-              size: response.size,
-              domain: classifyDomain(resolvedMime),
               blob_type: "original",
               parent_blob_id: null,
-              metadata: {},
+              metadata: { domain: classifyDomain(resolvedMime) },
             });
           }
 
@@ -957,7 +952,14 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           };
         } else {
           const file = new File([recordedBlob], filename, { type: recMime });
-          record = await storeBlobFromFile(file, "audio");
+          const fileRecord = await storeBlobFromFile(file, { metadata: { domain: "audio" } });
+          record = {
+            blob_id: fileRecord.blob_id,
+            sha256: fileRecord.sha256 ?? "",
+            blake3: fileRecord.blake3 || fileRecord.blob_id,
+            size: fileRecord.size,
+            mime: fileRecord.mime,
+          };
         }
         // the recorder has the blob locally the instant it's stored — record
         // that now, not just after some other peer later snatches it. without

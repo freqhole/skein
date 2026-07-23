@@ -7,7 +7,7 @@ import { createSkeinHarness } from "../harness/skein-harness";
 import { PresenceManager } from "../canvas/presence-manager";
 import { Viewport } from "../canvas/viewport";
 import { createWidgetDoc } from "../widgets/widget-doc";
-import { getBlobWorker, processBlobBytes, streamFileToOpfs } from "../workers/blob-worker-client";
+import { getBlobWorker, processBlobBytes, streamFileToOpfs } from "@freqhole/reliquary/worker";
 
 /**
  * a simple zod schema used by playwright tests to exercise createWidgetDoc.
@@ -21,6 +21,16 @@ const testWidgetSchema = z.object({
 
 interface TestInitOptions {
   canvasDocId?: string | null;
+  /**
+   * skip the automatic admin-stamp below for a freshly created canvas.
+   * for tests that specifically exercise `CanvasStore.stampAdmin()`'s own
+   * bootstrap-from-empty-acl behavior — without this, every fresh canvas
+   * already has the harness's own peer id stamped as admin, so a test
+   * calling `stampAdmin()` with a different node id observes it as a
+   * (correct, idempotent) no-op rather than the empty-acl case it means
+   * to test.
+   */
+  skipAutoAdmin?: boolean;
 }
 
 interface TestInitResult {
@@ -36,9 +46,9 @@ interface TestInitResult {
  * via page.evaluate(), and window.__skein for test assertions.
  */
 async function initSkeinForTest(options: TestInitOptions = {}): Promise<TestInitResult> {
-  // build the repo + canvas doc via the harness (see harness/skein-harness.ts —
-  // phase 2 step 1 of the SkeinHarness extraction) instead of hand-rolling a
+  // build the repo + canvas doc via the harness instead of hand-rolling a
   // BroadcastChannelNetworkAdapter + Repo here.
+  const isNewCanvas = !options.canvasDocId;
   const harness = await createSkeinHarness({ canvasDocId: options.canvasDocId ?? null });
 
   const canvas: SkeinCanvas = await initCanvas({
@@ -47,6 +57,17 @@ async function initSkeinForTest(options: TestInitOptions = {}): Promise<TestInit
     registry: createTestRegistry(),
     repo: harness.repo,
   });
+
+  // stamp the local peer's node id (and, for a freshly created canvas, admin
+  // role) the same way boot.ts does after initCanvas() — the toolbar/widget
+  // manager gate widget mutation on `store.isLocalViewer()`, which defaults
+  // to true until a node id is set, so skipping this leaves every test
+  // using this bootstrap permanently in read-only/viewer mode.
+  canvas.store.setLocalNodeId(harness.repo.peerId);
+  if (isNewCanvas && !options.skipAutoAdmin) {
+    canvas.store.stampAdmin(harness.repo.peerId);
+  }
+  canvas.toolbar.refreshRoleGating();
 
   (window as any).__skein = canvas;
   (window as any).__skeinTest = { canvas, p2p: null } satisfies SkeinTestBridge;

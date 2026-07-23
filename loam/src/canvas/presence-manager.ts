@@ -1,5 +1,5 @@
 import type { CanvasStore } from "./canvas-store";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 
 const TAG = "canvas.presence";
 

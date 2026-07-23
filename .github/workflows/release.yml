@@ -1,0 +1,409 @@
+# release build pipeline. runs while the changesets "Version Packages" PR is
+# open and (re)builds all platforms, uploading their assets to a DRAFT github
+# release tagged with the upcoming version.
+#
+# triggers (no PAT needed):
+#   - push to changeset-release/main (you pushing a commit to the version PR)
+#   - the version PR reopened or synchronized (close+reopen it, or push to it)
+#   - workflow_dispatch (rebuild a version on demand, e.g. after a flaky job)
+# the changesets bot's own push uses GITHUB_TOKEN, which github's recursion
+# guard stops from auto-triggering workflows - hence the user-driven levers above.
+#
+# builds run on the PR so problems get worked out before merge. when the version
+# PR merges, changesets.yml just publishes this already-built draft (it does not
+# rebuild anything).
+#
+# design goals:
+#   - one draft release; every platform job uploads its own assets to it.
+#   - jobs are independent (only `needs: create-release`) so a single failure
+#     never blocks the others; use "re-run failed jobs" to retry one platform,
+#     or build it locally with `make` and `gh release upload` by hand.
+#   - uploads use --clobber so retries (and re-pushes of the PR) overwrite cleanly.
+#   - signing/notarization happens when the matching secrets are present and is
+#     skipped gracefully otherwise (the make targets already no-op without them).
+#   - unlike tomb, linux builds run natively (no docker) since skein has no
+#     existing Dockerfile infrastructure - ubuntu-24.04/ubuntu-24.04-arm hosted
+#     runners provide genuine x86_64/arm64, so no cross-compilation is needed.
+name: release
+
+on:
+  push:
+    branches:
+      - "changeset-release/main"
+  pull_request:
+    types: [reopened, synchronize]
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version to (re)build, e.g. 0.1.1 (defaults to root package.json)"
+        required: false
+        type: string
+
+concurrency:
+  # normalize push (ref_name) and pull_request (head.ref) for the same branch to
+  # one group so the two events don't double-build.
+  group: release-build-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # tumulus/dev-data/ is gitignored, so every job that builds tumulus (all of
+  # them) installs sqlx-cli and runs `make dev-data` to (re)create this db
+  # before compiling - see the "install sqlx-cli" / "set up sqlite dev db"
+  # steps below.
+  DATABASE_URL: sqlite:tumulus/dev-data/skein-hub.db
+
+jobs:
+  create-release:
+    name: create draft release
+    # for pull_request events, only the version PR (head changeset-release/main)
+    # should build. push + workflow_dispatch always proceed. downstream platform
+    # jobs `needs` this, so skipping here skips them all.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.ref == 'changeset-release/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: resolve version + tag
+        id: meta
+        run: |
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ]; then V="$(node -p "require('./package.json').version")"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+
+      - name: create draft release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists, leaving it as-is"
+          else
+            # target main: the tag is created at main HEAD when the draft is
+            # published (after the version PR merges).
+            gh release create "$TAG" --draft --target main --generate-notes --title "$TAG"
+          fi
+
+      # set the draft body to the changeset changelog + generated notes so the
+      # "what changed" text is visible in the draft (not just after publish).
+      # idempotent: re-runs on each push to the version PR replace the body.
+      - name: set draft release notes from changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release-notes.mjs "${{ steps.meta.outputs.tag }}"
+
+  # ---- macOS arm64: tumulus cli + skein .dmg --------------------------------
+  mac-arm64:
+    name: macOS arm64 (cli + dmg)
+    needs: create-release
+    runs-on: macos-14
+    env:
+      APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: install tauri-cli
+        run: cargo install tauri-cli --version "^2.0" --locked
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+      - name: install loam deps
+        run: npm ci
+        working-directory: loam
+      - name: import apple signing certificate
+        if: env.APPLE_CERTIFICATE_P12_BASE64 != ''
+        run: |
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PWD="$(openssl rand -base64 24)"
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > cert.p12
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security import cert.p12 -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          rm -f cert.p12
+      # `make build-mac-arm` depends on `dev-data`, which (re)creates the
+      # sqlite dev db tumulus's sqlx compile-time query macros need.
+      - name: build tumulus cli (arm64)
+        run: make build-mac-arm
+      - name: build skein dmg (arm64)
+        run: make build-tauri-mac-arm
+      - name: upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.create-release.outputs.tag }}"
+          V="${{ needs.create-release.outputs.version }}"
+          chmod +x "build/$V/tumulus_${V}_darwin-aarch64"
+          gh release upload "$TAG" \
+            "build/$V/tumulus_${V}_darwin-aarch64" \
+            "build/$V/skein_${V}_aarch64.dmg" \
+            --clobber
+
+  # ---- macOS x86_64: tumulus cli + skein .dmg -------------------------------
+  # github retired the intel `macos-13` image, so there is no x86_64 hosted
+  # runner anymore (macos-14/15 are arm64). cross-compile the x86_64 target
+  # from the arm64 runner instead - the make targets already pass
+  # `--target x86_64-apple-darwin`, which builds + bundles fine from arm64.
+  mac-intel:
+    name: macOS x86_64 (cli + dmg)
+    needs: create-release
+    runs-on: macos-14
+    env:
+      APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: install tauri-cli
+        run: cargo install tauri-cli --version "^2.0" --locked
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+      - name: install loam deps
+        run: npm ci
+        working-directory: loam
+      - name: import apple signing certificate
+        if: env.APPLE_CERTIFICATE_P12_BASE64 != ''
+        run: |
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PWD="$(openssl rand -base64 24)"
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > cert.p12
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security import cert.p12 -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          rm -f cert.p12
+      # `make build-mac-intel` depends on `dev-data`, which (re)creates the
+      # sqlite dev db tumulus's sqlx compile-time query macros need.
+      - name: build tumulus cli (x86_64)
+        run: make build-mac-intel
+      - name: build skein dmg (x86_64)
+        run: make build-tauri-mac-intel
+      - name: upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.create-release.outputs.tag }}"
+          V="${{ needs.create-release.outputs.version }}"
+          chmod +x "build/$V/tumulus_${V}_darwin-x86_64"
+          gh release upload "$TAG" \
+            "build/$V/tumulus_${V}_darwin-x86_64" \
+            "build/$V/skein_${V}_x86_64.dmg" \
+            --clobber
+
+  # ---- linux x86_64: tumulus cli + skein .deb/.rpm (native, no docker) ------
+  linux-x86_64:
+    name: linux x86_64 (cli + deb/rpm)
+    needs: create-release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: install system deps (sqlite, gtk/webkit for tauri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            sqlite3 libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - name: install tauri-cli
+        run: cargo install tauri-cli --version "^2.0" --locked
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+      - name: install loam deps
+        run: npm ci
+        working-directory: loam
+      # `make build-linux` depends on `dev-data`, which (re)creates the
+      # sqlite dev db tumulus's sqlx compile-time query macros need.
+      - name: build tumulus cli (linux x86_64)
+        run: make build-linux
+      - name: build skein deb/rpm (linux x86_64)
+        run: make build-tauri-linux-intel
+      - name: upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.create-release.outputs.tag }}"
+          V="${{ needs.create-release.outputs.version }}"
+          chmod +x "build/$V/tumulus_${V}_linux-x86_64"
+          gh release upload "$TAG" \
+            "build/$V/tumulus_${V}_linux-x86_64" \
+            "build/$V/skein_${V}_x86_64.deb" \
+            "build/$V/skein_${V}_x86_64.rpm" \
+            --clobber
+
+  # ---- linux arm64: tumulus cli + skein .deb/.rpm (native arm runner) -------
+  linux-arm64:
+    name: linux arm64 (cli + deb/rpm)
+    needs: create-release
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: install system deps (sqlite, gtk/webkit for tauri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            sqlite3 libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - name: install tauri-cli
+        run: cargo install tauri-cli --version "^2.0" --locked
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+      - name: install loam deps
+        run: npm ci
+        working-directory: loam
+      # `make build-linux-arm64` depends on `dev-data`, which (re)creates
+      # the sqlite dev db tumulus's sqlx compile-time query macros need.
+      - name: build tumulus cli (linux aarch64)
+        run: make build-linux-arm64
+      - name: build skein deb/rpm (linux aarch64)
+        run: make build-tauri-linux-arm64
+      - name: upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.create-release.outputs.tag }}"
+          V="${{ needs.create-release.outputs.version }}"
+          chmod +x "build/$V/tumulus_${V}_linux-aarch64"
+          gh release upload "$TAG" \
+            "build/$V/tumulus_${V}_linux-aarch64" \
+            "build/$V/skein_${V}_aarch64.deb" \
+            "build/$V/skein_${V}_aarch64.rpm" \
+            --clobber
+
+  # ---- android: universal + arm64-only apks (best effort, non-blocking) -----
+  # android in ci is the fiddliest target (ndk + sdk + apksigner + tauri android
+  # init). it is non-blocking: if it fails, re-run it or build locally with
+  # `make build-tauri-android` and `gh release upload` by hand.
+  android:
+    name: android (universal + arm64 apk)
+    needs: create-release
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    env:
+      ANDROID_BUILD_TOOLS_VERSION: "34.0.0"
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: set up android sdk
+        uses: android-actions/setup-android@v3
+      - name: install ndk + build-tools
+        run: sdkmanager "ndk;26.3.11579264" "build-tools;${ANDROID_BUILD_TOOLS_VERSION}"
+      - name: export ndk path
+        run: echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+      - name: install tauri-cli
+        run: cargo install tauri-cli --version "^2.0" --locked
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+      - name: install loam deps
+        run: npm ci
+        working-directory: loam
+      # `cargo tauri android init` compiles the tauri crate (which depends
+      # on tumulus), so the sqlite dev db must exist before this step too -
+      # `make build-tauri-android`/`-arm64` further down also depend on
+      # `dev-data`, but running it explicitly here covers this earlier step.
+      - name: set up sqlite dev db (for sqlx compile-time query macros)
+        run: make dev-data
+      - name: init tauri android project (if not committed)
+        run: |
+          if [ ! -d tauri/gen/android ]; then
+            (cd tauri && DATABASE_URL=sqlite:$GITHUB_WORKSPACE/tumulus/dev-data/skein-hub.db cargo tauri android init)
+          fi
+      # cache + provision gradle so the gradle wrapper doesn't have to download
+      # the distribution on the build hot path (services.gradle.org times out
+      # intermittently, which fails the apk build at the very end).
+      - name: setup gradle (cache + provisioning)
+        uses: gradle/actions/setup-gradle@v4
+      - name: decode android keystore
+        if: env.ANDROID_KEY_ALIAS != ''
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+          echo "ANDROID_KEYSTORE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+      # forks without android signing secrets still get a working apk, signed
+      # with a throwaway key generated here. the key is ephemeral, so these
+      # apks can't upgrade-in-place over an official-signed install - that's
+      # fine for draft/ci artifacts and local testing.
+      - name: generate ephemeral android keystore (no signing secrets)
+        if: env.ANDROID_KEY_ALIAS == ''
+        run: |
+          KS="$RUNNER_TEMP/ephemeral.keystore"
+          PW="$(openssl rand -base64 24)"
+          echo "::add-mask::$PW"
+          keytool -genkeypair -v \
+            -keystore "$KS" -storetype PKCS12 \
+            -alias ephemeral -keyalg RSA -keysize 2048 -validity 365 \
+            -storepass "$PW" -keypass "$PW" \
+            -dname "CN=skein ci, OU=ci, O=freqhole, C=US"
+          echo "ANDROID_KEYSTORE=$KS" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_ALIAS=ephemeral" >> "$GITHUB_ENV"
+          echo "ANDROID_KEYSTORE_PASSWORD=$PW" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_PASSWORD=$PW" >> "$GITHUB_ENV"
+      - name: build apks
+        run: |
+          make build-tauri-android
+          make build-tauri-android-arm64
+      - name: upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.create-release.outputs.tag }}"
+          V="${{ needs.create-release.outputs.version }}"
+          gh release upload "$TAG" \
+            "build/$V/skein_${V}_android-universal.apk" \
+            "build/$V/skein_${V}_android-arm64.apk" \
+            --clobber

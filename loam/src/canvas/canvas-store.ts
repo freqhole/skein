@@ -236,12 +236,14 @@ export class CanvasStore {
   recordKnock(
     requesterNodeId: string,
     requesterUsername: string,
-    message: string
+    message: string,
+    knockId?: string
   ): PendingCanvasKnock {
     this.handle.change((doc) => {
       if (!doc.pendingKnocks) doc.pendingKnocks = {} as Record<string, PendingCanvasKnock>;
       if (!doc.pendingKnocks[requesterNodeId]) {
         doc.pendingKnocks[requesterNodeId] = {
+          knockId: knockId ?? crypto.randomUUID(),
           requesterNodeId,
           requesterUsername,
           message,
@@ -356,6 +358,25 @@ export class CanvasStore {
   }
 
   /**
+   * move this canvas's admin stamp from one node id to another.
+   *
+   * used when a peer that was admin-stamped under a temporary local id
+   * (see `p2p/anon-device-id.ts` — used before a real p2p identity
+   * exists) later establishes a real identity, so they don't lose
+   * ownership of canvases they created before that. a no-op if
+   * `oldNodeId` isn't the recorded admin — e.g. already migrated, or the
+   * admin is someone else entirely.
+   */
+  migrateAdminId(oldNodeId: string, newNodeId: string): void {
+    if (oldNodeId === newNodeId) return;
+    this.handle.change((doc) => {
+      if (!doc.acl || doc.acl[oldNodeId]?.role !== "admin") return;
+      delete doc.acl[oldNodeId];
+      doc.acl[newNodeId] = { role: "admin" };
+    });
+  }
+
+  /**
    * set (or change) a peer's role on this canvas. used both when an invite
    * is sent (role chosen at invite time) and later, to change an
    * already-invited peer's role.
@@ -375,27 +396,27 @@ export class CanvasStore {
   /**
    * effective role for a node id on this canvas.
    *
-   * a missing `.acl` entry defaults to `"member"` — this is a backward-
-   * compatibility default for canvases created before ACL roles existed
-   * (and for the common case of a peer who's connected but hasn't been
-   * explicitly assigned a role yet). the local node querying its own
+   * a peer without an explicit `.acl` entry has no assumed write access -
+   * `"viewer"` (read-only) is the safe floor for a node id that hasn't
+   * been granted a role, whether it's simply unrecorded or the entry on
+   * the doc is invalid/garbage. the local node querying its own
    * unrecorded role is treated the same way; there is no implicit
    * "stranger" state at this layer — that's gated separately by
    * `sharePolicy` / invite flow, not by `.acl`.
    *
    * **validates the raw value through `canvasRoleSchema` before trusting
    * it** — `.acl` is regular automerge doc data, synced from other peers
-   * with no server-side validation. a stale peer running pre-rename code
-   * (or a buggy/malicious one) could write an unrecognized role string;
-   * this falls back to the safe default rather than propagating garbage as
-   * if it were a valid role. see canvas-doc.ts's centralized role schemas
-   * for why this matters — this is the one place in the ACL model that
-   * reads untrusted synced data as a security-relevant value.
+   * with no server-side validation. a buggy or malicious peer could write
+   * an unrecognized role string; this falls back to the safe default
+   * rather than propagating garbage as if it were a valid role. see
+   * canvas-doc.ts's centralized role schemas for why this matters — this
+   * is the one place in the ACL model that reads untrusted synced data as
+   * a security-relevant value.
    */
   getRole(nodeId: string): CanvasRole {
     const raw = this.doc().acl?.[nodeId]?.role;
     const parsed = canvasRoleSchema.safeParse(raw);
-    return parsed.success ? parsed.data : "member";
+    return parsed.success ? parsed.data : "viewer";
   }
 
   /** convenience: true if `nodeId` has view-only access to this canvas. */
@@ -411,7 +432,7 @@ export class CanvasStore {
 
   /**
    * effective role for the local peer (via `setLocalNodeId()`). returns
-   * `"member"` if the local node id hasn't been set yet — same default as
+   * `"viewer"` if the local node id hasn't been set yet — same default as
    * `getRole()` for an unrecorded node, so callers don't need a separate
    * "not ready yet" branch.
    */

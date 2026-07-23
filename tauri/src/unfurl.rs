@@ -75,7 +75,10 @@ fn extract_link_meta(html: &str) -> LinkMeta {
 
     for tag in find_tag_slices(html, "meta") {
         let attrs = parse_attrs(tag);
-        let key = attrs.get("property").or_else(|| attrs.get("name")).map(String::as_str);
+        let key = attrs
+            .get("property")
+            .or_else(|| attrs.get("name"))
+            .map(String::as_str);
         let Some(content) = attrs.get("content") else {
             continue;
         };
@@ -190,7 +193,11 @@ fn parse_attrs(tag: &str) -> std::collections::HashMap<String, String> {
         }
 
         let name_start = i;
-        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+        while i < bytes.len()
+            && bytes[i] != b'='
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'>'
+        {
             i += 1;
         }
         let name = tag[name_start..i].to_ascii_lowercase();
@@ -268,7 +275,10 @@ mod link_unfurl_tests {
         let meta = extract_link_meta(html);
         assert_eq!(meta.title.as_deref(), Some("og title here"));
         assert_eq!(meta.description.as_deref(), Some("a great description"));
-        assert_eq!(meta.image_url.as_deref(), Some("https://example.com/preview.png"));
+        assert_eq!(
+            meta.image_url.as_deref(),
+            Some("https://example.com/preview.png")
+        );
     }
 
     #[test]
@@ -295,7 +305,10 @@ mod link_unfurl_tests {
         let html = "<meta property='og:image' content='https://example.com/img.jpg'>";
         let meta = extract_link_meta(html);
         assert_eq!(meta.title, None);
-        assert_eq!(meta.image_url.as_deref(), Some("https://example.com/img.jpg"));
+        assert_eq!(
+            meta.image_url.as_deref(),
+            Some("https://example.com/img.jpg")
+        );
     }
 
     #[test]

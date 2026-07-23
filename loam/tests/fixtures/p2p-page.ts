@@ -1,4 +1,5 @@
-import { test as base, expect, type BrowserContext, type Page } from "@playwright/test";
+import { test as base, expect, type BrowserContext, type Page, type TestInfo } from "@playwright/test";
+import { dumpPageCoverage } from "../helpers/e2e-coverage";
 
 interface P2PTestHandle {
   page: Page;
@@ -34,7 +35,7 @@ type P2PPageFactory = (options?: {
 export const test = base.extend<{
   p2pPage: P2PPageFactory;
 }>({
-  p2pPage: async ({ browser }, use) => {
+  p2pPage: async ({ browser }, use, testInfo) => {
     const handles: P2PTestHandle[] = [];
     const ownedContexts = new Set<BrowserContext>();
 
@@ -77,12 +78,14 @@ export const test = base.extend<{
         });
       }, initOpts);
 
+      const peerIndex = handles.length;
       const handle: P2PTestHandle = {
         page,
         context,
         canvasDocId: result.canvasDocId,
         nodeId: result.nodeId,
         close: async () => {
+          await dumpPageCoverage(page, testInfo, `peer${peerIndex}`).catch(() => {});
           await page.close().catch(() => {});
         },
       };

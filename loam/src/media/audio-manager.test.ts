@@ -64,7 +64,6 @@ async function freshManager() {
     getMediaPlaybackUrl: vi.fn(),
     revokeMediaUrl: vi.fn(),
   }));
-  // eslint-disable-next-line no-restricted-syntax -- vitest module reset requires dynamic import
   const mod = await import("./audio-manager");
   return mod.audioManager;
 }

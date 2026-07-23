@@ -11,9 +11,9 @@ describe("createNarthexRegistry", () => {
     expect(registry.has("join-canvas")).toBe(true);
   });
 
-  it("has exactly 11 widget types", () => {
+  it("has exactly 10 widget types", () => {
     const registry = createNarthexRegistry();
-    expect(registry.types().length).toBe(11);
+    expect(registry.types().length).toBe(10);
   });
 
   it("canvas-card is hidden", () => {
@@ -63,26 +63,16 @@ describe("createNarthexRegistry", () => {
     expect(registry.get("messagez")!.metadata.hidden).toBe(true);
   });
 
-  it("registers friend-canvas-bin", () => {
-    const registry = createNarthexRegistry();
-    expect(registry.has("friend-canvas-bin")).toBe(true);
-  });
-
-  it("friend-canvas-bin is not hidden (placeable via the add-widget palette)", () => {
-    const registry = createNarthexRegistry();
-    expect(registry.get("friend-canvas-bin")!.metadata.hidden).toBeFalsy();
-  });
-
   it("registers own-canvas-bin", () => {
     const registry = createNarthexRegistry();
     expect(registry.has("own-canvas-bin")).toBe(true);
   });
 
-  it("own-canvas-bin is a singleton and hidden (auto-managed, not manually placed)", () => {
+  it("own-canvas-bin is a singleton, visible in the palette (singletonId hides it once placed)", () => {
     const registry = createNarthexRegistry();
     expect(registry.get("own-canvas-bin")!.metadata.singleton).toBe(true);
     expect(registry.get("own-canvas-bin")!.metadata.singletonId).toBe("skein-own-canvas-bin");
-    expect(registry.get("own-canvas-bin")!.metadata.hidden).toBe(true);
+    expect(registry.get("own-canvas-bin")!.metadata.hidden).toBeFalsy();
   });
 
   it("non-hidden widgets for palette", () => {
@@ -96,11 +86,10 @@ describe("createNarthexRegistry", () => {
     expect(types).toContain("bin");
     expect(types).toContain("markdown");
     expect(types).toContain("trash");
-    expect(types).toContain("friend-canvas-bin");
-    // social + messagez + own-canvas-bin are hidden — auto-managed, not
-    // manually placed via the palette.
+    expect(types).toContain("own-canvas-bin");
+    // social + messagez are hidden — auto-managed, not manually placed via
+    // the palette.
     expect(types).not.toContain("social");
     expect(types).not.toContain("messagez");
-    expect(types).not.toContain("own-canvas-bin");
   });
 });

@@ -4,6 +4,7 @@ import type { SkeinCanvas } from "../canvas/init";
 import type { InvitableRole } from "../canvas/canvas-doc";
 import type { CanvasStore } from "../canvas/canvas-store";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
+import { restrictBlobToPeers } from "../p2p/iroh-network-adapter";
 import type { EndpointState, IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
 import {
   approveKnock,
@@ -18,10 +19,10 @@ import type { SocialDoc } from "../../widgets/narthex/social/types";
 import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { HubProfilePanelState } from "../../widgets/narthex/social/hub-profile-panel";
 import type { HubAdminHubProfile, HubAdminBlobUsageSummary } from "../p2p/hub-admin-client";
-import type { ProfileCanvasBinTestHooks } from "../../widgets/narthex/social/canvas-bin";
+import type { CanvasBinNode } from "../canvas/canvas-bin-doc";
 import type { ProfileCanvasEntry, ProfileStore } from "../canvas/profile-doc";
 import type { FriendInfo } from "../canvas/share-dialog";
-import { storeBlob, classifyDomain } from "../storage/skein-blob-store";
+import { storeBlob, classifyDomain } from "../storage/blob-store";
 import {
   type HubAdminRequest,
   type HubAdminResponse,
@@ -69,7 +70,7 @@ export interface SkeinP2PBridge {
    * stop maintaining the automerge-repo-level connection to a peer added via
    * `addPeer()` — closes the existing stream and stops reconnecting.
    * delegates to `IrohNetworkAdapter.forgetPeer()`. useful for tests that
-   * need to prove some *other* delivery path (e.g. the skein-friendz/1
+   * need to prove some *other* delivery path (e.g. the freqhole-friendz/1
    * gossip-digest message) works on its own, independent of ordinary
    * automerge doc-sync — severing this link means the automerge-repo
    * `Repo` genuinely has no way left to sync changes with that peer.
@@ -145,8 +146,8 @@ export interface SkeinP2PBridge {
    * restricts a blob (by blake3 hash) on THIS peer's
    * `iroh_blobs::BlobsProtocol` so only the given peer node ids may fetch
    * it. a hash never passed to this method is unrestricted (today's
-   * default, unchanged). delegates to `IrohNetworkAdapter.restrictBlobToPeers`
-   * — the same production entry point `CanvasBlobAclSync`
+   * default, unchanged). delegates to the same `restrictBlobToPeers()`
+   * helper (`p2p/iroh-network-adapter.ts`) that `CanvasBlobAclSync`
    * (`canvas/blob-acl-sync.ts`) uses to mirror a canvas's real `.acl` onto
    * this gate, so calling it directly here is a manual stand-in for that
    * real wiring, not a separate/fake code path.
@@ -158,7 +159,7 @@ export interface SkeinP2PBridge {
    * stream via the underlying midden node (same `open_bi` mechanism
    * `importBlob`/`fetchBlob` use), writes a CBOR-encoded request terminated
    * by `finish()`, then reads the CBOR-encoded response back with
-   * `read_to_end()` — mirrors reliquary's `protocol::hub_admin` framing.
+   * `read_to_end()` (one request/response pair per stream, no length prefix).
    *
    * the caller is only treated as an admin if their own node id is already
    * in the hub's `hub_adminz` table (bootstrapped locally, e.g. via
@@ -172,7 +173,7 @@ export interface SkeinP2PBridge {
  * friendz test bridge — methods only available when the page was
  * bootstrapped with a real FriendzProtocol instance (test-harness-p2p.html).
  *
- * this drives the `skein-friendz/1` handshake against any peer by node id —
+ * this drives the `freqhole-friendz/1` handshake against any peer by node id —
  * another browser peer or a real reliquary hub, the protocol doesn't
  * distinguish between the two. production wiring lives in
  * `standalone/friendz-wiring.ts` and writes into the real social automerge
@@ -420,6 +421,62 @@ export interface SkeinTestBridgeSocial {
 }
 
 /**
+ * test hooks for the profile canvas-bin widget (`canvas-bin.ts`) - see
+ * `ProfileCanvasBinContext.registerTestHooks` there for how/where an
+ * instance's hooks get exposed on `window.__skeinTest`. `getVisibleNodes()`
+ * reads the folder currently being viewed (root or a sub-folder) directly
+ * off `CanvasBinStore` - proves the tree, not just pixi render state (and
+ * is NOT paginated - pagination only affects which of these are actually
+ * drawn on the current page, see `getCurrentPage()`/`getTotalPages()`).
+ * `enterFolder`/`goBack`/`addFolder`/`moveNode`/`activateNode` call the
+ * widget's real internal handlers directly, same precedent as
+ * `FriendsTabTestHooks` (no infra in this repo for simulated pixi pointer
+ * drags).
+ */
+export interface ProfileCanvasBinTestHooks {
+  /** child nodes of the currently-viewed folder (or root). */
+  getVisibleNodes(): CanvasBinNode[];
+  /** the currently-viewed folder's id, or null at root. */
+  getCurrentFolderId(): string | null;
+  /** enter a folder (as if its card were tapped) or navigate to a canvas
+   *  (as if a canvas card were tapped) - dispatches on the node's kind. */
+  enterFolder(nodeId: string): void;
+  /** return to the parent folder, as if the "‹ back" button were tapped. */
+  goBack(): void;
+  /** create a new folder under the currently-viewed folder. returns the new
+   *  folder's id, or "" if it couldn't be created (also "" in read-only
+   *  mode - see `isReadOnly()`). */
+  addFolder(title: string): string;
+  /** move a node (folder or canvas reference) to a new parent folder id, or
+   *  to root when null - as if it had been dragged and dropped there.
+   *  returns whether the move succeeded (always `false` in read-only mode -
+   *  see `isReadOnly()`; see `CanvasBinStore.moveNode()` for the other
+   *  cases it refuses). */
+  moveNode(nodeId: string, newParentId: string | null): boolean;
+  /** whether this instance is rendering in read-only mode (no drag/add-
+   *  folder wiring - see `ProfileCanvasBinContext.isReadOnly`). */
+  isReadOnly(): boolean;
+  /** the current page (0-based) within the currently-viewed folder. */
+  getCurrentPage(): number;
+  /** total page count for the currently-viewed folder (at least 1). */
+  getTotalPages(): number;
+  /** advance to the next page, as if the "next" button were tapped.
+   *  no-op if already on the last page. */
+  nextPage(): void;
+  /** go back to the previous page, as if the "prev" button were tapped.
+   *  no-op if already on the first page. */
+  prevPage(): void;
+  /** activate a node by id exactly as a real tap would (enter folder /
+   *  navigate to canvas), regardless of which folder is currently visible. */
+  activateNode(nodeId: string): void;
+  /** node ids on the current page whose preview-image `Sprite` has actually
+   *  finished loading and attached (not just that the entry has a
+   *  `previewUrl` set) - lets a test (or live debugging) prove an image
+   *  genuinely rendered. */
+  getLoadedPreviewNodeIds(): string[];
+}
+
+/**
  * the single window-level test bridge placed on `window.__skeinTest`.
  *
  * consolidates all test-time APIs into one typed, documented object — no more
@@ -475,38 +532,6 @@ export interface SkeinTestBridge {
    * builds only.
    */
   widgets?: Record<string, unknown>;
-}
-
-/**
- * test hooks for the "friend canvas bin" narthex widget (a real,
- * palette-placeable `WidgetFactory` — see
- * widgets/narthex/friend-canvas-bin.ts). registered per widget instance via
- * `registerWidgetBridge(widgetId, hooks)` under
- * `window.__skeinTest.widgets[widgetId]`, since (unlike the social overlay's
- * singleton tabs) more than one instance of this widget can exist on the
- * narthex at once.
- */
-export interface FriendCanvasBinTestHooks {
-  /** the currently-configured friend selection, or null if the widget is
-   *  still in its unconfigured "pick a friend" state. */
-  getSelection(): { nodeId: string; profileDocId: string; displayName: string } | null;
-  /** select a friend as if their row in the picker had been tapped —
-   *  same precedent as other widgets' "drive the real internal handler
-   *  directly" test hooks (no infra for simulated pixi pointer taps). */
-  selectFriend(nodeId: string, profileDocId: string, displayName: string): void;
-  /** clear the current selection, returning to the "pick a friend" state,
-   *  as if the "change friend" link had been tapped. */
-  clearSelection(): void;
-  /** the picker's current candidate list (best-effort read of the local
-   *  peer's own friend list — see friend-directory.ts). */
-  getPickerCandidates(): Array<{ nodeId: string; profileDocId: string; displayName: string }>;
-  /** high-level resolution status, for asserting the "friend has no
-   *  canvas-bin doc yet" / "doc unreachable" best-effort cases without an
-   *  error UI. */
-  getStatus(): "unconfigured" | "resolving" | "no-canvas-bin" | "ready";
-  /** the mounted read-only bin's own test hooks, once `getStatus()` is
-   *  `"ready"` — null otherwise. */
-  getBinHooks(): ProfileCanvasBinTestHooks | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -565,17 +590,12 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
       const mime = options?.mime ?? "application/octet-stream";
       const filename = options?.filename ?? "test-blob";
       const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
-      await storeBlob(blake3, buffer, {
-        blob_id: blake3,
-        sha256: "",
-        blake3,
+      await storeBlob(buffer, {
         filename,
         mime,
-        size: data.byteLength,
-        domain: classifyDomain(mime),
         blob_type: "original",
         parent_blob_id: null,
-        metadata: {},
+        metadata: { domain: classifyDomain(mime) },
       });
 
       return blake3;
@@ -618,17 +638,12 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
       const mime = options?.mime ?? "application/octet-stream";
       const filename = options?.filename ?? "test-blob-streamed";
       const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
-      await storeBlob(blake3, buffer, {
-        blob_id: blake3,
-        sha256: "",
-        blake3,
+      await storeBlob(buffer, {
         filename,
         mime,
-        size: data.byteLength,
-        domain: classifyDomain(mime),
         blob_type: "original",
         parent_blob_id: null,
-        metadata: {},
+        metadata: { domain: classifyDomain(mime) },
       });
 
       return blake3;
@@ -726,11 +741,10 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
     },
 
     async restrictBlobToPeers(blake3Hash: string, peerNodeIds: string[]): Promise<void> {
-      // delegates to the real production entry point (IrohNetworkAdapter.
-      // restrictBlobToPeers, added alongside CanvasBlobAclSync) rather than
-      // reaching into the wasm node directly — this test hook and real
-      // canvas-ACL-driven callers now go through the exact same path.
-      return adapter.restrictBlobToPeers(blake3Hash, peerNodeIds);
+      // delegates to the same standalone restrictBlobToPeers() helper real
+      // canvas-acl-driven callers use (see canvas/blob-acl-sync.ts) — this
+      // test hook and production wiring go through the exact same path.
+      return restrictBlobToPeers(adapter, blake3Hash, peerNodeIds);
     },
 
   async hubAdminRequest(peerNodeId: string, request: AdminRequest): Promise<AdminResponse> {
@@ -929,6 +943,7 @@ export function buildKnockTestBridge(options: {
       const knocks = Object.values(doc.pendingKnocks ?? {})
         .filter((k) => k.requesterNodeId !== peerNodeId)
         .map((k) => ({
+          knockId: k.knockId,
           canvasDocId,
           requesterNodeId: k.requesterNodeId,
           requesterUsername: k.requesterUsername,

@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { CanvasStore } from "../src/canvas/canvas-store";
 import { createDomOverlay, type DomOverlayHandle } from "../src/widgets/dom-overlay";
 import { colorToCss } from "../src/widgets/format";
-import { pickImageAsDataUrl } from "../src/widgets/image-utils";
+import { pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import type {
   WidgetController,
   WidgetFactory,

@@ -15,7 +15,7 @@ import { Container, Graphics } from "pixi.js";
 import { audioManager, getMediaPlaybackUrl } from "../../src/media";
 import { getFullBlobDataUrl } from "../../src/widgets/file-utils";
 import { createMediaOverlay as createFullscreenOverlay } from "../../src/widgets/media-overlay";
-import { log } from "../../src/utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import type { RenderedCard } from "./bin-types";
 
 const TAG = "bin.media";

@@ -1,0 +1,215 @@
+# fast checks on every pull request. heavy platform builds live in release.yml
+# and only run post-merge on a version tag. keep this workflow quick.
+name: pr checks
+
+on:
+  pull_request:
+    branches: [main]
+
+# cancel superseded runs on the same PR.
+concurrency:
+  group: pr-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # tumulus/build.rs resolves its own DATABASE_URL via CARGO_MANIFEST_DIR, but
+  # tauri/build.rs has no such logic, so this must be set explicitly for the
+  # whole workspace. tumulus/dev-data/ is gitignored, so every job that
+  # compiles tumulus installs sqlx-cli and runs `make dev-data` first to
+  # (re)create this db - see the steps below.
+  DATABASE_URL: sqlite:tumulus/dev-data/skein-hub.db
+
+jobs:
+  rust-check:
+    name: rust (fmt + clippy + check + unit tests)
+    # skip on the changesets "Version Packages" PR: it only bumps versions +
+    # changelogs (no source changes), and release.yml already builds it. these
+    # jobs report as skipped, which satisfies required-status-check branch rules.
+    if: github.head_ref != 'changeset-release/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: install system deps (sqlite, gtk/webkit for tauri)
+        # the tauri crate pulls glib-sys/gtk/webkit via its build tree, so
+        # the dev libs must be present or pkg-config fails. webkit2gtk 4.1
+        # transitively provides glib, soup, javascriptcore .pc files.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            sqlite3 libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+
+      - name: set up sqlite dev db (for sqlx compile-time query macros)
+        # tumulus/src/{adminz,groupz,settingz,...}.rs use sqlx::query!/
+        # query_as!, which check queries against a REAL db at compile time
+        # via DATABASE_URL (set workflow-wide, above) - the file doesn't
+        # exist on a fresh checkout (tumulus/dev-data/ is gitignored, see
+        # skein's .gitignore), so it must be created + migrated before any
+        # step that compiles tumulus. mirrors `make dev-data`.
+        run: make dev-data
+
+      - name: cargo fmt (workspace)
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo unit tests (workspace)
+        run: cargo test --workspace
+
+  web-check:
+    name: web (typecheck + vitest + circular deps)
+    if: github.head_ref != 'changeset-release/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: install deps
+        working-directory: loam
+        run: npm ci
+
+      - name: typecheck
+        working-directory: loam
+        run: npm run typecheck
+
+      - name: unit tests
+        working-directory: loam
+        run: npm run test:coverage
+
+      - name: circular dependency check
+        working-directory: loam
+        run: npm run lint:circular
+
+  # eslint is split into its own status check so it's visible + independent
+  # of the core web gate above.
+  lint:
+    name: web (eslint)
+    if: github.head_ref != 'changeset-release/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: install deps
+        working-directory: loam
+        run: npm ci
+
+      - name: lint
+        working-directory: loam
+        run: npm run lint
+
+  e2e:
+    name: web (playwright e2e)
+    # unlike the other jobs, this one still runs for the changesets "Version
+    # Packages" PR - it's a pre-release smoke test that gets the full/heavy
+    # suite instead of the light one every other PR gets (see below).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features sqlite,rustls --locked
+
+      - name: set up sqlite dev db (for sqlx compile-time query macros)
+        # see the identical step in the rust-check job above - required
+        # before compiling tumulus, which this job does directly below.
+        run: make dev-data
+
+      # the heavy e2e specs (hub-admin, blob-sync, friendz-hub, etc.) spawn
+      # real `tumulus serve` child processes against target/debug/tumulus -
+      # see loam/tests/helpers/reliquary-hub.ts.
+      - name: build tumulus (debug)
+        run: cargo build -p tumulus
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: install deps
+        working-directory: loam
+        run: npm ci
+
+      - name: install playwright browsers
+        working-directory: loam
+        run: npx playwright install --with-deps chromium
+
+      # every regular PR gets the light e2e project - the heavy specs
+      # (multi-page meshes, real hub/iroh processes) are slow and serialized
+      # to a single worker, so they only run as a pre-release smoke test
+      # against the changesets "Version Packages" PR (below).
+      - name: run e2e tests (light)
+        if: github.head_ref != 'changeset-release/main'
+        working-directory: loam
+        run: npm run test:e2e:ci:light
+
+      - name: run e2e tests (full, incl. heavy)
+        if: github.head_ref == 'changeset-release/main'
+        working-directory: loam
+        run: npm run test:e2e:ci
+
+      - name: upload playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: loam/playwright-report/
+          retention-days: 7
+
+  changeset-check:
+    name: changeset present
+    if: github.head_ref != 'changeset-release/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # changeset status diffs against the base branch.
+          fetch-depth: 0
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: install changesets
+        run: npm install --no-save @changesets/cli
+
+      - name: verify a changeset was added
+        run: |
+          if npx changeset status --since=origin/${{ github.base_ref }} 2>&1 | grep -q "No changesets found"; then
+            echo "no changeset found for this PR."
+            echo "run 'make changes' (or 'npx changeset') and commit the generated file."
+            exit 1
+          fi

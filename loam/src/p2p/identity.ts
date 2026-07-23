@@ -11,9 +11,9 @@
 
 import { deleteMetaRecord, getMetaRecord, setMetaRecord } from "../storage/meta-db";
 import { checkTauriIdentityStatus, isTauriMode, TauriStreamNode } from "./tauri-transport";
-import { MiddenNode } from "midden";
-import { WorkerMiddenNode } from "../workers/midden-worker-client";
-import { log } from "../utils/log";
+import { MiddenNode } from "@freqhole/midden";
+import { WorkerMiddenNode } from "@freqhole/reliquary/worker";
+import { log } from "@freqhole/reliquary/utils";
 
 // ---------------------------------------------------------------------------
 // types
@@ -76,7 +76,10 @@ async function createBrowserNode(secretKey: Uint8Array | null): Promise<MiddenNo
     log.warn(TAG, "VITE_MIDDEN_MAIN_THREAD=1 — using in-thread midden node");
     return secretKey ? MiddenNode.create_from_key(secretKey) : MiddenNode.create();
   }
-  return WorkerMiddenNode.create(secretKey);
+  return WorkerMiddenNode.create(
+    secretKey,
+    () => new Worker(new URL("../workers/midden-worker.ts", import.meta.url), { type: "module" })
+  );
 }
 
 /** tear down the current node, terminating its worker when applicable. */

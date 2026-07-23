@@ -21,7 +21,7 @@ import { ProfileStore } from "../canvas/profile-doc";
 import { Viewport } from "../canvas/viewport";
 import { createSkeinHarness } from "../harness/skein-harness";
 import { FriendzProtocol } from "../p2p/friends-protocol";
-import { FRIENDZ_ALPN, type IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
+import { FRIENDZ_ALPN, restrictBlobToPeers, type IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
 import { createWidgetDoc } from "../widgets/widget-doc";
 import {
   buildFriendzTestBridge,
@@ -63,11 +63,10 @@ let sharedIrohAdapter: IrohNetworkAdapter | null = null;
  * skein-bridge.ts), then use `joinCanvas()` below to open the shared doc.
  */
 async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2PTestInitResult> {
-  // build the repo (broadcast + iroh) and canvas doc via the harness (see
-  // harness/skein-harness.ts — phase 2 step 4 of the SkeinHarness
-  // extraction) instead of hand-rolling ensureIdentity/IrohNetworkAdapter/
-  // Repo here. "both" mirrors what this file built by hand before: iroh for
-  // real cross-process peers, broadcast for same-browser-context tabs.
+  // build the repo (broadcast + iroh) and canvas doc via the harness
+  // instead of hand-rolling ensureIdentity/IrohNetworkAdapter/Repo here.
+  // "both" enables iroh for real cross-process peers and broadcast for
+  // same-browser-context tabs.
   const harness = await createSkeinHarness({
     network: "both",
     canvasDocId: options.canvasDocId ?? null,
@@ -83,7 +82,7 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
     registry: createTestRegistry(),
     repo: harness.repo,
     restrictBlobToPeers: (blake3Hash, peerNodeIds) =>
-      harness.iroh!.restrictBlobToPeers(blake3Hash, peerNodeIds),
+      restrictBlobToPeers(harness.iroh!, blake3Hash, peerNodeIds),
   });
 
   const irohAdapter = harness.iroh!;
@@ -114,7 +113,7 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
   }
 
   // wire up a real FriendzProtocol instance so tests can drive the
-  // skein-friendz/1 handshake (friend requests, accepts) against another
+  // freqhole-friendz/1 handshake (friend requests, accepts) against another
   // browser peer or a real reliquary hub — production wiring for this lives
   // in standalone/friendz-wiring.ts, which writes into the real social
   // automerge doc; this harness has no narthex/social doc, so accepted
@@ -212,7 +211,7 @@ async function joinCanvasForTest(docId: string): Promise<{ canvasDocId: string }
     registry: createTestRegistry(),
     repo: sharedRepo,
     restrictBlobToPeers: sharedIrohAdapter
-      ? (blake3Hash, peerNodeIds) => sharedIrohAdapter!.restrictBlobToPeers(blake3Hash, peerNodeIds)
+      ? (blake3Hash, peerNodeIds) => restrictBlobToPeers(sharedIrohAdapter!, blake3Hash, peerNodeIds)
       : undefined,
   });
 

@@ -8,7 +8,7 @@ import {
   type FederatedPointerEvent,
 } from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
-import { pickImageAsDataUrl } from "../widgets/image-utils";
+import { pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 
 import { createSkeinInput } from "../widgets/skein-input";
 import type { WidgetRegistry } from "../widgets/widget-registry";

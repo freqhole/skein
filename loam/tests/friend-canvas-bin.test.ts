@@ -1,9 +1,7 @@
 // e2e coverage for viewing a FRIEND's profile canvas bin — read-only,
 // paginated, grouping preserved (docs/hub-and-profile-plan.md section 10.2's
-// follow-on). covers both surfaces that render it:
-//   - friends-tab.ts's friend-detail view (window.__skeinTest.social.friendCanvasBin)
-//   - the new narthex-placeable "friend-canvas-bin" widget type
-//     (window.__skeinTest.widgets[widgetId])
+// follow-on), as rendered by friends-tab.ts's friend-detail view
+// (window.__skeinTest.social.friendCanvasBin).
 //
 // a friend's profile+bin doc pair is seeded directly via
 // window.__skein.store.repo.create() (CanvasStore.repo is a public field),
@@ -303,95 +301,5 @@ test.describe("friend canvas bin", () => {
       )
       .toContain(nodeId);
     expect(pixiWarnings).toEqual([]);
-  });
-
-  test("the friend-canvas-bin narthex widget: unconfigured until a friend is picked, then renders their bin read-only", async ({
-    page,
-  }) => {
-    await page.goto("/");
-    await waitForNarthex(page);
-    await ensureIdentityBridge(page);
-
-    const { profileDocId, rootCanvasIds } = await seedFriendCanvasBin(page);
-    const friendNodeId = "e".repeat(64);
-    await seedFriendWithProfile(page, {
-      nodeId: friendNodeId,
-      alias: "pinned-friendo",
-      profileDocId,
-    });
-
-    const widgetId = "friend-bin-w";
-    await page.evaluate((wid) => {
-      (window as any).__skein.store.addWidget({
-        id: wid,
-        type: "friend-canvas-bin",
-        x: 100,
-        y: 100,
-        width: 260,
-        height: 280,
-        zIndex: 0,
-        props: {},
-        collapsed: false,
-        docId: null,
-        parentId: null,
-      });
-    }, widgetId);
-
-    await page.waitForFunction(
-      (wid) => (window as any).__skeinTest?.widgets?.[wid] != null,
-      widgetId,
-      { timeout: 10_000 }
-    );
-
-    const initialStatus = await page.evaluate(
-      (wid) => (window as any).__skeinTest.widgets[wid].getStatus(),
-      widgetId
-    );
-    expect(initialStatus).toBe("unconfigured");
-
-    await expect
-      .poll(
-        async () =>
-          page.evaluate(
-            (wid) => (window as any).__skeinTest.widgets[wid].getPickerCandidates().length,
-            widgetId
-          ),
-        { timeout: 10_000 }
-      )
-      .toBeGreaterThan(0);
-
-    const candidates = await page.evaluate(
-      (wid) => (window as any).__skeinTest.widgets[wid].getPickerCandidates(),
-      widgetId
-    );
-    const picked = candidates.find((c: any) => c.displayName === "pinned-friendo");
-    expect(picked).toBeDefined();
-
-    await page.evaluate(
-      ({ wid, c }) => (window as any).__skeinTest.widgets[wid].selectFriend(c.nodeId, c.profileDocId, c.displayName),
-      { wid: widgetId, c: picked }
-    );
-
-    await expect
-      .poll(async () => page.evaluate((wid) => (window as any).__skeinTest.widgets[wid].getStatus(), widgetId), {
-        timeout: 10_000,
-      })
-      .toBe("ready");
-
-    const binHooks = await page.evaluate(
-      (wid) => {
-        const hooks = (window as any).__skeinTest.widgets[wid].getBinHooks();
-        return { isReadOnly: hooks.isReadOnly(), nodeCount: hooks.getVisibleNodes().length };
-      },
-      widgetId
-    );
-    expect(binHooks.isReadOnly).toBe(true);
-    expect(binHooks.nodeCount).toBe(rootCanvasIds.length + 1); // 6 canvases + 1 folder
-
-    // "change" clears the selection back to unconfigured.
-    await page.evaluate((wid) => (window as any).__skeinTest.widgets[wid].clearSelection(), widgetId);
-    expect(
-      await page.evaluate((wid) => (window as any).__skeinTest.widgets[wid].getStatus(), widgetId)
-    ).toBe("unconfigured");
   });
 });

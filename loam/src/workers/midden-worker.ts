@@ -13,7 +13,8 @@
 // store, endpoint, and protocols must share one wasm instance.
 
 import * as Comlink from "comlink";
-import { CancelToken, MiddenNode } from "midden";
+import { CancelToken, MiddenNode, MiddenNodeOptions } from "@freqhole/midden";
+import { MIDDEN_WORKER_READY_MESSAGE } from "@freqhole/reliquary/worker";
 
 let node: MiddenNode | null = null;
 
@@ -93,6 +94,13 @@ const OPFS_STORE_DIR = "midden-blob-store";
 /** web lock name guarding single-tab ownership of the OPFS store. */
 const STORE_LOCK_NAME = "skein-midden-blob-store";
 
+/** skein's own protocol ALPNs, registered alongside the package's default
+ *  set: blob proxying/small stream requests, and the shared friendz
+ *  protocol (`@freqhole/haruspex/protocol`'s `freqhole-friendz/1`, not a
+ *  skein-specific one - see `p2p/iroh-network-adapter.ts`'s `FRIENDZ_ALPN`). */
+const SKEIN_ALPN = "skein/1";
+const FRIENDZ_ALPN = "freqhole-friendz/1";
+
 /** resolves when we know whether this worker owns the store lock. the lock
  *  (when granted) is held for the worker's lifetime via a never-resolving
  *  promise — worker termination releases it automatically. */
@@ -141,9 +149,12 @@ async function init(
   }
   const storeDir = ownsStore ? OPFS_STORE_DIR : undefined;
 
-  node = secretKey
-    ? await MiddenNode.create_from_key(secretKey, storeDir)
-    : await MiddenNode.create(storeDir);
+  const options = new MiddenNodeOptions();
+  options.secret_key = secretKey ?? undefined;
+  options.opfs_store_dir = storeDir;
+  options.extra_alpns = [SKEIN_ALPN, FRIENDZ_ALPN];
+
+  node = await MiddenNode.create_with_options(options);
   const sk = node.secret_key();
   return { nodeId: node.node_id(), secretKey: Comlink.transfer(sk, [sk.buffer as ArrayBuffer]) };
 }
@@ -371,11 +382,10 @@ function unprotectBlob(blake3Hash: string): void {
   requireNode().unprotect_blob(blake3Hash);
 }
 
-async function computeBlake3(peerAddr: string, blobId: string): Promise<string | null> {
-  return (await requireNode().compute_blake3(peerAddr, blobId)) ?? null;
-}
-
-// ---- proxy requests --------------------------------------------------------
+// ---- api requests -----------------------------------------------------------
+// exposed as `proxyRequest` to match @freqhole/reliquary/worker's
+// MiddenWorkerApi contract, which this worker implements the receiving end
+// of.
 
 async function proxyRequest(
   peerAddr: string,
@@ -383,7 +393,7 @@ async function proxyRequest(
   path: string,
   body: string | null
 ): Promise<{ status: number; body: string }> {
-  return (await requireNode().proxy_request(peerAddr, method, path, body)) as {
+  return (await requireNode().api_request(peerAddr, method, path, body)) as {
     status: number;
     body: string;
   };
@@ -419,7 +429,6 @@ const api = {
   downloadCancel,
   protectBlob,
   unprotectBlob,
-  computeBlake3,
   proxyRequest,
 };
 
@@ -429,5 +438,6 @@ Comlink.expose(api);
 
 // ready signal AFTER Comlink registered its message listener — same race
 // (and same fix) as blob-worker.ts: an RPC posted before the listener
-// exists is dropped forever.
-postMessage("skein-midden-worker-ready");
+// exists is dropped forever. the exact literal matters: it must match
+// what @freqhole/reliquary/worker's WorkerMiddenNode client waits for.
+postMessage(MIDDEN_WORKER_READY_MESSAGE);

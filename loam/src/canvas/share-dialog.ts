@@ -12,7 +12,7 @@ import { ButtonContainer, Dialog, FancyButton } from "@pixi/ui";
 import { Container, Graphics, Text, type Application } from "pixi.js";
 import type { CanvasRole, InvitableRole } from "./canvas-doc";
 import type { SkeinTheme } from "../theme/skein-theme";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 
 const TAG = "canvas.share";
 

@@ -3,7 +3,7 @@
  * must be called early in the boot sequence — before any widgets are mounted.
  */
 
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 
 const TAG = "fonts";
 

@@ -18,7 +18,7 @@
 
 import { Assets, Container, Graphics, Rectangle, Sprite, Text } from "pixi.js";
 import { ScrollBox } from "@pixi/ui";
-import { log } from "../../../src/utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import { formatFileSize } from "../../../src/widgets/file-utils";
 import {
   type HubAdminClient,
@@ -31,7 +31,7 @@ import {
   type HubAdminHubProfile,
 } from "../../../src/p2p/hub-admin-client";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
-import { pickImageAsDataUrl } from "../../../src/widgets/image-utils";
+import { pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import { colorForName, isValidNodeId, truncate } from "./helpers";
 import {
   ACCENT,

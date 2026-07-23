@@ -1,12 +1,9 @@
 // ---------------------------------------------------------------------------
 // unit tests for file-utils.ts's tauri-mode branches.
 //
-// before this file, checkBlobLocality/snatchBlob/uploadFile had zero test
-// coverage of any kind (browser or tauri) — see
-// docs/widget-blob-acl-plan.md's phase 5 item 3. these tests target only
-// the isTauriMode() === true branches, mocking the tauri IPC boundary
-// (dispatch) and the blob-store/identity/blob-worker modules that would
-// otherwise touch real IndexedDB/OPFS/wasm.
+// these tests target the isTauriMode() === true branches, mocking the tauri
+// IPC boundary (dispatch) and the blob-store/identity/blob-worker modules
+// that would otherwise touch real IndexedDB/OPFS/wasm.
 // ---------------------------------------------------------------------------
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -34,21 +31,34 @@ vi.mock("../p2p/identity", () => ({
 
 // mock the blob store — the tauri-mode upload/dedup paths only ever touch
 // getBlobRecord/storeBlob/classifyDomain; mocking the whole module avoids
-// real IndexedDB/OPFS access.
+// real IndexedDB/OPFS access. storeBlob returns a fake record (the shared
+// package's real storeBlob computes blake3/sha256 from the bytes and
+// returns the stored record) — a generic default is enough everywhere
+// except the one test that asserts on the returned sha256 specifically.
 const mockGetBlobRecord = vi.fn<(blobId: string) => Promise<any>>();
-const mockStoreBlob = vi.fn<(...args: any[]) => Promise<void>>();
-const mockComputeSha256 = vi.fn<(data: ArrayBuffer) => Promise<string>>();
+const mockStoreBlob = vi.fn<(...args: any[]) => Promise<any>>(async (data: ArrayBuffer, meta: any) => ({
+  blob_id: "mock-stored-blob-id",
+  blake3: "mock-stored-blob-id",
+  sha256: "mock-stored-sha256",
+  filename: meta?.filename,
+  mime: meta?.mime,
+  size: data?.byteLength ?? 0,
+  blob_type: meta?.blob_type ?? "original",
+  parent_blob_id: meta?.parent_blob_id ?? null,
+  metadata: meta?.metadata,
+  created_at: Date.now(),
+}));
 const mockResolveBlob = vi.fn<(blobId: string, blake3?: string) => Promise<any>>();
 const mockHasBlobBytes = vi.fn<(blobId: string) => Promise<boolean>>();
-vi.mock("../storage/skein-blob-store", () => ({
+vi.mock("../storage/blob-store", () => ({
   hasBlobBytes: (...args: any[]) => mockHasBlobBytes(...args),
   getBlobRecord: (...args: any[]) => mockGetBlobRecord(...args),
   getBlobObjectURL: vi.fn(),
   storeBlob: (...args: any[]) => mockStoreBlob(...args),
-  computeSha256: (...args: any[]) => mockComputeSha256(...args),
   storeBlobFromFile: vi.fn(),
   resolveBlob: (...args: any[]) => mockResolveBlob(...args),
   getBlobData: vi.fn(),
+  getBlobDomain: (record: any) => record?.metadata?.domain ?? "file",
   classifyDomain: (mime: string) => {
     if (mime.startsWith("image/")) return "photo";
     if (mime.startsWith("video/")) return "video";
@@ -64,7 +74,7 @@ vi.mock("../storage/skein-blob-store", () => ({
 // proxy_request fallback download path (strategy 3 in
 // downloadBlobBytesFromPeer).
 const mockHashBlake3 = vi.fn<(bytes: Uint8Array) => Promise<string>>();
-vi.mock("../workers/blob-worker-client", () => ({
+vi.mock("@freqhole/reliquary/worker", () => ({
   base64Decode: vi.fn(async (b64: string) =>
     Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
   ),
@@ -84,6 +94,40 @@ import {
   getThumbnailDataUrl,
   uploadFile,
 } from "./file-utils";
+import { IrohNetworkAdapter } from "@freqhole/reliquary/automerge";
+import { createMockMidden, createMockBiStream } from "@freqhole/reliquary/testing";
+import { DEFAULT_ENSURE_ALPN } from "@freqhole/reliquary/ensure";
+import { handleSkeinStream, createSkeinEnsureBlobHandler } from "../p2p/skein-handler";
+
+// ---------------------------------------------------------------------------
+// test helpers
+// ---------------------------------------------------------------------------
+
+/** 
+ * create a mock open_bi implementation that simulates the ensure-blob protocol.
+ * used to adapt tests that previously mocked `ensure_blob` to the new
+ * `ensureBlobOverAlpn` code path (which calls `node.open_bi` internally).
+ */
+function createMockEnsureBlobProtocol(available: boolean | (() => boolean | Promise<boolean>)) {
+  return vi.fn(async (_peerAddr: string, _alpn: string) => {
+    const isAvailable = typeof available === "function" ? await available() : available;
+    const response = {
+      type: "ensure_blob_response",
+      id: 1,
+      available: isAvailable,
+    };
+    const responseBytes = new TextEncoder().encode(JSON.stringify(response));
+    
+    return {
+      read_to_end: vi.fn(async () => responseBytes),
+      write_message: vi.fn(),
+      write_raw_and_finish: vi.fn(),
+      close: vi.fn(),
+      peer_node_id: vi.fn(() => "mock-peer-id"),
+      _written: [] as any[],
+    };
+  });
+}
 
 describe("file-utils — tauri-mode branches", () => {
   beforeEach(() => {
@@ -216,7 +260,7 @@ describe("file-utils — tauri-mode branches", () => {
         filename: "movie.mp4",
       }));
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_to_native_store: downloadToNativeStore,
         // the buffered method must never be needed on this path
         download_verified_with_ensure_progress: vi.fn(async () => {
@@ -458,7 +502,7 @@ describe("file-utils — tauri-mode branches", () => {
       mockIsTauriMode.mockReturnValue(false);
       const payload = new Uint8Array([1, 2, 3, 4, 5]);
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_with_ensure_progress: vi.fn(
           async (
             _peerAddr: string,
@@ -497,7 +541,7 @@ describe("file-utils — tauri-mode branches", () => {
     it("throws when no peer has the blob, without ever calling write()", async () => {
       mockIsTauriMode.mockReturnValue(false);
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => false),
+        open_bi: createMockEnsureBlobProtocol(false),
       });
 
       const writable = { write: vi.fn(), close: vi.fn() };
@@ -523,10 +567,10 @@ describe("file-utils — tauri-mode branches", () => {
     it("propagates a disk-write failure directly, without retrying another peer", async () => {
       mockIsTauriMode.mockReturnValue(false);
       const payload = new Uint8Array([9, 9, 9]);
-      const ensureBlob = vi.fn(async () => true);
+      const openBi = createMockEnsureBlobProtocol(true);
       const downloadFn = vi.fn(async () => payload);
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: ensureBlob,
+        open_bi: openBi,
         download_verified_with_ensure_progress: downloadFn,
       });
 
@@ -560,7 +604,7 @@ describe("file-utils — tauri-mode branches", () => {
       // whichever peer wins the probe) and there is no second probe
       // round: a write failure is a real disk error, not a peer problem,
       // so it must not retry download against the other peer.
-      expect(ensureBlob).toHaveBeenCalledTimes(2);
+      expect(openBi).toHaveBeenCalledTimes(2);
       expect(downloadFn).toHaveBeenCalledTimes(1);
       expect(writable.close).not.toHaveBeenCalled();
       expect(mockStoreBlob).not.toHaveBeenCalled();
@@ -591,7 +635,7 @@ describe("file-utils — tauri-mode branches", () => {
       const chunk2 = new Uint8Array([5, 6, 7, 8]);
       const buffered = vi.fn();
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_with_ensure_progress: buffered,
         download_verified_streaming_with_ensure: vi.fn(
           async (
@@ -657,7 +701,7 @@ describe("file-utils — tauri-mode branches", () => {
         }
       );
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: streamFn,
       });
 
@@ -682,7 +726,7 @@ describe("file-utils — tauri-mode branches", () => {
     it("rejects a 0-byte streamed payload", async () => {
       mockIsTauriMode.mockReturnValue(false);
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: vi.fn(async () => 0),
       });
 
@@ -702,7 +746,7 @@ describe("file-utils — tauri-mode branches", () => {
     it("surfaces a chunk write failure instead of silently completing", async () => {
       mockIsTauriMode.mockReturnValue(false);
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: vi.fn(
           async (
             _peerAddr: string,
@@ -730,29 +774,27 @@ describe("file-utils — tauri-mode branches", () => {
       expect(writable.close).not.toHaveBeenCalled();
     });
 
-    it("falls back to the buffered path when the doc has no blake3 hash", async () => {
+    it("fails fast when the doc has no blake3 hash (no compute-on-demand fallback — the transport package always requires blake3 up front)", async () => {
       mockIsTauriMode.mockReturnValue(false);
-      const payload = new Uint8Array([1, 2, 3]);
-      const streamFn = vi.fn();
+      const streamFn = vi.fn(async () => {
+        throw new Error("peer rejected empty blake3 hash");
+      });
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: streamFn,
-        // strategy 2 path: blake3 unknown, so the buffered by-id download runs
-        download_verified_by_id_progress: vi.fn(async () => [payload, "computed-hash"]),
       });
 
       const writable = makeWritable();
 
-      const result = await snatchBlobToDisk(
-        { ...blobInfo, blake3: "" },
-        { peer1: { nodeId: "remote-node-id" } },
-        writable as unknown as FileSystemWritableFileStream
-      );
+      await expect(
+        snatchBlobToDisk(
+          { ...blobInfo, blake3: "" },
+          { peer1: { nodeId: "remote-node-id" } },
+          writable as unknown as FileSystemWritableFileStream
+        )
+      ).rejects.toThrow("peer rejected empty blake3 hash");
 
-      expect(streamFn).not.toHaveBeenCalled();
-      expect(result.size).toBe(3);
-      expect(writable.write).toHaveBeenCalledTimes(1);
-      expect(writable.close).toHaveBeenCalledTimes(1);
+      expect(writable.write).not.toHaveBeenCalled();
     });
   });
 
@@ -790,7 +832,7 @@ describe("file-utils — tauri-mode branches", () => {
         throw new Error("download cancelled");
       });
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: streamFn,
       });
 
@@ -820,7 +862,7 @@ describe("file-utils — tauri-mode branches", () => {
       });
       const strategy2 = vi.fn();
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_with_ensure_progress: strategy1,
         download_verified_by_id_progress: strategy2,
       });
@@ -851,7 +893,7 @@ describe("file-utils — tauri-mode branches", () => {
         }
       );
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: vi.fn(async () => true),
+        open_bi: createMockEnsureBlobProtocol(true),
         download_verified_streaming_with_ensure: streamFn,
       });
 
@@ -946,13 +988,12 @@ describe("snatchBlob — concurrent/duplicate snatch races (browser mode)", () =
 
   it("two concurrent snatchBlob calls for the SAME blake3 hash share one in-flight download (no redundant P2P work, no duplicate OPFS/IDB write)", async () => {
     const download = createDeferred<Uint8Array>();
-    const ensureBlob = vi.fn(async () => true);
+    const openBi = createMockEnsureBlobProtocol(true);
     const downloadFn = vi.fn(() => download.promise);
     mockGetMiddenNode.mockResolvedValue({
-      ensure_blob: ensureBlob,
+      open_bi: openBi,
       download_verified_with_ensure_progress: downloadFn,
     });
-    mockComputeSha256.mockResolvedValue("sha256-of-payload");
     mockGetBlobRecord.mockResolvedValue(null);
 
     const info = {
@@ -983,7 +1024,7 @@ describe("snatchBlob — concurrent/duplicate snatch races (browser mode)", () =
 
     // the second caller must have joined the first's in-flight promise
     // instead of starting its own redundant probe+download+store.
-    expect(ensureBlob).toHaveBeenCalledTimes(1);
+    expect(openBi).toHaveBeenCalledTimes(1);
     expect(downloadFn).toHaveBeenCalledTimes(1);
     expect(mockStoreBlob).toHaveBeenCalledTimes(1);
     expect(secondResult).toEqual(firstResult);
@@ -1030,13 +1071,12 @@ describe("snatchBlob — concurrent/duplicate snatch races (browser mode)", () =
   });
 
   it("two concurrent calls for DIFFERENT hashes do NOT get coalesced (dedup is content-scoped, not global)", async () => {
-    const ensureBlob = vi.fn(async () => true);
+    const openBi = createMockEnsureBlobProtocol(true);
     const downloadFn = vi.fn(async () => new Uint8Array([9, 9, 9]));
     mockGetMiddenNode.mockResolvedValue({
-      ensure_blob: ensureBlob,
+      open_bi: openBi,
       download_verified_with_ensure_progress: downloadFn,
     });
-    mockComputeSha256.mockResolvedValue("sha256-of-payload");
     mockGetBlobRecord.mockResolvedValue(null);
 
     const peers = { peer1: { nodeId: "remote-node-id" } };
@@ -1051,7 +1091,7 @@ describe("snatchBlob — concurrent/duplicate snatch races (browser mode)", () =
       ),
     ]);
 
-    expect(ensureBlob).toHaveBeenCalledTimes(2);
+    expect(openBi).toHaveBeenCalledTimes(2);
     expect(downloadFn).toHaveBeenCalledTimes(2);
     expect(a).not.toEqual(b);
   });
@@ -1078,13 +1118,12 @@ describe("snatchBlob — abort signal semantics (widget-deleted-mid-snatch scena
     // effect: no wasted persistence, but wasted bandwidth for anything
     // already in flight when abort() is called — a real, bounded cost.
     const download = createDeferred<Uint8Array>();
-    const ensureBlob = vi.fn(async () => true);
+    const openBi = createMockEnsureBlobProtocol(true);
     const downloadFn = vi.fn(() => download.promise);
     mockGetMiddenNode.mockResolvedValue({
-      ensure_blob: ensureBlob,
+      open_bi: openBi,
       download_verified_with_ensure_progress: downloadFn,
     });
-    mockComputeSha256.mockResolvedValue("sha256-of-payload");
     mockGetBlobRecord.mockResolvedValue(null);
 
     const abortController = new AbortController();
@@ -1218,8 +1257,8 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
   });
 
   it("rejects with a single clear error when every peer's probe reports the blob unavailable", async () => {
-    const ensureBlob = vi.fn(async () => false);
-    mockGetMiddenNode.mockResolvedValue({ ensure_blob: ensureBlob });
+    const openBi = createMockEnsureBlobProtocol(false);
+    mockGetMiddenNode.mockResolvedValue({ open_bi: openBi });
 
     await expect(
       snatchBlob(
@@ -1239,7 +1278,7 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
       )
     ).rejects.toThrow("no peer has the blob (all probes failed)");
 
-    expect(ensureBlob).toHaveBeenCalledTimes(3);
+    expect(openBi).toHaveBeenCalledTimes(3);
   });
 
   it("rejects with a single clear error (not a hang) when every peer's probe REJECTS outright (e.g. connection refused)", async () => {
@@ -1247,10 +1286,10 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
     // (lost|closed)|stream closed|reset|broken/i retry regex in
     // probeSinglePeer) so this test doesn't pay the 1.5s transient-retry
     // delay — the point here is total-failure behavior, not the retry path.
-    const ensureBlob = vi.fn(async () => {
+    const openBi = vi.fn(async () => {
       throw new Error("connection refused");
     });
-    mockGetMiddenNode.mockResolvedValue({ ensure_blob: ensureBlob });
+    mockGetMiddenNode.mockResolvedValue({ open_bi: openBi });
 
     await expect(
       snatchBlob(
@@ -1274,15 +1313,15 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
     // both peers report they HAVE the blob (probe succeeds), but the
     // actual download fails for both (peer went offline mid-transfer, or
     // never really had the bytes despite a stale/incorrect ensure_blob
-    // response). no download_verified_by_id_progress / proxy_request
-    // fallback is configured, so downloadBlobBytesFromPeer's own "no
-    // fallback available" error is what should surface.
-    const ensureBlob = vi.fn(async () => true);
+    // response). no streaming/proxy strategy is configured, so the
+    // transport package's own last-real-error (not a generic "no fallback"
+    // message) is what should surface.
+    const openBi = createMockEnsureBlobProtocol(true);
     const downloadFn = vi.fn(async () => {
       throw new Error("peer connection reset mid-transfer");
     });
     mockGetMiddenNode.mockResolvedValue({
-      ensure_blob: ensureBlob,
+      open_bi: openBi,
       download_verified_with_ensure_progress: downloadFn,
     });
 
@@ -1301,7 +1340,7 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
           peer2: { nodeId: "remote-node-id-2" },
         }
       )
-    ).rejects.toThrow("iroh-blobs download failed — no fallback available");
+    ).rejects.toThrow("peer connection reset mid-transfer");
 
     // both peers were genuinely tried for the download (retry-against-
     // next-peer worked), not just probed once and given up on.
@@ -1315,12 +1354,12 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
     process.on("unhandledRejection", onUnhandledRejection);
 
     try {
-      const ensureBlob = vi.fn(async () => true);
+      const openBi = createMockEnsureBlobProtocol(true);
       const downloadFn = vi.fn(async () => {
         throw new Error("gone");
       });
       mockGetMiddenNode.mockResolvedValue({
-        ensure_blob: ensureBlob,
+        open_bi: openBi,
         download_verified_with_ensure_progress: downloadFn,
       });
 
@@ -1347,11 +1386,11 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
 });
 
 // ---------------------------------------------------------------------------
-// hash-mismatch / corrupted-transfer verification (downloadBlobBytesFromPeer).
+// hash-mismatch / corrupted-transfer verification (the skein/1 proxy_request
+// fallback, delegated to @freqhole/reliquary/transfer's snatchBlob).
 //
-// strategies 1/2 (iroh-blobs download_verified_with_ensure_progress /
-// download_verified_by_id_progress) get real cryptographic verification for
-// free from iroh-blobs itself: midden's Rust implementation
+// the bulk/streamed verified download strategies get real cryptographic
+// verification for free from iroh-blobs itself: midden's Rust implementation
 // (midden/src/lib.rs's download_verified) parses the REQUESTED blake3_hash
 // into an iroh_blobs::Hash and downloads via
 // `blobs_downloader.download(HashAndFormat::raw(hash), ...)`, then reads the
@@ -1360,23 +1399,21 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
 // requested hash's BAO tree during the transfer itself (a
 // DownloadProgressItem::Error/DownloadError surfaces as an Err before any
 // bytes are ever returned to JS). a mismatching response is therefore
-// rejected at the WASM/Rust layer, not silently handed back — so these two
+// rejected at the WASM/Rust layer, not silently handed back — so these
 // strategies are deliberately NOT re-verified again here; doing so would be
 // redundant, not a real gap. this is NOT tested here (would require a real
 // iroh-blobs transfer, out of scope for a mocked unit test) but is recorded
 // as the evidenced reasoning behind the design.
 //
-// strategy 3 (the skein/1 proxy_request JSON fallback, used only when a
-// peer is a tauri app whose rust backend doesn't accept the iroh-blobs
-// ALPN) has NO such transport-level guarantee — it's a plain base64 JSON
-// response. file-utils.ts already computes blake3 of the received bytes in
-// JS (via hashBlake3, reused from the blob worker rather than a new
-// dependency) and rejects on mismatch — these tests prove that check
-// actually catches a corrupted/malicious response instead of silently
-// accepting it.
+// the skein/1 proxy_request JSON fallback (used only when a peer is a
+// tauri app whose rust backend doesn't accept the iroh-blobs ALPN) has NO
+// such transport-level guarantee — it's a plain base64 JSON response. the
+// transport package computes blake3 of the received bytes and rejects on
+// mismatch — these tests prove that check actually catches a corrupted/
+// malicious response instead of silently accepting it.
 // ---------------------------------------------------------------------------
 
-describe("downloadBlobBytesFromPeer — proxy_request fallback hash verification", () => {
+describe("snatchBlob — proxy_request fallback hash verification", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIsTauriMode.mockReturnValue(false);
@@ -1384,9 +1421,9 @@ describe("downloadBlobBytesFromPeer — proxy_request fallback hash verification
 
   function mockProxyRequestNode(base64Payload: string) {
     return {
-      // no download_verified_with_ensure_progress / download_verified_by_id_progress
+      // no download_verified_with_ensure_progress / download_verified_streaming_with_ensure
       // — forces strategy 3 (proxy_request), same as a real tauri-peer target.
-      ensure_blob: vi.fn(async () => true),
+      open_bi: createMockEnsureBlobProtocol(true),
       proxy_request: vi.fn(async () => ({
         status: 200,
         body: JSON.stringify({ success: true, data: { data: base64Payload, mime: "audio/mpeg" } }),
@@ -1426,8 +1463,19 @@ describe("downloadBlobBytesFromPeer — proxy_request fallback hash verification
     const base64Payload = btoa(String.fromCharCode(...payload));
     mockGetMiddenNode.mockResolvedValue(mockProxyRequestNode(base64Payload));
     mockHashBlake3.mockResolvedValue("expected-hash-of-real-content");
-    mockComputeSha256.mockResolvedValue("sha256-of-payload");
     mockGetBlobRecord.mockResolvedValue(null);
+    mockStoreBlob.mockResolvedValueOnce({
+      blob_id: "expected-hash-of-real-content",
+      blake3: "expected-hash-of-real-content",
+      sha256: "sha256-of-payload",
+      filename: "clip.mp3",
+      mime: "audio/mpeg",
+      size: payload.length,
+      blob_type: "original",
+      parent_blob_id: null,
+      metadata: { domain: "audio", source: "snatch" },
+      created_at: Date.now(),
+    });
 
     const result = await snatchBlob(
       {
@@ -1446,7 +1494,9 @@ describe("downloadBlobBytesFromPeer — proxy_request fallback hash verification
     expect(result.blobId).toBe("expected-hash-of-real-content");
     expect(result.sha256).toBe("sha256-of-payload");
     expect(mockStoreBlob).toHaveBeenCalledTimes(1);
-    expect(mockStoreBlob.mock.calls[0][0]).toBe("expected-hash-of-real-content");
+    expect(mockStoreBlob.mock.calls[0][1]).toMatchObject({
+      metadata: { domain: "audio", source: "snatch" },
+    });
   });
 });
 
@@ -1515,5 +1565,79 @@ describe("getThumbnailDataUrl — tauri blob_thumbnail path", () => {
       blake3: "some-blob-id",
       size: 64,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// browser-mode blob probing — ALPN mismatch regression
+//
+// found via live browser-to-browser testing (two loam tabs, no tauri): a
+// browser-mode snatch/probe between two peers always fails with
+// "no peer has the blob (all probes failed)", even when the peer genuinely
+// has it. root cause, traced through real source across three repos:
+//
+// - `probeSinglePeer` (above, in this file) calls `nodeAny.ensure_blob(...)`
+//   directly on whatever `getMiddenNode()` returns. in pure browser mode
+//   that's the wasm `MiddenNode`'s own native `ensure_blob` method (see
+//   `@freqhole/midden`'s `workers/midden-worker.ts` passthrough).
+// - midden's native `ensure_blob`/`connect_to_peer` (midden/src/lib.rs)
+//   dials the peer using `FREQHOLE_ALPN` (`"freqhole/1"`), and its own doc
+//   comment says the receiving app is expected to route it: "for other
+//   ALPNs, return a BiStream to JS... the caller should check stream.alpn()
+//   to route the connection to the appropriate handler."
+// - loam only ever registers "skein/1" (handleSkeinStream) and the friendz
+//   ALPN as receiving handlers (see `standalone/boot.ts`,
+//   `standalone/friendz-wiring.ts`) - nothing answers "freqhole/1".
+// - tauri mode's equivalent call (`tauri-transport.ts`'s `ensure_blob` ->
+//   rust `blob_iroh_probe`) correctly dials via `b"skein/1"` instead (see
+//   skein's `tauri/src/commands.rs`) - matching the registered handler.
+//   pure browser mode has no equivalent client-side implementation; it only
+//   ever calls the node's native `ensure_blob`, which can never reach a
+//   registered handler.
+//
+// this test reproduces the gap directly against real production code (the
+// actual `IrohNetworkAdapter` from `@freqhole/reliquary/automerge`, and
+// loam's actual `registerAlpnHandler("skein/1", handleSkeinStream)` call
+// site), simulating exactly what midden's native ensure_blob does on the
+// wire: dial the peer via FREQHOLE_ALPN and wait for a response.
+// ---------------------------------------------------------------------------
+
+describe("browser-mode blob probing — ALPN mismatch regression", () => {
+  it("a stream on FREQHOLE_ALPN ('freqhole/1') - the ALPN midden's native ensure_blob actually dials - reaches a registered handler in skein's real browser-mode ALPN wiring", async () => {
+    const mockMidden = createMockMidden();
+    const adapter = new IrohNetworkAdapter({
+      getNode: vi.fn(async () => mockMidden as any),
+      getIdentity: vi.fn(async () => ({ node_id: "a".repeat(64) })),
+      onIdentityChange: vi.fn(() => () => {}),
+    });
+
+    adapter.connect("local-peer-id" as any);
+    // register both handlers as the real browser-mode boot sequence does
+    // (see boot.ts ~416, friendz-wiring.ts ~242)
+    adapter.registerAlpnHandler("skein/1", handleSkeinStream);
+    adapter.registerAlpnHandler(DEFAULT_ENSURE_ALPN, createSkeinEnsureBlobHandler());
+    await new Promise((r) => setTimeout(r, 20)); // let the accept loop start
+
+    // simulate exactly what midden's native ensure_blob does on the wire:
+    // dial the peer via FREQHOLE_ALPN, write the request, and wait for a
+    // response. built directly with createMockBiStream (not
+    // mockMidden.open_bi, whose test double ignores the alpn argument and
+    // always defaults to the sync ALPN) so the stream is genuinely
+    // addressed to "freqhole/1".
+    const stream = createMockBiStream("peer-addr", "freqhole/1");
+    mockMidden.pushIncoming(stream);
+    await new Promise((r) => setTimeout(r, 20));
+    stream.pushMessage(
+      new TextEncoder().encode(
+        JSON.stringify({ type: "ensure_blob_request", id: 1, blake3_hash: "a".repeat(64) })
+      )
+    );
+    await new Promise((r) => setTimeout(r, 20));
+
+    // desired/correct behavior: the peer answers the request.
+    // the fix registers a "freqhole/1" handler that bridges to the
+    // ensure-blob logic.
+    expect(stream.close).not.toHaveBeenCalled();
+    expect(stream._written.length).toBeGreaterThan(0);
   });
 });

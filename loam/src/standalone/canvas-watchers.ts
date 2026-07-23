@@ -2,7 +2,7 @@ import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { moveCardToTrash } from "../../widgets/narthex/trash-widget";
 import type { CanvasDocument } from "../canvas/canvas-doc";
 import { CanvasStore } from "../canvas/canvas-store";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 
 const TAG = "canvas.watchers";
 

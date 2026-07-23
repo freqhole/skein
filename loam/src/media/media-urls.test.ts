@@ -8,7 +8,7 @@ vi.mock("../p2p/tauri-transport", () => ({
 // mock the blob store — we control what resolveBlob and getBlobData return
 const mockResolveBlob = vi.fn<(blobId: string, blake3?: string) => Promise<any | null>>();
 const mockGetBlobData = vi.fn<(blobId: string) => Promise<ArrayBuffer | null>>();
-vi.mock("../storage/skein-blob-store", () => ({
+vi.mock("../storage/blob-store", () => ({
   resolveBlob: (...args: any[]) => mockResolveBlob(...args),
   getBlobData: (...args: any[]) => mockGetBlobData(...args),
 }));

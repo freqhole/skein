@@ -5,10 +5,9 @@
 // access: async () => true }`) shares EVERY locally-known document with ANY
 // connected peer — narthex, every canvas ever created or visited, the
 // private social/messagez docs, all of it — the moment that peer connects
-// for automerge sync, regardless of what they were actually invited to. a
-// real, confirmed confidentiality gap, 2026-07-03 ("is it that the hub peer
-// is syncing ALL of a user's canvases? it should only sync stuff i share
-// with it").
+// for automerge sync, regardless of what they were actually invited to. this
+// is a confirmed confidentiality gap ("is it that the hub peer is syncing ALL
+// of a user's canvases? it should only sync stuff i share with it").
 //
 // this module scopes `announce` (do we proactively push a doc to a peer)
 // and `access` (do we honor a peer's own request/accept an inbound push for
@@ -16,8 +15,8 @@
 // evaluated the same way here — `announce` alone would leave the door open
 // for a peer to just ask for an unshared doc directly.
 //
-// CRITICAL DESIGN CONSTRAINT, discovered the hard way (2026-07-03: a peer
-// opening a canvas newly shared with them got an uncaught "Document ...
+// CRITICAL DESIGN CONSTRAINT: a peer opening a canvas newly shared with them
+// can trigger an uncaught "Document ...
 // is unavailable" crash): `access`/`announce` get evaluated on BOTH the
 // data-holding side (who has real content, real `.acl`, and can safely
 // make a content-based decision) AND the first-time-receiving side (who by

@@ -16,7 +16,8 @@ import { buildP2PBridge } from "../dev/test-bridge";
 import type { SkeinTestBridgeSocial, ShareTestHooks } from "../dev/test-bridge";
 import { sharedBlobAclRegistry } from "../canvas/blob-acl-registry";
 import { preloadFonts } from "../fonts/font-loader";
-import { handleSkeinStream } from "../p2p/skein-handler";
+import { handleSkeinStream, createSkeinEnsureBlobHandler } from "../p2p/skein-handler";
+import { DEFAULT_ENSURE_ALPN } from "@freqhole/reliquary/ensure";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
 import {
   destroyBridge,
@@ -35,8 +36,9 @@ import {
   getStoredIdentity,
   onIdentityChange,
 } from "../p2p/identity";
-import { IrohNetworkAdapter, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
-import { AclFilteringNetworkAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
+import { getOrCreateAnonDeviceId } from "../p2p/anon-device-id";
+import { IrohNetworkAdapter, restrictBlobToPeers, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
+import { createAclFilteringAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
 import type { RoleResolver } from "../p2p/acl-filtering-network-adapter";
 import { createCanvasScopedSharePolicy } from "../p2p/canvas-scoped-share-policy";
 import { decodeShareString, encodeShareString } from "../p2p/share-string";
@@ -67,16 +69,28 @@ import {
   CANVAS_INFO_OVERLAY_H,
 } from "../canvas/widget-overlay";
 import type { WidgetDoc, WidgetMountContext } from "../widgets/widget-types";
-import { log } from "../utils/log";
+import { configureLogging, log, type LogLevel } from "@freqhole/reliquary/utils";
+
+// configure logging as early as possible - this module is the app's entry
+// point (see index.html), so every other module's log calls run after this.
+// localStorage overrides still take priority over these build-time defaults.
+configureLogging({
+  level:
+    (import.meta.env.VITE_LOG_LEVEL as LogLevel | undefined) ??
+    (import.meta.env.DEV ? "debug" : "warn"),
+  filter: (import.meta.env.VITE_LOG_FILTER as string | undefined)
+    ?.split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+});
 
 // indexeddb key for the well-known narthex document id
 const NARTHEX_DOC_KEY = "skein-narthex-doc-id";
 const MESSAGEZ_DOC_KEY = "skein-messagez-doc-id";
 /** meta-db key for the standalone (browser-mode) social doc id — exported so
  *  other modules that need best-effort, read-only access to the local
- *  peer's own friend list (e.g. src/canvas/friend-directory.ts's friend
- *  picker for the "friend canvas bin" narthex widget) can look it up
- *  without duplicating the key string or depending on this whole class. */
+ *  peer's own friend list can look it up without duplicating the key
+ *  string or depending on this whole class. */
 export const SOCIAL_DOC_KEY = "skein-social-doc-id"; // browser mode only
 const TAG = "skein.boot";
 
@@ -128,6 +142,10 @@ class SkeinRouter {
   private transportPresenceUnsubs: Array<() => void> = [];
   private canvasWatcherUnsubs: Array<() => void> = [];
   private localNodeId: string = "";
+  /** stable per-installation fallback id (see p2p/anon-device-id.ts), used
+   *  in place of localNodeId for canvas ACL purposes when no real p2p
+   *  identity exists yet — resolved once in boot(). */
+  private anonDeviceId: string = "";
   private flushCanvasUpdates: (() => void) | null = null;
   private currentSocialOverlay: WidgetOverlay | null = null;
   private currentMessagesOverlay: WidgetOverlay | null = null;
@@ -207,7 +225,7 @@ class SkeinRouter {
     // same pattern as src/dev/acl-test-bootstrap.ts.
     const repoBox: { repo?: Repo } = {};
     const roleResolver: RoleResolver = (documentId, senderId) => {
-      if (!repoBox.repo) return "member";
+      if (!repoBox.repo) return "viewer";
       return createRepoRoleResolver(repoBox.repo)(documentId, senderId);
     };
 
@@ -227,7 +245,7 @@ class SkeinRouter {
       // createRepoRoleResolver()'s lookup falls through to the "member"
       // default (read/write, same as today's unfiltered behavior) for them,
       // so this is a no-op for non-canvas docs.
-      wrapNetworkAdapter: (iroh) => new AclFilteringNetworkAdapter(iroh, roleResolver),
+      wrapNetworkAdapter: (iroh) => createAclFilteringAdapter(iroh, roleResolver),
     });
     repoBox.repo = harness.repo;
 
@@ -236,6 +254,22 @@ class SkeinRouter {
 
   /** initial boot — resolve narthex doc id then navigate to the right place */
   async boot(): Promise<void> {
+    // resolve local node ID early so hasIdentity is available at canvas init
+    // time, and so effectiveLocalNodeId() is ready before narthex/canvas
+    // creation below. uses getStoredIdentity() in BOTH modes — a cheap,
+    // side-effect-free check that never generates a keypair or binds the
+    // iroh endpoint, so simply booting the app never creates a P2P identity
+    // on its own.
+    if (!this.localNodeId) {
+      try {
+        const identity = await getStoredIdentity();
+        this.localNodeId = identity?.node_id ?? "";
+      } catch {
+        // identity not ready yet
+      }
+    }
+    this.anonDeviceId = await getOrCreateAnonDeviceId();
+
     // resolve or create the narthex document id
     this.narthexDocId = await getMetaValue(NARTHEX_DOC_KEY);
 
@@ -250,18 +284,14 @@ class SkeinRouter {
       await ensureSingletonWidgets(this.repo, this.narthexDocId as DocumentId);
     }
 
-    // resolve local node ID early so hasIdentity is available at canvas init time.
-    // uses getStoredIdentity() in BOTH modes — a cheap, side-effect-free
-    // check that never generates a keypair or binds the iroh endpoint, so
-    // simply booting the app never creates a P2P identity on its own.
-    if (!this.localNodeId) {
-      try {
-        const identity = await getStoredIdentity();
-        this.localNodeId = identity?.node_id ?? "";
-      } catch {
-        // identity not ready yet
-      }
-    }
+    // self-heal every canvas this peer owns (narthex included) that's
+    // missing an admin stamp, or still stamped under the anonymous device
+    // id after a real identity has since been established — covers both
+    // this fix's own gap and canvases created before it existed. runs in
+    // the background; doesn't block boot.
+    this.healOwnedCanvases().catch((err) => {
+      log.warn(TAG, "failed to heal owned canvases:", err);
+    });
 
     // create SqliteSocialDoc early (tauri mode) so it's available for overlays
     // on any canvas — not just the narthex
@@ -368,6 +398,13 @@ class SkeinRouter {
           this.currentCanvas.presenceManager.setLocalNodeId(identity.node_id);
           this.currentCanvas.toolbar.refreshRoleGating();
         }
+        // migrate admin off the anonymous device id, for every canvas this
+        // peer owns, onto the real identity that just became available —
+        // otherwise canvases created before this identity existed would be
+        // permanently stuck admin-stamped under the now-unused anon id.
+        this.healOwnedCanvases().catch((err) => {
+          log.warn(TAG, "failed to heal owned canvases after identity change:", err);
+        });
         // write nodeId into the standalone social doc so the social widget
         // reflects the correct identity even before the user opens it
         if (!isTauriMode() && this.socialDoc) {
@@ -395,12 +432,13 @@ class SkeinRouter {
     });
     this.friendzDocUnsubs.push(unsubIdentity);
 
-    // register skein/1 ALPN handler early so the browser can serve blobs
+    // register ALPN handlers early so the browser can serve blobs
     // to peers regardless of friendz protocol initialization state.
-    // (friendz-wiring.ts also registers this, but that happens later and
+    // (friendz-wiring.ts also registers these, but that happens later and
     // only when navigating to the narthex with a valid identity.)
     if (!isTauriMode()) {
       this.irohAdapter.registerAlpnHandler("skein/1", handleSkeinStream);
+      this.irohAdapter.registerAlpnHandler(DEFAULT_ENSURE_ALPN, createSkeinEnsureBlobHandler());
     }
 
     // listen for hash changes (browser back/forward, programmatic navigation)
@@ -555,6 +593,72 @@ class SkeinRouter {
     }
   }
 
+  /**
+   * the node id to use for local ACL purposes on any canvas — a real p2p
+   * identity if one exists, else the persisted anonymous device id (see
+   * p2p/anon-device-id.ts). always non-empty once boot() has resolved
+   * both, so `CanvasStore.stampAdmin()`/`setLocalNodeId()` always have a
+   * usable id even for a peer that hasn't set up a real identity yet.
+   */
+  private effectiveLocalNodeId(): string {
+    return this.localNodeId || this.anonDeviceId;
+  }
+
+  /**
+   * self-heal every canvas this peer created themselves: stamp an admin
+   * if none is recorded yet, and migrate an existing admin stamp off the
+   * anonymous device id onto a real identity once one exists.
+   *
+   * safe to run unconditionally because sharing/joining a canvas requires
+   * a real p2p identity (see registerAndReconnectPeers()'s identity
+   * guard) — so every canvas this peer's own narthex links to with
+   * `isRemote !== true` was, by construction, created locally by this
+   * same peer (see linkCanvasToCurrent()'s doc comment on isRemote), and
+   * the narthex itself is a private, per-install singleton never synced
+   * to any other peer. `stampAdmin()`/`migrateAdminId()` are both no-ops
+   * when there's nothing to change, so this is safe to call repeatedly
+   * (every boot, and again whenever a real identity is established) —
+   * this doubles as the retroactive fix for canvases created under the
+   * older, buggy version of this code that skipped stamping an admin for
+   * an anonymous creator.
+   */
+  private async healOwnedCanvases(): Promise<void> {
+    if (!this.narthexDocId) return;
+    const effectiveId = this.effectiveLocalNodeId();
+
+    let narthexHandle;
+    try {
+      narthexHandle = await this.repo.find<CanvasDocument>(this.narthexDocId as DocumentId);
+      await narthexHandle.whenReady();
+    } catch {
+      return;
+    }
+
+    const narthexStore = await CanvasStore.open(this.repo, this.narthexDocId as DocumentId);
+    narthexStore.stampAdmin(effectiveId);
+    if (this.localNodeId) {
+      narthexStore.migrateAdminId(this.anonDeviceId, this.localNodeId);
+    }
+
+    const narthexDoc = narthexHandle.doc();
+    if (!narthexDoc?.widgets) return;
+
+    for (const entry of Object.values(narthexDoc.widgets)) {
+      if (entry.type !== "canvas-card") continue;
+      const props = entry.props as { canvasDocId?: string; isRemote?: boolean } | undefined;
+      if (!props?.canvasDocId || props.isRemote === true) continue;
+      try {
+        const store = await CanvasStore.open(this.repo, props.canvasDocId as DocumentId);
+        store.stampAdmin(effectiveId);
+        if (this.localNodeId) {
+          store.migrateAdminId(this.anonDeviceId, this.localNodeId);
+        }
+      } catch (err) {
+        log.warn(TAG, "failed to heal owned canvas:", props.canvasDocId, err);
+      }
+    }
+  }
+
   /** navigate to the narthex */
   private async navigateToNarthex(): Promise<void> {
     if (this.navigating) {
@@ -649,7 +753,12 @@ class SkeinRouter {
       this.currentSocialOverlay = this.mountSocialOverlay(canvas);
       this.currentMessagesOverlay = this.mountMessagesOverlay(canvas);
       this.wireBadges(canvas);
-      canvas.store.setLocalNodeId(this.localNodeId);
+      canvas.store.setLocalNodeId(this.effectiveLocalNodeId());
+      // the narthex is a private, per-install singleton never synced to
+      // any other peer, so it's always safe to self-heal its admin stamp
+      // here — idempotent no-op once a real admin is already recorded
+      // (see healOwnedCanvases(), which covers the same ground on boot).
+      canvas.store.stampAdmin(this.effectiveLocalNodeId());
       if (this.localNodeId) {
         canvas.presenceManager.setLocalNodeId(this.localNodeId);
       }
@@ -819,10 +928,10 @@ class SkeinRouter {
     // the recoverable cases this no longer treats as terminal) must not
     // propagate as an uncaught rejection: `destroyCurrent()` below already
     // tore down whatever was previously mounted by the time `initCanvas()`
-    // could throw, so an uncaught failure here left the app with *nothing*
-    // mounted at all — a real, user-reported crash ("everything turns
-    // black"), 2026-07-03. caught below and recovered by falling back to
-    // the narthex, same as clicking the home button would.
+    // could throw, so an uncaught failure here leaves the app with *nothing*
+    // mounted at all — a real, user-reported crash ("everything turns black").
+    // caught below and recovered by falling back to the narthex, same as
+    // clicking the home button would.
     let failure: unknown = null;
 
     try {
@@ -848,7 +957,7 @@ class SkeinRouter {
         repo: this.repo,
         connectionStateSource: this.connectionStateSource,
         restrictBlobToPeers: (blake3Hash, peerNodeIds) =>
-          this.irohAdapter.restrictBlobToPeers(blake3Hash, peerNodeIds),
+          restrictBlobToPeers(this.irohAdapter, blake3Hash, peerNodeIds),
         onNavigateHome: () => {
           log.debug(TAG, "home button clicked, navigating to narthex");
           window.location.hash = "";
@@ -909,10 +1018,7 @@ class SkeinRouter {
 
             // get already-invited node IDs from messagez outbox.
             // excludes declined shares — a friend who declined should be
-            // re-invitable, not permanently stuck off the invite list (a
-            // real bug: previously this checked canvasDocId only, so a
-            // declined invite blocked re-inviting that friend forever, even
-            // though the "declined" section below shows them as declined).
+            // re-invitable, not permanently stuck off the invite list.
             // also excludes cancelled shares (see onCancelInvite below) — a
             // pending invite that the sharer themselves cancels must free
             // the friend back up for re-inviting, same as a decline.
@@ -1387,7 +1493,19 @@ class SkeinRouter {
       this.currentMessagesOverlay = this.mountMessagesOverlay(canvas);
       this.currentCanvasInfoOverlay = this.mountCanvasInfoOverlay(canvas);
       this.wireBadges(canvas);
-      canvas.store.setLocalNodeId(this.localNodeId);
+      canvas.store.setLocalNodeId(this.effectiveLocalNodeId());
+      // self-heal a canvas this peer created while still anonymous — safe
+      // ONLY while still anonymous (this.localNodeId falsy): sharing/
+      // joining a canvas requires a real p2p identity (see
+      // registerAndReconnectPeers()'s identity guard), so an anonymous
+      // peer's local repo can only contain canvases it created itself.
+      // once a real identity exists, healOwnedCanvases() (run at boot and
+      // on identity creation) is the one that migrates admin over, rather
+      // than stamping unconditionally here — a canvas received from
+      // another peer might just not have synced its real admin down yet.
+      if (!this.localNodeId) {
+        canvas.store.stampAdmin(this.anonDeviceId);
+      }
       if (this.localNodeId) {
         canvas.presenceManager.setLocalNodeId(this.localNodeId);
       }
@@ -1842,6 +1960,10 @@ class SkeinRouter {
     // stamp our lastSeenAt on the canvas doc — used by gossip digest
     // to determine which canvases have updates since we last saw them
     canvas.store.setLocalNodeId(identity.node_id);
+    // migrate admin off the anonymous device id onto this real identity,
+    // in case this canvas was created before the identity existed and
+    // healOwnedCanvases() hasn't caught up yet — a no-op otherwise.
+    canvas.store.migrateAdminId(this.anonDeviceId, identity.node_id);
     canvas.store.stampLastSeen();
     canvas.toolbar.refreshRoleGating();
 
@@ -1905,12 +2027,12 @@ class SkeinRouter {
     const newStore = CanvasStore.create(this.repo);
     const newDocId = newStore.handle.documentId;
 
-    // record the creator as owner in the canvas's ACL (see canvas-store.ts's
-    // access control section) — skipped if no identity exists yet (anonymous
-    // creator); nothing to stamp in that case.
-    if (this.localNodeId) {
-      newStore.stampAdmin(this.localNodeId);
-    }
+    // record the creator as admin in the canvas's ACL (see canvas-store.ts's
+    // access control section) — uses the anonymous device id as a stable
+    // fallback when no real identity exists yet, so an anonymous creator
+    // still has admin access to their own canvas (see effectiveLocalNodeId()
+    // and p2p/anon-device-id.ts).
+    newStore.stampAdmin(this.effectiveLocalNodeId());
 
     const title = detail?.title || "untitled canvas";
     const now = new Date().toISOString();

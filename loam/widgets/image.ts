@@ -1,6 +1,6 @@
 import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
-import { pickImageAsDataUrl } from "../src/widgets/image-utils";
+import { pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import type {
   CompactInfo,
   WidgetController,

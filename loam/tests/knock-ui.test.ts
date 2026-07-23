@@ -132,7 +132,7 @@ async function clickKnockAction(page: Page, requesterNodeId: string, action: Kno
 }
 
 /** raw `.acl[nodeId]` entry — deliberately not CanvasStore.getRole(), which
- *  defaults a *missing* entry to "member" (see canvas-store.ts's doc
+ *  defaults a *missing* entry to "viewer" (see canvas-store.ts's doc
  *  comment) and would mask "no access was ever granted" as a false pass. */
 async function getAclEntry(page: Page, nodeId: string): Promise<{ role: string } | null> {
   return page.evaluate((id) => (window as any).__skein.store.doc().acl?.[id] ?? null, nodeId);

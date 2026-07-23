@@ -17,7 +17,7 @@ import {
   type PeersMap,
   type SnatchBlobInfo,
 } from "../../src/widgets/file-utils";
-import { log } from "../../src/utils/log";
+import { log } from "@freqhole/reliquary/utils";
 import type { ActionState, PeedeeeffState } from "./types";
 
 const TAG = "peedeeeff.snatch";

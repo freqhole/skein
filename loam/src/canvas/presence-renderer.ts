@@ -1,7 +1,7 @@
 import { Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { PeerPresence, PresenceManager } from "./presence-manager";
-import { log } from "../utils/log";
+import { log } from "@freqhole/reliquary/utils";
 
 const TAG = "canvas.presence";
 

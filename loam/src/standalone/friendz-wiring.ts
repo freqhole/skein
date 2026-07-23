@@ -20,10 +20,11 @@ import {
 
 import type { SocialState } from "../../widgets/narthex/social/schema";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
-import { handleSkeinStream } from "../p2p/skein-handler";
+import { handleSkeinStream, createSkeinEnsureBlobHandler } from "../p2p/skein-handler";
+import { DEFAULT_ENSURE_ALPN } from "@freqhole/reliquary/ensure";
 import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
-import { log } from "../utils/log";
-import { getBlobRecordByBlake3 } from "../storage/skein-blob-store";
+import { log } from "@freqhole/reliquary/utils";
+import { getBlobRecordByBlake3 } from "../storage/blob-store";
 
 export interface FriendzWiringDeps {
   repo: Repo;
@@ -237,9 +238,10 @@ export async function initFriendzWiring(
     protocol.handleStream(stream);
   });
 
-  // register ALPN handler for incoming skein/1 streams (blob serving, proxy requests)
-  log.debug(TAG, "registering skein/1 handler on irohAdapter");
+  // register ALPN handlers for incoming skein/1 and freqhole/1 streams
+  log.debug(TAG, "registering skein/1 and freqhole/1 handlers on irohAdapter");
   irohAdapter.registerAlpnHandler("skein/1", handleSkeinStream);
+  irohAdapter.registerAlpnHandler(DEFAULT_ENSURE_ALPN, createSkeinEnsureBlobHandler());
 
   // collect unsub callbacks so the caller can tear everything down
   const unsubs: Array<() => void> = [];
@@ -298,6 +300,12 @@ export async function initFriendzWiring(
         // alias is left alone — it's a user-controlled local label.
         if (matched && msg.username) {
           friend.username = msg.username;
+        }
+        // sticky hub flag (section 3.3): a fresh profile fetch can also be
+        // how a missed/stale hub flag gets corrected - only ever set true,
+        // never reset to false/undefined on a response that omits it.
+        if (matched && msg.isHub === true && friend.isHub !== true) {
+          friend.isHub = true;
         }
       }
     });
@@ -560,7 +568,7 @@ export async function initFriendzWiring(
     });
   });
 
-  // --- canvas update federation (phase 2): send side ---
+  // --- canvas update federation: send side ---
   // track which canvas docs we're already watching (by per-widget docId)
   const watchedCanvasWidgets = new Set<string>();
   // canvases with changes since last heartbeat flush
@@ -954,6 +962,7 @@ export async function initFriendzWiring(
           for (const knock of Object.values(canvasDoc.pendingKnocks ?? {})) {
             if (knock.requesterNodeId === peerNodeId) continue;
             pendingKnocks.push({
+              knockId: knock.knockId,
               canvasDocId,
               requesterNodeId: knock.requesterNodeId,
               requesterUsername: knock.requesterUsername,
@@ -1848,7 +1857,7 @@ export function wireKnockHandlers(deps: KnockHandlersDeps): void {
         return;
       }
 
-      store.recordKnock(msg.requesterNodeId, msg.requesterUsername, msg.message);
+      store.recordKnock(msg.requesterNodeId, msg.requesterUsername, msg.message, msg.knockId);
 
       if (fromNodeId !== msg.requesterNodeId) {
         onKnockRelayed?.({
@@ -1966,7 +1975,7 @@ export async function mergeGossipDigestKnocks(
   for (const knock of msg.pendingKnocks) {
     try {
       const store = await CanvasStore.open(repo, knock.canvasDocId as DocumentId);
-      store.recordKnock(knock.requesterNodeId, knock.requesterUsername, knock.message);
+      store.recordKnock(knock.requesterNodeId, knock.requesterUsername, knock.message, knock.knockId);
       log.debug(
         TAG,
         "gossip digest: merged pending knock for canvas:",

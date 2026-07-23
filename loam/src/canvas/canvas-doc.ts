@@ -120,6 +120,12 @@ export interface PendingCanvasInvite {
  * idempotent-retry rules.
  */
 export interface PendingCanvasKnock {
+  /** stable id for this specific knock attempt - generated once, the
+   *  first time this requester's knock is recorded (see
+   *  `CanvasStore.recordKnock()`), and carried unchanged through any
+   *  gossip relay so a `knock-outcome` reply correlates back to the
+   *  original request across hops. */
+  knockId: string;
   /** node id of the peer knocking. redundant with the map key, kept for
    *  convenience when iterating values without the key. */
   requesterNodeId: string;

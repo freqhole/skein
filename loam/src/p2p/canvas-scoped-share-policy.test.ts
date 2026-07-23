@@ -153,16 +153,15 @@ describe("createCanvasScopedSharePolicy", () => {
 
   // -------------------------------------------------------------------------
   // rule 4 — the exact scenario behind a real, user-reported production
-  // crash (2026-07-03): a peer opening a canvas newly shared with them hit
-  // an uncaught "Document ... is unavailable" error. root cause: the
-  // previous design waited up to 200ms for a not-yet-ready handle then
-  // DENIED it — but denying a doc's `access` check makes automerge-repo
-  // emit an explicit "doc-unavailable" message back to the requester,
-  // permanently marking THEIR handle unavailable for that request. a
-  // peer receiving a doc for the very first time can *never* have a ready
-  // handle for it yet (that's exactly what's being negotiated) — so the
-  // old design would reliably deny the very first sync attempt for any
-  // brand-new shared canvas. these tests prove the fix: a not-yet-ready
+  // crash: a peer opening a canvas newly shared with them hit an uncaught
+  // "Document ... is unavailable" error. root cause: waiting up to 200ms for
+  // a not-yet-ready handle then DENYING it causes automerge-repo to emit an
+  // explicit "doc-unavailable" message back to the requester, permanently
+  // marking THEIR handle unavailable for that request. a peer receiving a doc
+  // for the very first time can *never* have a ready handle for it yet (that's
+  // exactly what's being negotiated) — so that design would reliably deny the
+  // very first sync attempt for any brand-new shared canvas. these tests prove
+  // the fix: a not-yet-ready
   // handle gets an immediate friend-gate answer, no waiting, no denial.
   // -------------------------------------------------------------------------
 

@@ -1,6 +1,6 @@
 [package]
 name = "skein"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "skein desktop shell"
 
@@ -41,7 +41,14 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 
-reliquary = { path = "../reliquary" }
+tumulus = { path = "../tumulus" }
+freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.2" }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+# test-utils pulls in reliquary::testing (make_local_storage_node etc.) — only
+# activated for test builds, resolver v2 keeps it out of the release binary.
+freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.2", features = [
+    "test-utils",
+] }
+tempfile = "3"
