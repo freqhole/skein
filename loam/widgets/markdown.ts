@@ -1,4 +1,12 @@
-import { Container, Graphics, HTMLText, Text, type TextStyleFontWeight } from "pixi.js";
+import {
+  CanvasTextMetrics,
+  Container,
+  Graphics,
+  HTMLText,
+  Text,
+  TextStyle,
+  type TextStyleFontWeight,
+} from "pixi.js";
 import { z } from "zod";
 import { FONT_OPTIONS } from "../src/fonts/font-loader";
 import { createDomOverlay, type DomOverlayHandle } from "../src/widgets/dom-overlay";
@@ -14,6 +22,12 @@ import {
 
 const PADDING = 12;
 const BORDER_EDITING_COLOR = 0xd946ef;
+
+// extra padding inside each rendered Text/HTMLText object so descenders
+// (g, q, p, y) aren't clipped against the object's own bounds, and a
+// line-height ratio so wrapped rows within a paragraph have breathing room
+const TEXT_PADDING = 4;
+const LINE_HEIGHT_RATIO = 1.35;
 
 export const markdownSchema = z.object({
   text: z
@@ -194,6 +208,159 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
       return tagged.includes("<code>");
     }
 
+    // -------------------------------------------------------------------
+    // link-aware line layout
+    //
+    // a line containing a markdown link ([label](url)) is rendered as
+    // several small Text objects instead of one tagged block, so only
+    // the link substring is interactive and links wrap correctly across
+    // rows. lines without a link keep the simpler single-object path
+    // above.
+    // -------------------------------------------------------------------
+
+    interface LineRun {
+      text: string;
+      bold?: boolean;
+      italic?: boolean;
+      code?: boolean;
+      link?: string;
+    }
+
+    interface RunStyleParams {
+      fontFamily: string;
+      fontSize: number;
+      fontWeight: TextStyleFontWeight;
+      baseFill: number;
+      accentColor: number;
+      codeColor: number;
+    }
+
+    interface LinePlacement {
+      text: string;
+      run: LineRun;
+      x: number;
+      y: number;
+    }
+
+    const LINK_RE = /\[([^\]]+)\]\((\S+?)\)/g;
+    const INLINE_RE = /\*\*(.+?)\*\*|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|`(.+?)`/g;
+
+    function hasLink(text: string): boolean {
+      LINK_RE.lastIndex = 0;
+      return LINK_RE.test(text);
+    }
+
+    // parse inline bold/italic/code markers (no links) into runs
+    function parseInlineRuns(text: string): LineRun[] {
+      const runs: LineRun[] = [];
+      INLINE_RE.lastIndex = 0;
+      let lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = INLINE_RE.exec(text))) {
+        if (m.index > lastIndex) runs.push({ text: text.slice(lastIndex, m.index) });
+        if (m[1] !== undefined) runs.push({ text: m[1], bold: true });
+        else if (m[2] !== undefined) runs.push({ text: m[2], italic: true });
+        else if (m[3] !== undefined) runs.push({ text: m[3], code: true });
+        lastIndex = INLINE_RE.lastIndex;
+      }
+      if (lastIndex < text.length) runs.push({ text: text.slice(lastIndex) });
+      return runs;
+    }
+
+    // parse a line (already stripped of heading/list markers) into an
+    // ordered list of runs: split on links first, then bold/italic/code
+    // within each non-link segment
+    function parseLineToRuns(line: string): LineRun[] {
+      const runs: LineRun[] = [];
+      LINK_RE.lastIndex = 0;
+      let lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = LINK_RE.exec(line))) {
+        if (m.index > lastIndex) runs.push(...parseInlineRuns(line.slice(lastIndex, m.index)));
+        runs.push({ text: m[1], link: m[2] });
+        lastIndex = LINK_RE.lastIndex;
+      }
+      if (lastIndex < line.length) runs.push(...parseInlineRuns(line.slice(lastIndex)));
+      return runs.filter((r) => r.text.length > 0);
+    }
+
+    function styleForRun(run: LineRun, params: RunStyleParams) {
+      return {
+        fontFamily: run.code ? "Courier New, monospace" : params.fontFamily,
+        fontSize: params.fontSize,
+        fontWeight: run.bold ? ("bold" as TextStyleFontWeight) : params.fontWeight,
+        fontStyle: run.italic ? ("italic" as const) : ("normal" as const),
+        fill: safeColor(
+          run.link ? params.accentColor : run.code ? params.codeColor : params.baseFill
+        ),
+      };
+    }
+
+    // manually word-wrap a line's runs, measuring each word with pixi's own
+    // public text metrics so wrapping matches real glyph widths. groups
+    // consecutive words of the same run on the same row into one placement
+    // so a plain sentence stays a small handful of objects, not one per word.
+    function layoutRuns(
+      runs: LineRun[],
+      params: RunStyleParams,
+      cw: number,
+      lineHeight: number
+    ): { placements: LinePlacement[]; height: number } {
+      const placements: LinePlacement[] = [];
+      let x = 0;
+      let y = 0;
+      let rowHasWord = false;
+      let pieceRunIndex = -1;
+      let pieceText = "";
+      let pieceX = 0;
+
+      const flush = () => {
+        if (pieceText.length > 0) {
+          placements.push({ text: pieceText, run: runs[pieceRunIndex], x: pieceX, y });
+        }
+        pieceText = "";
+      };
+
+      for (let ri = 0; ri < runs.length; ri++) {
+        const run = runs[ri];
+        const words = run.text.split(/\s+/).filter((w) => w.length > 0);
+        const style = new TextStyle(styleForRun(run, params));
+        const spaceWidth = CanvasTextMetrics.measureText(" ", style).width;
+
+        for (const word of words) {
+          const wordWidth = CanvasTextMetrics.measureText(word, style).width;
+          const gap = rowHasWord ? spaceWidth : 0;
+
+          // an unbreakably long word/link on an otherwise-empty row is left
+          // to overflow rather than wrapped, avoiding an infinite loop
+          if (rowHasWord && x + gap + wordWidth > cw) {
+            flush();
+            pieceRunIndex = -1;
+            x = 0;
+            y += lineHeight;
+            rowHasWord = false;
+          } else if (rowHasWord) {
+            x += gap;
+          }
+
+          if (ri !== pieceRunIndex) {
+            flush();
+            pieceRunIndex = ri;
+            pieceX = x;
+          } else {
+            pieceText += " ";
+          }
+
+          pieceText += word;
+          x += wordWidth;
+          rowHasWord = true;
+        }
+      }
+      flush();
+
+      return { placements, height: y + lineHeight };
+    }
+
     // parse and render markdown source into PixiJS display objects
     function renderMarkdown(source: string, state: MarkdownState) {
       // clear existing rendered elements
@@ -228,35 +395,82 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
           continue;
         }
 
-        let taggedText: string;
+        let lineBody: string;
         let fontSize: number;
         let fontWeight: TextStyleFontWeight = "normal";
         let fill: number;
+        let bulletPrefix = "";
 
         if (line.startsWith("### ")) {
-          taggedText = markdownToTagged(line.slice(4));
+          lineBody = line.slice(4);
           fontSize = state.fontSize * 1.1;
           fontWeight = "bold";
           fill = state.headingColor;
         } else if (line.startsWith("## ")) {
-          taggedText = markdownToTagged(line.slice(3));
+          lineBody = line.slice(3);
           fontSize = state.fontSize * 1.3;
           fontWeight = "bold";
           fill = state.headingColor;
         } else if (line.startsWith("# ")) {
-          taggedText = markdownToTagged(line.slice(2));
+          lineBody = line.slice(2);
           fontSize = state.fontSize * 1.6;
           fontWeight = "bold";
           fill = state.headingColor;
         } else if (line.startsWith("- ")) {
-          taggedText = "\u2022 " + markdownToTagged(line.slice(2));
+          bulletPrefix = "\u2022 ";
+          lineBody = line.slice(2);
           fontSize = state.fontSize;
           fill = state.textColor;
         } else {
-          taggedText = markdownToTagged(line);
+          lineBody = line;
           fontSize = state.fontSize;
           fill = state.textColor;
         }
+
+        const lineHeight = Math.round(fontSize * LINE_HEIGHT_RATIO);
+
+        // lines with a markdown link get manual run-based layout instead
+        // of the single tagged Text/HTMLText object below
+        if (hasLink(lineBody)) {
+          const runs = parseLineToRuns(lineBody);
+          if (bulletPrefix) runs.unshift({ text: bulletPrefix });
+
+          const runParams: RunStyleParams = {
+            fontFamily: state.fontFamily,
+            fontSize,
+            fontWeight,
+            baseFill: fill,
+            accentColor: state.accentColor,
+            codeColor: state.codeColor,
+          };
+          const { placements, height } = layoutRuns(runs, runParams, cw, lineHeight);
+
+          for (const p of placements) {
+            const runStyle = styleForRun(p.run, runParams);
+            const piece = new Text({
+              text: p.text,
+              resolution: 2,
+              style: { ...runStyle, padding: TEXT_PADDING, lineHeight },
+            });
+            piece.x = p.x;
+            piece.y = y + p.y;
+            piece.alpha = isTransparent(runStyle.fill) ? 0 : 1;
+            if (p.run.link) {
+              const url = p.run.link;
+              piece.eventMode = "static";
+              piece.cursor = "pointer";
+              piece.on("pointertap", () => {
+                window.open(url, "_blank", "noopener,noreferrer");
+              });
+            }
+            content.addChild(piece);
+            renderedElements.push(piece);
+          }
+          y += height + state.fontSize * 0.25;
+          continue;
+        }
+
+        const taggedText = bulletPrefix + markdownToTagged(lineBody);
 
         // use HTMLText for lines that contain <code> tags so we get CSS
         // background + border-radius. use regular Text for everything
@@ -277,6 +491,8 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
                 fill: safeColor(fill),
                 wordWrap: true,
                 wordWrapWidth: cw,
+                padding: TEXT_PADDING,
+                lineHeight,
                 tagStyles: {
                   b: { fontWeight: "bold" },
                   i: { fontStyle: "italic" },
@@ -300,6 +516,8 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
                 fill: safeColor(fill),
                 wordWrap: true,
                 wordWrapWidth: cw,
+                padding: TEXT_PADDING,
+                lineHeight,
                 tagStyles: {
                   b: { fontWeight: "bold" as TextStyleFontWeight },
                   i: { fontStyle: "italic" as const },
