@@ -75,6 +75,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
     category: "canvas",
     hidden: true,
     singleton: true,
+    closable: true, // shows a header "x" button for quick dismissal
     defaultWidth: 280,
     defaultHeight: 340,
   },

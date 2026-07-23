@@ -510,6 +510,7 @@ export class WidgetManager {
 
     // create the pixi frame
     const frame = new WidgetFrame(entry, widgetName, this.theme, callbacks);
+    frame.setClosable(factory.metadata.closable === true);
 
     // if this widget is the currently selected one, mark it
     if (this.inputRouter.selectedWidgetId === entry.id) {

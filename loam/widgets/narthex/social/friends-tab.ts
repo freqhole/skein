@@ -12,6 +12,7 @@ import {
   isOnline as bridgeIsOnline,
   isProtocolReady as bridgeIsProtocolReady,
   onOnlineChange,
+  probePeer,
   requestProfile,
   sendFriendRequest,
 } from "../../../src/p2p/friendz-bridge";
@@ -145,6 +146,14 @@ export function createFriendsTab(ctx: TabContext): TabController {
   // settles (success or failure) or a different friend is opened.
   let profileRefreshRequestedFor: string | null = null;
   let profileRefreshPendingFor: string | null = null;
+
+  // active presence probe (one-shot heartbeat) for the currently-viewed
+  // friend — see rebuildDetailView()'s "presence probe" section. re-checks
+  // online status once per detail-view visit rather than relying solely on
+  // the last passively-received heartbeat, which can be stale by up to
+  // HEARTBEAT_TIMEOUT_MS. cleared by layout() alongside
+  // profileRefreshRequestedFor when leaving "detail".
+  let presenceProbeRequestedFor: string | null = null;
 
   // scroll state for the list view
   let scrollY = 0;
@@ -1301,6 +1310,26 @@ export function createFriendsTab(ctx: TabContext): TabController {
     dy += DETAIL_NAME_SIZE + 6;
 
     // -----------------------------------------------------------------------
+    // presence probe — actively re-check this friend's online status by
+    // sending a one-shot heartbeat to each of their known node ids, rather
+    // than relying solely on the last passively-received heartbeat (which
+    // can be stale by up to HEARTBEAT_TIMEOUT_MS). any reply updates
+    // presence state and fires onOnlineChange, which re-renders this view
+    // through the existing online-status subscription. fires at most once
+    // per detail-view visit (presenceProbeRequestedFor, cleared by layout()
+    // on leaving "detail"). best-effort — no error UI if a probe fails.
+    // -----------------------------------------------------------------------
+
+    if (presenceProbeRequestedFor !== friend.id) {
+      presenceProbeRequestedFor = friend.id;
+      for (const { nodeId } of friend.nodeIds) {
+        probePeer(nodeId).catch((err) => {
+          log.warn("social.friends", "presence probe failed for", nodeId.slice(0, 16) + "...", err);
+        });
+      }
+    }
+
+    // -----------------------------------------------------------------------
     // live profile refresh — the friend-detail view otherwise only shows
     // whatever username/bio/avatar/isHub snapshot was last learned via
     // gossip relay or a prior profile-response (see friendz-wiring.ts's
@@ -1355,10 +1384,11 @@ export function createFriendsTab(ctx: TabContext): TabController {
 
     if (friend.isHub) {
       const hubNodeIdForFriend = friend.nodeIds[0]?.nodeId;
+      const hubOnline = !!hubNodeIdForFriend && bridgeIsOnline(hubNodeIdForFriend);
 
       const manageHubBtn = new Container();
-      manageHubBtn.eventMode = "static";
-      manageHubBtn.cursor = "pointer";
+      manageHubBtn.eventMode = hubOnline ? "static" : "none";
+      manageHubBtn.cursor = hubOnline ? "pointer" : "default";
       manageHubBtn.hitArea = new Rectangle(0, 0, contentW, DETAIL_BTN_HEIGHT);
       manageHubBtn.y = dy;
       detailInner.addChild(manageHubBtn);
@@ -1366,12 +1396,12 @@ export function createFriendsTab(ctx: TabContext): TabController {
       const manageHubBg = new Graphics();
       manageHubBg.eventMode = "none";
       manageHubBg.roundRect(0, 0, contentW, DETAIL_BTN_HEIGHT, DETAIL_BTN_RADIUS);
-      manageHubBg.fill({ color: ACCENT });
+      manageHubBg.fill({ color: hubOnline ? ACCENT : OFFLINE_COLOR });
       manageHubBtn.addChild(manageHubBg);
 
       const manageHubText = new Text({
-        text: "manage hub",
-        style: { fontFamily: FONT, fontSize: TEXT_SIZE, fill: 0xffffff },
+        text: hubOnline ? "manage hub" : "manage hub (offline)",
+        style: { fontFamily: FONT, fontSize: TEXT_SIZE, fill: hubOnline ? 0xffffff : MUTED_TEXT },
         resolution: RESOLUTION,
       });
       manageHubText.eventMode = "none";
@@ -1379,15 +1409,17 @@ export function createFriendsTab(ctx: TabContext): TabController {
       manageHubText.y = (DETAIL_BTN_HEIGHT - TEXT_SIZE) / 2;
       manageHubBtn.addChild(manageHubText);
 
-      manageHubBtn.on("pointertap", (e) => {
-        e.stopPropagation();
-        if (!hubNodeIdForFriend) {
-          log.warn("social.friends", "hub friend has no node id to administer:", friend.id);
-          return;
-        }
-        viewMode = "hubProfile";
-        layout(currentWidth, currentHeight);
-      });
+      if (hubOnline) {
+        manageHubBtn.on("pointertap", (e) => {
+          e.stopPropagation();
+          if (!hubNodeIdForFriend) {
+            log.warn("social.friends", "hub friend has no node id to administer:", friend.id);
+            return;
+          }
+          viewMode = "hubProfile";
+          layout(currentWidth, currentHeight);
+        });
+      }
 
       dy += DETAIL_BTN_HEIGHT + 10;
 
@@ -2296,6 +2328,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
     // (same friend or not) fetches fresh again.
     if (viewMode !== "detail") {
       profileRefreshRequestedFor = null;
+      presenceProbeRequestedFor = null;
     }
 
     switch (viewMode) {
