@@ -38,6 +38,8 @@ const HEAVY_TEST_FILES = [
   "knock-ui.test.ts",
   "profile-gossip.spec.ts",
   "share-dialog.test.ts",
+  "sync.test.ts",
+  "text-input.test.ts",
   "viewer-role-ui.test.ts",
 ];
 

@@ -1,3 +1,12 @@
+// most tests in this file drive a single canvasPage() peer, but the
+// "...syncs between peers" tests below open a second peer sharing a
+// canvasDocId — a multi-page BroadcastChannel mesh, which contends for cpu
+// with other heavy specs if run concurrently (see playwright.config.ts's
+// HEAVY_TEST_FILES doc comment). the whole file is serialized alongside
+// them for simplicity rather than splitting the sync tests out.
+//
+// run with: npx playwright test tests/text-input.test.ts --workers=1
+
 import { expect, test } from "./fixtures/canvas-page";
 
 // ---------------------------------------------------------------------------
