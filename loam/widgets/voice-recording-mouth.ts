@@ -49,10 +49,22 @@ export function smoothLerp(current: number, target: number, attack = 0.6, decay 
 /** samples per second in a precomputed playback envelope */
 export const ENVELOPE_HZ = 30;
 
+/** resting/animating mouth curvature: frown (sad), neutral (default), or smile (happy) */
+export type Mood = "frown" | "neutral" | "smile";
+
+/** teeth row shape: a flat row (straight) or one that hugs the mood-curved lip line (curved) */
+export type TeethStyle = "straight" | "curved";
+
 /** clamp a lip thickness value to the 1..10 range the widget exposes */
 export function clampThickness(t: number): number {
   if (!Number.isFinite(t)) return 5;
   return Math.max(1, Math.min(10, t));
+}
+
+/** clamp a cupid's bow prominence value to the 0..10 range the widget exposes */
+export function clampBowAmount(a: number): number {
+  if (!Number.isFinite(a)) return 4;
+  return Math.max(0, Math.min(10, a));
 }
 
 /**
@@ -93,10 +105,20 @@ export function computeRmsEnvelope(
  */
 export class MouthRenderer {
   private readonly gfx: Graphics;
+  /** cavity + teeth + tongue, clipped to the mouth-opening shape via `maskGfx` */
+  private readonly innerGfx: Graphics;
+  /** geometry-only mask matching the current mouth-opening shape; never rendered itself */
+  private readonly maskGfx: Graphics;
   private openness = 0;
   private lipsColor: number;
   /** 1 (thin) .. 10 (plump); scales the lip band height around the default 5 */
   private lipThickness: number;
+  /** resting/animating mouth curvature */
+  private mood: Mood;
+  /** flat teeth row vs. one that hugs the mood-curved lip line */
+  private teethStyle: TeethStyle;
+  /** 0 (no bow, plain arc) .. 10 (fully pronounced double-peak bow) */
+  private cupidBowAmount: number;
   private w: number;
   private h: number;
 
@@ -105,12 +127,31 @@ export class MouthRenderer {
     width: number,
     height: number,
     lipsColor: number,
-    lipThickness = 5
+    lipThickness = 5,
+    mood: Mood = "neutral",
+    teethStyle: TeethStyle = "straight",
+    cupidBowAmount = 4
   ) {
     this.w = width;
     this.h = height;
     this.lipsColor = lipsColor;
     this.lipThickness = clampThickness(lipThickness);
+    this.mood = mood;
+    this.teethStyle = teethStyle;
+    this.cupidBowAmount = clampBowAmount(cupidBowAmount);
+    this.innerGfx = new Graphics();
+    this.innerGfx.eventMode = "none";
+    parent.addChild(this.innerGfx);
+    // the mask must be a normal child (added + `renderable` left true) for
+    // pixi to build its geometry for the stencil pass — `renderable =
+    // false` blocks that too, not just its normal draw, and silently masks
+    // everything away. `alpha = 0` hides it visually without touching the
+    // flags the mask system depends on.
+    this.maskGfx = new Graphics();
+    this.maskGfx.eventMode = "none";
+    this.maskGfx.alpha = 0;
+    parent.addChild(this.maskGfx);
+    this.innerGfx.mask = this.maskGfx;
     this.gfx = new Graphics();
     this.gfx.eventMode = "none";
     parent.addChild(this.gfx);
@@ -135,6 +176,25 @@ export class MouthRenderer {
     this.draw();
   }
 
+  setMood(mood: Mood): void {
+    if (mood === this.mood) return;
+    this.mood = mood;
+    this.draw();
+  }
+
+  setTeethStyle(style: TeethStyle): void {
+    if (style === this.teethStyle) return;
+    this.teethStyle = style;
+    this.draw();
+  }
+
+  setCupidBowAmount(amount: number): void {
+    const a = clampBowAmount(amount);
+    if (a === this.cupidBowAmount) return;
+    this.cupidBowAmount = a;
+    this.draw();
+  }
+
   resize(w: number, h: number): void {
     this.w = w;
     this.h = h;
@@ -142,8 +202,10 @@ export class MouthRenderer {
   }
 
   draw(): void {
-    const { gfx, openness, lipsColor, w, h } = this;
+    const { gfx, innerGfx, maskGfx, openness, lipsColor, mood, teethStyle, w, h } = this;
     gfx.clear();
+    innerGfx.clear();
+    maskGfx.clear();
 
     // geometry: scale to widget bounds with horizontal padding
     const padX = w * 0.13;
@@ -156,117 +218,257 @@ export class MouthRenderer {
     const thicknessScale = 0.45 + ((this.lipThickness - 1) / 9) * 1.15;
     const lipH = mouthW * 0.115 * thicknessScale;
     const cupidDip = lipH * 0.42;
+    // mood pulls the mouth corners up (smile) or down (frown); this scales
+    // with lip thickness (thicker lips → taller lipH → a bigger corner
+    // pull), computed early since the idle-grin floor below needs to scale
+    // the same way.
+    const maxMoodShift = lipH * 1.3;
 
-    // mouths widen slightly as they open
-    const stretch = 1 + openness * 0.08;
+    // a resting/idle smile is a full toothy grin, not just a sliver of
+    // upper teeth — give smile mood a baseline opening floor (independent
+    // of actual talking volume) high enough to clear both the upper AND
+    // lower teeth reveal thresholds below. tied to maxMoodShift (rather
+    // than a flat constant) so it scales with lip thickness: thicker lips
+    // pull the corners further via maxMoodShift, so the reveal gap needs
+    // to grow to match or the grin looks undersized/pinched relative to
+    // how far the corners lifted, and the mask (which also moves with the
+    // corners) can end up clipping the outer teeth. this floor is allowed
+    // to exceed the tongue threshold checked further down because tongue
+    // visibility there is gated on raw talking volume, not this floor — so
+    // a big idle grin never shows tongue no matter how large this gets.
+    // neutral/frown get no such floor.
+    const smileGapBonus =
+      mood === "smile" ? Math.min(0.45, (maxMoodShift * 0.55) / maxGapHalf) : 0;
+    // every mood keeps at least a sliver of a gap, even fully at rest — a
+    // truly closed mouth still shows a thin dark line where the lips meet,
+    // never a single seamless colored shape. kept well below the teeth
+    // reveal thresholds so neutral/frown stay toothless at rest.
+    const restGapFraction = 0.1;
+    const effectiveOpenness = Math.max(openness, restGapFraction, smileGapBonus);
+    const gapHalf = effectiveOpenness * maxGapHalf;
+
+    // mouths widen as they open, and a grin spreads the corners outward
+    // further still — a toothy smile isn't just taller, it's noticeably
+    // wider than a neutral mouth at the same opening. also scaled by
+    // thicknessScale: thicker lips need the extra width more, to keep the
+    // outer teeth clear of the mask's pinched corners.
+    const moodStretchBonus = mood === "smile" ? 0.05 + 0.05 * thicknessScale : 0;
+    const stretch = 1 + effectiveOpenness * 0.08 + moodStretchBonus;
     const hw = (mouthW / 2) * stretch;
     const lx = cx - hw;
     const rx = cx + hw;
 
-    const gapHalf = openness * maxGapHalf;
-    const upperBotY = cy - gapHalf;
-    const lowerTopY = cy + gapHalf;
+    // mood pulls the mouth CORNERS up (smile) or down (frown) by the full
+    // amount, and nudges the rest of the band (teeth, tongue, cavity, lip
+    // curves) by a smaller fraction so the whole mouth moves together
+    // instead of only the corners shifting — otherwise the teeth/cavity
+    // stay anchored to the true center while the corners droop/lift away
+    // from them, creating gaps or overlap at the lip line.
+    const moodOffset = mood === "smile" ? maxMoodShift : mood === "frown" ? -maxMoodShift : 0;
+    const cornerY = cy - moodOffset;
+    // smiling pulls the corners up a lot, but the reveal band itself
+    // shouldn't rise nearly as much — a small fraction keeps both teeth
+    // rows sitting closer to vertical center instead of hugging the top of
+    // the mouth, which is where they ended up with the same -0.3 fraction
+    // frowning uses (frowning wants the opposite: a bigger pull, handled
+    // below).
+    const upperCenterShift = mood === "smile" ? moodOffset * -0.1 : moodOffset * -0.3;
+    // the lower half gets pulled down further than the upper half when
+    // frowning specifically — user feedback repeatedly found the bottom
+    // teeth "still too high" with a symmetric shift, and only the bottom
+    // row was ever reported as needing it (the top row should stay put).
+    const lowerCenterShift =
+      mood === "frown" ? moodOffset * -0.65 : mood === "smile" ? moodOffset * -0.1 : moodOffset * -0.3;
+
+    const upperBotY = cy - gapHalf + upperCenterShift;
+    const lowerTopY = cy + gapHalf + lowerCenterShift;
     const upperTopY = upperBotY - lipH;
     const lowerBotY = lowerTopY + lipH;
+    // the lower lip's inner edge is a single symmetric bezier (both control
+    // points at the same y) — that shape only reaches 75% of the way from
+    // corner to control point at its midpoint, so the control point is
+    // pulled further than lowerTopY itself to correct for it. this control
+    // point is shared verbatim between the actual lower lip curve and the
+    // cavity trace below, so the two are drawn from identical geometry —
+    // there's no way for a gap or overlap to appear between the black
+    // cavity and the lip color, since they're literally the same path.
+    const lowerInnerCtrlY = cornerY + (lowerTopY - cornerY) * (4 / 3);
+    // a smiling mouth's cupid's bow dip looks disproportionately "saggy"
+    // in the middle once the corners lift a lot, hiding the middle teeth
+    // behind it — shallow it out for smile specifically so more of the
+    // middle teeth show. shared between the cavity trace and the actual
+    // upper lip curve below so they still match exactly.
+    const effectiveCupidDip = mood === "smile" ? cupidDip * 0.45 : cupidDip;
 
-    const strokeColor = darkenHex(lipsColor, 0.7);
+    // the mouth-opening shape (same outline for the mask and the cavity
+    // fill) — everything drawn into `innerGfx` (cavity, teeth, tongue) gets
+    // clipped to this path, so teeth/tongue can never poke out above the
+    // upper lip or below the lower lip, even when mood curvature pulls the
+    // corners well away from the true vertical center. this reuses the
+    // exact same control points as the visible upper/lower lip inner edges
+    // further down, rather than an independently-tuned approximation — any
+    // mismatch between the two was the source of a visible gap between the
+    // black cavity and the lip color.
+    const traceCavity = (g: Graphics): void => {
+      g.moveTo(lx, cornerY);
+      g.bezierCurveTo(
+        lx + hw * 0.18, upperBotY,
+        cx - hw * 0.14, upperBotY + effectiveCupidDip,
+        cx, upperBotY + effectiveCupidDip
+      );
+      g.bezierCurveTo(
+        cx + hw * 0.14, upperBotY + effectiveCupidDip,
+        rx - hw * 0.18, upperBotY,
+        rx, cornerY
+      );
+      g.bezierCurveTo(rx - hw * 0.18, lowerInnerCtrlY, lx + hw * 0.18, lowerInnerCtrlY, lx, cornerY);
+      g.closePath();
+    };
 
-    // -- inner mouth cavity (fades in as mouth opens) --
-    if (openness > 0.04) {
-      const alpha = Math.min(1, (openness - 0.04) / 0.12);
-      gfx.moveTo(lx, cy);
-      gfx.bezierCurveTo(lx + hw * 0.28, upperBotY, rx - hw * 0.28, upperBotY, rx, cy);
-      gfx.bezierCurveTo(rx - hw * 0.28, lowerTopY, lx + hw * 0.28, lowerTopY, lx, cy);
-      gfx.closePath();
-      gfx.fill({ color: 0x1a0508, alpha });
-    }
+    traceCavity(maskGfx);
+    maskGfx.fill({ color: 0xffffff });
 
-    // -- teeth: upper row descending from the upper lip --
-    if (openness > 0.18) {
-      const alpha = Math.min(1, (openness - 0.18) / 0.18);
-      const teethTop = upperBotY + 1.5;
-      const teethH = Math.max(2, gapHalf * 0.52);
+    // -- inner mouth cavity: always visible, even with the mouth fully at
+    // rest — a mouth is never a single sealed, colorless shape, there's
+    // always a dark gap where the lips meet. solid black immediately
+    // (no fade-in) so animating through small opennesses never shows a
+    // seam/gap while alpha "catches up" to the gap size. --
+    traceCavity(innerGfx);
+    innerGfx.fill({ color: 0x000000 });
+
+    // -- teeth: upper row descending from the upper lip. flat by default
+    // ("straight") — in "curved" style each tooth instead tracks the
+    // mood-curved mouth-opening boundary at its own x position (center →
+    // corner) so the outer teeth hug the lip line instead of leaving a gap
+    // near the corners. --
+    if (effectiveOpenness > 0.18) {
+      // real teeth stay close to a fixed size (tied to lip thickness)
+      // rather than stretching taller the wider the mouth opens — it's the
+      // GAP between the rows that should grow. "retreat" pulls the whole
+      // row further away from center as the mouth opens past the reveal
+      // threshold, so talking visibly moves the teeth out of the way
+      // instead of just leaving them hugging the lip line while the
+      // opening grows around them. capped at a fraction of lipH so it can
+      // never push the row out past the mask boundary near the corners.
+      const teethH = Math.max(2, lipH * 0.6 + gapHalf * 0.15);
+      const retreat = Math.min(lipH * 0.9, Math.max(0, gapHalf - maxGapHalf * 0.18) * 0.9);
       const toothCount = 5;
       const totalW = hw * 1.15;
       const toothW = totalW / toothCount - 1.8;
       const startX = cx - totalW / 2;
+      // straight rows stay flat for neutral/frown, but a smile lifts the
+      // corners so much that a flat row leaves a visible gap between the
+      // outer teeth and the corners — lean the outer teeth up toward the
+      // corner curve at half strength, enough to close that gap without
+      // the fuller per-tooth stagger "curved" style produces.
+      const cornerLean = teethStyle === "curved" ? 1 : mood === "smile" ? 0.5 : 0;
       for (let i = 0; i < toothCount; i++) {
         const tx = startX + i * (toothW + 1.8);
-        gfx.roundRect(tx, teethTop, toothW, teethH, 2);
+        const u = cornerLean * Math.min(1, Math.abs(tx + toothW / 2 - cx) / hw);
+        const localTop = upperBotY + (cornerY - upperBotY) * u * u + 1.5 - retreat;
+        innerGfx.roundRect(tx, localTop, toothW, teethH, 2);
       }
-      gfx.fill({ color: 0xf5eee0, alpha });
+      innerGfx.fill({ color: 0xf5eee0 });
     }
 
-    // -- teeth: lower row rising from the lower lip (slightly smaller and
-    // dimmer than the uppers, like real mouths) --
-    if (openness > 0.26) {
-      const alpha = Math.min(1, (openness - 0.26) / 0.2) * 0.92;
-      const teethH = Math.max(1.5, gapHalf * 0.38);
-      const teethBot = lowerTopY - 1.5;
+    // -- tongue: resting on the lower lip, rising and rounding as the mouth
+    // opens. drawn BEFORE the lower teeth so the teeth sit in front of it
+    // (a tongue in front of the bottom teeth isn't anatomically sound).
+    // two stacked ellipses give it a center groove. gated on raw talking
+    // volume (not effectiveOpenness) so mood-driven floors (e.g. the idle
+    // smile grin above) never reveal tongue on their own — only actually
+    // opening the mouth wide while talking does. --
+    if (openness > 0.3) {
+      const alpha = Math.min(1, (openness - 0.3) / 0.2);
+      const rise = (openness - 0.3) / 0.7;
+      const tongueH = Math.max(2, gapHalf * 0.85 * rise);
+      const tongueW = hw * 0.92;
+      const tongueCy = lowerTopY - tongueH * 0.42;
+      innerGfx.ellipse(cx, tongueCy, tongueW / 2, tongueH / 2);
+      innerGfx.fill({ color: 0xe05878, alpha });
+      // center groove: a subtle darker crease down the middle
+      innerGfx.ellipse(cx, tongueCy - tongueH * 0.08, tongueW * 0.06, tongueH * 0.34);
+      innerGfx.fill({ color: darkenHex(0xe05878, 0.78), alpha: alpha * 0.7 });
+      // highlight: small lighter sheen on the front
+      innerGfx.ellipse(cx - tongueW * 0.18, tongueCy + tongueH * 0.1, tongueW * 0.13, tongueH * 0.16);
+      innerGfx.fill({ color: 0xf07a95, alpha: alpha * 0.6 });
+    }
+
+    // -- teeth: lower row rising from the lower lip (slightly smaller than
+    // the uppers, like real mouths) — drawn AFTER the tongue so they sit in
+    // front of it. flat by default ("straight"); the extra frown-mood
+    // downshift already lives in lowerTopY itself (see lowerCenterShift
+    // above), so this row automatically drops further for a frown without
+    // needing its own separate lean. "curved" style varies the lean per
+    // tooth for a fuller curve. --
+    if (effectiveOpenness > 0.26) {
+      // same fixed-size + retreat treatment as the upper row, mirrored
+      // downward, so the bottom row pulls away from center as the mouth
+      // opens instead of just growing taller in place.
+      const teethH = Math.max(2, lipH * 0.55 + gapHalf * 0.15);
+      const retreat = Math.min(lipH * 0.9, Math.max(0, gapHalf - maxGapHalf * 0.26) * 0.9);
       const toothCount = 6;
       const totalW = hw * 1.0;
       const toothW = totalW / toothCount - 1.6;
       const startX = cx - totalW / 2;
+      // same corner-gap fix as the upper row, mirrored for the bottom lip.
+      const cornerLean = teethStyle === "curved" ? 1 : mood === "smile" ? 0.5 : 0;
       for (let i = 0; i < toothCount; i++) {
         const tx = startX + i * (toothW + 1.6);
-        gfx.roundRect(tx, teethBot - teethH, toothW, teethH, 1.5);
+        const u = cornerLean * Math.min(1, Math.abs(tx + toothW / 2 - cx) / hw);
+        const localBot = lowerTopY + (cornerY - lowerTopY) * u * u - 1.5 + retreat;
+        innerGfx.roundRect(tx, localBot - teethH, toothW, teethH, 1.5);
       }
-      gfx.fill({ color: 0xe9e0d0, alpha });
+      innerGfx.fill({ color: 0xe9e0d0 });
     }
 
-    // -- tongue: resting on the lower lip, rising and rounding as the mouth
-    // opens. two stacked ellipses give it a center groove.  --
-    if (openness > 0.3) {
-      const alpha = Math.min(1, (openness - 0.3) / 0.2);
-      const rise = (openness - 0.3) / 0.7;
-      const tongueH = Math.max(1.5, gapHalf * 0.62 * rise);
-      const tongueW = hw * 0.78;
-      const tongueCy = lowerTopY - tongueH * 0.25;
-      gfx.ellipse(cx, tongueCy, tongueW / 2, tongueH / 2);
-      gfx.fill({ color: 0xe05878, alpha });
-      // center groove: a subtle darker crease down the middle
-      gfx.ellipse(cx, tongueCy - tongueH * 0.08, tongueW * 0.06, tongueH * 0.34);
-      gfx.fill({ color: darkenHex(0xe05878, 0.78), alpha: alpha * 0.7 });
-      // highlight: small lighter sheen on the front
-      gfx.ellipse(cx - tongueW * 0.18, tongueCy + tongueH * 0.1, tongueW * 0.13, tongueH * 0.16);
-      gfx.fill({ color: 0xf07a95, alpha: alpha * 0.6 });
-    }
-
-    // -- upper lip: filled bezier shape with cupid's bow inner edge --
-    // outer arc: left corner → top peak → right corner
-    gfx.moveTo(lx, cy);
-    gfx.bezierCurveTo(lx + hw * 0.22, upperTopY, rx - hw * 0.22, upperTopY, rx, cy);
-    // inner arc back with cupid's bow dip at center
+    // -- upper lip: filled bezier shape with cupid's bow on both edges --
+    // outer arc: left corner → left peak → center dip → right peak → right
+    // corner. the two peaks with a shallow dip between them are the
+    // cupid's bow silhouette; without them the top edge is just a plain
+    // arc with no bow shape at all. cupidBowAmount (0..10) scales how far
+    // the peaks/dip depart from a plain arc — 0 collapses them back to one.
+    const bowScale = this.cupidBowAmount / 10;
+    const bowPeakX = hw * 0.16;
+    const bowPeakY = upperTopY - lipH * 0.22 * bowScale;
+    const bowDipY = upperTopY + lipH * 0.1 * bowScale;
+    gfx.moveTo(lx, cornerY);
+    gfx.bezierCurveTo(
+      lx + hw * 0.32, upperTopY,
+      cx - bowPeakX - hw * 0.06, bowPeakY,
+      cx - bowPeakX, bowPeakY
+    );
+    gfx.bezierCurveTo(cx - bowPeakX * 0.3, bowDipY, cx + bowPeakX * 0.3, bowDipY, cx + bowPeakX, bowPeakY);
+    gfx.bezierCurveTo(
+      cx + bowPeakX + hw * 0.06, bowPeakY,
+      rx - hw * 0.32, upperTopY,
+      rx, cornerY
+    );
+    // inner arc back with the (mood-adjusted) cupid's bow dip at center
     gfx.bezierCurveTo(
       rx - hw * 0.18, upperBotY,
-      cx + hw * 0.14, upperBotY + cupidDip,
-      cx, upperBotY + cupidDip
+      cx + hw * 0.14, upperBotY + effectiveCupidDip,
+      cx, upperBotY + effectiveCupidDip
     );
     gfx.bezierCurveTo(
-      cx - hw * 0.14, upperBotY + cupidDip,
+      cx - hw * 0.14, upperBotY + effectiveCupidDip,
       lx + hw * 0.18, upperBotY,
-      lx, cy
+      lx, cornerY
     );
     gfx.closePath();
     gfx.fill({ color: lipsColor });
-    // stroke outer edge only
-    gfx.moveTo(lx, cy);
-    gfx.bezierCurveTo(lx + hw * 0.22, upperTopY, rx - hw * 0.22, upperTopY, rx, cy);
-    gfx.stroke({ color: strokeColor, width: 1.2 });
 
     // -- lower lip: filled bezier shape --
-    gfx.moveTo(lx, cy);
-    gfx.bezierCurveTo(lx + hw * 0.18, lowerTopY, rx - hw * 0.18, lowerTopY, rx, cy);
-    gfx.bezierCurveTo(rx - hw * 0.14, lowerBotY, lx + hw * 0.14, lowerBotY, lx, cy);
+    gfx.moveTo(lx, cornerY);
+    gfx.bezierCurveTo(lx + hw * 0.18, lowerInnerCtrlY, rx - hw * 0.18, lowerInnerCtrlY, rx, cornerY);
+    gfx.bezierCurveTo(rx - hw * 0.14, lowerBotY, lx + hw * 0.14, lowerBotY, lx, cornerY);
     gfx.closePath();
     gfx.fill({ color: lipsColor });
-    // stroke outer edge only
-    gfx.moveTo(rx, cy);
-    gfx.bezierCurveTo(rx - hw * 0.14, lowerBotY, lx + hw * 0.14, lowerBotY, lx, cy);
-    gfx.stroke({ color: strokeColor, width: 1.2 });
   }
 
   destroy(): void {
     this.gfx.destroy();
+    this.innerGfx.destroy();
+    this.maskGfx.destroy();
   }
 }
