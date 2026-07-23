@@ -366,8 +366,8 @@ bump-version: ## bump all skein package versions in lockstep (NEW_VERSION=x.y.z,
 		sed -i.bak 's/^version = "[^"]*"/version = "$(NEW_VERSION)"/' tauri/Cargo.toml && rm -f tauri/Cargo.toml.bak; \
 		echo "  updating tauri/tauri.conf.json..."; \
 		sed -i.bak 's/"version": "[^"]*"/"version": "$(NEW_VERSION)"/' tauri/tauri.conf.json && rm -f tauri/tauri.conf.json.bak; \
-		echo "  updating loam/package.json..."; \
-		node -e "const fs=require('fs'); const p='loam/package.json'; const j=JSON.parse(fs.readFileSync(p,'utf8')); j.version='$(NEW_VERSION)'; fs.writeFileSync(p, JSON.stringify(j,null,2)+'\n');"; \
+		echo "  updating loam/package.json + loam/package-lock.json..."; \
+		(cd loam && npm version $(NEW_VERSION) --no-git-tag-version --allow-same-version >/dev/null); \
 		echo ""; \
 		echo "version bumped to $(NEW_VERSION)"; \
 		echo ""; \
