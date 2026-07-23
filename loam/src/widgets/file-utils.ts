@@ -36,7 +36,6 @@ import { save, open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   hasBlobBytes,
-  getBlobRecord,
   getBlobObjectURL,
   storeBlob,
   storeBlobFromFile,
@@ -2012,12 +2011,15 @@ export async function uploadFile(
   // docs/narthex-widgets-and-file-transfer-plan.md section 7 for the full
   // "three copies of a multi-gigabyte file in memory" root-cause writeup).
   //
-  // the base64 `data` mirror (into OPFS/IndexedDB, for the browser-mode
-  // display paths — thumbnail load, image full-data-url) only comes back
-  // for files under `blob_insert_from_path`'s own size threshold; for a
-  // large file `response.data` is `null` and the mirror step below is
-  // skipped entirely — the blob simply stays rust-only, which
-  // `getBlobData()`'s existing tauri fallback already handles gracefully.
+  // no OPFS/IndexedDB mirror here — tauri never reads blobs back through
+  // the browser blob-store (media playback, locality checks, and preview
+  // data all go through rust dispatch calls like `blob_get_path`/`blob_get`,
+  // see getLocalBlobUrl()/getMediaPlaybackUrl()/checkBlobLocality()), and
+  // the browser blob worker's blake3 hasher has no midden module to hash
+  // with in a tauri build (it always degrades to an empty string), so a
+  // mirror write here was keyed under a bogus id and, once OPFS started
+  // rejecting empty names outright, threw and failed the whole upload even
+  // though rust had already stored the blob successfully.
 
   if (!picked.path) {
     throw new Error("tauri uploadFile requires picked.path");
@@ -2093,7 +2095,6 @@ export async function uploadFile(
   const domain = classifyDomain(resolvedMime);
 
   let thumbnailDataUrl: string | null = null;
-  let existing = false;
 
   if (response.data !== null) {
     const bytes = base64ToBytes(response.data);
@@ -2101,20 +2102,6 @@ export async function uploadFile(
       bytes.byteOffset,
       bytes.byteOffset + bytes.byteLength
     ) as ArrayBuffer;
-
-    // dedup: if we already mirrored this blake3, skip the OPFS write.
-    const existingRecord = await getBlobRecord(meta.blake3);
-    existing = !!existingRecord;
-
-    if (!existingRecord) {
-      await storeBlob(buffer, {
-        filename: meta.filename || picked.filename,
-        mime: resolvedMime,
-        blob_type: "original",
-        parent_blob_id: null,
-        metadata: { domain },
-      });
-    }
 
     // generate a thumbnail data url for images so the widget can paint
     // immediately without a follow-up fetch.
@@ -2141,7 +2128,7 @@ export async function uploadFile(
     blake3: meta.blake3,
     size: meta.size,
     mime: resolvedMime,
-    existing,
+    existing: false,
     thumbnailDataUrl,
   };
 }

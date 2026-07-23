@@ -221,7 +221,7 @@ build-tauri-mac-arm: dev-data ## build the tauri desktop app for macOS arm64 (.d
 		cd $(TAURI_DIR) && DATABASE_URL=sqlite:$(DEV_DB) APPLE_SIGNING_IDENTITY=- cargo tauri build --target $(MAC_ARM_TARGET); \
 	fi
 	@mkdir -p $(BUILD_DIR)/$(VERSION)
-	cp $(TAURI_DIR)/target/$(MAC_ARM_TARGET)/release/bundle/dmg/*.dmg $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_aarch64.dmg
+	cp target/$(MAC_ARM_TARGET)/release/bundle/dmg/*.dmg $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_aarch64.dmg
 	@echo "built: $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_aarch64.dmg"
 	@if [ -n "$(APPLE_SIGNING_IDENTITY)" ] && [ -n "$(APPLE_ID)" ] && [ -n "$(APPLE_PASSWORD)" ] && [ -n "$(APPLE_TEAM_ID)" ]; then \
 		echo "notarizing dmg (this may take a few minutes)..."; \
@@ -241,7 +241,7 @@ build-tauri-mac-intel: dev-data ## build the tauri desktop app for macOS x86_64 
 		cd $(TAURI_DIR) && DATABASE_URL=sqlite:$(DEV_DB) APPLE_SIGNING_IDENTITY=- cargo tauri build --target $(MAC_INTEL_TARGET); \
 	fi
 	@mkdir -p $(BUILD_DIR)/$(VERSION)
-	cp $(TAURI_DIR)/target/$(MAC_INTEL_TARGET)/release/bundle/dmg/*.dmg $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_x86_64.dmg
+	cp target/$(MAC_INTEL_TARGET)/release/bundle/dmg/*.dmg $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_x86_64.dmg
 	@echo "built: $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_x86_64.dmg"
 	@if [ -n "$(APPLE_SIGNING_IDENTITY)" ] && [ -n "$(APPLE_ID)" ] && [ -n "$(APPLE_PASSWORD)" ] && [ -n "$(APPLE_TEAM_ID)" ]; then \
 		echo "notarizing dmg (this may take a few minutes)..."; \
@@ -255,8 +255,8 @@ build-tauri-linux-intel: dev-data ## build the tauri desktop app for linux x86_6
 	@echo "building tauri app for linux x86_64..."
 	cd $(TAURI_DIR) && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri build --target $(LINUX_TARGET)
 	@mkdir -p $(BUILD_DIR)/$(VERSION)
-	cp $(TAURI_DIR)/target/$(LINUX_TARGET)/release/bundle/deb/*.deb $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_x86_64.deb
-	cp $(TAURI_DIR)/target/$(LINUX_TARGET)/release/bundle/rpm/*.rpm $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_x86_64.rpm
+	cp target/$(LINUX_TARGET)/release/bundle/deb/*.deb $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_x86_64.deb
+	cp target/$(LINUX_TARGET)/release/bundle/rpm/*.rpm $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_x86_64.rpm
 	@echo "built: $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_x86_64.deb"
 	@echo "built: $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_x86_64.rpm"
 
@@ -264,8 +264,8 @@ build-tauri-linux-arm64: dev-data ## build the tauri desktop app for linux aarch
 	@echo "building tauri app for linux aarch64..."
 	cd $(TAURI_DIR) && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri build --target $(LINUX_ARM64_TARGET)
 	@mkdir -p $(BUILD_DIR)/$(VERSION)
-	cp $(TAURI_DIR)/target/$(LINUX_ARM64_TARGET)/release/bundle/deb/*.deb $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_aarch64.deb
-	cp $(TAURI_DIR)/target/$(LINUX_ARM64_TARGET)/release/bundle/rpm/*.rpm $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_aarch64.rpm
+	cp target/$(LINUX_ARM64_TARGET)/release/bundle/deb/*.deb $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_aarch64.deb
+	cp target/$(LINUX_ARM64_TARGET)/release/bundle/rpm/*.rpm $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_aarch64.rpm
 	@echo "built: $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_aarch64.deb"
 	@echo "built: $(BUILD_DIR)/$(VERSION)/skein_$(VERSION)_aarch64.rpm"
 
@@ -289,7 +289,7 @@ build-tauri-android: dev-data ## build the android app (universal apk, no 32-bit
 		echo "error: keystore not found at $(ANDROID_KEYSTORE)"; \
 		echo "set ANDROID_KEYSTORE in .env or your environment"; exit 1; \
 	fi
-	cd $(TAURI_DIR) && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri android build -- --apk --target aarch64 --target x86_64 --target i686
+	cd $(TAURI_DIR) && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri android build --apk --target aarch64 --target x86_64 --target i686
 	@echo "signing apk with apksigner..."
 	$(ANDROID_APKSIGNER) sign \
 		--ks "$(ANDROID_KEYSTORE)" \
@@ -316,7 +316,7 @@ build-tauri-android-arm64: dev-data ## build the android app (arm64-only apk, si
 		echo "error: keystore not found at $(ANDROID_KEYSTORE)"; \
 		echo "set ANDROID_KEYSTORE in .env or your environment"; exit 1; \
 	fi
-	cd $(TAURI_DIR) && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri android build -- --apk --target aarch64
+	cd $(TAURI_DIR) && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri android build --apk --target aarch64
 	@echo "signing apk with apksigner..."
 	$(ANDROID_APKSIGNER) sign \
 		--ks "$(ANDROID_KEYSTORE)" \
@@ -332,7 +332,8 @@ build-tauri-android-arm64: dev-data ## build the android app (arm64-only apk, si
 .PHONY: clean-build
 clean-build: ## remove build/ artifacts + tauri bundle output
 	rm -rf $(BUILD_DIR)/
-	rm -rf $(TAURI_DIR)/target/release/bundle
+	rm -rf target/release/bundle
+	rm -rf target/*/release/bundle
 
 # ---- version management -----------------------------------------------------
 

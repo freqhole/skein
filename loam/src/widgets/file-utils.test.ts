@@ -304,9 +304,8 @@ describe("file-utils — tauri-mode branches", () => {
   });
 
   describe("uploadFile (tauri mode)", () => {
-    it("uploads via blob_insert_from_path and mirrors the bytes into the local blob store", async () => {
+    it("uploads via blob_insert_from_path without mirroring bytes into OPFS/IndexedDB", async () => {
       mockIsTauriMode.mockReturnValue(true);
-      mockGetBlobRecord.mockResolvedValue(null); // not already mirrored locally
       mockDispatch.mockResolvedValue({
         meta: {
           blake3: "newblake3hash",
@@ -332,36 +331,15 @@ describe("file-utils — tauri-mode branches", () => {
         mime: "text/plain",
         upload_id: expect.any(String),
       });
-      expect(mockStoreBlob).toHaveBeenCalledTimes(1);
+      // no browser blob-store mirror: tauri media/locality/preview reads all
+      // go through rust dispatch calls, and the browser blake3 hasher can't
+      // work in a tauri build (no midden module to hash with) — see
+      // uploadFile()'s tauri-mode comment.
+      expect(mockGetBlobRecord).not.toHaveBeenCalled();
+      expect(mockStoreBlob).not.toHaveBeenCalled();
       expect(result.existing).toBe(false);
       expect(result.blake3).toBe("newblake3hash");
       expect(result.domain).toBe("file");
-    });
-
-    it("skips re-storing bytes when the blake3 is already mirrored locally", async () => {
-      mockIsTauriMode.mockReturnValue(true);
-      mockGetBlobRecord.mockResolvedValue({ blob_id: "newblake3hash" });
-      mockDispatch.mockResolvedValue({
-        meta: {
-          blake3: "newblake3hash",
-          iroh_hash: "irohhash",
-          filename: "notes.txt",
-          mime: "text/plain",
-          size: 11,
-          created_at: Date.now(),
-        },
-        data: btoa("hello world"),
-      });
-
-      const result = await uploadFile({
-        path: "/Users/x/notes.txt",
-        filename: "notes.txt",
-        size: 0,
-        file: null,
-      });
-
-      expect(mockStoreBlob).not.toHaveBeenCalled();
-      expect(result.existing).toBe(true);
     });
 
     it("throws when called in tauri mode without a picked.path", async () => {
