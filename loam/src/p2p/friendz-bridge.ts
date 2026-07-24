@@ -97,6 +97,8 @@ export function destroyBridge(): void {
   outboundRequestHook = null;
   acceptAndJoinHandler = null;
   knockSocialDoc = null;
+  unsubscribeFriendsChange?.();
+  unsubscribeFriendsChange = null;
   knockRelayInfo.clear();
   knockRelayListeners = [];
   knockAckedCanvasIds.clear();
@@ -388,12 +390,52 @@ export function getProtocol(): FriendzProtocol | null {
  *  lifecycle. pass `null` on teardown. */
 export function initKnockSocialDocBridge(doc: SocialDoc | null): void {
   knockSocialDoc = doc;
+  unsubscribeFriendsChange?.();
+  unsubscribeFriendsChange = null;
+  ensureFriendsChangeSubscription();
 }
 
 /** the social doc registered via `initKnockSocialDocBridge()`, or null if
  *  not ready yet. */
 export function getKnockSocialDoc(): SocialDoc | null {
   return knockSocialDoc;
+}
+
+// ---------------------------------------------------------------------------
+// friend status (used by the blob-fetch friend gate — see file-utils.ts's
+// `BlobAccessDeniedError` and `pending-blob-access.ts`)
+// ---------------------------------------------------------------------------
+
+/** true if `nodeId` is one of our accepted friends' node ids. reads the
+ *  same social doc `initKnockSocialDocBridge()` registered — friend state
+ *  is synced into that doc's `friends` list in both tauri and browser
+ *  mode, so this check works identically regardless of platform. */
+export function isFriend(nodeId: string): boolean {
+  const friends = knockSocialDoc?.current.friends ?? [];
+  return friends.some((f) => f.nodeIds?.some((n) => n.nodeId === nodeId));
+}
+
+let friendsChangeListeners: Array<() => void> = [];
+let unsubscribeFriendsChange: (() => void) | null = null;
+
+function ensureFriendsChangeSubscription(): void {
+  if (unsubscribeFriendsChange || !knockSocialDoc) return;
+  unsubscribeFriendsChange = knockSocialDoc.on("change", () => {
+    for (const handler of friendsChangeListeners) handler();
+  });
+}
+
+/** subscribe to be notified whenever the social doc's friends list changes
+ *  (accept, remove, profile update, etc.) — used to retry a blob fetch
+ *  once a pending friend request is accepted. if the social doc isn't
+ *  registered yet, the subscription is (re-)attempted the next time
+ *  `initKnockSocialDocBridge()` runs. returns an unsubscribe function. */
+export function onFriendsChange(handler: () => void): () => void {
+  friendsChangeListeners.push(handler);
+  ensureFriendsChangeSubscription();
+  return () => {
+    friendsChangeListeners = friendsChangeListeners.filter((h) => h !== handler);
+  };
 }
 
 /** record that `info.requesterNodeId`'s knock (on `info.canvasDocId`) was

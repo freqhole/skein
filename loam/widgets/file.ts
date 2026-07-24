@@ -21,10 +21,13 @@ import {
   snatchBlob,
   snatchBlobToDisk,
   uploadFile,
+  BlobAccessDeniedError,
   type PeersMap,
   type PickedFile,
   type ThumbnailOptions,
 } from "../src/widgets/file-utils";
+import { sendFriendRequest } from "../src/p2p/friendz-bridge";
+import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import { createInlinePlayer, type InlinePlayerHandle } from "../src/widgets/inline-media";
 import { createMediaOverlay, type MediaOverlayHandle } from "../src/widgets/media-overlay";
 import { peerNameFor } from "../src/canvas/peer-names";
@@ -93,7 +96,9 @@ type ActionState =
   | "snatching"
   | "paused"
   | "disk-snatching"
-  | "disk-paused";
+  | "disk-paused"
+  | "needs-friend" // only non-friend peers have the blob; tap to send a friend request
+  | "friend-requested"; // friend request sent; waiting to retry the snatch
 
 const INFO_BAR_HEIGHT = 48;
 const ACTION_BAR_HEIGHT = 28;
@@ -296,6 +301,11 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     let activePlayer: InlinePlayerHandle | null = null;
     let hoverOverlay: Container | null = null;
     let hoverOverlayVisible = false;
+    // friend-gated snatch: the peer known to have the blob but not (yet) a
+    // friend, and the pending-retry-on-friend-accept unregister function —
+    // see requestFriendAndRetry() and file-utils.ts's BlobAccessDeniedError.
+    let deniedPeerNodeId: string | null = null;
+    let unregisterPendingRetry: (() => void) | null = null;
 
     // flag: true when the user uploaded the file through this widget instance.
     // prevents showing "save to disk" for files the user just uploaded.
@@ -497,10 +507,15 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     actionContainer.visible = false;
     infoContainer.addChild(actionContainer);
 
-    // snatch button — shown when blob is remote (doubles as resume when paused)
+    // snatch button — shown when blob is remote (doubles as resume when
+    // paused, or "send friend request" when only a non-friend peer has it)
     const snatchBtn = createPillButton("snatch", 0x2d5a27, () => {
       if (actionState === "snatching") {
         cancelSnatch();
+      } else if (actionState === "needs-friend") {
+        void requestFriendAndRetry();
+      } else if (actionState === "friend-requested") {
+        // request already sent — retry fires automatically once accepted
       } else {
         handleSnatch();
       }
@@ -636,9 +651,14 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     function syncActionButtons() {
       if (destroyed) return;
 
-      // snatch: visible when remote, actively snatching, or paused (resume)
+      // snatch: visible when remote, actively snatching, paused (resume), or
+      // when the only peer(s) with the blob aren't friends yet
       snatchBtn.setVisible(
-        actionState === "remote" || actionState === "snatching" || actionState === "paused"
+        actionState === "remote" ||
+          actionState === "snatching" ||
+          actionState === "paused" ||
+          actionState === "needs-friend" ||
+          actionState === "friend-requested"
       );
       if (actionState === "snatching") {
         // label is managed by the progress callback in handleSnatch
@@ -646,6 +666,12 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       } else if (actionState === "paused") {
         snatchBtn.setLabel(snatchPausedPct ? `resume (${snatchPausedPct})` : "resume");
         snatchBtn.setColor(0x2d5a27);
+      } else if (actionState === "needs-friend") {
+        snatchBtn.setLabel("add friend to fetch");
+        snatchBtn.setColor(0x5a2727);
+      } else if (actionState === "friend-requested") {
+        snatchBtn.setLabel("request sent…");
+        snatchBtn.setColor(0x555555);
       } else {
         snatchBtn.setLabel("snatch");
         snatchBtn.setColor(0x2d5a27);
@@ -1828,12 +1854,50 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           log.debug("file-widget", "snatch failed after widget destroyed:", err);
           return;
         }
+        if (err instanceof BlobAccessDeniedError) {
+          log.debug("file-widget", "snatch denied — no friend has this blob yet:", err.message);
+          deniedPeerNodeId = err.peerNodeId;
+          actionState = "needs-friend";
+          syncActionButtons();
+          positionInfoBar(currentWidth, currentHeight);
+          return;
+        }
         log.error("file-widget", "snatch failed:", err);
         actionState = "remote";
         syncActionButtons();
       } finally {
         snatchAbort = null;
       }
+    }
+
+    /** send a friend request to the peer holding this blob, then
+     *  automatically retry the snatch once the request is accepted (see
+     *  pending-blob-access.ts). session-only — if the widget is destroyed
+     *  before the request is accepted, the retry is simply dropped. */
+    async function requestFriendAndRetry() {
+      if (actionState !== "needs-friend") return;
+      const peerNodeId = deniedPeerNodeId;
+      if (!peerNodeId) return;
+
+      unregisterPendingRetry?.();
+      try {
+        await sendFriendRequest(peerNodeId);
+      } catch (err) {
+        log.error("file-widget", "sendFriendRequest failed:", err);
+        return;
+      }
+      if (destroyed) return;
+
+      actionState = "friend-requested";
+      syncActionButtons();
+      positionInfoBar(currentWidth, currentHeight);
+
+      unregisterPendingRetry = registerPendingBlobRetry(peerNodeId, () => {
+        unregisterPendingRetry = null;
+        if (destroyed) return;
+        actionState = "remote";
+        void handleSnatch();
+      });
     }
 
     // -- snatch-to-disk handler ------------------------------------------------
@@ -2498,6 +2562,8 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         }
         unsub();
         destroyed = true;
+        unregisterPendingRetry?.();
+        unregisterPendingRetry = null;
         // a paused disk snatch holds an open writable — abort it so the
         // reserved on-disk file isn't left dangling
         if (diskSnatchWritable) {

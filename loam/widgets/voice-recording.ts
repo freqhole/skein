@@ -32,8 +32,11 @@ import {
   checkBlobLocality,
   getLocalNodeId,
   snatchBlob,
+  BlobAccessDeniedError,
   type PeersMap,
 } from "../src/widgets/file-utils";
+import { sendFriendRequest } from "../src/p2p/friendz-bridge";
+import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import {
   isTransparent,
   type CompactInfo,
@@ -171,7 +174,9 @@ type RecordState =
   | "ready"
   | "fetching"
   | "playing"
-  | "error";
+  | "error"
+  | "needs-friend" // only non-friend peers have the blob; tap to send a friend request
+  | "friend-requested"; // friend request sent; waiting to retry the fetch
 
 export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = {
   type: "voice-recording",
@@ -228,6 +233,13 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     let playbackUrl: string | null = null;
     let fetchProgressText = "downloading…";
     let fetchErrorMessage = "";
+    /** the peer known to have the blob but not (yet) a friend — see the
+     *  "needs-friend"/"friend-requested" states below. */
+    let deniedPeerNodeId: string | null = null;
+    /** unregisters the pending-retry-on-friend-accept hook (see
+     *  requestFriendAndRetry()); called on destroy() so it never fires
+     *  against a torn-down widget. */
+    let unregisterPendingRetry: (() => void) | null = null;
 
     // -- animation frame IDs --
     let mouthRafId: number | null = null;
@@ -437,6 +449,16 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         case "error":
           statusText.text = "mic access denied\ntap to try again";
           statusText.style.fill = COLOR_ERROR;
+          statusText.visible = true;
+          break;
+        case "needs-friend":
+          statusText.text = "only a non-friend peer has this recording\ntap to send a friend request";
+          statusText.style.fill = COLOR_ERROR;
+          statusText.visible = true;
+          break;
+        case "friend-requested":
+          statusText.text = "friend request sent\nwill retry automatically once accepted";
+          statusText.style.fill = COLOR_STATUS;
           statusText.visible = true;
           break;
         default:
@@ -701,6 +723,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           ctx.canvasStore ? (nodeId: string) => ctx.canvasStore!.isPeerOnline(nodeId) : undefined
         );
       } catch (err) {
+        if (err instanceof BlobAccessDeniedError) throw err;
         console.error("[voice-widget] resolveAudioBytes failed:", err);
         return null;
       }
@@ -763,7 +786,21 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         ctx.setHeaderActions?.(makeHeaderActions());
       }
 
-      const url = await getPlaybackUrl();
+      let url: string | null;
+      try {
+        url = await getPlaybackUrl();
+      } catch (err) {
+        if (destroyed) return;
+        if (err instanceof BlobAccessDeniedError) {
+          deniedPeerNodeId = err.peerNodeId;
+          recState = "needs-friend";
+          refresh();
+          ctx.setHeaderActions?.(makeHeaderActions());
+          return;
+        }
+        console.error("[voice-widget] getPlaybackUrl failed:", err);
+        url = null;
+      }
       if (destroyed) return;
       if (!url) {
         recState = "ready";
@@ -820,6 +857,34 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       ctx.setHeaderActions?.(makeHeaderActions());
     };
 
+    /** send a friend request to the peer holding this recording, then
+     *  automatically retry playback once the request is accepted (see
+     *  pending-blob-access.ts). session-only — if the widget is destroyed
+     *  before the request is accepted, the retry is simply dropped. */
+    const requestFriendAndRetry = async (): Promise<void> => {
+      const peerNodeId = deniedPeerNodeId;
+      if (!peerNodeId) return;
+
+      unregisterPendingRetry?.();
+      try {
+        await sendFriendRequest(peerNodeId);
+      } catch (err) {
+        console.error("[voice-widget] sendFriendRequest failed:", err);
+        return;
+      }
+      if (destroyed) return;
+
+      recState = "friend-requested";
+      refresh();
+      ctx.setHeaderActions?.(makeHeaderActions());
+
+      unregisterPendingRetry = registerPendingBlobRetry(peerNodeId, () => {
+        unregisterPendingRetry = null;
+        if (destroyed) return;
+        void startPlayback();
+      });
+    };
+
     const deleteRecording = (): void => {
       if (recState === "playing") {
         audioEl?.pause();
@@ -858,6 +923,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       if (ctx.canvasStore?.isLocalViewer()) return;
       if (recState === "ready") void startPlayback();
       else if (recState === "playing") pausePlayback();
+      else if (recState === "needs-friend") void requestFriendAndRetry();
     });
 
     btnGfx.on("pointerup", () => {
@@ -905,6 +971,18 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           audioEl?.pause();
           stopPlayAnim();
         }
+        smoothOpenness = 0;
+        mouth.setOpenness(0);
+        recState = "idle";
+        refresh();
+        ctx.setHeaderActions?.(makeHeaderActions());
+        return;
+      }
+
+      if ((recState === "needs-friend" || recState === "friend-requested") && !blobId) {
+        unregisterPendingRetry?.();
+        unregisterPendingRetry = null;
+        deniedPeerNodeId = null;
         smoothOpenness = 0;
         mouth.setOpenness(0);
         recState = "idle";
@@ -973,6 +1051,8 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         destroyed = true;
         stopRecordingAnim();
         stopPlayAnim();
+        unregisterPendingRetry?.();
+        unregisterPendingRetry = null;
         mediaRecorder?.stop();
         mediaStream?.getTracks().forEach((t) => t.stop());
         void audioCtx?.close();

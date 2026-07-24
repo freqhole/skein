@@ -1,5 +1,6 @@
 import { Container, Graphics, Text } from "pixi.js";
 import { z } from "zod";
+import { getStoredIdentity } from "../../src/p2p/identity";
 import { decodeShareString } from "../../src/p2p/share-string";
 import { createSkeinInput } from "../../src/widgets/skein-input";
 import type {
@@ -219,15 +220,29 @@ export const joinCanvasWidget: WidgetFactory<typeof joinCanvasSchema> = {
         return;
       }
 
-      setError(null);
-      window.dispatchEvent(
-        new CustomEvent("skein:join-canvas", {
-          detail: {
-            shareString,
-            wizardWidgetId: ctx.widgetId,
-          },
+      // never join through an implicitly-generated identity - the user must
+      // set one up first (profile widget's "generate identity"/"import"
+      // actions), so bail here instead of letting the join proceed and
+      // silently create one as a side effect.
+      getStoredIdentity()
+        .then((identity) => {
+          if (!identity) {
+            setError("set up your identity first - open your profile to generate or import one");
+            return;
+          }
+          setError(null);
+          window.dispatchEvent(
+            new CustomEvent("skein:join-canvas", {
+              detail: {
+                shareString,
+                wizardWidgetId: ctx.widgetId,
+              },
+            })
+          );
         })
-      );
+        .catch(() => {
+          setError("couldn't check your identity - try again");
+        });
     });
 
     // ---------------------------------------------------------------------------

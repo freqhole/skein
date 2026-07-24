@@ -62,10 +62,13 @@ import {
   checkBlobLocality,
   getLocalNodeId,
   snatchBlob,
+  BlobAccessDeniedError,
   type BlobLocalityInfo,
   type PeersMap,
   type SnatchOptions,
 } from "../src/widgets/file-utils";
+import { sendFriendRequest } from "../src/p2p/friendz-bridge";
+import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import {
   isTransparent,
   type CompactInfo,
@@ -329,7 +332,9 @@ type RecordState =
   | "ready" // has a recording; play button shown
   | "fetching" // remote peer: downloading blob bytes before playback
   | "playing" // playing back the recording
-  | "error"; // getUserMedia, storage, or remote-fetch failure
+  | "error" // getUserMedia, storage, or remote-fetch failure
+  | "needs-friend" // only non-friend peers have the blob; tap to send a friend request
+  | "friend-requested"; // friend request sent; waiting to retry the fetch
 
 export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = {
   type: "audio-recording",
@@ -400,6 +405,13 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     /** message shown after a failed remote-fetch attempt (cleared on next try) */
     let fetchErrorMessage = "";
     let fetchRafId: number | null = null;
+    /** the peer known to have the blob but not (yet) a friend — see the
+     *  "needs-friend"/"friend-requested" states below. */
+    let deniedPeerNodeId: string | null = null;
+    /** unregisters the pending-retry-on-friend-accept hook (see
+     *  requestFriendAndRetry()); called on destroy() so it never fires
+     *  against a torn-down widget. */
+    let unregisterPendingRetry: (() => void) | null = null;
     /** current rotation offset (radians) for the indeterminate fetch-ring spinner */
     let fetchAnimAngle = 0;
 
@@ -640,6 +652,18 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           btnGfx.circle(bx, by, BTN_R * 0.38);
           btnGfx.stroke({ color: 0xffffff, width: 2, alpha: 0.6 });
           break;
+
+        case "needs-friend":
+        case "friend-requested":
+          btnGfx.circle(bx, by, BTN_R);
+          btnGfx.fill({ color: COLOR_MUTED });
+          btnGfx.circle(bx, by, BTN_R * 0.38);
+          btnGfx.stroke({
+            color: 0xffffff,
+            width: 2,
+            alpha: recState === "friend-requested" ? 0.3 : 0.6,
+          });
+          break;
       }
 
       btnGfx.hitArea = new Rectangle(bx - BTN_R, by - BTN_R, BTN_R * 2, BTN_R * 2);
@@ -737,6 +761,16 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           statusText.text = "";
           infoText.text = "";
           errorText.text = "mic access denied\ntap to try again";
+          break;
+        case "needs-friend":
+          statusText.text = "";
+          infoText.text = "";
+          errorText.text = "only a non-friend peer has this recording\ntap to send a friend request";
+          break;
+        case "friend-requested":
+          statusText.text = "";
+          infoText.text = "";
+          errorText.text = "friend request sent\nwill retry automatically once accepted";
           break;
       }
     };
@@ -1041,6 +1075,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           ctx.canvasStore ? (nodeId: string) => ctx.canvasStore!.isPeerOnline(nodeId) : undefined
         );
       } catch (err) {
+        if (err instanceof BlobAccessDeniedError) throw err;
         console.error("[audio-recording] resolveAudioBytes failed:", err);
         return null;
       }
@@ -1088,7 +1123,22 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         ctx.setHeaderActions?.(makeHeaderActions());
       }
 
-      const url = await getPlaybackUrl();
+      let url: string | null;
+      try {
+        url = await getPlaybackUrl();
+      } catch (err) {
+        if (destroyed) return;
+        if (err instanceof BlobAccessDeniedError) {
+          stopFetchAnim();
+          deniedPeerNodeId = err.peerNodeId;
+          recState = "needs-friend";
+          refresh();
+          ctx.setHeaderActions?.(makeHeaderActions());
+          return;
+        }
+        console.error("[audio-recording] getPlaybackUrl failed:", err);
+        url = null;
+      }
       if (destroyed) return;
       if (!url) {
         console.error("[audio-recording] no playback URL available");
@@ -1131,6 +1181,34 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       startPlayAnim();
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
+    };
+
+    /** send a friend request to the peer holding this recording, then
+     *  automatically retry playback once the request is accepted (see
+     *  pending-blob-access.ts). session-only — if the widget is destroyed
+     *  before the request is accepted, the retry is simply dropped. */
+    const requestFriendAndRetry = async () => {
+      const peerNodeId = deniedPeerNodeId;
+      if (!peerNodeId) return;
+
+      unregisterPendingRetry?.();
+      try {
+        await sendFriendRequest(peerNodeId);
+      } catch (err) {
+        console.error("[audio-recording] sendFriendRequest failed:", err);
+        return;
+      }
+      if (destroyed) return;
+
+      recState = "friend-requested";
+      refresh();
+      ctx.setHeaderActions?.(makeHeaderActions());
+
+      unregisterPendingRetry = registerPendingBlobRetry(peerNodeId, () => {
+        unregisterPendingRetry = null;
+        if (destroyed) return;
+        void startPlayback();
+      });
     };
 
     const pausePlayback = () => {
@@ -1191,6 +1269,9 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         case "playing":
           pausePlayback();
           break;
+        case "needs-friend":
+          void requestFriendAndRetry();
+          break;
       }
     });
 
@@ -1239,6 +1320,17 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         return;
       }
 
+      if ((recState === "needs-friend" || recState === "friend-requested") && !blobId) {
+        unregisterPendingRetry?.();
+        unregisterPendingRetry = null;
+        deniedPeerNodeId = null;
+        capturedSamples = [];
+        recState = "idle";
+        refresh();
+        ctx.setHeaderActions?.(makeHeaderActions());
+        return;
+      }
+
       // bgColor / border / other prop change
       drawBg();
     });
@@ -1273,6 +1365,8 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         stopWaveAnim();
         stopPlayAnim();
         stopFetchAnim();
+        unregisterPendingRetry?.();
+        unregisterPendingRetry = null;
         mediaRecorder?.stop();
         mediaStream?.getTracks().forEach((t) => t.stop());
         void audioCtx?.close();

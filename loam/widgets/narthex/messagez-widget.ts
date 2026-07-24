@@ -855,6 +855,17 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
           acceptBtn.on("pointertap", (e) => {
             e.stopPropagation();
 
+            // never accept through an implicitly-generated identity - the
+            // user must set one up first (profile widget's "generate
+            // identity"/"import" actions). `localNodeId` is resolved once
+            // at mount from getStoredIdentity() (see above), so an empty
+            // value here means no identity exists yet.
+            if (!localNodeId) {
+              acceptLabel.text = "no identity";
+              acceptLabel.x = acceptW / 2;
+              return;
+            }
+
             // immediate visual feedback — pulsing animation
             acceptBtn.eventMode = "none";
             acceptBtn.cursor = "default";

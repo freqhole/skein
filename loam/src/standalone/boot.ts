@@ -22,6 +22,7 @@ import type { FriendzProtocol } from "../p2p/friends-protocol";
 import {
   destroyBridge,
   initKnockSocialDocBridge,
+  isFriend,
   recordKnockAck,
   recordKnockRelay,
   sendAclChange,
@@ -30,12 +31,7 @@ import {
   setOutboundRequestHook,
 } from "../p2p/friendz-bridge";
 
-import {
-  ensureIdentity,
-  getMiddenNode,
-  getStoredIdentity,
-  onIdentityChange,
-} from "../p2p/identity";
+import { ensureIdentity, getMiddenNode, getStoredIdentity, onIdentityChange } from "../p2p/identity";
 import { getOrCreateAnonDeviceId } from "../p2p/anon-device-id";
 import { IrohNetworkAdapter, restrictBlobToPeers, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
 import { createAclFilteringAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
@@ -572,12 +568,17 @@ class SkeinRouter {
         await this.navigateToNarthex();
       }
     } else {
-      // non-empty hash → open that canvas. a bare canvas-id hash resolved on
-      // the very first navigation since boot (a cold URL paste, or a reload
-      // while already viewing one) has no known live peer connection to
-      // fall back on if the doc never arrives — fail fast instead of
-      // waiting out automerge-repo's full ~60-120s default.
-      await this.navigateToCanvas(hash, { coldOpen: isColdOpen });
+      // non-empty hash → open that canvas. fail fast (rather than waiting
+      // out automerge-repo's full ~60-120s default) whenever this is a cold
+      // open (see isInitialNavigation's doc comment) OR there's no local
+      // identity at all — with no identity there's no p2p endpoint
+      // running, so a canvas that isn't already stored locally can never
+      // arrive no matter how long we wait. a canvas already known locally
+      // (e.g. one the user created) still resolves near-instantly
+      // regardless of this timeout, so this never affects opening one's
+      // own canvases.
+      const identity = await getStoredIdentity();
+      await this.navigateToCanvas(hash, { coldOpen: isColdOpen || !identity });
     }
   }
 
@@ -1708,12 +1709,13 @@ class SkeinRouter {
   }
 
   /**
-   * called when a cold-open (see `isInitialNavigation`) navigation fails to
-   * reach a canvas that has a known narthex card. marks the card as
-   * access-pending (so its "request access" pill shows up in the narthex,
-   * even if the user dismisses the prompt below) and, when the card names a
-   * known owner, offers to send a knock immediately instead of making the
-   * user go find and click the pill themselves.
+   * called when a canvas navigation fails to reach a canvas that has a
+   * known narthex card - either a genuine cold open (see
+   * `isInitialNavigation`) or a navigation with no local identity, which
+   * can never succeed over the network either (see `onHashChange`). marks
+   * the card as access-pending so its "request access" pill shows up in
+   * the narthex - the user decides from there whether to actually send a
+   * request, rather than being interrupted with a blocking prompt here.
    */
   private async offerAccessRequestForUnreachableCanvas(docId: string): Promise<void> {
     if (!this.narthexDocId) return;
@@ -1733,15 +1735,9 @@ class SkeinRouter {
         const narthexStore = await CanvasStore.open(this.repo, this.narthexDocId as DocumentId);
         await narthexStore.updateWidgetProps(entry.id, { accessPending: true });
 
-        const ownerNodeId = props.ownerNodeId ?? "";
-        if (!ownerNodeId) return;
-
-        const wantsToAsk = window.confirm(
-          "can't reach this canvas right now. request access from its owner?"
-        );
-        if (wantsToAsk) {
-          await this.requestCanvasAccess(docId, ownerNodeId);
-        }
+        // mark it access-pending and stop there — the card's own "request
+        // access" pill (canvas-card.ts) already surfaces this, so there's
+        // no need to interrupt the user with a blocking confirm() dialog.
         return;
       }
     } catch (err) {
@@ -1750,11 +1746,12 @@ class SkeinRouter {
   }
 
   /**
-   * send a `canvas-knock` to a canvas's owner asking to be let in. used by
-   * both the narthex card's "request access" pill (`canvas-card.ts`) and the
-   * cold-open failure prompt above. best-effort — connecting to the owner
-   * or delivering the knock may simply not succeed if they're offline too,
-   * same as any other p2p message in this app.
+   * send a `canvas-knock` to a canvas's owner asking to be let in, and a
+   * friend request too if the owner isn't already a friend. used by the
+   * narthex card's "request access" pill (`canvas-card.ts`). best-effort —
+   * connecting to the owner or delivering either message may simply not
+   * succeed if they're offline too, same as any other p2p message in this
+   * app.
    */
   private async requestCanvasAccess(canvasDocId: string, ownerNodeId: string): Promise<void> {
     if (!this.friendzProtocol) {
@@ -1776,6 +1773,19 @@ class SkeinRouter {
       await this.irohAdapter.addPeer(ownerNodeId);
     } catch (err) {
       log.warn(TAG, "failed to connect to canvas owner for knock:", err);
+    }
+
+    // asking to access someone's canvas is also a natural moment to ask to
+    // be their friend, if not already — a knock alone doesn't establish a
+    // friend relationship, and other gating elsewhere (e.g. the
+    // friend-only blob-fetch gate) depends on one existing.
+    if (!isFriend(ownerNodeId)) {
+      try {
+        await sendFriendRequest(ownerNodeId);
+        log.debug(TAG, "sent friend request to canvas owner:", ownerNodeId.slice(0, 16) + "...");
+      } catch (err) {
+        log.warn(TAG, "failed to send friend request to canvas owner:", err);
+      }
     }
 
     try {
@@ -1829,9 +1839,14 @@ class SkeinRouter {
       detail.fromNodeId.slice(0, 16) + "..."
     );
 
-    // ensure we have an identity (generates one if needed, starts midden)
-    await ensureIdentity();
+    // never generate an identity as a side effect of accepting an invite —
+    // the inbox widget already checks this before dispatching, this is
+    // just a safety net so we never silently create one here either.
     const identity = await getStoredIdentity();
+    if (!identity) {
+      log.debug(TAG, "cannot accept canvas invite — no identity set up yet");
+      return;
+    }
 
     // connect to the inviter's peer via the iroh adapter. if that fails
     // and this invite was relayed through a hub, also try the hub directly
@@ -2039,8 +2054,15 @@ class SkeinRouter {
       decoded.nodeId.slice(0, 16) + "..."
     );
 
-    // ensure we have an identity (generates one if needed, starts midden)
-    await ensureIdentity();
+    // never generate an identity as a side effect of joining — the join
+    // wizard already checks this before dispatching, this is just a
+    // safety net (also covers the cold-open share-link path in
+    // onHashChange, which has no wizard UI to have checked it first).
+    const identity = await getStoredIdentity();
+    if (!identity) {
+      log.debug(TAG, "cannot join canvas — no identity set up yet");
+      return;
+    }
 
     // connect to the peer via the iroh adapter
     try {

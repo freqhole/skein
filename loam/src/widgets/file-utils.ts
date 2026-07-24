@@ -56,6 +56,7 @@ import {
   type SnatchOptions as TransferSnatchOptions,
 } from "@freqhole/reliquary/transfer";
 import { ensureBlobOverAlpn } from "@freqhole/reliquary/ensure";
+import { isFriend } from "../p2p/friendz-bridge";
 
 const TAG = "file-utils";
 
@@ -597,6 +598,30 @@ export async function snatchBlob(
   return promise;
 }
 
+/**
+ * thrown by `snatchBlob()`/`snatchBlobToDisk()` (and anything built on
+ * `resolveAudioBytes()`) when every peer known to have the blob (per the
+ * ensure/1 probe) isn't a friend yet. we don't attempt those peers' actual
+ * downloads at all - both platforms currently deny non-friend blob
+ * fetches, so it'd just hang or fail - the caller should offer to send a
+ * friend request instead (see `pending-blob-access.ts` for retrying once
+ * the request is accepted).
+ */
+export class BlobAccessDeniedError extends Error {
+  /** the peer to target for a friend request - the first peer (by probe/
+   *  connectivity order) known to have the blob. */
+  readonly peerNodeId: string;
+  /** every peer known to have the blob but not currently a friend. */
+  readonly peerNodeIds: string[];
+
+  constructor(peerNodeIds: string[]) {
+    super(`peer ${peerNodeIds[0]!.slice(0, 16)}... has this blob but isn't a friend yet`);
+    this.name = "BlobAccessDeniedError";
+    this.peerNodeId = peerNodeIds[0]!;
+    this.peerNodeIds = peerNodeIds;
+  }
+}
+
 async function snatchBlobUncached(
   info: SnatchBlobInfo,
   peers: PeersMap,
@@ -664,7 +689,16 @@ async function snatchBlobUncached(
     throw new Error("no peer has the blob (all probes failed)");
   }
 
-  const winner = availablePeers[0]!;
+  // don't bother attempting a download from a peer we're not friends with —
+  // both platforms currently deny non-friend blob fetches, so it'd just
+  // hang or fail. if every peer that has it is a non-friend, surface that
+  // distinctly so the caller can offer a friend-request UI instead.
+  const friendPeers = availablePeers.filter((peer) => isFriend(peer));
+  if (friendPeers.length === 0) {
+    throw new BlobAccessDeniedError(availablePeers);
+  }
+
+  const winner = friendPeers[0]!;
   const winnerOnline = options?.isPeerOnline?.(winner) ?? false;
   options?.onPeerAttempt?.(allPeerAddrs.indexOf(winner), allPeerAddrs.length, winnerOnline);
   log.debug(
@@ -674,7 +708,7 @@ async function snatchBlobUncached(
 
   // both browser midden and TauriStreamNode satisfy the snatch contract
   // (download_verified_* on midden, proxy_request fallback on tauri).
-  return snatchFromBrowserPeer(info, availablePeers, options);
+  return snatchFromBrowserPeer(info, friendPeers, options);
 }
 
 // ---------------------------------------------------------------------------
