@@ -18,6 +18,7 @@ describe("canvasCardSchema", () => {
       ownerUsername: "",
       role: "admin",
       accessRevoked: false,
+      accessPending: false,
       lastVisitedAt: "",
       hasUpdates: false,
       lastKnownModifiedAt: "",

@@ -1915,10 +1915,22 @@ export function wireKnockHandlers(deps: KnockHandlersDeps): void {
       msg.role
     );
 
+    // force a genuine disconnect + reconnect rather than a bare addPeer():
+    // this approval can follow an earlier, denied/unresolved knock or join
+    // attempt against the same peer whose underlying connection never
+    // actually dropped (a sync-level denial isn't a transport-level
+    // disconnect) — a bare addPeer() against an already-open stream is a
+    // no-op (see IrohNetworkAdapter.addPeer's `streams.has` guard) and
+    // never gives automerge-repo's synchronizer a fresh peer event, so it
+    // never re-evaluates whether this doc can now be shared. forgetPeer()
+    // always emits peer-disconnected (even with no live stream), so the
+    // reconnect below is guaranteed to be a genuine one.
+    irohAdapter.forgetPeer(fromNodeId);
     irohAdapter.addPeer(fromNodeId).catch(() => {
       // best effort — the requester may not be able to dial back yet
     });
     if (msg.approverNodeId && msg.approverNodeId !== fromNodeId) {
+      irohAdapter.forgetPeer(msg.approverNodeId);
       irohAdapter.addPeer(msg.approverNodeId).catch(() => {
         // best effort
       });

@@ -94,6 +94,12 @@ const MESSAGEZ_DOC_KEY = "skein-messagez-doc-id";
  *  string or depending on this whole class. */
 export const SOCIAL_DOC_KEY = "skein-social-doc-id"; // browser mode only
 const TAG = "skein.boot";
+/** cold-open fast-fail bound (see `isInitialNavigation`'s doc comment) — a
+ *  doc that's going to arrive at all either resolves from local storage
+ *  near-instantly or gets a quick reply from a reachable peer; waiting
+ *  longer than this doesn't change the outcome, it just makes the user
+ *  stare at a blank screen for a genuinely dead link. */
+const COLD_OPEN_TIMEOUT_MS = 3000;
 
 // ---------------------------------------------------------------------------
 // router — manages navigation between the narthex and individual canvases
@@ -115,6 +121,15 @@ class SkeinRouter {
   private pendingNavToNarthex = false;
   /** stashed by joinCanvasFromNarthex so navigateToCanvas can write it into the doc */
   private pendingPeerNodeId: string | null = null;
+  /** true only for the very first navigation resolved since boot (a cold
+   *  page load) — flipped false the first time `onHashChange()` runs. a
+   *  bare-hash navigation (no share/invite context) only gets the short
+   *  fast-fail timeout (see `navigateToCanvas()`) while this is still true;
+   *  in-app navigation (clicking a canvas card, going home and back) always
+   *  gets the library's ordinary, much longer wait, since a real, slower
+   *  sync over the network shouldn't get cut off early just because the
+   *  user happens to be a few clicks into the app. */
+  private isInitialNavigation = true;
 
   private friendzProtocol: FriendzProtocol | null = null;
   private friendzDocUnsubs: Array<() => void> = [];
@@ -492,6 +507,17 @@ class SkeinRouter {
       });
     }) as EventListener);
 
+    // listen for the request-canvas-access event dispatched from a
+    // narthex canvas-card's "request access" pill (widgets/narthex/canvas-card.ts)
+    window.addEventListener("skein:request-canvas-access", ((e: CustomEvent) => {
+      const { canvasDocId, ownerNodeId } = e.detail ?? {};
+      if (typeof canvasDocId === "string" && typeof ownerNodeId === "string") {
+        this.requestCanvasAccess(canvasDocId, ownerNodeId).catch((err) => {
+          log.warn(TAG, "failed to request canvas access:", err);
+        });
+      }
+    }) as EventListener);
+
     // listen for widget self-removal (e.g. wizard cancel button)
     window.addEventListener("skein:remove-widget", ((e: CustomEvent) => {
       const widgetId = e.detail?.widgetId;
@@ -523,6 +549,8 @@ class SkeinRouter {
   /** determine the target from the hash and navigate */
   private async onHashChange(): Promise<void> {
     const hash = window.location.hash.slice(1);
+    const isColdOpen = this.isInitialNavigation;
+    this.isInitialNavigation = false;
 
     if (!hash || hash === this.narthexDocId) {
       // empty hash or explicit narthex hash → go to narthex
@@ -544,8 +572,12 @@ class SkeinRouter {
         await this.navigateToNarthex();
       }
     } else {
-      // non-empty hash → open that canvas
-      await this.navigateToCanvas(hash);
+      // non-empty hash → open that canvas. a bare canvas-id hash resolved on
+      // the very first navigation since boot (a cold URL paste, or a reload
+      // while already viewing one) has no known live peer connection to
+      // fall back on if the doc never arrives — fail fast instead of
+      // waiting out automerge-repo's full ~60-120s default.
+      await this.navigateToCanvas(hash, { coldOpen: isColdOpen });
     }
   }
 
@@ -937,7 +969,7 @@ class SkeinRouter {
   }
 
   /** navigate to a specific canvas by document id */
-  private async navigateToCanvas(docId: string): Promise<void> {
+  private async navigateToCanvas(docId: string, opts?: { coldOpen?: boolean }): Promise<void> {
     if (this.navigating) return;
     this.navigating = true;
 
@@ -974,6 +1006,7 @@ class SkeinRouter {
         registry: createTestRegistry(),
         repo: this.repo,
         connectionStateSource: this.connectionStateSource,
+        openTimeoutMs: opts?.coldOpen ? COLD_OPEN_TIMEOUT_MS : undefined,
         restrictBlobToPeers: (blake3Hash, peerNodeIds) =>
           restrictBlobToPeers(this.irohAdapter, blake3Hash, peerNodeIds),
         onNavigateHome: () => {
@@ -1662,12 +1695,100 @@ class SkeinRouter {
 
     if (failure) {
       log.error(TAG, "failed to open canvas, falling back to narthex:", docId, failure);
+      if (opts?.coldOpen) {
+        await this.offerAccessRequestForUnreachableCanvas(docId);
+      }
       await this.navigateToNarthex();
     } else if (this.pendingNavToNarthex) {
       // a nav-home arrived while this canvas navigation was in flight —
       // honor it now instead of silently dropping it
       log.debug(TAG, "executing queued narthex navigation");
       await this.navigateToNarthex();
+    }
+  }
+
+  /**
+   * called when a cold-open (see `isInitialNavigation`) navigation fails to
+   * reach a canvas that has a known narthex card. marks the card as
+   * access-pending (so its "request access" pill shows up in the narthex,
+   * even if the user dismisses the prompt below) and, when the card names a
+   * known owner, offers to send a knock immediately instead of making the
+   * user go find and click the pill themselves.
+   */
+  private async offerAccessRequestForUnreachableCanvas(docId: string): Promise<void> {
+    if (!this.narthexDocId) return;
+    try {
+      const narthexHandle = await this.repo.find<CanvasDocument>(this.narthexDocId as DocumentId);
+      await narthexHandle.whenReady();
+      const narthexDoc = narthexHandle.doc();
+      if (!narthexDoc?.widgets) return;
+
+      for (const entry of Object.values(narthexDoc.widgets)) {
+        const props = entry.props as
+          | { canvasDocId?: string; isRemote?: boolean; accessRevoked?: boolean; ownerNodeId?: string }
+          | undefined;
+        if (entry.type !== "canvas-card" || props?.canvasDocId !== docId) continue;
+        if (!props.isRemote || props.accessRevoked) return;
+
+        const narthexStore = await CanvasStore.open(this.repo, this.narthexDocId as DocumentId);
+        await narthexStore.updateWidgetProps(entry.id, { accessPending: true });
+
+        const ownerNodeId = props.ownerNodeId ?? "";
+        if (!ownerNodeId) return;
+
+        const wantsToAsk = window.confirm(
+          "can't reach this canvas right now. request access from its owner?"
+        );
+        if (wantsToAsk) {
+          await this.requestCanvasAccess(docId, ownerNodeId);
+        }
+        return;
+      }
+    } catch (err) {
+      log.warn(TAG, "failed to offer access request for unreachable canvas:", docId, err);
+    }
+  }
+
+  /**
+   * send a `canvas-knock` to a canvas's owner asking to be let in. used by
+   * both the narthex card's "request access" pill (`canvas-card.ts`) and the
+   * cold-open failure prompt above. best-effort — connecting to the owner
+   * or delivering the knock may simply not succeed if they're offline too,
+   * same as any other p2p message in this app.
+   */
+  private async requestCanvasAccess(canvasDocId: string, ownerNodeId: string): Promise<void> {
+    if (!this.friendzProtocol) {
+      log.warn(TAG, "cannot send canvas knock — friendz protocol not ready");
+      return;
+    }
+    const identity = await getStoredIdentity();
+    if (!identity) {
+      log.debug(TAG, "no identity — generate one first (profile widget)");
+      return;
+    }
+
+    // a prior join/invite attempt against this same owner may have left a
+    // stale, already-open stream that the adapter would otherwise silently
+    // reuse (see IrohNetworkAdapter.addPeer()'s doc comment) — forget it
+    // first so this actually attempts a fresh connection.
+    this.irohAdapter.forgetPeer(ownerNodeId);
+    try {
+      await this.irohAdapter.addPeer(ownerNodeId);
+    } catch (err) {
+      log.warn(TAG, "failed to connect to canvas owner for knock:", err);
+    }
+
+    try {
+      await this.friendzProtocol.sendCanvasKnock(ownerNodeId, {
+        knockId: crypto.randomUUID(),
+        canvasDocId,
+        requesterNodeId: identity.node_id,
+        requesterUsername: this.friendzProtocol.getLocalUsername() ?? "",
+        message: "",
+      });
+      log.debug(TAG, "sent canvas knock to:", ownerNodeId.slice(0, 16) + "...");
+    } catch (err) {
+      log.warn(TAG, "failed to send canvas knock:", err);
     }
   }
 
@@ -1819,7 +1940,7 @@ class SkeinRouter {
           return (w.props as Record<string, unknown>)?.canvasDocId === detail.canvasDocId;
         });
         if (existingCard) {
-          narthexStore.updateWidgetProps(existingCard.id, {
+          await narthexStore.updateWidgetProps(existingCard.id, {
             title: detail.canvasTitle || "shared canvas",
             description: detail.canvasDescription || "",
             color: detail.canvasColor || 0x06b6d4,
@@ -1830,6 +1951,7 @@ class SkeinRouter {
             ownerUsername: detail.fromUsername || "",
             role: detail.role ?? "member",
             accessRevoked: false,
+            accessPending: false,
           });
         }
       } else {
@@ -1978,6 +2100,7 @@ class SkeinRouter {
             ownerUsername: "",
             role: "viewer", // share-string joiners default to viewer
             accessRevoked: false,
+            accessPending: true,
             lastVisitedAt: "",
           },
           collapsed: false,

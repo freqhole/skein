@@ -27,6 +27,13 @@ export const canvasCardSchema = z.object({
   ownerUsername: z.string().default(""),
   role: canvasRoleSchema.default("admin"),
   accessRevoked: z.boolean().default(false),
+  /** true while a remote card has never successfully synced (e.g. a
+   *  "syncing..." placeholder from an access-denied or unreachable join) —
+   *  shows a "request access" pill instead of the ordinary "new" indicator,
+   *  letting the user send a knock without needing to open the canvas
+   *  first. cleared once the canvas actually opens or a real invite is
+   *  accepted for it. */
+  accessPending: z.boolean().default(false),
   lastVisitedAt: z.string().default(""),
   hasUpdates: z.boolean().default(false),
   lastKnownModifiedAt: z.string().default(""),
@@ -431,6 +438,29 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
     updatePillText.zIndex = 50;
     container.addChild(updatePillText);
 
+    // --- request-access pill (remote cards that have never synced) ---
+    const requestAccessContainer = new Container();
+    requestAccessContainer.visible = false;
+    requestAccessContainer.zIndex = 50;
+    requestAccessContainer.eventMode = "static";
+    requestAccessContainer.cursor = "pointer";
+    container.addChild(requestAccessContainer);
+
+    const requestAccessBg = new Graphics();
+    requestAccessContainer.addChild(requestAccessBg);
+
+    const requestAccessText = new Text({
+      text: "request access",
+      style: {
+        fontFamily: "system-ui, sans-serif",
+        fontSize: DATE_FONT_SIZE,
+        fontWeight: "600",
+        fill: 0xf59e0b,
+      },
+      resolution: 3,
+    });
+    requestAccessContainer.addChild(requestAccessText);
+
     // --- syncing indicator for newly accepted remote cards ---
     const syncingContainer = new Container();
     syncingContainer.visible = false;
@@ -769,8 +799,12 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
     };
 
     const drawSyncingIndicator = (w: number, _h: number, state: CanvasCardState) => {
-      // show for remote cards that have never been visited
-      const isNew = state.isRemote && !state.lastVisitedAt && !state.accessRevoked;
+      // show for remote cards that have never been visited, but not while
+      // a request-access pill is already covering the same ground (a card
+      // stuck pending access isn't just "new", it can't actually be opened
+      // yet).
+      const isNew =
+        state.isRemote && !state.lastVisitedAt && !state.accessRevoked && !state.accessPending;
       syncingContainer.visible = isNew;
       if (!isNew) return;
 
@@ -790,6 +824,29 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
 
       syncingText.x = pillX + padX;
       syncingText.y = pillY + padY;
+    };
+
+    const drawRequestAccessPill = (w: number, _h: number, state: CanvasCardState) => {
+      const show = state.isRemote && state.accessPending && !state.accessRevoked && !state.isDeleted;
+      requestAccessContainer.visible = show;
+      if (!show) return;
+
+      const tw = requestAccessText.width;
+      const th = requestAccessText.height;
+      const padX = 6;
+      const padY = 2;
+      const pillW = tw + padX * 2;
+      const pillH = th + padY * 2;
+      const pillX = w - pillW - PADDING_X;
+      const pillY = ACCENT_HEIGHT + 6;
+
+      requestAccessBg.clear();
+      requestAccessBg.roundRect(pillX, pillY, pillW, pillH, pillH / 2);
+      requestAccessBg.fill({ color: 0xf59e0b, alpha: 0.15 });
+      requestAccessBg.stroke({ color: 0xf59e0b, width: 1, alpha: 0.4 });
+
+      requestAccessText.x = pillX + padX;
+      requestAccessText.y = pillY + padY;
     };
 
     // --- full layout ---
@@ -876,6 +933,9 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       // syncing indicator for newly accepted remote cards
       drawSyncingIndicator(w, h, state);
 
+      // request-access pill for remote cards that never successfully synced
+      drawRequestAccessPill(w, h, state);
+
       // deleted overlay — renders above the update pill
       drawDeletedOverlay(w, h, state);
 
@@ -929,6 +989,21 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       if (state.canvasDocId) {
         window.location.hash = state.canvasDocId;
       }
+    });
+
+    // --- request-access pill click ---
+    // a separate hit target from the whole-card tap above — stops
+    // propagation so tapping the pill sends a knock instead of also
+    // triggering navigation to a canvas that's known not to be reachable yet.
+    requestAccessContainer.on("pointertap", (event) => {
+      event.stopPropagation();
+      const state = ctx.doc.current;
+      if (!state.canvasDocId || !state.ownerNodeId) return;
+      window.dispatchEvent(
+        new CustomEvent("skein:request-canvas-access", {
+          detail: { canvasDocId: state.canvasDocId, ownerNodeId: state.ownerNodeId },
+        })
+      );
     });
 
     // --- title sync ---
