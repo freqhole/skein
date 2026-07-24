@@ -32,8 +32,13 @@
 //   recorded blobId/blake3/etc, exactly the file-utils.ts uploadFile() bug
 //   this mirrors the fix for.
 //   immediate post-record playback uses URL.createObjectURL() on the in-memory blob.
-//   restore-from-doc playback uses getBlobData() which reads OPFS first, then
-//   falls back to the rust-side blob_get dispatch in tauri mode.
+//   restore-from-doc playback uses getAudioBlobData() (below), which reads
+//   OPFS in browser mode and falls back to the rust-side `blob_get` dispatch
+//   in tauri mode — the plain getBlobData() re-exported from blob-store.ts
+//   is OPFS-only and always misses in tauri, which used to make every
+//   restored recording (this peer's own, after a reload, or any other
+//   peer's) fall through resolveAudioBytes() straight to null instead of
+//   ever reading the bytes back.
 //   waveformSamples are stored in the Automerge doc so collaborators can see
 //   the waveform without playing the audio — but the audio bytes themselves
 //   never travel with the doc. on a peer that didn't make the recording,
@@ -51,8 +56,8 @@
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { z } from "zod";
 import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
-import { getBlobData, storeBlobFromFile } from "../src/storage/blob-store";
-import { base64Encode } from "@freqhole/reliquary/worker";
+import { getBlobData as getBrowserBlobData, storeBlobFromFile } from "../src/storage/blob-store";
+import { base64Encode, base64Decode } from "@freqhole/reliquary/worker";
 import {
   checkBlobLocality,
   getLocalNodeId,
@@ -216,6 +221,35 @@ export interface ResolvedAudioBytes {
   /** set when a P2P snatch happened — the caller should record this node in
    *  the doc's `snatchedBy` list so other peers can target it for downloads */
   snatchedByNodeId: string | null;
+}
+
+/**
+ * read a recording's bytes back by blob id (== blake3 hex), regardless of
+ * mode. browser mode reads OPFS directly; tauri mode has no OPFS mirror
+ * (see this file's module doc comment) so it goes through the rust
+ * `blob_get` dispatch instead, decoding the returned base64 payload.
+ *
+ * this is the `getBlobData` implementation `resolveAudioBytes()` needs in
+ * tauri mode \u2014 the plain OPFS-only `getBlobData` re-exported from
+ * blob-store.ts always misses there, which used to make every restored
+ * recording (local or a peer's) resolve to nothing.
+ */
+export async function getAudioBlobData(blobId: string): Promise<ArrayBuffer | null> {
+  if (!isTauriMode()) return getBrowserBlobData(blobId);
+
+  try {
+    const response = (await dispatch("blob_get", { blake3: blobId })) as {
+      data?: string;
+    } | null;
+    if (!response?.data) return null;
+    const bytes = await base64Decode(response.data);
+    // slice() (no args) copies into a freshly allocated ArrayBuffer of
+    // exactly the right size — .buffer alone can be larger than the view
+    // (or, per its type, a SharedArrayBuffer) and isn't safe to hand back.
+    return bytes.slice().buffer;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -997,7 +1031,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         resolved = await resolveAudioBytes(
           { blobId, filename, mime, size, blake3 },
           peers,
-          { getBlobData, checkBlobLocality, snatchBlob, getLocalNodeId },
+          { getBlobData: getAudioBlobData, checkBlobLocality, snatchBlob, getLocalNodeId },
           (fraction) => {
             fetchProgressFraction = fraction;
             fetchProgressText =

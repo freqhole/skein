@@ -26,7 +26,7 @@
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { z } from "zod";
 import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
-import { getBlobData, storeBlobFromFile } from "../src/storage/blob-store";
+import { storeBlobFromFile } from "../src/storage/blob-store";
 import { base64Encode } from "@freqhole/reliquary/worker";
 import {
   checkBlobLocality,
@@ -45,6 +45,7 @@ import {
 } from "../src/widgets/widget-types";
 import {
   addSnatcher,
+  getAudioBlobData,
   resolveAudioBytes,
   type AudioBlobRef,
   type ResolvedAudioBytes,
@@ -691,7 +692,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         resolved = await resolveAudioBytes(
           { blobId, filename, mime, size, blake3 } as AudioBlobRef,
           peers,
-          { getBlobData, checkBlobLocality, snatchBlob, getLocalNodeId },
+          { getBlobData: getAudioBlobData, checkBlobLocality, snatchBlob, getLocalNodeId },
           (fraction) => {
             fetchProgressText =
               fraction >= 0 ? `downloading… ${Math.round(fraction * 100)}%` : "downloading…";
