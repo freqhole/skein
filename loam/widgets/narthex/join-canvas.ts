@@ -1,5 +1,6 @@
 import { Container, Graphics, Text } from "pixi.js";
 import { z } from "zod";
+import { getStoredIdentity } from "../../src/p2p/identity";
 import { decodeShareString } from "../../src/p2p/share-string";
 import { createSkeinInput } from "../../src/widgets/skein-input";
 import type {
@@ -30,6 +31,7 @@ const LABEL_COLOR = 0x888898;
 const TEXT_COLOR = 0xf0f0ff;
 const MUTED_TEXT = 0x666678;
 const ACCENT = 0x6366f1;
+const ERROR_COLOR = 0xef4444;
 
 const CARD_RADIUS = 6;
 const BUTTON_RADIUS = 4;
@@ -122,12 +124,37 @@ export const joinCanvasWidget: WidgetFactory<typeof joinCanvasSchema> = {
       placeholder: "paste share string...",
       value: ctx.doc.current.shareString || "",
       onChange: (value: string) => {
+        setError(null);
         ctx.doc.change((draft) => {
           draft.shareString = value;
         });
       },
     });
     container.addChild(shareField.input);
+
+    // ---------------------------------------------------------------------------
+    // error message (hidden until a paste fails to decode)
+    // ---------------------------------------------------------------------------
+
+    const errorText = new Text({
+      text: "",
+      style: {
+        fontFamily: FONT,
+        fontSize: LABEL_SIZE,
+        fill: ERROR_COLOR,
+        wordWrap: true,
+        wordWrapWidth: currentWidth - PADDING_X * 2,
+      },
+      resolution: RESOLUTION,
+    });
+    errorText.eventMode = "none";
+    errorText.visible = false;
+    container.addChild(errorText);
+
+    const setError = (message: string | null) => {
+      errorText.text = message || "";
+      errorText.visible = !!message;
+    };
 
     // ---------------------------------------------------------------------------
     // buttons
@@ -180,23 +207,42 @@ export const joinCanvasWidget: WidgetFactory<typeof joinCanvasSchema> = {
       shareField.blur();
       const shareString = shareField.value.trim();
 
-      if (!shareString) return;
+      if (!shareString) {
+        setError("paste a share string or link first");
+        return;
+      }
 
       // validate the share string
       const decoded = decodeShareString(shareString);
       if (!decoded) {
-        console.warn("[join-canvas] invalid share string");
+        console.warn("[join-canvas] invalid share string:", shareString.slice(0, 32) + "...");
+        setError("not a valid share link — ask the canvas owner for a fresh invite link");
         return;
       }
 
-      window.dispatchEvent(
-        new CustomEvent("skein:join-canvas", {
-          detail: {
-            shareString,
-            wizardWidgetId: ctx.widgetId,
-          },
+      // never join through an implicitly-generated identity - the user must
+      // set one up first (profile widget's "generate identity"/"import"
+      // actions), so bail here instead of letting the join proceed and
+      // silently create one as a side effect.
+      getStoredIdentity()
+        .then((identity) => {
+          if (!identity) {
+            setError("set up your identity first - open your profile to generate or import one");
+            return;
+          }
+          setError(null);
+          window.dispatchEvent(
+            new CustomEvent("skein:join-canvas", {
+              detail: {
+                shareString,
+                wizardWidgetId: ctx.widgetId,
+              },
+            })
+          );
         })
-      );
+        .catch(() => {
+          setError("couldn't check your identity - try again");
+        });
     });
 
     // ---------------------------------------------------------------------------
@@ -233,6 +279,11 @@ export const joinCanvasWidget: WidgetFactory<typeof joinCanvasSchema> = {
       if (!(shareField as any).input?.editing) {
         shareField.value = state.shareString;
       }
+
+      // error message — sits just below the field, above the buttons
+      errorText.style.wordWrapWidth = contentW;
+      errorText.x = PADDING_X;
+      errorText.y = y + LABEL_SIZE + 4 + FIELD_HEIGHT + 6;
 
       // buttons — anchored to the bottom of the card
       const buttonY = h - PADDING_Y - BUTTON_HEIGHT;

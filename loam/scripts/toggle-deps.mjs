@@ -2,32 +2,41 @@
 // switches loam's @freqhole/haruspex, @freqhole/midden, @freqhole/reliquary
 // dependencies between published npm versions (for ci/production builds)
 // and file: links to the sibling repos on disk (for local development
-// against unreleased changes). run `npm install` afterward to apply.
+// against unreleased changes).
+//
+// shells out to `npm install <pkg>@<spec>` directly instead of hand-editing
+// package.json and node_modules ourselves - a plain `npm install` with no
+// args won't replace an existing local file: link (or npm tarball) already
+// in node_modules just because package.json's version spec changed (it
+// sees the lockfile/tree as already satisfied and no-ops), which leaves a
+// stale entry in place. installing each package by name forces npm's own
+// resolver to actually replace it, and npm handles updating package.json
+// and package-lock.json itself as part of that.
 //
 // usage: node scripts/toggle-deps.mjs <local|npm>
 
-import { readFileSync, writeFileSync } from "fs";
+import { execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import path from "path";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
-const packageJsonPath = path.resolve(dirname, "..", "package.json");
+const loamDir = path.resolve(dirname, "..");
 
-// npm version ranges are the checked-in default; local paths are relative
-// to loam/, matching the sibling repos' ts/wasm-pack build output dirs.
-// midden lives under tomb/lib/midden (not its own top-level sibling repo).
+// local paths are relative to loam/. haruspex, midden, and reliquary all
+// live under tomb/lib/ (not their own top-level sibling repos), matching
+// their ts/wasm-pack build output dirs there.
 const packages = {
     "@freqhole/haruspex": {
-        npm: "^0.2.2",
-        local: "file:../../haruspex/ts",
+        npm: "^0.2.3",
+        local: "file:../../tomb/lib/haruspex/ts",
     },
     "@freqhole/midden": {
-        npm: "^0.2.2",
+        npm: "^0.2.3",
         local: "file:../../tomb/lib/midden/pkg",
     },
     "@freqhole/reliquary": {
-        npm: "^0.2.2",
-        local: "file:../../reliquary/ts",
+        npm: "^0.2.3",
+        local: "file:../../tomb/lib/reliquary/ts",
     },
 };
 
@@ -37,18 +46,9 @@ if (mode !== "local" && mode !== "npm") {
     process.exit(1);
 }
 
-const raw = readFileSync(packageJsonPath, "utf8");
-const pkg = JSON.parse(raw);
+const specs = Object.entries(packages).map(([name, targets]) => `${name}@${targets[mode]}`);
 
-for (const [name, targets] of Object.entries(packages)) {
-    if (!pkg.dependencies?.[name]) {
-        console.warn(`warning: ${name} not found in dependencies, skipping`);
-        continue;
-    }
-    pkg.dependencies[name] = targets[mode];
-}
+console.log(`installing: ${specs.join(", ")}`);
+execFileSync("npm", ["install", ...specs], { cwd: loamDir, stdio: "inherit" });
 
-writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + "\n");
-
-console.log(`switched @freqhole/{haruspex,midden,reliquary} to ${mode} in package.json`);
-console.log("run `npm install` to apply");
+console.log(`switched @freqhole/{haruspex,midden,reliquary} to ${mode}`);

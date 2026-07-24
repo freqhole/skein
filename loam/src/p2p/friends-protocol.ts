@@ -80,6 +80,15 @@ export interface FriendRequestMessage {
   type: "friend-request";
   fromNodeId: string;
   fromUsername: string;
+  // identity info sent regardless of the sender's own profile visibility
+  // setting - the recipient hasn't agreed to anything yet, but seeing a
+  // name/avatar/bio rather than a bare node id is expected for a request
+  // the sender is actively initiating themselves. resending this message
+  // (e.g. after the sender edits their profile) lets the recipient update
+  // an already-pending request's display in place.
+  bio?: string;
+  avatarDataUrl?: string;
+  accentColor?: number;
   isHub?: boolean;
 }
 
@@ -87,12 +96,28 @@ export interface FriendAcceptMessage {
   type: "friend-accept";
   fromNodeId: string;
   fromUsername: string;
+  bio?: string;
+  avatarDataUrl?: string;
+  accentColor?: number;
   isHub?: boolean;
 }
 
 export interface FriendRejectMessage {
   type: "friend-reject";
   fromNodeId: string;
+}
+
+/** proactive identity update - pushed to an already-connected peer right
+ *  after the local user edits their own username/bio/avatar/accent color,
+ *  so the peer's display refreshes immediately instead of waiting for the
+ *  next on-demand profile fetch. */
+export interface IdentityUpdateMessage {
+  type: "identity-update";
+  nodeId: string;
+  username?: string;
+  bio?: string;
+  avatarDataUrl?: string;
+  accentColor?: number;
 }
 
 /** lightweight activity summary for a shared canvas, piggybacked on
@@ -126,6 +151,13 @@ export interface CanvasInviteMessage {
   canvasPreviewUrl?: string;
   originNodeId: string;
   originUsername: string;
+  // identity info for the inviting peer, carried the same way a friend
+  // request's bio/avatar rides along - lets the invite show more than a
+  // bare username, and updated in place on a resend after the sender
+  // edits their profile.
+  originBio?: string;
+  originAvatarDataUrl?: string;
+  originAccentColor?: number;
   role: InvitableRole;
   targets: string[];
   acked: string[];
@@ -316,6 +348,7 @@ export interface BlobOfferMessage {
 export type OnFriendRequest = (request: FriendRequestMessage, fromNodeId: string) => void;
 export type OnFriendAccept = (accept: FriendAcceptMessage, fromNodeId: string) => void;
 export type OnFriendReject = (reject: FriendRejectMessage, fromNodeId: string) => void;
+export type OnIdentityUpdate = (update: IdentityUpdateMessage, fromNodeId: string) => void;
 export type OnProfileResponse = (profile: ProfileResponseMessage, fromNodeId: string) => void;
 export type OnHeartbeat = (heartbeat: HeartbeatMessage, fromNodeId: string) => void;
 export type OnFriendAcceptAck = (ack: FriendAcceptAckMessage, fromNodeId: string) => void;
@@ -353,6 +386,11 @@ export interface FriendzProtocolOptions {
     isHub?: boolean;
   };
   isFriend: (nodeId: string) => boolean;
+  /** true if `nodeId` has a pending (not yet accepted) friend-request
+   *  relationship with the local user, in either direction. lets a peer's
+   *  identity be fetched/pushed before the request is accepted, without
+   *  fully opening `profileVisibility: "friends"` up to strangers. */
+  hasPendingRelationship?: (nodeId: string) => boolean;
   profileVisibility?: "friends" | "everyone" | "nobody";
   friendRequestsFrom?: "everyone" | "nobody";
   canvasInvitesFrom?: "everyone" | "friends" | "nobody";
@@ -383,6 +421,7 @@ export class FriendzProtocol {
   private localUsername: string;
   private getLocalProfile: FriendzProtocolOptions["getLocalProfile"];
   private isFriend: (nodeId: string) => boolean;
+  private hasPendingRelationship: (nodeId: string) => boolean;
   private profileVisibility: "friends" | "everyone" | "nobody";
   private friendRequestsFrom: "everyone" | "nobody";
   private canvasInvitesFrom: "everyone" | "friends" | "nobody";
@@ -397,6 +436,7 @@ export class FriendzProtocol {
   onFriendRequest: OnFriendRequest | null = null;
   onFriendAccept: OnFriendAccept | null = null;
   onFriendReject: OnFriendReject | null = null;
+  onIdentityUpdate: OnIdentityUpdate | null = null;
   onProfileResponse: OnProfileResponse | null = null;
   onHeartbeat: OnHeartbeat | null = null;
   onFriendAcceptAck: OnFriendAcceptAck | null = null;
@@ -423,6 +463,7 @@ export class FriendzProtocol {
     this.localUsername = options.localUsername;
     this.getLocalProfile = options.getLocalProfile;
     this.isFriend = options.isFriend;
+    this.hasPendingRelationship = options.hasPendingRelationship ?? (() => false);
     this.profileVisibility = options.profileVisibility ?? "friends";
     this.friendRequestsFrom = options.friendRequestsFrom ?? "everyone";
     this.canvasInvitesFrom = options.canvasInvitesFrom ?? "everyone";
@@ -520,6 +561,9 @@ export class FriendzProtocol {
             type: "friend-accept",
             fromNodeId: msg.fromNodeId,
             fromUsername: msg.fromUsername,
+            ...(msg.bio !== undefined ? { bio: msg.bio } : {}),
+            ...(msg.avatarDataUrl !== undefined ? { avatarDataUrl: msg.avatarDataUrl } : {}),
+            ...(msg.accentColor !== undefined ? { accentColor: msg.accentColor } : {}),
             ...(msg.isHub !== undefined ? { isHub: msg.isHub } : {}),
           },
           fromNodeId
@@ -597,7 +641,17 @@ export class FriendzProtocol {
         break;
 
       case "identity-update":
-        // not adopted this pass - no consumer needs it yet.
+        this.onIdentityUpdate?.(
+          {
+            type: "identity-update",
+            nodeId: msg.nodeId,
+            ...(msg.username !== undefined ? { username: msg.username } : {}),
+            ...(msg.bio !== undefined ? { bio: msg.bio } : {}),
+            ...(msg.avatarDataUrl !== undefined ? { avatarDataUrl: msg.avatarDataUrl } : {}),
+            ...(msg.accentColor !== undefined ? { accentColor: msg.accentColor } : {}),
+          },
+          fromNodeId
+        );
         break;
 
       case "acl-change":
@@ -748,7 +802,11 @@ export class FriendzProtocol {
 
   private handleProfileRequest(fromNodeId: string): void {
     if (this.profileVisibility === "nobody") return;
-    if (this.profileVisibility === "friends" && !this.isFriend(fromNodeId)) {
+    if (
+      this.profileVisibility === "friends" &&
+      !this.isFriend(fromNodeId) &&
+      !this.hasPendingRelationship(fromNodeId)
+    ) {
       log.debug(TAG, "ignoring profile request from non-friend:", fromNodeId.slice(0, 16) + "...");
       return;
     }
@@ -780,6 +838,9 @@ export class FriendzProtocol {
         type: "friend-request",
         fromNodeId: msg.fromNodeId,
         fromUsername: msg.fromUsername,
+        ...(msg.bio !== undefined ? { bio: msg.bio } : {}),
+        ...(msg.avatarDataUrl !== undefined ? { avatarDataUrl: msg.avatarDataUrl } : {}),
+        ...(msg.accentColor !== undefined ? { accentColor: msg.accentColor } : {}),
         ...(msg.isHub !== undefined ? { isHub: msg.isHub } : {}),
       },
       fromNodeId
@@ -798,6 +859,11 @@ export class FriendzProtocol {
   // --- outbound protocol actions ---
 
   async sendFriendRequest(peerNodeId: string): Promise<void> {
+    // identity info rides along regardless of profileVisibility - the
+    // recipient hasn't agreed to anything yet, but the whole point of a
+    // request the local user is actively initiating is to be recognizable
+    // rather than showing up as a bare node id.
+    const profile = this.getLocalProfile();
     await this.client.sendMessage(
       peerNodeId,
       coreMessage({
@@ -805,11 +871,15 @@ export class FriendzProtocol {
         v: 1,
         fromNodeId: this.localNodeId,
         fromUsername: this.localUsername,
+        bio: profile.bio,
+        avatarDataUrl: profile.avatarDataUrl,
+        ...(profile.accentColor !== undefined ? { accentColor: profile.accentColor } : {}),
       })
     );
   }
 
   async sendFriendAccept(peerNodeId: string): Promise<void> {
+    const profile = this.getLocalProfile();
     await this.client.sendMessage(
       peerNodeId,
       coreMessage({
@@ -817,6 +887,29 @@ export class FriendzProtocol {
         v: 1,
         fromNodeId: this.localNodeId,
         fromUsername: this.localUsername,
+        bio: profile.bio,
+        avatarDataUrl: profile.avatarDataUrl,
+        ...(profile.accentColor !== undefined ? { accentColor: profile.accentColor } : {}),
+      })
+    );
+  }
+
+  /** push the local user's current username/bio/avatar/accent color to an
+   *  already-connected peer - called right after a profile edit so the
+   *  peer's display refreshes immediately instead of waiting for their
+   *  next on-demand profile fetch. */
+  async sendIdentityUpdate(peerNodeId: string): Promise<void> {
+    const profile = this.getLocalProfile();
+    await this.client.sendMessage(
+      peerNodeId,
+      coreMessage({
+        type: "identity-update",
+        v: 1,
+        nodeId: this.localNodeId,
+        username: profile.username,
+        bio: profile.bio,
+        avatarDataUrl: profile.avatarDataUrl,
+        ...(profile.accentColor !== undefined ? { accentColor: profile.accentColor } : {}),
       })
     );
   }
@@ -1166,6 +1259,19 @@ export class FriendzProtocol {
     return this.localUsername;
   }
 
+  /** get a snapshot of the local user's current profile (username, bio,
+   *  avatar, accent color) - the same data sent with a friend request/
+   *  accept or an identity-update push, for callers (e.g. canvas invites)
+   *  that need to attach identity info to their own outbound messages. */
+  getLocalProfileSnapshot(): {
+    username: string;
+    bio: string;
+    avatarDataUrl: string;
+    accentColor?: number;
+  } {
+    return this.getLocalProfile();
+  }
+
   /** update the local username (e.g. when profile changes). */
   setLocalUsername(username: string): void {
     this.localUsername = username;
@@ -1201,6 +1307,7 @@ export class FriendzProtocol {
     this.onFriendRequest = null;
     this.onFriendAccept = null;
     this.onFriendReject = null;
+    this.onIdentityUpdate = null;
     this.onProfileResponse = null;
     this.onHeartbeat = null;
     this.onFriendAcceptAck = null;

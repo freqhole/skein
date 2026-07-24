@@ -27,19 +27,19 @@
     "lint:circular": "npx madge --circular --extensions ts src/ widgets/",
     "ts-prune": "ts-prune",
     "check": "npm run typecheck && npm run lint && npm run lint:circular && npm run test:all",
-    "deps:local": "node scripts/toggle-deps.mjs local && npm install",
-    "deps:npm": "node scripts/toggle-deps.mjs npm && npm install"
+    "deps:local": "node scripts/toggle-deps.mjs local",
+    "deps:npm": "node scripts/toggle-deps.mjs npm"
   },
   "dependencies": {
     "@automerge/automerge": "^3.2.6",
     "@automerge/automerge-repo": "^2.5.6",
     "@automerge/automerge-repo-network-broadcastchannel": "^2.5.6",
     "@automerge/automerge-repo-storage-indexeddb": "^2.5.6",
+    "@freqhole/haruspex": "^0.2.3",
+    "@freqhole/midden": "^0.2.3",
+    "@freqhole/reliquary": "^0.2.3",
     "@pixi/ui": "^2.3.2",
     "comlink": "^4.4.2",
-    "@freqhole/haruspex": "^0.2.2",
-    "@freqhole/midden": "^0.2.2",
-    "@freqhole/reliquary": "^0.2.2",
     "pixi.js": "^8.19.0",
     "zod": "^4.4.3"
   },

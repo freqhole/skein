@@ -78,6 +78,9 @@ export const ONLINE_DOT_BORDER = 2;
 
 // request rows
 export const REQUEST_ROW_HEIGHT = 52;
+// taller variant used when a row also shows a truncated bio line (mirrors
+// ROW_HEIGHT/ROW_HEIGHT_BIO's relationship above)
+export const REQUEST_ROW_HEIGHT_BIO = 66;
 export const ACTION_BTN_SIZE = 24;
 
 // settings

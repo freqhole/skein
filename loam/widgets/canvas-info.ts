@@ -341,6 +341,14 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
     let previewTexture: Texture | null = null;
     let loadedAssetKey = "";
 
+    // set when the widget is destroyed; async handlers and store/doc-change
+    // callbacks check this to bail out instead of touching pixi objects
+    // that destroy() has already torn down (e.g. a canvasStore.onChange
+    // notification that was already in flight when this widget got
+    // unmounted mid-navigation would otherwise crash trying to set
+    // `titleText.style.fill` after `titleText.destroy()` nulled its style).
+    let destroyed = false;
+
     const setImageText = new Text({
       text: "set image",
       style: {
@@ -402,6 +410,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
       }
       try {
         const texture = await Assets.load<Texture>(url);
+        if (destroyed) return;
         previewTexture = texture;
         loadedAssetKey = url;
 
@@ -860,6 +869,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
         }
 
         // compute total
+        if (destroyed) return;
         const totalBytes = entries.reduce((sum, e) => sum + e.bytes, 0);
         totalSizeText.text = `total size: ${formatSize(totalBytes)}`;
 
@@ -907,6 +917,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
     let prevPreviewUrl = meta.previewUrl;
 
     const unsubCanvas = canvasStore.onChange(() => {
+      if (destroyed) return;
       const newMeta = canvasStore.metadata();
 
       // reload preview image if it changed
@@ -926,6 +937,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
 
     // subscribe to per-widget doc changes (tab switching)
     const unsubDoc = ctx.doc.on("change", () => {
+      if (destroyed) return;
       updateTabStyles();
       syncTabVisibility();
     });
@@ -941,6 +953,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
       },
 
       destroy() {
+        destroyed = true;
         if (titleOverlay) {
           titleOverlay.remove();
           titleOverlay = null;

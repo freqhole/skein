@@ -91,6 +91,13 @@ export const shareGroupSchema = z.object({
 export const pendingFriendRequestSchema = z.object({
   fromNodeId: z.string(),
   fromUsername: z.string().default(""),
+  // identity info carried on the request itself (sent regardless of the
+  // sender's own profile visibility setting) so a pending request shows
+  // more than a bare node id/username - updated in place if the sender
+  // resends the request after editing their profile.
+  fromBio: z.string().default(""),
+  fromAvatarDataUrl: z.string().default(""),
+  fromAccentColor: z.number().optional(),
   receivedAt: z.string().default(""),
   status: z.enum(["pending", "accepted", "accepted-pending-ack", "rejected"]).default("pending"),
 });
@@ -98,6 +105,11 @@ export const pendingFriendRequestSchema = z.object({
 export const outboundFriendRequestSchema = z.object({
   toNodeId: z.string(),
   toUsername: z.string().default(""),
+  /** filled in once known, via a profile-response or identity-update from
+   *  the recipient (never known at send time — an outbound friend request
+   *  is often the very first contact with this node id) — see
+   *  friendz-wiring.ts's onProfileResponse/onIdentityUpdate handlers. */
+  toAvatarDataUrl: z.string().default(""),
   sentAt: z.string().default(""),
   status: z.enum(["pending", "accepted", "accepted-pending-ack", "rejected"]).default("pending"),
 });

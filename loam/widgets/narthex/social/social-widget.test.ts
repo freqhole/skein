@@ -81,6 +81,8 @@ describe("socialSchema", () => {
         {
           fromNodeId: "c".repeat(64),
           fromUsername: "charlie",
+          fromBio: "charlie's bio",
+          fromAvatarDataUrl: "data:image/png;base64,charlie",
           receivedAt: "2025-06-01",
           status: "pending" as const,
         },
@@ -89,6 +91,7 @@ describe("socialSchema", () => {
         {
           toNodeId: "d".repeat(64),
           toUsername: "dave",
+          toAvatarDataUrl: "",
           sentAt: "2025-06-01",
           status: "pending" as const,
         },

@@ -32,8 +32,13 @@
 //   recorded blobId/blake3/etc, exactly the file-utils.ts uploadFile() bug
 //   this mirrors the fix for.
 //   immediate post-record playback uses URL.createObjectURL() on the in-memory blob.
-//   restore-from-doc playback uses getBlobData() which reads OPFS first, then
-//   falls back to the rust-side blob_get dispatch in tauri mode.
+//   restore-from-doc playback uses getAudioBlobData() (below), which reads
+//   OPFS in browser mode and falls back to the rust-side `blob_get` dispatch
+//   in tauri mode — the plain getBlobData() re-exported from blob-store.ts
+//   is OPFS-only and always misses in tauri, which used to make every
+//   restored recording (this peer's own, after a reload, or any other
+//   peer's) fall through resolveAudioBytes() straight to null instead of
+//   ever reading the bytes back.
 //   waveformSamples are stored in the Automerge doc so collaborators can see
 //   the waveform without playing the audio — but the audio bytes themselves
 //   never travel with the doc. on a peer that didn't make the recording,
@@ -51,16 +56,19 @@
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { z } from "zod";
 import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
-import { getBlobData, storeBlobFromFile } from "../src/storage/blob-store";
-import { base64Encode } from "@freqhole/reliquary/worker";
+import { getBlobData as getBrowserBlobData, storeBlobFromFile } from "../src/storage/blob-store";
+import { base64Encode, base64Decode } from "@freqhole/reliquary/worker";
 import {
   checkBlobLocality,
   getLocalNodeId,
   snatchBlob,
+  BlobAccessDeniedError,
   type BlobLocalityInfo,
   type PeersMap,
   type SnatchOptions,
 } from "../src/widgets/file-utils";
+import { sendFriendRequest } from "../src/p2p/friendz-bridge";
+import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import {
   isTransparent,
   type CompactInfo,
@@ -219,6 +227,35 @@ export interface ResolvedAudioBytes {
 }
 
 /**
+ * read a recording's bytes back by blob id (== blake3 hex), regardless of
+ * mode. browser mode reads OPFS directly; tauri mode has no OPFS mirror
+ * (see this file's module doc comment) so it goes through the rust
+ * `blob_get` dispatch instead, decoding the returned base64 payload.
+ *
+ * this is the `getBlobData` implementation `resolveAudioBytes()` needs in
+ * tauri mode \u2014 the plain OPFS-only `getBlobData` re-exported from
+ * blob-store.ts always misses there, which used to make every restored
+ * recording (local or a peer's) resolve to nothing.
+ */
+export async function getAudioBlobData(blobId: string): Promise<ArrayBuffer | null> {
+  if (!isTauriMode()) return getBrowserBlobData(blobId);
+
+  try {
+    const response = (await dispatch("blob_get", { blake3: blobId })) as {
+      data?: string;
+    } | null;
+    if (!response?.data) return null;
+    const bytes = await base64Decode(response.data);
+    // slice() (no args) copies into a freshly allocated ArrayBuffer of
+    // exactly the right size — .buffer alone can be larger than the view
+    // (or, per its type, a SharedArrayBuffer) and isn't safe to hand back.
+    return bytes.slice().buffer;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * add a node id to a `snatchedBy` list, deduped. used both right after a
  * fresh recording is stored (the recorder always has the blob locally, so
  * it must be recorded as a snatcher immediately — otherwise a hub or peer
@@ -295,7 +332,9 @@ type RecordState =
   | "ready" // has a recording; play button shown
   | "fetching" // remote peer: downloading blob bytes before playback
   | "playing" // playing back the recording
-  | "error"; // getUserMedia, storage, or remote-fetch failure
+  | "error" // getUserMedia, storage, or remote-fetch failure
+  | "needs-friend" // only non-friend peers have the blob; tap to send a friend request
+  | "friend-requested"; // friend request sent; waiting to retry the fetch
 
 export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = {
   type: "audio-recording",
@@ -366,6 +405,13 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     /** message shown after a failed remote-fetch attempt (cleared on next try) */
     let fetchErrorMessage = "";
     let fetchRafId: number | null = null;
+    /** the peer known to have the blob but not (yet) a friend — see the
+     *  "needs-friend"/"friend-requested" states below. */
+    let deniedPeerNodeId: string | null = null;
+    /** unregisters the pending-retry-on-friend-accept hook (see
+     *  requestFriendAndRetry()); called on destroy() so it never fires
+     *  against a torn-down widget. */
+    let unregisterPendingRetry: (() => void) | null = null;
     /** current rotation offset (radians) for the indeterminate fetch-ring spinner */
     let fetchAnimAngle = 0;
 
@@ -606,6 +652,18 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           btnGfx.circle(bx, by, BTN_R * 0.38);
           btnGfx.stroke({ color: 0xffffff, width: 2, alpha: 0.6 });
           break;
+
+        case "needs-friend":
+        case "friend-requested":
+          btnGfx.circle(bx, by, BTN_R);
+          btnGfx.fill({ color: COLOR_MUTED });
+          btnGfx.circle(bx, by, BTN_R * 0.38);
+          btnGfx.stroke({
+            color: 0xffffff,
+            width: 2,
+            alpha: recState === "friend-requested" ? 0.3 : 0.6,
+          });
+          break;
       }
 
       btnGfx.hitArea = new Rectangle(bx - BTN_R, by - BTN_R, BTN_R * 2, BTN_R * 2);
@@ -703,6 +761,16 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           statusText.text = "";
           infoText.text = "";
           errorText.text = "mic access denied\ntap to try again";
+          break;
+        case "needs-friend":
+          statusText.text = "";
+          infoText.text = "";
+          errorText.text = "only a non-friend peer has this recording\ntap to send a friend request";
+          break;
+        case "friend-requested":
+          statusText.text = "";
+          infoText.text = "";
+          errorText.text = "friend request sent\nwill retry automatically once accepted";
           break;
       }
     };
@@ -997,7 +1065,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         resolved = await resolveAudioBytes(
           { blobId, filename, mime, size, blake3 },
           peers,
-          { getBlobData, checkBlobLocality, snatchBlob, getLocalNodeId },
+          { getBlobData: getAudioBlobData, checkBlobLocality, snatchBlob, getLocalNodeId },
           (fraction) => {
             fetchProgressFraction = fraction;
             fetchProgressText =
@@ -1007,6 +1075,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           ctx.canvasStore ? (nodeId: string) => ctx.canvasStore!.isPeerOnline(nodeId) : undefined
         );
       } catch (err) {
+        if (err instanceof BlobAccessDeniedError) throw err;
         console.error("[audio-recording] resolveAudioBytes failed:", err);
         return null;
       }
@@ -1054,7 +1123,22 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         ctx.setHeaderActions?.(makeHeaderActions());
       }
 
-      const url = await getPlaybackUrl();
+      let url: string | null;
+      try {
+        url = await getPlaybackUrl();
+      } catch (err) {
+        if (destroyed) return;
+        if (err instanceof BlobAccessDeniedError) {
+          stopFetchAnim();
+          deniedPeerNodeId = err.peerNodeId;
+          recState = "needs-friend";
+          refresh();
+          ctx.setHeaderActions?.(makeHeaderActions());
+          return;
+        }
+        console.error("[audio-recording] getPlaybackUrl failed:", err);
+        url = null;
+      }
       if (destroyed) return;
       if (!url) {
         console.error("[audio-recording] no playback URL available");
@@ -1097,6 +1181,34 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       startPlayAnim();
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
+    };
+
+    /** send a friend request to the peer holding this recording, then
+     *  automatically retry playback once the request is accepted (see
+     *  pending-blob-access.ts). session-only — if the widget is destroyed
+     *  before the request is accepted, the retry is simply dropped. */
+    const requestFriendAndRetry = async () => {
+      const peerNodeId = deniedPeerNodeId;
+      if (!peerNodeId) return;
+
+      unregisterPendingRetry?.();
+      try {
+        await sendFriendRequest(peerNodeId);
+      } catch (err) {
+        console.error("[audio-recording] sendFriendRequest failed:", err);
+        return;
+      }
+      if (destroyed) return;
+
+      recState = "friend-requested";
+      refresh();
+      ctx.setHeaderActions?.(makeHeaderActions());
+
+      unregisterPendingRetry = registerPendingBlobRetry(peerNodeId, () => {
+        unregisterPendingRetry = null;
+        if (destroyed) return;
+        void startPlayback();
+      });
     };
 
     const pausePlayback = () => {
@@ -1157,6 +1269,9 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         case "playing":
           pausePlayback();
           break;
+        case "needs-friend":
+          void requestFriendAndRetry();
+          break;
       }
     });
 
@@ -1205,6 +1320,17 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         return;
       }
 
+      if ((recState === "needs-friend" || recState === "friend-requested") && !blobId) {
+        unregisterPendingRetry?.();
+        unregisterPendingRetry = null;
+        deniedPeerNodeId = null;
+        capturedSamples = [];
+        recState = "idle";
+        refresh();
+        ctx.setHeaderActions?.(makeHeaderActions());
+        return;
+      }
+
       // bgColor / border / other prop change
       drawBg();
     });
@@ -1239,6 +1365,8 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         stopWaveAnim();
         stopPlayAnim();
         stopFetchAnim();
+        unregisterPendingRetry?.();
+        unregisterPendingRetry = null;
         mediaRecorder?.stop();
         mediaStream?.getTracks().forEach((t) => t.stop());
         void audioCtx?.close();

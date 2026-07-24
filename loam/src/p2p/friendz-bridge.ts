@@ -97,6 +97,8 @@ export function destroyBridge(): void {
   outboundRequestHook = null;
   acceptAndJoinHandler = null;
   knockSocialDoc = null;
+  unsubscribeFriendsChange?.();
+  unsubscribeFriendsChange = null;
   knockRelayInfo.clear();
   knockRelayListeners = [];
   knockAckedCanvasIds.clear();
@@ -261,6 +263,9 @@ export async function sendCanvasInvite(
     canvasPreviewUrl?: string;
     originNodeId: string;
     originUsername: string;
+    originBio?: string;
+    originAvatarDataUrl?: string;
+    originAccentColor?: number;
     role: InvitableRole;
     targets: string[];
     acked: string[];
@@ -388,12 +393,86 @@ export function getProtocol(): FriendzProtocol | null {
  *  lifecycle. pass `null` on teardown. */
 export function initKnockSocialDocBridge(doc: SocialDoc | null): void {
   knockSocialDoc = doc;
+  unsubscribeFriendsChange?.();
+  unsubscribeFriendsChange = null;
+  ensureFriendsChangeSubscription();
 }
 
 /** the social doc registered via `initKnockSocialDocBridge()`, or null if
  *  not ready yet. */
 export function getKnockSocialDoc(): SocialDoc | null {
   return knockSocialDoc;
+}
+
+// ---------------------------------------------------------------------------
+// friend status (used by the blob-fetch friend gate — see file-utils.ts's
+// `BlobAccessDeniedError` and `pending-blob-access.ts`)
+// ---------------------------------------------------------------------------
+
+/** true if `nodeId` is one of our accepted friends' node ids. reads the
+ *  same social doc `initKnockSocialDocBridge()` registered — friend state
+ *  is synced into that doc's `friends` list in both tauri and browser
+ *  mode, so this check works identically regardless of platform. */
+export function isFriend(nodeId: string): boolean {
+  const friends = knockSocialDoc?.current.friends ?? [];
+  return friends.some((f) => f.nodeIds?.some((n) => n.nodeId === nodeId));
+}
+
+/** display info (username, avatar, bio) for a friend's node id, or null if
+ *  `nodeId` isn't a known friend. reads the same social doc
+ *  `initKnockSocialDocBridge()` registered, so it stays current as friend
+ *  profiles update — callers building a card/badge for a friend's canvas
+ *  (e.g. a share-link join) should look this up fresh rather than leaving
+ *  these fields blank. */
+export function getFriendInfo(
+  nodeId: string
+): { username?: string; avatarDataUrl?: string; bio?: string } | null {
+  const friends = knockSocialDoc?.current.friends ?? [];
+  for (const friend of friends) {
+    for (const n of friend.nodeIds ?? []) {
+      if (n.nodeId === nodeId) {
+        return {
+          username: friend.alias || n.username || friend.username,
+          avatarDataUrl: n.avatarDataUrl,
+          bio: n.bio,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/** the local user's own social identity profile accent color (set on the
+ *  profile tab, see profile-tab.ts's palette picker), or null if the social
+ *  doc isn't registered yet. reads the same social doc
+ *  `initKnockSocialDocBridge()` registered — used by widgets that want to
+ *  default some cosmetic choice (e.g. a new voice-recording widget's lip
+ *  color) to the user's own identity color instead of picking randomly. */
+export function getLocalAccentColor(): number | null {
+  return knockSocialDoc?.current.profile.accentColor ?? null;
+}
+
+let friendsChangeListeners: Array<() => void> = [];
+let unsubscribeFriendsChange: (() => void) | null = null;
+
+function ensureFriendsChangeSubscription(): void {
+  if (unsubscribeFriendsChange || !knockSocialDoc) return;
+  unsubscribeFriendsChange = knockSocialDoc.on("change", () => {
+    for (const handler of friendsChangeListeners) handler();
+  });
+}
+
+/** subscribe to be notified whenever the social doc's friends list changes
+ *  (accept, remove, profile update, etc.) — used to retry a blob fetch
+ *  once a pending friend request is accepted. if the social doc isn't
+ *  registered yet, the subscription is (re-)attempted the next time
+ *  `initKnockSocialDocBridge()` runs. returns an unsubscribe function. */
+export function onFriendsChange(handler: () => void): () => void {
+  friendsChangeListeners.push(handler);
+  ensureFriendsChangeSubscription();
+  return () => {
+    friendsChangeListeners = friendsChangeListeners.filter((h) => h !== handler);
+  };
 }
 
 /** record that `info.requesterNodeId`'s knock (on `info.canvasDocId`) was

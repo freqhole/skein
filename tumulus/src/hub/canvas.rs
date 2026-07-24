@@ -295,25 +295,24 @@ impl HubPeerService {
         });
     }
 
-    /// handle an incoming canvas knock — a request for canvas access from a
-    /// peer who is not yet a friend/collaborator on the canvas.
+    /// handle an incoming canvas knock sent directly to the hub.
     ///
-    /// unlike [`Self::handle_canvas_invite`], this does **not** gate on
-    /// friendship: a knock's entire purpose is to let a stranger ask for
-    /// access, so requiring `is_friend` first would make the feature
-    /// impossible to use. the hub instead requires that it already holds a
-    /// live copy of the referenced canvas doc (via the existing "share
-    /// canvas with hub" flow, see `handle_canvas_invite`) — if it doesn't,
-    /// this is a graceful no-op (logged, no ack sent), not a panic or an
-    /// error response, since there is no doc to record the knock into.
-    ///
-    /// on success: records (or idempotently confirms an existing)
-    /// `pendingKnocks` entry directly in the hub's copy of the canvas doc
-    /// (see [`record_knock_in_canvas_doc`] for the exact idempotency
-    /// rules, mirroring `CanvasStore.recordKnock()`'s TS-side logic), then
-    /// sends a `knock-ack` back immediately — normal automerge sync then
-    /// propagates the new entry to every admin's device, no further push
-    /// logic needed.
+    /// **gated on friendship, same as [`Self::handle_canvas_invite`]**: a
+    /// knock's entire purpose is to let a stranger ask for canvas access,
+    /// but the requester and the hub are, by definition, not friends yet
+    /// (that's the whole reason a knock is a knock and not a normal
+    /// friend-and-invite flow) — so the hub can never be a stranger-facing
+    /// knock target, only a relay between peers it's already friends with.
+    /// a knock from a non-friend is dropped here: no ack, no record, just a
+    /// log line. this is a deliberate reversal of an earlier design where
+    /// the hub accepted any knock it could resolve a doc for, regardless of
+    /// friendship — see `docs/knock-and-hub-relay-plan.md` section 5.2. the
+    /// hub still *does* help relay an already-recorded knock between actual
+    /// friends: see [`Self::handle_gossip_digest`]'s `pending_knocks`
+    /// handling, which a friend who already holds the canvas doc (and thus
+    /// already has the knock in their own `pendingKnocks`) gossips to the
+    /// hub — that path requires no direct contact between the hub and the
+    /// original (non-friend) requester at all.
     pub(crate) async fn handle_canvas_knock(
         &self,
         from_node_id: &str,
@@ -323,6 +322,16 @@ impl HubPeerService {
         requester_username: &str,
         message: &str,
     ) {
+        if !self.is_friend(from_node_id).await {
+            tracing::info!(
+                peer = %from_node_id,
+                knock_id = %knock_id,
+                canvas_doc_id = %canvas_doc_id,
+                "ignoring canvas knock sent directly by a non-friend"
+            );
+            return;
+        }
+
         tracing::info!(
             peer = %from_node_id,
             knock_id = %knock_id,
@@ -715,6 +724,20 @@ impl HubPeerService {
         shared_canvas_ids: Vec<String>,
         profiles: Vec<haruspex::protocol::GossipDigestProfileEntry>,
     ) {
+        // gossip is a friends-only relay mechanism, full stop: a non-friend
+        // could otherwise hand the hub fabricated canvas updates/invites/
+        // knocks and get it to start tracking an arbitrary canvas doc,
+        // send an invite-accept to an arbitrary target, or merge a bogus
+        // knock into a doc it holds — none of which requires ever having
+        // been on the canvas together, let alone being an actual friend.
+        if !self.is_friend(from_node_id).await {
+            tracing::info!(
+                peer = %from_node_id,
+                "ignoring gossip digest from a non-friend"
+            );
+            return;
+        }
+
         tracing::info!(
             peer = %from_node_id,
             updates = canvas_updates.len(),
@@ -981,6 +1004,43 @@ impl HubPeerService {
                 }
             }
         }
+    }
+
+    /// true if `node_id` is named in the `acl` or `pendingInvites` of any
+    /// canvas doc the hub currently holds — i.e. an actual canvas admin
+    /// already decided to grant (or offer) this peer canvas access, even
+    /// though the hub itself has no prior friend relationship with them.
+    ///
+    /// this is the "canvas-vouched" auto-accept condition for an inbound
+    /// `FriendRequest` (see `hub/messages.rs`): it's what lets a brand-new
+    /// invitee discover a hub's node id from a canvas share link, send it
+    /// a friend request, and get auto-accepted — without the canvas owner
+    /// needing to be online, and without the hub operator needing to
+    /// manually pre-approve the invitee's node id via the hub-admin
+    /// protocol. the hub already holds a synced copy of the canvas doc
+    /// (that's how it came to be tracking it at all), so this check is
+    /// just a local doc read, no network round-trip.
+    pub(crate) async fn is_vouched_by_any_canvas(&self, node_id: &str) -> bool {
+        let doc_ids: Vec<String> = {
+            let ids = self.canvas_doc_ids.lock().await;
+            ids.iter().cloned().collect()
+        };
+
+        for doc_id in doc_ids {
+            let Some(handle) = self.hub_repo.find(&doc_id).await else {
+                continue;
+            };
+            let node_id_owned = node_id.to_string();
+            let vouched = tokio::task::spawn_blocking(move || {
+                canvas_acl_or_invite_contains(&handle, &node_id_owned)
+            })
+            .await
+            .unwrap_or(false);
+            if vouched {
+                return true;
+            }
+        }
+        false
     }
 
     /// send a BlobSeek to a peer with all missing blob hashes.
@@ -1367,6 +1427,28 @@ fn record_knock_in_canvas_doc(
 // automerge doc reading helpers
 // ---------------------------------------------------------------------------
 
+/// true if `node_id` appears as a key in a canvas doc's `acl` map or its
+/// `pendingInvites` map. runs inside `spawn_blocking` because doc access
+/// holds a lock. see [`HubPeerService::is_vouched_by_any_canvas`] for why
+/// this check exists.
+fn canvas_acl_or_invite_contains(handle: &crate::hub_repo::DocHandle, node_id: &str) -> bool {
+    use automerge::ReadDoc;
+
+    handle.with_document(|doc| {
+        if let Ok(Some((_, acl_obj))) = doc.get(automerge::ROOT, "acl") {
+            if doc.get(&acl_obj, node_id).ok().flatten().is_some() {
+                return true;
+            }
+        }
+        if let Ok(Some((_, pending_obj))) = doc.get(automerge::ROOT, "pendingInvites") {
+            if doc.get(&pending_obj, node_id).ok().flatten().is_some() {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 /// read a canvas document's automerge state to extract gossip-relevant data
 /// for a specific peer.
 ///
@@ -1700,7 +1782,112 @@ mod tests {
             .expect("HubRepo::new (reload) should succeed")
     }
 
-    /// seed a canvas doc with a `peers` entry for `member_node_id` and,
+    /// seed a canvas doc with an `acl` entry and/or a `pendingInvites` entry
+    /// for `node_id` — for exercising `canvas_acl_or_invite_contains`.
+    async fn seed_canvas_with_acl_or_invite(
+        db_path: &std::path::Path,
+        canvas_doc_id: &str,
+        node_id: &str,
+        in_acl: bool,
+        in_pending_invites: bool,
+    ) -> HubRepo {
+        let storage = crate::hub_repo::HubDocStorage::new(db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            tx.put(automerge::ROOT, "version", 1_i64)?;
+            tx.put_object(automerge::ROOT, "widgets", automerge::ObjType::Map)?;
+            tx.put(automerge::ROOT, "title", "test canvas")?;
+
+            if in_acl {
+                let acl = tx.put_object(automerge::ROOT, "acl", automerge::ObjType::Map)?;
+                let entry = tx.put_object(&acl, node_id, automerge::ObjType::Map)?;
+                tx.put(&entry, "role", "member")?;
+            }
+            if in_pending_invites {
+                let pending =
+                    tx.put_object(automerge::ROOT, "pendingInvites", automerge::ObjType::Map)?;
+                let entry = tx.put_object(&pending, node_id, automerge::ObjType::Map)?;
+                tx.put(&entry, "invitedBy", "someone-else")?;
+                tx.put(&entry, "role", "member")?;
+            }
+            Ok(())
+        })
+        .expect("canvas doc transact should succeed");
+        storage.save_doc(canvas_doc_id, &doc.save()).await;
+
+        HubRepo::new("hub-node".to_string(), db_path)
+            .await
+            .expect("HubRepo::new (reload) should succeed")
+    }
+
+    #[tokio::test]
+    async fn canvas_acl_or_invite_contains_finds_an_acl_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        let hub_repo =
+            seed_canvas_with_acl_or_invite(&db_path, "canvas-1", "peer-b", true, false).await;
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+
+        let found =
+            tokio::task::spawn_blocking(move || canvas_acl_or_invite_contains(&handle, "peer-b"))
+                .await
+                .expect("spawn_blocking should not panic");
+
+        assert!(found, "a node id in the canvas's acl should be found");
+    }
+
+    #[tokio::test]
+    async fn canvas_acl_or_invite_contains_finds_a_pending_invite_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        let hub_repo =
+            seed_canvas_with_acl_or_invite(&db_path, "canvas-1", "peer-b", false, true).await;
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+
+        let found =
+            tokio::task::spawn_blocking(move || canvas_acl_or_invite_contains(&handle, "peer-b"))
+                .await
+                .expect("spawn_blocking should not panic");
+
+        assert!(
+            found,
+            "a node id in the canvas's pendingInvites should be found"
+        );
+    }
+
+    #[tokio::test]
+    async fn canvas_acl_or_invite_contains_excludes_an_unrelated_stranger() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        let hub_repo =
+            seed_canvas_with_acl_or_invite(&db_path, "canvas-1", "peer-b", true, false).await;
+        let handle = hub_repo
+            .find("canvas-1")
+            .await
+            .expect("doc should be found");
+
+        let found = tokio::task::spawn_blocking(move || {
+            canvas_acl_or_invite_contains(&handle, "total-stranger")
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+
+        assert!(
+            !found,
+            "a node id absent from both acl and pendingInvites must not be vouched for"
+        );
+    }
+
     /// optionally, a `pendingKnocks` entry for `requester_node_id` — for
     /// exercising `read_canvas_for_gossip`'s knock-scanning gate (only
     /// gossips knocks to peers who are full `peers` members).

@@ -82,6 +82,24 @@ vi.mock("@freqhole/reliquary/worker", () => ({
   hashBlake3: (...args: any[]) => mockHashBlake3(...args),
 }));
 
+// mock the friend-status check used by the friend-fetch gate — defaults
+// every peer to "friend" so the existing transport/probe/error tests below
+// (none of which are about friend-gating) aren't affected. tests that
+// specifically exercise the gate override this per-test.
+const mockIsFriend = vi.fn<(nodeId: string) => boolean>(() => true);
+vi.mock("../p2p/friendz-bridge", () => ({
+  isFriend: (...args: any[]) => mockIsFriend(...args),
+}));
+
+// reset to the "everyone is a friend" default before every test in this
+// file — most describe blocks below aren't testing the friend gate at all,
+// and a per-test override via mockImplementation() (see the friend-gate
+// describe) would otherwise leak into later, unrelated tests (clearAllMocks
+// clears call history but not a previously-set implementation).
+beforeEach(() => {
+  mockIsFriend.mockReturnValue(true);
+});
+
 import {
   canSnatchToDisk,
   checkBlobLocality,
@@ -93,6 +111,7 @@ import {
   snatchBlobToDisk,
   getThumbnailDataUrl,
   uploadFile,
+  BlobAccessDeniedError,
 } from "./file-utils";
 import { IrohNetworkAdapter } from "@freqhole/reliquary/automerge";
 import { createMockMidden, createMockBiStream } from "@freqhole/reliquary/testing";
@@ -1360,6 +1379,76 @@ describe("snatchBlob — every candidate peer fails (no hang, no unhandled rejec
     } finally {
       process.off("unhandledRejection", onUnhandledRejection);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// friend-fetch gate: snatchBlob() shouldn't bother attempting a download
+// from a peer we're not friends with (both platforms deny it) — it should
+// throw BlobAccessDeniedError instead, distinctly from "no peer has it at
+// all", so a caller can offer a friend-request UI. see friendz-bridge.ts's
+// isFriend() (mocked above) and pending-blob-access.ts's retry registry.
+// ---------------------------------------------------------------------------
+
+describe("snatchBlob — friend-fetch gate (BlobAccessDeniedError)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockIsTauriMode.mockReturnValue(false);
+    mockIsFriend.mockReturnValue(true);
+  });
+
+  it("throws BlobAccessDeniedError (not the generic all-probes-failed error) when the only peer with the blob isn't a friend", async () => {
+    mockIsFriend.mockReturnValue(false);
+    const openBi = createMockEnsureBlobProtocol(true);
+    mockGetMiddenNode.mockResolvedValue({ open_bi: openBi });
+
+    const err: unknown = await snatchBlob(
+      {
+        blobId: "doc-blob-id",
+        filename: "clip.mp3",
+        mime: "audio/mpeg",
+        size: 5,
+        blake3: "hash-friend-gate-1",
+        domain: "audio",
+      },
+      { peer1: { nodeId: "non-friend-node-id" } }
+    ).catch((e) => e);
+
+    expect(err).toBeInstanceOf(BlobAccessDeniedError);
+    expect((err as BlobAccessDeniedError).peerNodeId).toBe("non-friend-node-id");
+    expect((err as BlobAccessDeniedError).peerNodeIds).toEqual(["non-friend-node-id"]);
+    expect(mockIsFriend).toHaveBeenCalledWith("non-friend-node-id");
+  });
+
+  it("proceeds with the download when at least one peer with the blob IS a friend, ignoring non-friend peers that also have it", async () => {
+    const openBi = createMockEnsureBlobProtocol(true);
+    const downloadFn = vi.fn(async () => new Uint8Array([1, 2, 3]));
+    mockGetMiddenNode.mockResolvedValue({
+      open_bi: openBi,
+      download_verified_with_ensure_progress: downloadFn,
+    });
+    // only "friend-node-id" is a friend
+    mockIsFriend.mockImplementation((nodeId: string) => nodeId === "friend-node-id");
+
+    const result = await snatchBlob(
+      {
+        blobId: "doc-blob-id",
+        filename: "clip.mp3",
+        mime: "audio/mpeg",
+        size: 5,
+        blake3: "hash-friend-gate-2",
+        domain: "audio",
+      },
+      {
+        peer1: { nodeId: "non-friend-node-id" },
+        peer2: { nodeId: "friend-node-id" },
+      }
+    );
+
+    expect(result).toBeTruthy();
+    // the download was only attempted against the friend peer
+    expect(downloadFn).toHaveBeenCalledTimes(1);
+    expect(downloadFn.mock.calls[0]?.[0]).toBe("friend-node-id");
   });
 });
 

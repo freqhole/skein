@@ -14,33 +14,33 @@ import path from "path";
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(dirname, "..");
 
-const GIT_TAG = "v0.2.2";
+const GIT_TAG = "v0.2.3";
 const GIT_SOURCE = `git = "https://github.com/freqhole/tomb", tag = "${GIT_TAG}"`;
 
-// each file lists the local/git forms of every dependency line to swap between.
+function escapeRegExp(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// each entry names a crate's dependency prefix (the literal text right
+// before its source spec, e.g. `haruspex = { ` or `freqhole-reliquary = {
+// package = "reliquary", `) plus its local sibling-repo path. only the
+// prefix + source substring gets swapped, never the whole dependency line
+// - that way this survives however the trailing `features = [...]` array
+// happens to be formatted (single-line or wrapped across lines) and, via
+// the "g" regex flag, fixes every occurrence of the same crate in one pass
+// (e.g. both a [dependencies] and a [dev-dependencies] entry).
 const files = {
     "tumulus/Cargo.toml": [
         {
-            local: `freqhole-reliquary = { package = "reliquary", path = "../../reliquary/rust" }`,
-            git: `freqhole-reliquary = { package = "reliquary", ${GIT_SOURCE} }`,
+            prefix: `freqhole-reliquary = { package = "reliquary", `,
+            localPath: "../../tomb/lib/reliquary/rust",
         },
-        {
-            local: `haruspex = { path = "../../haruspex/rust", features = ["iroh"] }`,
-            git: `haruspex = { ${GIT_SOURCE}, features = ["iroh"] }`,
-        },
-        {
-            local: `haruspex = { path = "../../haruspex/rust", features = ["iroh", "test-utils"] }`,
-            git: `haruspex = { ${GIT_SOURCE}, features = ["iroh", "test-utils"] }`,
-        },
+        { prefix: `haruspex = { `, localPath: "../../tomb/lib/haruspex/rust" },
     ],
     "tauri/Cargo.toml": [
         {
-            local: `freqhole-reliquary = { package = "reliquary", path = "../../reliquary/rust" }`,
-            git: `freqhole-reliquary = { package = "reliquary", ${GIT_SOURCE} }`,
-        },
-        {
-            local: `freqhole-reliquary = { package = "reliquary", path = "../../reliquary/rust", features = [\n    "test-utils",\n] }`,
-            git: `freqhole-reliquary = { package = "reliquary", ${GIT_SOURCE}, features = [\n    "test-utils",\n] }`,
+            prefix: `freqhole-reliquary = { package = "reliquary", `,
+            localPath: "../../tomb/lib/reliquary/rust",
         },
     ],
 };
@@ -52,22 +52,28 @@ if (mode !== "local" && mode !== "git") {
 }
 
 let changedAny = false;
-for (const [relPath, swaps] of Object.entries(files)) {
+for (const [relPath, deps] of Object.entries(files)) {
     const filePath = path.join(root, relPath);
     let content = readFileSync(filePath, "utf8");
     let changed = false;
 
-    for (const { local, git } of swaps) {
-        const target = mode === "local" ? local : git;
-        const other = mode === "local" ? git : local;
+    for (const { prefix, localPath } of deps) {
+        const localSource = `path = "${localPath}"`;
+        const target = mode === "local" ? localSource : GIT_SOURCE;
+        const other = mode === "local" ? GIT_SOURCE : localSource;
 
-        if (content.includes(target)) continue;
-        if (content.includes(other)) {
-            content = content.replace(other, target);
-            changed = true;
-        } else {
-            console.warn(`warning: could not find either form of a dependency line in ${relPath}`);
+        const pattern = new RegExp(escapeRegExp(prefix) + escapeRegExp(other), "g");
+        if (!pattern.test(content)) {
+            if (!content.includes(prefix + target)) {
+                console.warn(
+                    `warning: could not find a "${prefix.trim()}" dependency line in ${relPath}`
+                );
+            }
+            continue;
         }
+
+        content = content.replace(pattern, prefix + target);
+        changed = true;
     }
 
     if (changed) {

@@ -6,6 +6,7 @@ import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { log } from "@freqhole/reliquary/utils";
 import {
   acceptFriendRequest,
+  isOnline as bridgeIsOnline,
   rejectFriendRequest,
   requestProfile,
 } from "../../../src/p2p/friendz-bridge";
@@ -17,6 +18,7 @@ import {
   MUTED_TEXT,
   REJECT_COLOR,
   REQUEST_ROW_HEIGHT,
+  REQUEST_ROW_HEIGHT_BIO,
   RESOLUTION,
   ROW_ALT_BG,
   ROW_AVATAR_SIZE,
@@ -26,7 +28,8 @@ import {
   SCROLL_SPEED,
   TEXT_COLOR,
 } from "./constants";
-import { colorForName, truncate } from "./helpers";
+import { renderAvatar } from "./avatar-renderer";
+import { truncate } from "./helpers";
 import type {
   FriendEntry,
   FriendNodeId,
@@ -120,9 +123,14 @@ export function createRequestsTab(ctx: TabContext): TabController {
 
     // -- incoming pending requests ------------------------------------------
 
+    let incomingCursorY = 0;
+
     for (let i = 0; i < pending.length; i++) {
       const request = pending[i];
-      const rowY = i * REQUEST_ROW_HEIGHT;
+      const bio = request.fromBio;
+      const effectiveRowHeight = bio ? REQUEST_ROW_HEIGHT_BIO : REQUEST_ROW_HEIGHT;
+      const rowY = incomingCursorY;
+      incomingCursorY += effectiveRowHeight;
 
       const row = new Container();
       row.eventMode = "static";
@@ -133,40 +141,27 @@ export function createRequestsTab(ctx: TabContext): TabController {
       if (i % 2 === 1) {
         const rowBg = new Graphics();
         rowBg.eventMode = "none";
-        rowBg.rect(0, 0, contentW, REQUEST_ROW_HEIGHT);
+        rowBg.rect(0, 0, contentW, effectiveRowHeight);
         rowBg.fill({ color: ROW_ALT_BG, alpha: 0.5 });
         row.addChild(rowBg);
       }
 
-      // avatar circle
+      // avatar circle, async image overlay, and online/offline status dot
       const displayName = request.fromUsername || request.fromNodeId.slice(0, 8);
-      const avatarColor = colorForName(displayName, i);
       const avatarX = ROW_PADDING_X + ROW_AVATAR_SIZE / 2;
-      const avatarY = REQUEST_ROW_HEIGHT / 2;
+      const avatarY = effectiveRowHeight / 2;
 
-      const avatar = new Graphics();
-      avatar.eventMode = "none";
-      avatar.circle(avatarX, avatarY, ROW_AVATAR_SIZE / 2);
-      avatar.fill({ color: avatarColor });
-      row.addChild(avatar);
-
-      const initial = (request.fromUsername || "?").charAt(0).toUpperCase();
-      const avatarLetter = new Text({
-        text: initial,
-        style: {
-          fontFamily: FONT,
-          fontSize: 9,
-          fontWeight: "bold",
-          fill: 0xffffff,
-          align: "center",
-        },
-        resolution: RESOLUTION,
+      renderAvatar({
+        parent: row,
+        cacheKey: `request-avatar-${request.fromNodeId}`,
+        centerX: avatarX,
+        centerY: avatarY,
+        size: ROW_AVATAR_SIZE,
+        displayName,
+        colorSeed: i,
+        avatarUrl: request.fromAvatarDataUrl,
+        online: bridgeIsOnline(request.fromNodeId),
       });
-      avatarLetter.eventMode = "none";
-      avatarLetter.anchor.set(0.5);
-      avatarLetter.x = avatarX;
-      avatarLetter.y = avatarY;
-      row.addChild(avatarLetter);
 
       // name
       const textX = ROW_PADDING_X + ROW_AVATAR_SIZE + ROW_PADDING_X;
@@ -209,6 +204,24 @@ export function createRequestsTab(ctx: TabContext): TabController {
         row.addChild(subText);
       }
 
+      // bio line — shown truncated when there's room (a taller row, see
+      // effectiveRowHeight above)
+      if (bio) {
+        const maxBioChars = Math.max(
+          10,
+          Math.floor((contentW - textX - ROW_PADDING_X - 20) / (ROW_SUB_SIZE * 0.55))
+        );
+        const bioText = new Text({
+          text: truncate(bio, maxBioChars),
+          style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        bioText.eventMode = "none";
+        bioText.x = textX;
+        bioText.y = 44;
+        row.addChild(bioText);
+      }
+
       // accept button (outlined rounded rect with label)
       const acceptW = 52;
       const acceptH = 22;
@@ -217,7 +230,7 @@ export function createRequestsTab(ctx: TabContext): TabController {
       acceptBtn.cursor = "pointer";
       acceptBtn.hitArea = new Rectangle(0, 0, acceptW, acceptH);
       acceptBtn.x = contentW - acceptW - 52 - ROW_PADDING_X - 4;
-      acceptBtn.y = (REQUEST_ROW_HEIGHT - acceptH) / 2;
+      acceptBtn.y = (effectiveRowHeight - acceptH) / 2;
 
       const acceptBg = new Graphics();
       acceptBg.eventMode = "none";
@@ -265,8 +278,8 @@ export function createRequestsTab(ctx: TabContext): TabController {
                   addedAt: new Date().toISOString(),
                   lastSeenAt: "",
                   username: request.fromUsername,
-                  bio: "",
-                  avatarDataUrl: "",
+                  bio: request.fromBio ?? "",
+                  avatarDataUrl: request.fromAvatarDataUrl ?? "",
                   profileDocId: "",
                   profileUpdatedAt: "",
                 },
@@ -295,7 +308,7 @@ export function createRequestsTab(ctx: TabContext): TabController {
       rejectBtn.cursor = "pointer";
       rejectBtn.hitArea = new Rectangle(0, 0, rejectW, rejectH);
       rejectBtn.x = contentW - rejectW - ROW_PADDING_X;
-      rejectBtn.y = (REQUEST_ROW_HEIGHT - rejectH) / 2;
+      rejectBtn.y = (effectiveRowHeight - rejectH) / 2;
 
       const rejectBg = new Graphics();
       rejectBg.eventMode = "none";
@@ -333,7 +346,7 @@ export function createRequestsTab(ctx: TabContext): TabController {
 
     // -- outbound pending requests ------------------------------------------
 
-    let cursorY = pending.length * REQUEST_ROW_HEIGHT;
+    let cursorY = incomingCursorY;
 
     if (pendingOutbound.length > 0) {
       // "sent requests" section label
@@ -367,35 +380,25 @@ export function createRequestsTab(ctx: TabContext): TabController {
           row.addChild(rowBg);
         }
 
-        // avatar
+        // avatar circle, async image overlay, and online/offline status dot
+        // (no bio here — outboundFriendRequestSchema doesn't carry one, only
+        // a username + avatar, both filled in once known via a
+        // profile-response/identity-update from the recipient)
         const displayName = outReq.toUsername || outReq.toNodeId.slice(0, 8);
-        const avatarColor = colorForName(displayName, pending.length + i);
         const avatarX = ROW_PADDING_X + ROW_AVATAR_SIZE / 2;
         const avatarY = REQUEST_ROW_HEIGHT / 2;
 
-        const avatar = new Graphics();
-        avatar.eventMode = "none";
-        avatar.circle(avatarX, avatarY, ROW_AVATAR_SIZE / 2);
-        avatar.fill({ color: avatarColor });
-        row.addChild(avatar);
-
-        const initial = (outReq.toUsername || "?").charAt(0).toUpperCase();
-        const avatarLetter = new Text({
-          text: initial,
-          style: {
-            fontFamily: FONT,
-            fontSize: 9,
-            fontWeight: "bold",
-            fill: 0xffffff,
-            align: "center",
-          },
-          resolution: RESOLUTION,
+        renderAvatar({
+          parent: row,
+          cacheKey: `outbound-request-avatar-${outReq.toNodeId}`,
+          centerX: avatarX,
+          centerY: avatarY,
+          size: ROW_AVATAR_SIZE,
+          displayName,
+          avatarUrl: outReq.toAvatarDataUrl || undefined,
+          colorSeed: pending.length + i,
+          online: bridgeIsOnline(outReq.toNodeId),
         });
-        avatarLetter.eventMode = "none";
-        avatarLetter.anchor.set(0.5);
-        avatarLetter.x = avatarX;
-        avatarLetter.y = avatarY;
-        row.addChild(avatarLetter);
 
         // name + "pending..." status
         const textX = ROW_PADDING_X + ROW_AVATAR_SIZE + ROW_PADDING_X;

@@ -92,17 +92,69 @@ export class CanvasStore {
    * that, backed by the library's own internal timeout, not a
    * hand-rolled setTimeout/poll loop here.
    */
-  static async open(repo: Repo, docId: DocumentId): Promise<CanvasStore> {
-    const handle = await repo.find<CanvasDocument>(docId, {
-      allowableStates: ["ready", "unavailable"],
-    });
-    if (!handle.isReady()) {
-      // throws (via the library's own internal timeout) if the doc
-      // genuinely never arrives — that's a real failure the caller should
-      // handle, not swallow.
-      await handle.whenReady(["ready"]);
+  /**
+   * `opts.timeoutMs`, when given, bounds the wait with an `AbortSignal`
+   * instead of automerge-repo's own internal ~60-120s default — used for a
+   * cold open with no known peer to dial at all (a bare canvas-id URL with
+   * no prior session), where waiting out the library's full default is
+   * pointless: the doc either resolves fast (already local, or a peer
+   * responds quickly) or it never will from this entry point. left
+   * unspecified for ordinary in-app navigation, where a real, slower sync
+   * over the network shouldn't get cut off early.
+   *
+   * `opts.signal`, when given, lets a caller cancel the wait on demand —
+   * e.g. a user clicking a "cancel" button on a loading screen while this
+   * is still in flight. combined with `opts.timeoutMs`'s own internal
+   * controller (whichever fires first wins), rather than replacing it.
+   */
+  static async open(
+    repo: Repo,
+    docId: DocumentId,
+    opts?: { timeoutMs?: number; signal?: AbortSignal }
+  ): Promise<CanvasStore> {
+    let signal: AbortSignal | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onExternalAbort: (() => void) | undefined;
+    if (opts?.timeoutMs !== undefined || opts?.signal) {
+      const controller = new AbortController();
+      if (opts?.timeoutMs !== undefined) {
+        timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+      }
+      if (opts?.signal) {
+        if (opts.signal.aborted) {
+          controller.abort();
+        } else {
+          onExternalAbort = () => controller.abort();
+          opts.signal.addEventListener("abort", onExternalAbort);
+        }
+      }
+      signal = controller.signal;
     }
-    return new CanvasStore(repo, handle);
+    try {
+      const handle = await repo.find<CanvasDocument>(docId, {
+        allowableStates: ["ready", "unavailable"],
+        signal,
+      });
+      if (!handle.isReady()) {
+        // throws (via `signal`'s abort if `opts.timeoutMs`/`opts.signal` was
+        // given, else the library's own internal timeout) if the doc
+        // genuinely never arrives — that's a real failure the caller
+        // should handle, not swallow. `signal` must be threaded through
+        // here too, not just into `repo.find()` above: a doc that resolves
+        // to "unavailable" quickly (an allowable state above, so
+        // `repo.find()` itself doesn't wait out its own timeout for it)
+        // still needs to become "ready" from here, and without `signal`
+        // this second wait would silently fall back to automerge-repo's
+        // own internal ~60-120s default regardless of `opts.timeoutMs` —
+        // exactly the case a newly-shared canvas hits on the requester's
+        // first open (see this method's doc comment above).
+        await handle.whenReady(["ready"], { signal });
+      }
+      return new CanvasStore(repo, handle);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (opts?.signal && onExternalAbort) opts.signal.removeEventListener("abort", onExternalAbort);
+    }
   }
 
   /** get the current document state. */
@@ -541,6 +593,49 @@ export class CanvasStore {
     this.handle.change((doc) => {
       delete doc.widgets[id];
       this.touchModified(doc);
+    });
+  }
+
+  /**
+   * merge a partial props patch into an existing widget. no-op if the
+   * widget doesn't exist.
+   *
+   * a mounted widget's *live* state lives in its own per-widget automerge
+   * document (`entry.docId`, see `WidgetManager.mountWidget()`) — the
+   * `entry.props` seeded here on this canvas doc are only ever read once,
+   * to seed that per-widget doc's *initial* content the first time it's
+   * created (`entry.docId` still unset). so once a widget has been
+   * mounted at least once (the overwhelmingly common case), patching
+   * `entry.props` alone is a silent no-op as far as anything the user
+   * actually sees is concerned — this method writes to whichever one is
+   * actually live: the per-widget doc if `entry.docId` is already set,
+   * or `entry.props` (so it seeds correctly on first mount) otherwise.
+   */
+  async updateWidgetProps(id: string, patch: Record<string, unknown>): Promise<void> {
+    const entry = this.getWidget(id);
+    if (!entry) return;
+
+    if (entry.docId) {
+      try {
+        const widgetHandle = await this.repo.find<Record<string, unknown>>(
+          entry.docId as DocumentId
+        );
+        await widgetHandle.whenReady();
+        widgetHandle.change((draft) => {
+          Object.assign(draft, patch);
+        });
+      } catch {
+        // best-effort — the per-widget doc may not be reachable right now
+      }
+      return;
+    }
+
+    this.handle.change((doc) => {
+      const widget = doc.widgets[id];
+      if (widget) {
+        Object.assign(widget.props as Record<string, unknown>, patch);
+        this.touchModified(doc);
+      }
     });
   }
 

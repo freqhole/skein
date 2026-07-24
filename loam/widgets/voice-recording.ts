@@ -26,14 +26,17 @@
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { z } from "zod";
 import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
-import { getBlobData, storeBlobFromFile } from "../src/storage/blob-store";
+import { storeBlobFromFile } from "../src/storage/blob-store";
 import { base64Encode } from "@freqhole/reliquary/worker";
 import {
   checkBlobLocality,
   getLocalNodeId,
   snatchBlob,
+  BlobAccessDeniedError,
   type PeersMap,
 } from "../src/widgets/file-utils";
+import { getLocalAccentColor, sendFriendRequest } from "../src/p2p/friendz-bridge";
+import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import {
   isTransparent,
   type CompactInfo,
@@ -45,6 +48,7 @@ import {
 } from "../src/widgets/widget-types";
 import {
   addSnatcher,
+  getAudioBlobData,
   resolveAudioBytes,
   type AudioBlobRef,
   type ResolvedAudioBytes,
@@ -144,13 +148,23 @@ function mimeToExt(mime: string): string {
   return "webm";
 }
 
-/** pick a random vivid lip color on init — mirrors doodle.ts's randomDoodleColor approach */
+/** pick a random vivid lip color — fallback for when the user's social
+ *  identity profile accent color isn't available yet (see
+ *  `defaultLipColor()`). mirrors doodle.ts's randomDoodleColor approach. */
 function randomLipColor(): number {
   const palette = [
     0xc2455a, 0xdb2777, 0xe11d48, 0xf43f5e, 0xec4899, 0xd946ef, 0xef4444, 0xf97316, 0xfb7185,
     0xbe185d, 0x9d174d, 0xa21caf, 0xc026d3, 0xe879f9, 0xfb923c,
   ];
   return palette[Math.floor(Math.random() * palette.length)];
+}
+
+/** default a new widget's lip color to the user's own social identity
+ *  profile accent color (profile-tab.ts's palette picker) — falls back to
+ *  a random vivid color only if the social doc isn't registered yet (e.g.
+ *  no identity set up). */
+function defaultLipColor(): number {
+  return getLocalAccentColor() ?? randomLipColor();
 }
 
 /** pick a random lip thickness (1..10) on init */
@@ -170,7 +184,9 @@ type RecordState =
   | "ready"
   | "fetching"
   | "playing"
-  | "error";
+  | "error"
+  | "needs-friend" // only non-friend peers have the blob; tap to send a friend request
+  | "friend-requested"; // friend request sent; waiting to retry the fetch
 
 export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = {
   type: "voice-recording",
@@ -184,10 +200,10 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
   },
   schema: voiceRecordingSchema,
   editableProps: [
-    { key: "lipsColor", label: "lips color", type: "color" as const, default: 0xc2455a },
     { key: "bgColor", label: "background", type: "color" as const, default: -1 },
     { key: "borderColor", label: "border", type: "color" as const, default: -1 },
     { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
+    { key: "lipsColor", label: "lips color", type: "color" as const, default: 0xc2455a },
   ],
 
   getCompactInfo: (state: VoiceRecordingState): CompactInfo => ({
@@ -227,6 +243,13 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     let playbackUrl: string | null = null;
     let fetchProgressText = "downloading…";
     let fetchErrorMessage = "";
+    /** the peer known to have the blob but not (yet) a friend — see the
+     *  "needs-friend"/"friend-requested" states below. */
+    let deniedPeerNodeId: string | null = null;
+    /** unregisters the pending-retry-on-friend-accept hook (see
+     *  requestFriendAndRetry()); called on destroy() so it never fires
+     *  against a torn-down widget. */
+    let unregisterPendingRetry: (() => void) | null = null;
 
     // -- animation frame IDs --
     let mouthRafId: number | null = null;
@@ -264,11 +287,12 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
 
     void enumerateDevices();
 
-    // randomize lip color/thickness once, the first time this widget is ever
-    // mounted — subsequent mounts (reload, reconnect) keep whatever was seeded.
+    // seed lip color/thickness once, the first time this widget is ever
+    // mounted — subsequent mounts (reload, reconnect) keep whatever was
+    // seeded. lip color defaults to the user's own profile accent color.
     if (!ctx.doc.current.lipsSeeded) {
       ctx.doc.change((d) => {
-        d.lipsColor = randomLipColor();
+        d.lipsColor = defaultLipColor();
         d.lipThickness = randomLipThickness();
         d.lipsSeeded = true;
       });
@@ -436,6 +460,16 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         case "error":
           statusText.text = "mic access denied\ntap to try again";
           statusText.style.fill = COLOR_ERROR;
+          statusText.visible = true;
+          break;
+        case "needs-friend":
+          statusText.text = "only a non-friend peer has this recording\ntap to send a friend request";
+          statusText.style.fill = COLOR_ERROR;
+          statusText.visible = true;
+          break;
+        case "friend-requested":
+          statusText.text = "friend request sent\nwill retry automatically once accepted";
+          statusText.style.fill = COLOR_STATUS;
           statusText.visible = true;
           break;
         default:
@@ -691,7 +725,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         resolved = await resolveAudioBytes(
           { blobId, filename, mime, size, blake3 } as AudioBlobRef,
           peers,
-          { getBlobData, checkBlobLocality, snatchBlob, getLocalNodeId },
+          { getBlobData: getAudioBlobData, checkBlobLocality, snatchBlob, getLocalNodeId },
           (fraction) => {
             fetchProgressText =
               fraction >= 0 ? `downloading… ${Math.round(fraction * 100)}%` : "downloading…";
@@ -700,6 +734,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           ctx.canvasStore ? (nodeId: string) => ctx.canvasStore!.isPeerOnline(nodeId) : undefined
         );
       } catch (err) {
+        if (err instanceof BlobAccessDeniedError) throw err;
         console.error("[voice-widget] resolveAudioBytes failed:", err);
         return null;
       }
@@ -762,7 +797,21 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         ctx.setHeaderActions?.(makeHeaderActions());
       }
 
-      const url = await getPlaybackUrl();
+      let url: string | null;
+      try {
+        url = await getPlaybackUrl();
+      } catch (err) {
+        if (destroyed) return;
+        if (err instanceof BlobAccessDeniedError) {
+          deniedPeerNodeId = err.peerNodeId;
+          recState = "needs-friend";
+          refresh();
+          ctx.setHeaderActions?.(makeHeaderActions());
+          return;
+        }
+        console.error("[voice-widget] getPlaybackUrl failed:", err);
+        url = null;
+      }
       if (destroyed) return;
       if (!url) {
         recState = "ready";
@@ -819,6 +868,34 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       ctx.setHeaderActions?.(makeHeaderActions());
     };
 
+    /** send a friend request to the peer holding this recording, then
+     *  automatically retry playback once the request is accepted (see
+     *  pending-blob-access.ts). session-only — if the widget is destroyed
+     *  before the request is accepted, the retry is simply dropped. */
+    const requestFriendAndRetry = async (): Promise<void> => {
+      const peerNodeId = deniedPeerNodeId;
+      if (!peerNodeId) return;
+
+      unregisterPendingRetry?.();
+      try {
+        await sendFriendRequest(peerNodeId);
+      } catch (err) {
+        console.error("[voice-widget] sendFriendRequest failed:", err);
+        return;
+      }
+      if (destroyed) return;
+
+      recState = "friend-requested";
+      refresh();
+      ctx.setHeaderActions?.(makeHeaderActions());
+
+      unregisterPendingRetry = registerPendingBlobRetry(peerNodeId, () => {
+        unregisterPendingRetry = null;
+        if (destroyed) return;
+        void startPlayback();
+      });
+    };
+
     const deleteRecording = (): void => {
       if (recState === "playing") {
         audioEl?.pause();
@@ -857,6 +934,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       if (ctx.canvasStore?.isLocalViewer()) return;
       if (recState === "ready") void startPlayback();
       else if (recState === "playing") pausePlayback();
+      else if (recState === "needs-friend") void requestFriendAndRetry();
     });
 
     btnGfx.on("pointerup", () => {
@@ -912,6 +990,18 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         return;
       }
 
+      if ((recState === "needs-friend" || recState === "friend-requested") && !blobId) {
+        unregisterPendingRetry?.();
+        unregisterPendingRetry = null;
+        deniedPeerNodeId = null;
+        smoothOpenness = 0;
+        mouth.setOpenness(0);
+        recState = "idle";
+        refresh();
+        ctx.setHeaderActions?.(makeHeaderActions());
+        return;
+      }
+
       // bgColor / borderColor / borderWidth change
       drawBg();
     });
@@ -926,6 +1016,9 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       headerActions: makeHeaderActions(),
       widgetActions,
       editableProps: [
+        { key: "bgColor", label: "background", type: "color" as const, default: -1 },
+        { key: "borderColor", label: "border", type: "color" as const, default: -1 },
+        { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
         { key: "lipsColor", label: "lips color", type: "color" as const, default: 0xc2455a },
         {
           key: "lipThickness",
@@ -935,9 +1028,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           min: 1,
           max: 10,
         },
-        { key: "bgColor", label: "background", type: "color" as const, default: -1 },
-        { key: "borderColor", label: "border", type: "color" as const, default: -1 },
-        { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
         {
           key: "mouthMood",
           label: "mouth mood",
@@ -972,6 +1062,8 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         destroyed = true;
         stopRecordingAnim();
         stopPlayAnim();
+        unregisterPendingRetry?.();
+        unregisterPendingRetry = null;
         mediaRecorder?.stop();
         mediaStream?.getTracks().forEach((t) => t.stop());
         void audioCtx?.close();

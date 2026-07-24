@@ -70,6 +70,21 @@ export interface InitCanvasOptions {
    * widgets).
    */
   restrictBlobToPeers?: (blake3Hash: string, peerNodeIds: string[]) => Promise<void>;
+  /**
+   * bounds `CanvasStore.open()`'s wait with a short `AbortSignal`-based
+   * timeout instead of automerge-repo's own internal ~60-120s default — see
+   * `CanvasStore.open()`'s doc comment for when this is appropriate (a cold
+   * open with no known peer to dial at all). omitted for ordinary in-app
+   * navigation.
+   */
+  openTimeoutMs?: number;
+  /**
+   * lets a caller cancel `CanvasStore.open()`'s wait on demand — e.g. a
+   * user clicking "cancel" on a loading screen shown while this is in
+   * flight. distinct from `openTimeoutMs`: both bound the same wait, but
+   * this one fires on user action rather than a fixed deadline.
+   */
+  openAbortSignal?: AbortSignal;
 }
 
 export interface SkeinCanvas {
@@ -148,7 +163,10 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
   // step 3: load or create canvas document
   let store: CanvasStore;
   if (canvasDocId) {
-    store = await CanvasStore.open(repo, canvasDocId as DocumentId);
+    store = await CanvasStore.open(repo, canvasDocId as DocumentId, {
+      timeoutMs: options.openTimeoutMs,
+      signal: options.openAbortSignal,
+    });
   } else {
     store = CanvasStore.create(repo);
   }

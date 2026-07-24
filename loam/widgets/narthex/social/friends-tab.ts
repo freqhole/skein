@@ -24,6 +24,7 @@ import {
   PROFILE_CANVAS_BIN_HEIGHT,
   type ProfileCanvasBinController,
 } from "./canvas-bin";
+import { renderAvatar } from "./avatar-renderer";
 import {
   ACCENT,
   BG,
@@ -41,7 +42,6 @@ import {
   MUTED_TEXT,
   OFFLINE_COLOR,
   ONLINE_COLOR,
-  ONLINE_DOT_BORDER,
   ONLINE_DOT_SIZE,
   OPTION_FONT_SIZE,
   OPTION_PILL_GAP,
@@ -791,79 +791,25 @@ export function createFriendsTab(ctx: TabContext): TabController {
           groupLine.fill({ color: groupLineColor });
           rowContainer.addChild(groupLine);
         }
-        // avatar circle with initial letter
+        // avatar circle with initial letter, async image overlay, and
+        // online/offline status dot (see avatar-renderer.ts)
         const displayName = friendDisplayName(friend);
-        const avatarColor = colorForName(displayName, i);
         const avatarX = ROW_PADDING_X + ROW_AVATAR_SIZE / 2;
         const avatarY = effectiveRowHeight / 2;
-
         const avatarUrl = friend.nodeIds.find((n) => n.avatarDataUrl)?.avatarDataUrl;
-
-        const avatar = new Graphics();
-        avatar.eventMode = "none";
-        avatar.circle(avatarX, avatarY, ROW_AVATAR_SIZE / 2);
-        avatar.fill({ color: avatarColor });
-        rowContainer.addChild(avatar);
-
-        const initial = displayName.charAt(0).toUpperCase() || "?";
-        const avatarLetter = new Text({
-          text: initial,
-          style: {
-            fontFamily: FONT,
-            fontSize: 11,
-            fontWeight: "bold",
-            fill: 0xffffff,
-            align: "center",
-          },
-          resolution: RESOLUTION,
-        });
-        avatarLetter.eventMode = "none";
-        avatarLetter.anchor.set(0.5);
-        avatarLetter.x = avatarX;
-        avatarLetter.y = avatarY;
-        rowContainer.addChild(avatarLetter);
-
-        // async avatar image overlay
-        if (avatarUrl) {
-          const cacheKey = `friend-avatar-${friend.id}`;
-          Assets.load({ src: avatarUrl, alias: cacheKey })
-            .then((texture) => {
-              if (rowContainer.destroyed) return;
-              const avatarSprite = new Sprite(texture);
-              avatarSprite.eventMode = "none";
-              avatarSprite.width = ROW_AVATAR_SIZE;
-              avatarSprite.height = ROW_AVATAR_SIZE;
-              avatarSprite.x = avatarX - ROW_AVATAR_SIZE / 2;
-              avatarSprite.y = avatarY - ROW_AVATAR_SIZE / 2;
-
-              const spriteMask = new Graphics();
-              spriteMask.circle(avatarX, avatarY, ROW_AVATAR_SIZE / 2);
-              spriteMask.fill({ color: 0xffffff });
-              rowContainer.addChild(spriteMask);
-              avatarSprite.mask = spriteMask;
-              rowContainer.addChild(avatarSprite);
-
-              avatar.visible = false;
-              avatarLetter.visible = false;
-            })
-            .catch(() => {});
-        }
-
-        // online/offline dot — overlaid on avatar bottom-right with border ring
         const isAnyNodeOnline = friend.nodeIds.some((n) => bridgeIsOnline(n.nodeId));
-        const dotColor = isAnyNodeOnline ? ONLINE_COLOR : OFFLINE_COLOR;
-        const dotCx = avatarX + ROW_AVATAR_SIZE / 2 - ONLINE_DOT_SIZE / 2 + 1;
-        const dotCy = avatarY + ROW_AVATAR_SIZE / 2 - ONLINE_DOT_SIZE / 2 + 1;
 
-        const onlineDot = new Graphics();
-        onlineDot.eventMode = "none";
-        // border ring (matches parent background)
-        onlineDot.circle(dotCx, dotCy, ONLINE_DOT_SIZE / 2 + ONLINE_DOT_BORDER);
-        onlineDot.fill({ color: BG });
-        // inner dot
-        onlineDot.circle(dotCx, dotCy, ONLINE_DOT_SIZE / 2);
-        onlineDot.fill({ color: dotColor });
-        rowContainer.addChild(onlineDot);
+        renderAvatar({
+          parent: rowContainer,
+          cacheKey: `friend-avatar-${friend.id}`,
+          centerX: avatarX,
+          centerY: avatarY,
+          size: ROW_AVATAR_SIZE,
+          displayName,
+          colorSeed: i,
+          avatarUrl,
+          online: isAnyNodeOnline,
+        });
 
         // name text — shifted up if bio present
         const textX = ROW_PADDING_X + ROW_AVATAR_SIZE + ROW_PADDING_X;
