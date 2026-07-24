@@ -544,6 +544,22 @@ export class CanvasStore {
     });
   }
 
+  /**
+   * merge a partial props patch into an existing widget. no-op if the
+   * widget doesn't exist. used to refresh a widget's display fields (e.g.
+   * a remote canvas-card's title/role/preview) after they've changed
+   * upstream, without touching position/size/other unrelated fields.
+   */
+  updateWidgetProps(id: string, patch: Record<string, unknown>): void {
+    this.handle.change((doc) => {
+      const widget = doc.widgets[id];
+      if (widget) {
+        Object.assign(widget.props as Record<string, unknown>, patch);
+        this.touchModified(doc);
+      }
+    });
+  }
+
   /** move a widget to a new position. */
   moveWidget(id: string, x: number, y: number): void {
     this.handle.change((doc) => {

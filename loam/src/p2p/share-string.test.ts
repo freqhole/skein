@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { decodeShareString, encodeShareString, shareFragment } from "./share-string";
+import { describe, expect, it, vi } from "vitest";
+import { buildShareUrl, decodeShareString, encodeShareString, shareFragment } from "./share-string";
 
 describe("encodeShareString", () => {
   it("produces a base64 string", () => {
@@ -66,6 +66,22 @@ describe("decodeShareString", () => {
     const result = decodeShareString(`  ${payload}  `);
     expect(result).toEqual({ nodeId: "e".repeat(64), docId: "doc-ws" });
   });
+
+  it("accepts a full share URL with scheme + host", () => {
+    const payload = btoa(JSON.stringify({ n: "g".repeat(64), d: "doc-url" }));
+    const result = decodeShareString(`https://skein.freqhole.net/#share/${payload}`);
+    expect(result).toEqual({ nodeId: "g".repeat(64), docId: "doc-url" });
+  });
+
+  it("accepts a full share URL from a local dev server", () => {
+    const payload = btoa(JSON.stringify({ n: "h".repeat(64), d: "doc-dev" }));
+    const result = decodeShareString(`http://localhost:5173/#share/${payload}`);
+    expect(result).toEqual({ nodeId: "h".repeat(64), docId: "doc-dev" });
+  });
+
+  it("returns null for a bare canvas doc id URL (not a share link)", () => {
+    expect(decodeShareString("https://skein.freqhole.net/#3rK6y8mZRiTPWeCzy6khb18pcnn7")).toBeNull();
+  });
 });
 
 describe("shareFragment", () => {
@@ -78,5 +94,26 @@ describe("shareFragment", () => {
     const frag = shareFragment("f".repeat(64), "doc-frag");
     const decoded = decodeShareString(frag);
     expect(decoded).toEqual({ nodeId: "f".repeat(64), docId: "doc-frag" });
+  });
+});
+
+describe("buildShareUrl", () => {
+  it("uses the real browser origin + pathname outside tauri mode", () => {
+    vi.stubGlobal("window", {
+      location: { origin: "http://localhost:5173", pathname: "/" },
+    });
+    const url = buildShareUrl("i".repeat(64), "doc-browser");
+    expect(url.startsWith("http://localhost:5173/#share/")).toBe(true);
+    vi.unstubAllGlobals();
+  });
+
+  it("uses the production origin in tauri mode instead of tauri://localhost", () => {
+    vi.stubGlobal("window", {
+      location: { origin: "tauri://localhost", pathname: "/" },
+      __TAURI_INTERNALS__: { invoke: () => Promise.resolve() },
+    });
+    const url = buildShareUrl("j".repeat(64), "doc-tauri");
+    expect(url.startsWith("https://skein.freqhole.net/#share/")).toBe(true);
+    vi.unstubAllGlobals();
   });
 });

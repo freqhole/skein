@@ -41,7 +41,7 @@ import { IrohNetworkAdapter, restrictBlobToPeers, type MiddenStreamNode } from "
 import { createAclFilteringAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
 import type { RoleResolver } from "../p2p/acl-filtering-network-adapter";
 import { createCanvasScopedSharePolicy } from "../p2p/canvas-scoped-share-policy";
-import { decodeShareString, encodeShareString } from "../p2p/share-string";
+import { buildShareUrl, decodeShareString, encodeShareString } from "../p2p/share-string";
 import { resolveFriendDisplay, SqliteSocialDoc } from "../p2p/sqlite-social-doc";
 import { dispatch, isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
@@ -993,8 +993,7 @@ class SkeinRouter {
             log.debug(TAG, "no identity — generate one first (profile widget)");
             return;
           }
-          const shareStr = encodeShareString(identity.node_id, docId);
-          const shareUrl = window.location.origin + window.location.pathname + "#share/" + shareStr;
+          const shareUrl = buildShareUrl(identity.node_id, docId);
 
           // recomputes the full options object fresh from current doc state
           // each time it's called — see the onChange subscriptions below
@@ -1636,11 +1635,7 @@ class SkeinRouter {
         } catch {
           log.debug(TAG, "share string (copy manually):", shareStr);
         }
-        log.debug(
-          TAG,
-          "share URL:",
-          window.location.origin + window.location.pathname + "#share/" + shareStr
-        );
+        log.debug(TAG, "share URL:", buildShareUrl(identity.node_id, docId));
       };
 
       log.debug(
@@ -1725,8 +1720,21 @@ class SkeinRouter {
     // offline. without this fallback, a hub-relayed invite's accept could
     // never be recorded anywhere: the direct dial to a still-offline
     // inviter fails, and there was no other way to reach the doc.
+    //
+    // force a genuine disconnect + reconnect rather than a bare addPeer():
+    // this accept can follow an earlier, denied join attempt against the
+    // same peer whose underlying connection never actually dropped (a
+    // sync-level access denial isn't a transport-level disconnect) — a
+    // bare addPeer() against an already-open stream is a no-op (see
+    // IrohNetworkAdapter.addPeer's `streams.has` guard) and never gives
+    // automerge-repo's synchronizer a fresh peer event, so it never
+    // re-evaluates whether this doc can now be shared. forgetPeer() always
+    // emits peer-disconnected (even with no live stream), guaranteeing the
+    // repo's synchronizer clears its stale per-peer bookkeeping for this
+    // doc and re-requests it from scratch on the reconnect.
     let connected = false;
     try {
+      this.irohAdapter.forgetPeer(detail.fromNodeId);
       await this.irohAdapter.addPeer(detail.fromNodeId);
       connected = true;
     } catch (err) {
@@ -1735,6 +1743,7 @@ class SkeinRouter {
     }
     if (!connected && detail.relayedBy && detail.relayedBy !== detail.fromNodeId) {
       try {
+        this.irohAdapter.forgetPeer(detail.relayedBy);
         await this.irohAdapter.addPeer(detail.relayedBy);
         connected = true;
       } catch (err) {
@@ -1796,7 +1805,34 @@ class SkeinRouter {
         return (w.props as Record<string, unknown>)?.canvasDocId === detail.canvasDocId;
       });
 
-      if (!alreadyExists) {
+      if (alreadyExists) {
+        // a canvas-card for this doc already exists — most commonly a
+        // "syncing..." placeholder left behind by joinCanvasFromNarthex()
+        // after an earlier, denied join attempt. refresh its display
+        // fields to reflect this (now-permitted) invite instead of leaving
+        // stale placeholder props forever: the card's local props never
+        // updated on their own since the earlier join never actually
+        // finished, and the user has no other visible sign the invite did
+        // anything.
+        const existingCard = existing.find((w) => {
+          if (w.type !== "canvas-card") return false;
+          return (w.props as Record<string, unknown>)?.canvasDocId === detail.canvasDocId;
+        });
+        if (existingCard) {
+          narthexStore.updateWidgetProps(existingCard.id, {
+            title: detail.canvasTitle || "shared canvas",
+            description: detail.canvasDescription || "",
+            color: detail.canvasColor || 0x06b6d4,
+            previewUrl: detail.canvasPreviewUrl || "",
+            modifiedAt: new Date().toISOString(),
+            isRemote: true,
+            ownerNodeId: detail.fromNodeId,
+            ownerUsername: detail.fromUsername || "",
+            role: detail.role ?? "member",
+            accessRevoked: false,
+          });
+        }
+      } else {
         // add a remote canvas-card widget to the narthex — placed in the
         // first empty spot found (layout-placement.ts's findEmptySpot()),
         // not a naive count-based stagger that ignores actual occupied
