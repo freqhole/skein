@@ -154,10 +154,16 @@ impl HubPeerService {
                 }
             }
             CoreMessage::FriendRequest { from_username, .. } => {
-                // policy: auto-accept only if the peer was pre-approved by the
-                // operator (status = Allowed) or already accepted. unknown peers
-                // are recorded as Pending so the operator can promote them later
-                // (e.g. via `reliquary friend allow <node-id>`).
+                // policy: auto-accept if the peer was pre-approved by the
+                // operator (status = Allowed), already accepted, OR is
+                // "canvas-vouched" — already named in the acl/pendingInvites
+                // of a canvas doc the hub holds (see
+                // `is_vouched_by_any_canvas`'s doc comment: this is what
+                // lets a brand-new invitee discover the hub via a canvas
+                // share link and get auto-accepted, without the canvas
+                // owner needing to be online). anyone else is recorded as
+                // Pending so the operator can promote them later (e.g. via
+                // `reliquary friend allow <node-id>`).
                 tracing::info!(
                     peer = %from_node_id,
                     username = %from_username,
@@ -181,10 +187,18 @@ impl HubPeerService {
 
                 use crate::friendz::FriendStatus;
                 let existing = self.friendz_store.get(from_node_id).await.ok().flatten();
-                let auto_accept = matches!(
+                let pre_approved = matches!(
                     existing.as_ref().map(|f| f.status),
                     Some(FriendStatus::Allowed) | Some(FriendStatus::Accepted)
                 );
+                let vouched = !pre_approved && self.is_vouched_by_any_canvas(from_node_id).await;
+                let auto_accept = pre_approved || vouched;
+                if vouched {
+                    tracing::info!(
+                        peer = %from_node_id,
+                        "auto-accepting friend request: canvas-vouched (named in a canvas doc's acl/pendingInvites the hub holds)"
+                    );
+                }
 
                 if !auto_accept {
                     // record as pending and stop here — operator must promote
@@ -245,6 +259,9 @@ impl HubPeerService {
                     v: 1,
                     from_node_id: self.node_id_str.clone(),
                     from_username: hub_username.clone(),
+                    bio: Some(hub_bio.clone()),
+                    avatar_data_url: Some(hub_avatar_data_url.clone()),
+                    accent_color: Some(hub_accent_color),
                     // this router is a hub's friendz handler — always flag
                     // ourselves as a hub node (see docs/hub-and-profile-plan.md
                     // section 3.2; the tauri-desktop-peer router in service.rs
@@ -426,6 +443,21 @@ impl HubPeerService {
                     changed_by_username = %changed_by_username,
                     "received ACL change notification"
                 );
+
+                // gossip/relay machinery only ever trusts friends (see
+                // `handle_gossip_digest`'s doc comment) — an ACL change is
+                // no different: a non-friend could otherwise fabricate a
+                // revocation of the hub's own access to make it silently
+                // stop tracking (and gossiping about) a canvas it's
+                // legitimately part of.
+                if !self.is_friend(from_node_id).await {
+                    tracing::info!(
+                        peer = %from_node_id,
+                        resource_id = %resource_id,
+                        "ignoring ACL change from a non-friend"
+                    );
+                    return;
+                }
 
                 // if the hub was removed from this canvas, stop tracking it.
                 // an absent `new_role` means revoked (haruspex's `AclChange`

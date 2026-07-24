@@ -2,6 +2,13 @@ import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
 import { canvasRoleSchema } from "../../src/canvas/canvas-doc";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
+import {
+  getFriendInfo,
+  hasKnockAckForCanvas,
+  isOnline,
+  onFriendsChange,
+  onKnockAcked,
+} from "../../src/p2p/friendz-bridge";
 import { formatRelativeTime, formatShortDate } from "../../src/widgets/format";
 import {
   isTransparent,
@@ -12,6 +19,7 @@ import {
   type WidgetMountContext,
 } from "../../src/widgets/widget-types";
 import { trashCanvasCard } from "./trash-widget";
+import { renderAvatar } from "./social/avatar-renderer";
 
 export const canvasCardSchema = z.object({
   canvasDocId: z.string().default(""),
@@ -25,6 +33,7 @@ export const canvasCardSchema = z.object({
   isRemote: z.boolean().default(false),
   ownerNodeId: z.string().default(""),
   ownerUsername: z.string().default(""),
+  ownerAvatarDataUrl: z.string().default(""),
   role: canvasRoleSchema.default("admin"),
   accessRevoked: z.boolean().default(false),
   /** true while a remote card has never successfully synced (e.g. a
@@ -34,6 +43,30 @@ export const canvasCardSchema = z.object({
    *  first. cleared once the canvas actually opens or a real invite is
    *  accepted for it. */
   accessPending: z.boolean().default(false),
+  /** ISO timestamp set the moment the "request access" pill is clicked —
+   *  keeps the pill from being clicked again while a knock is already in
+   *  flight (delivery is retried automatically by the app whenever the
+   *  owner or a fallback hub comes online, so a second click is never
+   *  needed). cleared once access is actually granted. */
+  accessRequestedAt: z.string().default(""),
+  /** true once a `canvas-knock-decline` arrives for this canvas — cleared
+   *  by `friendz-wiring.ts`'s `onCanvasKnockDecline` alongside
+   *  `accessRequestedAt` (reset to ""), and cleared again locally the next
+   *  time the pill is clicked to retry. lets the pill distinguish "the
+   *  owner said no" from "still waiting to hear back". */
+  accessDeclined: z.boolean().default(false),
+  /** node ids of hubs the sharer's canvas has been explicitly shared
+   *  with, carried over from the share link (see share-string.ts's
+   *  `hubNodeIds`) — when non-empty on a not-yet-accessible remote card,
+   *  offers a "connect via hub" pill alongside "request access" so the
+   *  invitee can befriend a reachable hub instead of waiting for the
+   *  owner to come back online. */
+  hubNodeIds: z.array(z.string()).default([]),
+  /** ISO timestamp set the moment the "connect via hub" pill is clicked —
+   *  mirrors `accessRequestedAt`'s debounce role for the hub-connect
+   *  action; cleared if the card is ever reset back to a fresh
+   *  access-pending state. */
+  hubConnectRequestedAt: z.string().default(""),
   lastVisitedAt: z.string().default(""),
   hasUpdates: z.boolean().default(false),
   lastKnownModifiedAt: z.string().default(""),
@@ -335,6 +368,14 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
     authorNameText.eventMode = "none";
     container.addChild(authorNameText);
 
+    // small avatar shown next to the owner's name on remote cards — a
+    // persistent container so drawAuthorBadge can clear and redraw it on
+    // every layout() without leaking children (see renderAvatar's doc
+    // comment: it always appends fresh children to whatever parent it's
+    // given).
+    const authorAvatarContainer = new Container();
+    container.addChild(authorAvatarContainer);
+
     // --- remote: corner badge ---
 
     const remoteBadge = new Text({
@@ -460,6 +501,29 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       resolution: 3,
     });
     requestAccessContainer.addChild(requestAccessText);
+
+    // --- connect-via-hub pill (remote cards with a share-link hub id) ---
+    const connectHubContainer = new Container();
+    connectHubContainer.visible = false;
+    connectHubContainer.zIndex = 50;
+    connectHubContainer.eventMode = "static";
+    connectHubContainer.cursor = "pointer";
+    container.addChild(connectHubContainer);
+
+    const connectHubBg = new Graphics();
+    connectHubContainer.addChild(connectHubBg);
+
+    const connectHubText = new Text({
+      text: "connect via hub",
+      style: {
+        fontFamily: "system-ui, sans-serif",
+        fontSize: DATE_FONT_SIZE,
+        fontWeight: "600",
+        fill: 0x38bdf8,
+      },
+      resolution: 3,
+    });
+    connectHubContainer.addChild(connectHubText);
 
     // --- syncing indicator for newly accepted remote cards ---
     const syncingContainer = new Container();
@@ -638,29 +702,67 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
     };
 
     const drawAuthorBadge = (w: number, h: number, state: CanvasCardState) => {
-      // for remote cards, show owner info instead of local author
+      // for remote cards, prefer live friend data over the card's own
+      // props — ownerUsername/ownerAvatarDataUrl are only ever stamped
+      // once, at card-creation time (from whatever the inviter/share link
+      // knew then), and go stale the moment the friend's profile changes
+      // (or was learned only after this card already existed). the local
+      // social doc is the current source of truth for a known friend, so
+      // look it up fresh on every render instead, same as isOnline() below.
+      const friendInfo = state.isRemote ? getFriendInfo(state.ownerNodeId) : null;
       const displayName = state.isRemote
-        ? state.ownerUsername.trim() || state.ownerNodeId.slice(0, 8)
+        ? (friendInfo?.username || state.ownerUsername).trim() || state.ownerNodeId.slice(0, 8)
         : state.authorName.trim();
+
+      // clear any avatar drawn on a previous layout() pass — renderAvatar
+      // always appends fresh children, so the container must be emptied
+      // first rather than redrawn in place.
+      while (authorAvatarContainer.children.length > 0) {
+        authorAvatarContainer.removeChildAt(0).destroy({ children: true });
+      }
 
       if (displayName.length === 0) {
         authorNameText.visible = false;
+        authorAvatarContainer.visible = false;
         return;
       }
 
       authorNameText.visible = true;
 
       const footerY = h - FOOTER_HEIGHT;
+      const AVATAR_SIZE = 14;
+      // avatar only for remote cards — a local card's "author" is just the
+      // user themselves, nothing to show a picture of.
+      const showAvatar = state.isRemote;
+      authorAvatarContainer.visible = showAvatar;
+      const avatarReserved = showAvatar ? AVATAR_SIZE + 4 : 0;
+
       // leave room for the date/edited text sharing this same footer row
       // (dateText.text/x/y are already set earlier in layout(), before this
       // is called) — reuse its measured width rather than re-deriving it.
       const dateReserved = dateText.visible ? dateText.width + AUTHOR_NAME_GAP : 0;
-      const maxWidth = Math.max(20, w - PADDING_X * 2 - dateReserved);
+      const maxWidth = Math.max(20, w - PADDING_X * 2 - dateReserved - avatarReserved);
       const maxChars = estimateMaxChars(maxWidth, AUTHOR_NAME_FONT_SIZE);
 
       authorNameText.text = truncate(displayName, maxChars);
       authorNameText.x = w - PADDING_X;
       authorNameText.y = footerY + FOOTER_HEIGHT / 2;
+
+      if (showAvatar) {
+        const avatarCenterX = authorNameText.x - authorNameText.width - avatarReserved / 2;
+        renderAvatar({
+          parent: authorAvatarContainer,
+          cacheKey: `canvas-card-owner-avatar-${state.ownerNodeId}`,
+          centerX: avatarCenterX,
+          centerY: footerY + FOOTER_HEIGHT / 2,
+          size: AVATAR_SIZE,
+          displayName,
+          colorSeed: 0,
+          avatarUrl: friendInfo?.avatarDataUrl || state.ownerAvatarDataUrl,
+          online: isOnline(state.ownerNodeId),
+          dotBorderColor: BG_COLOR,
+        });
+      }
     };
 
     const drawRemoteBadge = (w: number, remote: boolean) => {
@@ -826,10 +928,34 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       syncingText.y = pillY + padY;
     };
 
+    const REQUEST_SENT_COLOR = 0x888898;
+    const REQUEST_DECLINED_COLOR = 0xef4444;
+
     const drawRequestAccessPill = (w: number, _h: number, state: CanvasCardState) => {
       const show = state.isRemote && state.accessPending && !state.accessRevoked && !state.isDeleted;
       requestAccessContainer.visible = show;
       if (!show) return;
+
+      // once clicked, the pill stops being clickable — a knock is already
+      // in flight (or delivered) and the app retries delivery on its own
+      // whenever the owner or a fallback hub comes online, so a second
+      // click would only risk minting a duplicate knock rather than
+      // helping anything land faster. a decline reopens it for a retry.
+      const requested = !!state.accessRequestedAt;
+      const declined = !requested && state.accessDeclined;
+      const delivered = requested && hasKnockAckForCanvas(state.canvasDocId);
+      requestAccessContainer.eventMode = requested ? "none" : "static";
+      requestAccessContainer.cursor = requested ? "default" : "pointer";
+
+      const color = declined ? REQUEST_DECLINED_COLOR : requested ? REQUEST_SENT_COLOR : 0xf59e0b;
+      requestAccessText.text = declined
+        ? "access declined \u2022 tap to retry"
+        : delivered
+          ? "request sent \u2022 waiting for admin"
+          : requested
+            ? "request sent"
+            : "request access";
+      requestAccessText.style.fill = color;
 
       const tw = requestAccessText.width;
       const th = requestAccessText.height;
@@ -842,11 +968,54 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
 
       requestAccessBg.clear();
       requestAccessBg.roundRect(pillX, pillY, pillW, pillH, pillH / 2);
-      requestAccessBg.fill({ color: 0xf59e0b, alpha: 0.15 });
-      requestAccessBg.stroke({ color: 0xf59e0b, width: 1, alpha: 0.4 });
+      requestAccessBg.fill({ color, alpha: 0.15 });
+      requestAccessBg.stroke({ color, width: 1, alpha: 0.4 });
 
       requestAccessText.x = pillX + padX;
       requestAccessText.y = pillY + padY;
+    };
+
+    const HUB_SENT_COLOR = 0x888898;
+
+    const drawConnectHubPill = (w: number, _h: number, state: CanvasCardState) => {
+      const show =
+        state.isRemote &&
+        state.accessPending &&
+        !state.accessRevoked &&
+        !state.isDeleted &&
+        state.hubNodeIds.length > 0;
+      connectHubContainer.visible = show;
+      if (!show) return;
+
+      // once clicked, stops being clickable — the friend request +
+      // connect attempt is already in flight, and a second click would
+      // only risk sending a duplicate friend request.
+      const requested = !!state.hubConnectRequestedAt;
+      connectHubContainer.eventMode = requested ? "none" : "static";
+      connectHubContainer.cursor = requested ? "default" : "pointer";
+
+      const color = requested ? HUB_SENT_COLOR : 0x38bdf8;
+      connectHubText.text = requested ? "connecting via hub..." : "connect via hub";
+      connectHubText.style.fill = color;
+
+      const tw = connectHubText.width;
+      const th = connectHubText.height;
+      const padX = 6;
+      const padY = 2;
+      const pillW = tw + padX * 2;
+      const pillH = th + padY * 2;
+      const pillX = w - pillW - PADDING_X;
+      // stacked just below the request-access pill, same right edge —
+      // both can be visible at once (a stranger may want either path).
+      const pillY = ACCENT_HEIGHT + 6 + pillH + 4;
+
+      connectHubBg.clear();
+      connectHubBg.roundRect(pillX, pillY, pillW, pillH, pillH / 2);
+      connectHubBg.fill({ color, alpha: 0.15 });
+      connectHubBg.stroke({ color, width: 1, alpha: 0.4 });
+
+      connectHubText.x = pillX + padX;
+      connectHubText.y = pillY + padY;
     };
 
     // --- full layout ---
@@ -936,6 +1105,9 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       // request-access pill for remote cards that never successfully synced
       drawRequestAccessPill(w, h, state);
 
+      // connect-via-hub pill for remote cards whose share link carried hub node ids
+      drawConnectHubPill(w, h, state);
+
       // deleted overlay — renders above the update pill
       drawDeletedOverlay(w, h, state);
 
@@ -999,9 +1171,43 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       event.stopPropagation();
       const state = ctx.doc.current;
       if (!state.canvasDocId || !state.ownerNodeId) return;
+      // already requested — drawRequestAccessPill() disables the hit
+      // target for this case too, but guard here as well in case a tap
+      // event was already in flight when that ran.
+      if (state.accessRequestedAt) return;
+      ctx.doc.change((d: CanvasCardState) => {
+        d.accessRequestedAt = new Date().toISOString();
+        d.accessDeclined = false;
+      });
       window.dispatchEvent(
         new CustomEvent("skein:request-canvas-access", {
-          detail: { canvasDocId: state.canvasDocId, ownerNodeId: state.ownerNodeId },
+          detail: {
+            canvasDocId: state.canvasDocId,
+            ownerNodeId: state.ownerNodeId,
+          },
+        })
+      );
+    });
+
+    // --- connect-via-hub pill click ---
+    // a separate hit target, same rationale as the request-access pill
+    // above: stops propagation so tapping the pill connects to the hub
+    // instead of also navigating to a canvas known not to be reachable
+    // directly yet. this is the explicit, user-initiated action required
+    // before any friend request or connection attempt is made against a
+    // hub node id discovered from a share link — never automatic.
+    connectHubContainer.on("pointertap", (event) => {
+      event.stopPropagation();
+      const state = ctx.doc.current;
+      const hubNodeId = state.hubNodeIds[0];
+      if (!hubNodeId) return;
+      if (state.hubConnectRequestedAt) return;
+      ctx.doc.change((d: CanvasCardState) => {
+        d.hubConnectRequestedAt = new Date().toISOString();
+      });
+      window.dispatchEvent(
+        new CustomEvent("skein:connect-via-hub", {
+          detail: { hubNodeId },
         })
       );
     });
@@ -1059,6 +1265,24 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       layout(currentWidth, currentHeight);
     });
 
+    // a remote card's owner badge (drawAuthorBadge) reads live friend info
+    // (username/avatar) via getFriendInfo() at render time — re-run layout
+    // whenever the friends list changes (profile response arrives, avatar
+    // synced later, etc.) so an already-mounted card picks it up without
+    // needing a reload or an unrelated prop change to force a redraw.
+    const unsubFriends = onFriendsChange(() => {
+      if (ctx.doc.current.isRemote) layout(currentWidth, currentHeight);
+    });
+
+    // the request-access pill's "waiting for admin" text (drawRequestAccessPill)
+    // depends on hasKnockAckForCanvas(), a session-only signal — re-run
+    // layout whenever any knock is acked so a pill already showing
+    // "request sent" upgrades live the moment delivery is confirmed,
+    // without needing a reload.
+    const unsubKnockAcked = onKnockAcked(() => {
+      layout(currentWidth, currentHeight);
+    });
+
     return {
       container,
       destroy() {
@@ -1066,6 +1290,8 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
         unsub();
         unsubDocTitle();
         unsubStoreTitle?.();
+        unsubFriends();
+        unsubKnockAcked();
         if (previewSprite) {
           container.removeChild(previewSprite);
           previewSprite.mask = null;

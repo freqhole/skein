@@ -69,15 +69,15 @@ export default defineConfig({
   optimizeDeps: {
     exclude: ["@freqhole/midden"],
   },
-  // allow serving the @freqhole/midden package (../../midden/pkg) and the
-  // @freqhole/reliquary package (../../reliquary/ts) - both sibling repos of
-  // skein, two levels above loam, linked in via a file: dependency. without
+  // allow serving the @freqhole/midden package (../../tomb/lib/midden/pkg)
+  // and the @freqhole/reliquary package (../../tomb/lib/reliquary/ts) -
+  // both live under tomb/lib/, linked in via a file: dependency. without
   // this, the browser's worker import of reliquary's blob-worker.js (which
   // resolves through the node_modules symlink to the real path outside
   // loam's project root) is rejected by vite's dev-server fs allow list.
   server: {
     fs: {
-      allow: ["..", "../../midden", "../../reliquary"],
+      allow: ["..", "../../tomb/lib/midden", "../../tomb/lib/reliquary"],
     },
   },
 });

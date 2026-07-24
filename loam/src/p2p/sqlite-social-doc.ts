@@ -235,6 +235,12 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
     pendingRequests: raw.pending_requests.map((r) => ({
       fromNodeId: r.remote_node_id || "",
       fromUsername: r.remote_display_name || r.remote_alias || r.remote_username,
+      // identity info carried on the request itself (docs/hub-and-profile-
+      // plan.md section 6) is browser/automerge-only for now — tauri's
+      // sqlite-backed social doc has no equivalent columns to source this
+      // from yet.
+      fromBio: "",
+      fromAvatarDataUrl: "",
       receivedAt: unixToIso(r.created_at),
       status: r.status as "pending" | "accepted" | "accepted-pending-ack" | "rejected",
     })),
@@ -242,6 +248,9 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
     outboundRequests: raw.outbound_requests.map((r) => ({
       toNodeId: r.remote_node_id || "",
       toUsername: r.remote_display_name || r.remote_alias || r.remote_username,
+      // same tauri/sqlite limitation as pendingRequests' fromAvatarDataUrl
+      // above — no column to source this from yet.
+      toAvatarDataUrl: "",
       sentAt: unixToIso(r.created_at),
       status: r.status as "pending" | "accepted" | "accepted-pending-ack" | "rejected",
     })),

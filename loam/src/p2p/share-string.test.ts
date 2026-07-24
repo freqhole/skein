@@ -16,6 +16,50 @@ describe("encodeShareString", () => {
     const decoded = decodeShareString(encoded);
     expect(decoded).toEqual({ nodeId, docId });
   });
+
+  it("embeds the canvas title when given", () => {
+    const nodeId = "a".repeat(64);
+    const docId = "doc-with-title";
+    const encoded = encodeShareString(nodeId, docId, "my cool canvas");
+    const decoded = decodeShareString(encoded);
+    expect(decoded).toEqual({ nodeId, docId, canvasTitle: "my cool canvas" });
+  });
+
+  it("truncates a long canvas title", () => {
+    const nodeId = "a".repeat(64);
+    const docId = "doc-long-title";
+    const longTitle = "x".repeat(80);
+    const encoded = encodeShareString(nodeId, docId, longTitle);
+    const decoded = decodeShareString(encoded);
+    expect(decoded?.canvasTitle?.length).toBeLessThan(longTitle.length);
+    expect(decoded?.canvasTitle?.endsWith("\u2026")).toBe(true);
+  });
+
+  it("omits the title field entirely when given an empty/whitespace title", () => {
+    const nodeId = "a".repeat(64);
+    const docId = "doc-empty-title";
+    const encoded = encodeShareString(nodeId, docId, "   ");
+    const decoded = decodeShareString(encoded);
+    expect(decoded).toEqual({ nodeId, docId });
+  });
+
+  it("embeds hub node ids when given", () => {
+    const nodeId = "a".repeat(64);
+    const docId = "doc-with-hubs";
+    const hubNodeIds = ["k".repeat(64), "l".repeat(64)];
+    const encoded = encodeShareString(nodeId, docId, undefined, hubNodeIds);
+    const decoded = decodeShareString(encoded);
+    expect(decoded).toEqual({ nodeId, docId, hubNodeIds });
+  });
+
+  it("omits the hub field entirely when given an empty array", () => {
+    const nodeId = "a".repeat(64);
+    const docId = "doc-no-hubs";
+    const encoded = encodeShareString(nodeId, docId, undefined, []);
+    const decoded = decodeShareString(encoded);
+    expect(decoded).toEqual({ nodeId, docId });
+  });
+
 });
 
 describe("decodeShareString", () => {
@@ -82,6 +126,33 @@ describe("decodeShareString", () => {
   it("returns null for a bare canvas doc id URL (not a share link)", () => {
     expect(decodeShareString("https://skein.freqhole.net/#3rK6y8mZRiTPWeCzy6khb18pcnn7")).toBeNull();
   });
+
+  it("decodes an h field into hubNodeIds", () => {
+    const hubNodeId = "k".repeat(64);
+    const payload = btoa(
+      JSON.stringify({ n: "m".repeat(64), d: "doc-with-hubs", h: [hubNodeId] })
+    );
+    const result = decodeShareString(payload);
+    expect(result).toEqual({
+      nodeId: "m".repeat(64),
+      docId: "doc-with-hubs",
+      hubNodeIds: [hubNodeId],
+    });
+  });
+
+  it("ignores a malformed h field (not an array of strings)", () => {
+    const payload = btoa(
+      JSON.stringify({ n: "n".repeat(64), d: "doc-bad-hubs", h: [123, "ok"] })
+    );
+    const result = decodeShareString(payload);
+    expect(result).toEqual({ nodeId: "n".repeat(64), docId: "doc-bad-hubs" });
+  });
+
+  it("ignores an empty h array", () => {
+    const payload = btoa(JSON.stringify({ n: "p".repeat(64), d: "doc-empty-hubs", h: [] }));
+    const result = decodeShareString(payload);
+    expect(result).toEqual({ nodeId: "p".repeat(64), docId: "doc-empty-hubs" });
+  });
 });
 
 describe("shareFragment", () => {
@@ -94,6 +165,13 @@ describe("shareFragment", () => {
     const frag = shareFragment("f".repeat(64), "doc-frag");
     const decoded = decodeShareString(frag);
     expect(decoded).toEqual({ nodeId: "f".repeat(64), docId: "doc-frag" });
+  });
+
+  it("round-trips hub node ids through decodeShareString", () => {
+    const hubNodeIds = ["q".repeat(64)];
+    const frag = shareFragment("f".repeat(64), "doc-frag-hubs", undefined, hubNodeIds);
+    const decoded = decodeShareString(frag);
+    expect(decoded).toEqual({ nodeId: "f".repeat(64), docId: "doc-frag-hubs", hubNodeIds });
   });
 });
 

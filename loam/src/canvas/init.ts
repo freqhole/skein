@@ -78,6 +78,13 @@ export interface InitCanvasOptions {
    * navigation.
    */
   openTimeoutMs?: number;
+  /**
+   * lets a caller cancel `CanvasStore.open()`'s wait on demand — e.g. a
+   * user clicking "cancel" on a loading screen shown while this is in
+   * flight. distinct from `openTimeoutMs`: both bound the same wait, but
+   * this one fires on user action rather than a fixed deadline.
+   */
+  openAbortSignal?: AbortSignal;
 }
 
 export interface SkeinCanvas {
@@ -156,11 +163,10 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
   // step 3: load or create canvas document
   let store: CanvasStore;
   if (canvasDocId) {
-    store = await CanvasStore.open(
-      repo,
-      canvasDocId as DocumentId,
-      options.openTimeoutMs !== undefined ? { timeoutMs: options.openTimeoutMs } : undefined
-    );
+    store = await CanvasStore.open(repo, canvasDocId as DocumentId, {
+      timeoutMs: options.openTimeoutMs,
+      signal: options.openAbortSignal,
+    });
   } else {
     store = CanvasStore.create(repo);
   }

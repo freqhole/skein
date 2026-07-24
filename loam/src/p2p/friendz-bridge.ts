@@ -263,6 +263,9 @@ export async function sendCanvasInvite(
     canvasPreviewUrl?: string;
     originNodeId: string;
     originUsername: string;
+    originBio?: string;
+    originAvatarDataUrl?: string;
+    originAccentColor?: number;
     role: InvitableRole;
     targets: string[];
     acked: string[];
@@ -413,6 +416,40 @@ export function getKnockSocialDoc(): SocialDoc | null {
 export function isFriend(nodeId: string): boolean {
   const friends = knockSocialDoc?.current.friends ?? [];
   return friends.some((f) => f.nodeIds?.some((n) => n.nodeId === nodeId));
+}
+
+/** display info (username, avatar, bio) for a friend's node id, or null if
+ *  `nodeId` isn't a known friend. reads the same social doc
+ *  `initKnockSocialDocBridge()` registered, so it stays current as friend
+ *  profiles update — callers building a card/badge for a friend's canvas
+ *  (e.g. a share-link join) should look this up fresh rather than leaving
+ *  these fields blank. */
+export function getFriendInfo(
+  nodeId: string
+): { username?: string; avatarDataUrl?: string; bio?: string } | null {
+  const friends = knockSocialDoc?.current.friends ?? [];
+  for (const friend of friends) {
+    for (const n of friend.nodeIds ?? []) {
+      if (n.nodeId === nodeId) {
+        return {
+          username: friend.alias || n.username || friend.username,
+          avatarDataUrl: n.avatarDataUrl,
+          bio: n.bio,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/** the local user's own social identity profile accent color (set on the
+ *  profile tab, see profile-tab.ts's palette picker), or null if the social
+ *  doc isn't registered yet. reads the same social doc
+ *  `initKnockSocialDocBridge()` registered — used by widgets that want to
+ *  default some cosmetic choice (e.g. a new voice-recording widget's lip
+ *  color) to the user's own identity color instead of picking randomly. */
+export function getLocalAccentColor(): number | null {
+  return knockSocialDoc?.current.profile.accentColor ?? null;
 }
 
 let friendsChangeListeners: Array<() => void> = [];

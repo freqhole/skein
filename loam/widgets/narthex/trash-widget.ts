@@ -690,6 +690,30 @@ export async function trashCanvasCard(
 ): Promise<void> {
   await softDeleteCanvasForWidget(repo, narthexStore, cardWidgetId);
   await moveCardToTrash(repo, narthexStore, cardWidgetId);
+
+  // let boot.ts clear any outbox entries (sent canvas invites, sent access
+  // requests) that referenced this canvas — they're no longer actionable
+  // once the canvas itself is gone. friend requests are deliberately left
+  // alone here: those are a real relationship, not tied to this one
+  // canvas, and already have their own manual "cancel" control in the
+  // social widget's requests tab.
+  try {
+    const widget = narthexStore.getWidget(cardWidgetId);
+    if (!widget?.docId) return;
+
+    const cardHandle = await repo.find(widget.docId as DocumentId);
+    await cardHandle.whenReady();
+    const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
+    if (!cardDoc?.canvasDocId || typeof cardDoc.canvasDocId !== "string") return;
+
+    window.dispatchEvent(
+      new CustomEvent("skein:canvas-card-trashed", {
+        detail: { canvasDocId: cardDoc.canvasDocId },
+      })
+    );
+  } catch (err) {
+    log.warn("trash-widget", "failed to dispatch canvas-card-trashed event:", cardWidgetId, err);
+  }
 }
 
 // -----------------------------------------------------------------------

@@ -4,6 +4,7 @@ import {
   getKnockRelayedBy,
   getKnockSocialDoc,
   getProtocol,
+  isOnline as bridgeIsOnline,
   onKnockAcked,
   onKnockRelayed,
   recordKnockAck,
@@ -16,6 +17,7 @@ import { approveKnock, declineKnock } from "../../src/standalone/friendz-wiring"
 import { invitableRoleSchema, type InvitableRole, type PendingCanvasKnock } from "../../src/canvas/canvas-doc";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import { defaultTheme } from "../../src/theme/skein-theme";
+import { renderAvatar } from "./social/avatar-renderer";
 import {
   isTransparent,
   safeColor,
@@ -37,6 +39,12 @@ const canvasInviteSchema = z.object({
   canvasPreviewUrl: z.string().default(""),
   fromNodeId: z.string(),
   fromUsername: z.string().default(""),
+  // identity info carried on the invite itself (mirrors pendingFriendRequestSchema's
+  // fromBio/fromAvatarDataUrl) - updated in place if the inviter resends after
+  // editing their profile, see messagez-wiring's onCanvasInvite dedup handling.
+  fromBio: z.string().default(""),
+  fromAvatarDataUrl: z.string().default(""),
+  fromAccentColor: z.number().optional(),
   relayedBy: z.string().catch(""),
   // the role actually offered by the invite — falls back to "member" for
   // any already-persisted invite written before this field existed, not as
@@ -57,6 +65,11 @@ const canvasShareSchema = z.object({
   canvasPreviewUrl: z.string().default(""),
   toNodeId: z.string(),
   toUsername: z.string().default(""),
+  /** filled in from the friend list at send time (the sender is already
+   *  friends with the recipient before sharing a canvas, so this is
+   *  usually available immediately), and kept fresh afterward via
+   *  friendz-wiring.ts's onIdentityUpdate/onProfileResponse handlers. */
+  toAvatarDataUrl: z.string().default(""),
   sentAt: z.string(),
   delivered: z.boolean().default(false),
   accepted: z.boolean().default(false),
@@ -793,7 +806,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
           rowContainer.addChild(descText);
         }
 
-        // line 3: from: username  ·  time  ·  relayed/via hub
+        // line 3: peer avatar + online dot, "from: username", time, relayed/via hub
         const displayName = invite.fromUsername || invite.fromNodeId.slice(0, 8);
         // hub-ness (section 7.3) is only knowable for the currently-open
         // canvas's own CanvasStore (`hubNodeIds` lives per-canvas-doc) — an
@@ -808,6 +821,20 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         if (isHubInvite) metaLabel += " \u00b7 via hub";
         else if (invite.relayedBy) metaLabel += " \u00b7 relayed";
 
+        const metaY = hasDesc ? 47 : 42;
+        const metaAvatarSize = 14;
+        renderAvatar({
+          parent: rowContainer,
+          cacheKey: `invite-avatar-${invite.id}`,
+          centerX: textX + metaAvatarSize / 2,
+          centerY: metaY + ROW_SUB_SIZE / 2,
+          size: metaAvatarSize,
+          displayName,
+          colorSeed: i,
+          avatarUrl: invite.fromAvatarDataUrl,
+          online: bridgeIsOnline(invite.fromNodeId),
+        });
+
         const metaText = new Text({
           text: metaLabel,
           style: {
@@ -818,9 +845,25 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
           resolution: RESOLUTION,
         });
         metaText.eventMode = "none";
-        metaText.x = textX;
-        metaText.y = hasDesc ? 47 : 42;
+        metaText.x = textX + metaAvatarSize + 4;
+        metaText.y = metaY;
         rowContainer.addChild(metaText);
+
+        // line 4: bio, truncated — only when there's still room in the
+        // fixed-height row (both the with-description and without-description
+        // layouts above leave at least ~18px free below the meta line)
+        if (invite.fromBio) {
+          const bioText = new Text({
+            text: truncate(invite.fromBio, maxNameChars),
+            style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          bioText.eventMode = "none";
+          bioText.x = textX;
+          bioText.y = hasDesc ? 62 : 58;
+          rowContainer.addChild(bioText);
+        }
+
 
         // right side — depends on status
         if (invite.status === "pending") {
@@ -954,6 +997,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
                   canvasColor: invite.canvasColor ?? 0,
                   canvasPreviewUrl: invite.canvasPreviewUrl ?? "",
                   fromUsername: invite.fromUsername ?? "",
+                  fromAvatarDataUrl: invite.fromAvatarDataUrl ?? "",
                   relayedBy: invite.relayedBy || "",
                   role: invite.role,
                 },
@@ -1104,6 +1148,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
                   canvasColor: invite.canvasColor ?? 0,
                   canvasPreviewUrl: invite.canvasPreviewUrl ?? "",
                   fromUsername: invite.fromUsername ?? "",
+                  fromAvatarDataUrl: invite.fromAvatarDataUrl ?? "",
                   relayedBy: invite.relayedBy || "",
                   role: invite.role,
                 },
@@ -1721,9 +1766,23 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
           rowContainer.addChild(descText);
         }
 
-        // line 3: to: username  ·  time
+        // line 3: peer avatar + online dot, "to: username", time
         const displayName = share.toUsername || share.toNodeId.slice(0, 8);
         const metaLabel = `to: ${displayName}  \u00b7  ${relativeTime(share.sentAt)}`;
+
+        const shareMetaY = hasDesc ? 47 : 42;
+        const shareMetaAvatarSize = 14;
+        renderAvatar({
+          parent: rowContainer,
+          cacheKey: `share-avatar-${share.id}`,
+          centerX: textX + shareMetaAvatarSize / 2,
+          centerY: shareMetaY + ROW_SUB_SIZE / 2,
+          size: shareMetaAvatarSize,
+          displayName,
+          avatarUrl: share.toAvatarDataUrl || undefined,
+          colorSeed: i,
+          online: bridgeIsOnline(share.toNodeId),
+        });
 
         const metaText = new Text({
           text: metaLabel,
@@ -1731,8 +1790,8 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
           resolution: RESOLUTION,
         });
         metaText.eventMode = "none";
-        metaText.x = textX;
-        metaText.y = hasDesc ? 47 : 42;
+        metaText.x = textX + shareMetaAvatarSize + 4;
+        metaText.y = shareMetaY;
         rowContainer.addChild(metaText);
 
         // right side — status indicator

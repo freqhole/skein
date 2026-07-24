@@ -16,9 +16,14 @@ describe("canvasCardSchema", () => {
       isRemote: false,
       ownerNodeId: "",
       ownerUsername: "",
+      ownerAvatarDataUrl: "",
       role: "admin",
       accessRevoked: false,
       accessPending: false,
+      accessRequestedAt: "",
+      accessDeclined: false,
+      hubNodeIds: [],
+      hubConnectRequestedAt: "",
       lastVisitedAt: "",
       hasUpdates: false,
       lastKnownModifiedAt: "",
@@ -171,6 +176,23 @@ describe("remote canvas card schema", () => {
     // silently accepted.
     expect(() => canvasCardSchema.parse({ role: "owner" })).toThrow();
     expect(() => canvasCardSchema.parse({ role: 42 })).toThrow();
+  });
+
+  it("parses hub node ids carried over from a share link", () => {
+    const result = canvasCardSchema.parse({
+      canvasDocId: "remote-doc-with-hub",
+      isRemote: true,
+      accessPending: true,
+      hubNodeIds: ["hub-node-abc"],
+    });
+    expect(result.hubNodeIds).toEqual(["hub-node-abc"]);
+    expect(result.hubConnectRequestedAt).toBe("");
+  });
+
+  it("defaults hubNodeIds to an empty array when omitted", () => {
+    const result = canvasCardSchema.parse({ title: "test" });
+    expect(result.hubNodeIds).toEqual([]);
+    expect(result.hubConnectRequestedAt).toBe("");
   });
 
   it("backwards compatibility — old-style object gets correct defaults", () => {

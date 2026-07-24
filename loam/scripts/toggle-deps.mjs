@@ -14,20 +14,21 @@ const dirname = path.dirname(fileURLToPath(import.meta.url));
 const packageJsonPath = path.resolve(dirname, "..", "package.json");
 
 // npm version ranges are the checked-in default; local paths are relative
-// to loam/, matching the sibling repos' ts/wasm-pack build output dirs.
-// midden lives under tomb/lib/midden (not its own top-level sibling repo).
+// to loam/. haruspex, midden, and reliquary all live under tomb/lib/ (not
+// their own top-level sibling repos), matching their ts/wasm-pack build
+// output dirs there.
 const packages = {
     "@freqhole/haruspex": {
-        npm: "^0.2.2",
-        local: "file:../../haruspex/ts",
+        npm: "^0.2.3",
+        local: "file:../../tomb/lib/haruspex/ts",
     },
     "@freqhole/midden": {
-        npm: "^0.2.2",
+        npm: "^0.2.3",
         local: "file:../../tomb/lib/midden/pkg",
     },
     "@freqhole/reliquary": {
-        npm: "^0.2.2",
-        local: "file:../../reliquary/ts",
+        npm: "^0.2.3",
+        local: "file:../../tomb/lib/reliquary/ts",
     },
 };
 

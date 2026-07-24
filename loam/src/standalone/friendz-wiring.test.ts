@@ -179,6 +179,44 @@ describe("wireFriendHandlers — onFriendRequest", () => {
     const friend = sDoc.current.friends.find((f) => f.nodeIds.some((n) => n.nodeId === BOB));
     expect(friend!.isHub).toBe(true);
   });
+
+  it("refreshes identity fields in place on a resend from an already-pending fromNodeId, without duplicating the entry", () => {
+    const sDoc = createTestSocialDoc();
+    const protocol = createTestProtocol();
+    wireFriendHandlers({ protocol, sDoc });
+
+    protocol.onFriendRequest!(
+      {
+        type: "friend-request",
+        fromNodeId: BOB,
+        fromUsername: "bob",
+        bio: "old bio",
+        avatarDataUrl: "data:old",
+      },
+      BOB
+    );
+
+    // bob edits his profile and resends the still-pending request
+    protocol.onFriendRequest!(
+      {
+        type: "friend-request",
+        fromNodeId: BOB,
+        fromUsername: "bobby",
+        bio: "new bio",
+        avatarDataUrl: "data:new",
+        accentColor: 0x123456,
+      },
+      BOB
+    );
+
+    const matching = sDoc.current.pendingRequests.filter((r) => r.fromNodeId === BOB);
+    expect(matching).toHaveLength(1);
+    expect(matching[0].fromUsername).toBe("bobby");
+    expect(matching[0].fromBio).toBe("new bio");
+    expect(matching[0].fromAvatarDataUrl).toBe("data:new");
+    expect((matching[0] as any).fromAccentColor).toBe(0x123456);
+    expect(matching[0].status).toBe("pending");
+  });
 });
 
 // ---------------------------------------------------------------------------

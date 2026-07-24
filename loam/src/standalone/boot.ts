@@ -21,6 +21,7 @@ import { DEFAULT_ENSURE_ALPN } from "@freqhole/reliquary/ensure";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
 import {
   destroyBridge,
+  getFriendInfo,
   initKnockSocialDocBridge,
   isFriend,
   recordKnockAck,
@@ -126,6 +127,20 @@ class SkeinRouter {
    *  sync over the network shouldn't get cut off early just because the
    *  user happens to be a few clicks into the app. */
   private isInitialNavigation = true;
+
+  /** the docId of the most recent canvas navigation that failed to open
+   *  (see `navigateToCanvas()`) — checked by `handleKnockApproved()` so a
+   *  knock approval that arrives for exactly this canvas can retry opening
+   *  it automatically instead of leaving the user to notice and manually
+   *  retry. cleared on the next successful navigation to any canvas. */
+  private lastFailedCanvasDocId: string | null = null;
+
+  /** the loading-overlay element shown for the duration of a canvas
+   *  navigation's async work (see `showNavSpinner()`/`hideNavSpinner()`) —
+   *  without it, the mount element sits fully blank while automerge-repo's
+   *  own sync wait runs, which reads to the user as the app being frozen
+   *  rather than just loading. */
+  private navSpinnerEl: HTMLDivElement | null = null;
 
   private friendzProtocol: FriendzProtocol | null = null;
   private friendzDocUnsubs: Array<() => void> = [];
@@ -514,6 +529,31 @@ class SkeinRouter {
       }
     }) as EventListener);
 
+    // listen for the connect-via-hub event dispatched from a narthex
+    // canvas-card's "connect via hub" pill (widgets/narthex/canvas-card.ts)
+    // — an explicit, user-initiated action (never automatic) for a canvas
+    // whose share link carried hub node ids, see connectViaHub()'s doc
+    // comment for the full rationale.
+    window.addEventListener("skein:connect-via-hub", ((e: CustomEvent) => {
+      const { hubNodeId } = e.detail ?? {};
+      if (typeof hubNodeId === "string") {
+        this.connectViaHub(hubNodeId).catch((err) => {
+          log.warn(TAG, "failed to connect via hub:", err);
+        });
+      }
+    }) as EventListener);
+
+    // listen for the canvas-card-trashed event dispatched from
+    // trashCanvasCard() (widgets/narthex/trash-widget.ts) once a narthex
+    // canvas card has been soft-deleted — clears any now-stale outbox
+    // entries for that canvas.
+    window.addEventListener("skein:canvas-card-trashed", ((e: CustomEvent) => {
+      const { canvasDocId } = e.detail ?? {};
+      if (typeof canvasDocId === "string") {
+        this.clearOutboxForCanvas(canvasDocId);
+      }
+    }) as EventListener);
+
     // listen for widget self-removal (e.g. wizard cancel button)
     window.addEventListener("skein:remove-widget", ((e: CustomEvent) => {
       const widgetId = e.detail?.widgetId;
@@ -642,6 +682,59 @@ class SkeinRouter {
       this.currentCanvas.destroy();
       this.currentCanvas = null;
     }
+  }
+
+  /**
+   * show a lightweight loading overlay in the mount element for the
+   * duration of a canvas navigation's async work — reuses the boot
+   * spinner's own css (`.spinner-ring`/`@keyframes boot-spin`, defined in
+   * index.html) rather than defining a second copy. without this, the
+   * mount element sits fully blank (no pixi canvas painted yet) for as
+   * long as automerge-repo's own sync wait takes — which can legitimately
+   * be a while for a real, slower sync (see `isInitialNavigation`'s doc
+   * comment on why in-app navigation deliberately doesn't get a short
+   * fast-fail timeout) — and reads to the user as the app being frozen
+   * rather than just loading.
+   */
+  /**
+   * @param onCancel when given, renders a "cancel" button below the spinner
+   *   that invokes it — used by `navigateToCanvas()` to let the user bail
+   *   out of a stuck/slow open and return to the narthex instead of waiting
+   *   out the full sync timeout (which can legitimately be a while, see
+   *   `isInitialNavigation`'s doc comment).
+   */
+  private showNavSpinner(onCancel?: () => void): void {
+    if (this.navSpinnerEl) return;
+    const el = document.createElement("div");
+    el.id = "canvas-nav-spinner";
+    el.style.cssText =
+      "position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;" +
+      "justify-content:center;gap:12px;color:#666678;font-family:system-ui,sans-serif;" +
+      "font-size:13px;z-index:1000;";
+    const ring = document.createElement("div");
+    ring.className = "spinner-ring";
+    const label = document.createElement("div");
+    label.textContent = "loading canvas…";
+    el.appendChild(ring);
+    el.appendChild(label);
+    if (onCancel) {
+      const cancelBtn = document.createElement("button");
+      cancelBtn.textContent = "cancel";
+      cancelBtn.style.cssText =
+        "margin-top:4px;padding:6px 16px;border-radius:6px;border:1px solid #444458;" +
+        "background:transparent;color:#a0a0b8;font-family:system-ui,sans-serif;" +
+        "font-size:13px;cursor:pointer;";
+      cancelBtn.addEventListener("click", onCancel);
+      el.appendChild(cancelBtn);
+    }
+    this.mountElement.appendChild(el);
+    this.navSpinnerEl = el;
+  }
+
+  /** remove the loading overlay shown by `showNavSpinner()`, if present. */
+  private hideNavSpinner(): void {
+    this.navSpinnerEl?.remove();
+    this.navSpinnerEl = null;
   }
 
   /**
@@ -964,9 +1057,54 @@ class SkeinRouter {
       repo: this.repo,
       irohAdapter: this.irohAdapter,
       localNodeId: this.localNodeId,
+      narthexDocId: this.narthexDocId ?? undefined,
+      messagezHandle: this.messagezDocHandle,
       onKnockRelayed: (info) => recordKnockRelay(info),
       onKnockAcked: (info) => recordKnockAck(info),
+      onKnockApproved: (info) => {
+        this.handleKnockApproved(info).catch((err) => {
+          log.warn(TAG, "failed to handle knock approval:", err);
+        });
+      },
     });
+  }
+
+  /**
+   * react to a `canvas-knock-approve` notification: clear the narthex
+   * card's access-pending pill now that access was actually granted, and
+   * if the user is currently sitting on the narthex having just failed to
+   * open exactly this canvas (see `lastFailedCanvasDocId`), retry opening
+   * it automatically instead of leaving them to notice and manually
+   * retry. deliberately does NOT yank the user away from some other
+   * canvas they're actively using, even if it happens to also have a
+   * stale access-pending pill — only the narthex-and-just-failed case
+   * auto-navigates.
+   */
+  private async handleKnockApproved(info: { canvasDocId: string; role: InvitableRole }): Promise<void> {
+    if (this.narthexDocId) {
+      try {
+        const narthexStore = await CanvasStore.open(this.repo, this.narthexDocId as DocumentId);
+        for (const entry of narthexStore.allWidgets()) {
+          if (entry.type !== "canvas-card") continue;
+          const props = entry.props as { canvasDocId?: string; accessPending?: boolean } | undefined;
+          if (props?.canvasDocId !== info.canvasDocId || !props.accessPending) continue;
+          await narthexStore.updateWidgetProps(entry.id, {
+            accessPending: false,
+            accessRequestedAt: "",
+          });
+          break;
+        }
+      } catch (err) {
+        log.warn(TAG, "failed to clear access-pending pill after knock approval:", err);
+      }
+    }
+
+    const onNarthex = this.currentCanvas?.store.handle.documentId === this.narthexDocId;
+    if (onNarthex && this.lastFailedCanvasDocId === info.canvasDocId) {
+      log.debug(TAG, "access granted for previously-failed canvas, retrying:", info.canvasDocId);
+      this.lastFailedCanvasDocId = null;
+      await this.navigateToCanvas(info.canvasDocId);
+    }
   }
 
   /** navigate to a specific canvas by document id */
@@ -984,6 +1122,11 @@ class SkeinRouter {
     // caught below and recovered by falling back to the narthex, same as
     // clicking the home button would.
     let failure: unknown = null;
+    // true only when the failure above is the user clicking "cancel" on the
+    // nav spinner (see showNavSpinner's onCancel below), not a genuine
+    // open failure — suppresses the error log and the unreachable-canvas
+    // access-request offer, both of which would be misleading here.
+    let cancelledByUser = false;
 
     try {
       // stamp lastVisitedAt before tearing down so own edits aren't flagged
@@ -1001,6 +1144,12 @@ class SkeinRouter {
 
       log.debug(TAG, "navigating to canvas:", docId);
 
+      const abortController = new AbortController();
+      this.showNavSpinner(() => {
+        cancelledByUser = true;
+        abortController.abort();
+      });
+
       const canvas = await initCanvas({
         mountElement: this.mountElement,
         canvasDocId: docId,
@@ -1008,6 +1157,7 @@ class SkeinRouter {
         repo: this.repo,
         connectionStateSource: this.connectionStateSource,
         openTimeoutMs: opts?.coldOpen ? COLD_OPEN_TIMEOUT_MS : undefined,
+        openAbortSignal: abortController.signal,
         restrictBlobToPeers: (blake3Hash, peerNodeIds) =>
           restrictBlobToPeers(this.irohAdapter, blake3Hash, peerNodeIds),
         onNavigateHome: () => {
@@ -1027,7 +1177,12 @@ class SkeinRouter {
             log.debug(TAG, "no identity — generate one first (profile widget)");
             return;
           }
-          const shareUrl = buildShareUrl(identity.node_id, docId);
+
+          // persists across dialog rebuilds (see `rebuild()` below) so
+          // flipping the toggle doesn't reset itself the next time the
+          // canvas doc changes. default true: a canvas explicitly shared
+          // with a hub includes it in the link unless the sharer opts out.
+          let includeHubsInLink = true;
 
           // recomputes the full options object fresh from current doc state
           // each time it's called — see the onChange subscriptions below
@@ -1038,8 +1193,39 @@ class SkeinRouter {
           // bug: pending-invite/role/accepted-state changes never showed up
           // in an already-open share dialog).
           const buildShareOptions = (): ShareDialogOptions => {
+          // hub node ids this canvas has been explicitly shared with (see
+          // canvas-doc.ts's `hubNodeIds`) — recomputed fresh each rebuild so
+          // the link picks up a hub invited *after* the dialog was opened,
+          // even while that invite is still pending (delivery to the hub is
+          // best-effort/gossip-relayed, same as any other invite).
+          const canvasHubNodeIds = this.currentCanvas!.store.doc().hubNodeIds ?? [];
+          const shareUrl = buildShareUrl(
+            identity.node_id,
+            docId,
+            this.currentCanvas!.store.doc().title,
+            includeHubsInLink ? canvasHubNodeIds : undefined
+          );
+
           // build peer list from canvas doc (exclude self)
           const peersRecord = this.currentCanvas!.store.peers();
+          // known friends by nodeId, for avatar/online lookups on already-
+          // joined peers below (a peer may or may not be a confirmed friend)
+          const friendByNodeId = new Map<
+            string,
+            { username?: string; avatarDataUrl?: string; bio?: string }
+          >();
+          if (this.socialDoc?.current?.friends) {
+            for (const friend of this.socialDoc.current.friends) {
+              for (const n of friend.nodeIds ?? []) {
+                if (!n.nodeId) continue;
+                friendByNodeId.set(n.nodeId, {
+                  username: friend.alias || n.username || friend.username,
+                  avatarDataUrl: n.avatarDataUrl,
+                  bio: n.bio,
+                });
+              }
+            }
+          }
           const peerList = Object.values(peersRecord)
             .filter((p) => {
               // guard: automerge may return non-string nodeId from Rust-written entries
@@ -1058,6 +1244,8 @@ class SkeinRouter {
               nodeId: String(p.nodeId),
               joinedAt: String(p.joinedAt ?? ""),
               role: this.currentCanvas!.store.getRole(String(p.nodeId)),
+              avatarDataUrl: friendByNodeId.get(String(p.nodeId))?.avatarDataUrl,
+              isOnline: this.friendzProtocol?.isOnline(String(p.nodeId)) ?? false,
             }));
 
           // build friends list for invite picker — exclude already shared
@@ -1107,6 +1295,7 @@ class SkeinRouter {
                     username: friend.alias || n.username || friend.username || "",
                     nodeId: n.nodeId,
                     avatarDataUrl: n.avatarDataUrl,
+                    bio: n.bio,
                     isOnline: this.friendzProtocol?.isOnline(n.nodeId) ?? false,
                     isHub: friend.isHub === true,
                   });
@@ -1132,6 +1321,8 @@ class SkeinRouter {
                   friendId: req.fromNodeId,
                   username: req.fromUsername || "",
                   nodeId: req.fromNodeId,
+                  avatarDataUrl: req.fromAvatarDataUrl,
+                  bio: req.fromBio,
                   isOnline: this.friendzProtocol?.isOnline(req.fromNodeId) ?? false,
                   isHub: false,
                   isPending: true,
@@ -1222,6 +1413,12 @@ class SkeinRouter {
             peerDisplayNames,
             readOnly: !isAdmin,
             knownFriendNodeIds,
+            hubNodeIds: canvasHubNodeIds,
+            includeHubsInLink,
+            onToggleIncludeHubs: (include: boolean) => {
+              includeHubsInLink = include;
+              rebuild();
+            },
             onRemovePeer: !isAdmin
               ? undefined
               : (nodeId: string) => {
@@ -1342,6 +1539,7 @@ class SkeinRouter {
                     canvasPreviewUrl,
                     toNodeId: friend.nodeId,
                     toUsername: friend.username,
+                    toAvatarDataUrl: friend.avatarDataUrl ?? "",
                     sentAt: new Date().toISOString(),
                     delivered: false,
                     accepted: false,
@@ -1369,6 +1567,7 @@ class SkeinRouter {
 
               // attempt direct send — best effort, gossip relay handles offline peers
               try {
+                const localProfile = this.friendzProtocol?.getLocalProfileSnapshot();
                 await sendCanvasInvite(friend.nodeId, {
                   inviteId,
                   canvasDocId: docId,
@@ -1378,6 +1577,9 @@ class SkeinRouter {
                   canvasPreviewUrl,
                   originNodeId: localIdentity.node_id,
                   originUsername: this.friendzProtocol?.getLocalUsername() ?? "",
+                  originBio: localProfile?.bio,
+                  originAvatarDataUrl: localProfile?.avatarDataUrl,
+                  originAccentColor: localProfile?.accentColor,
                   role,
                   targets: allTargets,
                   acked: [],
@@ -1662,14 +1864,14 @@ class SkeinRouter {
           log.debug(TAG, "no identity — generate one first (profile widget)");
           return;
         }
-        const shareStr = encodeShareString(identity.node_id, docId);
+        const shareStr = encodeShareString(identity.node_id, docId, canvas.store.doc().title);
         try {
           await navigator.clipboard.writeText(shareStr);
           log.debug(TAG, "share string copied to clipboard:", shareStr);
         } catch {
           log.debug(TAG, "share string (copy manually):", shareStr);
         }
-        log.debug(TAG, "share URL:", buildShareUrl(identity.node_id, docId));
+        log.debug(TAG, "share URL:", buildShareUrl(identity.node_id, docId, canvas.store.doc().title));
       };
 
       log.debug(
@@ -1692,19 +1894,28 @@ class SkeinRouter {
       failure = err;
     } finally {
       this.navigating = false;
+      this.hideNavSpinner();
     }
 
     if (failure) {
-      log.error(TAG, "failed to open canvas, falling back to narthex:", docId, failure);
-      if (opts?.coldOpen) {
-        await this.offerAccessRequestForUnreachableCanvas(docId);
+      if (cancelledByUser) {
+        log.debug(TAG, "canvas navigation cancelled by user:", docId);
+      } else {
+        log.error(TAG, "failed to open canvas, falling back to narthex:", docId, failure);
+        this.lastFailedCanvasDocId = docId;
+        if (opts?.coldOpen) {
+          await this.offerAccessRequestForUnreachableCanvas(docId);
+        }
       }
       await this.navigateToNarthex();
-    } else if (this.pendingNavToNarthex) {
-      // a nav-home arrived while this canvas navigation was in flight —
-      // honor it now instead of silently dropping it
-      log.debug(TAG, "executing queued narthex navigation");
-      await this.navigateToNarthex();
+    } else {
+      this.lastFailedCanvasDocId = null;
+      if (this.pendingNavToNarthex) {
+        // a nav-home arrived while this canvas navigation was in flight —
+        // honor it now instead of silently dropping it
+        log.debug(TAG, "executing queued narthex navigation");
+        await this.navigateToNarthex();
+      }
     }
   }
 
@@ -1746,12 +1957,58 @@ class SkeinRouter {
   }
 
   /**
-   * send a `canvas-knock` to a canvas's owner asking to be let in, and a
-   * friend request too if the owner isn't already a friend. used by the
-   * narthex card's "request access" pill (`canvas-card.ts`). best-effort —
-   * connecting to the owner or delivering either message may simply not
-   * succeed if they're offline too, same as any other p2p message in this
-   * app.
+   * remove any outbox entries referencing a canvas that's just been
+   * trashed via a narthex canvas-card (see the `skein:canvas-card-trashed`
+   * listener above) — a sent invite (`shares`) or a sent access request
+   * (`accessRequests`) for a canvas that no longer exists (or is at least
+   * gone from this device) has nothing left to track. friend requests
+   * (`outboundRequests`, social doc) are untouched here on purpose — see
+   * the caller's doc comment.
+   *
+   * mutates the arrays in place via `splice()` rather than reassigning a
+   * `.filter()`'d copy — automerge throws `RangeError: Cannot create a
+   * reference to an existing document object` if a change handler
+   * reassigns a document array to a new array built from that same
+   * array's (still document-owned) elements.
+   */
+  private clearOutboxForCanvas(canvasDocId: string): void {
+    if (!this.messagezDocHandle) return;
+    this.messagezDocHandle.change((draft: any) => {
+      if (draft.shares) {
+        for (let i = draft.shares.length - 1; i >= 0; i--) {
+          if (draft.shares[i].canvasDocId === canvasDocId) draft.shares.splice(i, 1);
+        }
+      }
+      if (draft.accessRequests) {
+        for (let i = draft.accessRequests.length - 1; i >= 0; i--) {
+          if (draft.accessRequests[i].canvasDocId === canvasDocId) draft.accessRequests.splice(i, 1);
+        }
+      }
+    });
+  }
+
+  /**
+   * send a `canvas-knock` directly to a canvas's owner asking to be let
+   * in, and a friend request too if the owner isn't already a friend.
+   * used by the narthex card's "request access" pill (`canvas-card.ts`).
+   *
+   * the knock is persisted to the messagez doc's `accessRequests` outbox
+   * BEFORE any send attempt — a durable record that survives a failed
+   * send, a reload, or the app being closed entirely, mirroring the
+   * canvas-invite outbox pattern (`draft.shares`) above. `friendzProtocol`
+   * itself already retries a still-`pending` outbound friend request the
+   * next time that peer is seen online (`friendz-wiring.ts`'s
+   * `onPeerBecameOnline`); `onPeerBecameOnline` does the same for this
+   * outbox's undelivered knocks, so a single click here is enough —
+   * delivery doesn't depend on the owner being reachable at click time.
+   *
+   * deliberately never dials a hub as a fallback target here: a knock
+   * from a stranger has no friend relationship with anyone yet, so
+   * relaying it through a hub (or anyone else) would bypass the
+   * friends-only gossip network — see docs/knock-and-hub-relay-plan.md's
+   * relay design. if the owner is offline, this is simply retried the
+   * next time the owner comes back online, same as any other p2p message
+   * in this app — that's what the outbox + retry-on-online is for.
    */
   private async requestCanvasAccess(canvasDocId: string, ownerNodeId: string): Promise<void> {
     if (!this.friendzProtocol) {
@@ -1764,21 +2021,42 @@ class SkeinRouter {
       return;
     }
 
-    // a prior join/invite attempt against this same owner may have left a
-    // stale, already-open stream that the adapter would otherwise silently
-    // reuse (see IrohNetworkAdapter.addPeer()'s doc comment) — forget it
-    // first so this actually attempts a fresh connection.
-    this.irohAdapter.forgetPeer(ownerNodeId);
-    try {
-      await this.irohAdapter.addPeer(ownerNodeId);
-    } catch (err) {
-      log.warn(TAG, "failed to connect to canvas owner for knock:", err);
+    // reuse an existing, not-yet-delivered outbox entry for this canvas
+    // (e.g. a retry after the click handler's own debounce somehow didn't
+    // prevent a second dispatch) rather than minting a fresh knockId every
+    // time — keeps `CanvasStore.recordKnock()`'s idempotent-retry rule
+    // (docs/knock-and-hub-relay-plan.md section 3.2) meaningful from the
+    // requester's side too.
+    const existingRequests = (this.messagezDocHandle?.doc()?.accessRequests ?? []) as Array<{
+      knockId: string;
+      canvasDocId: string;
+      delivered: boolean;
+    }>;
+    const existing = existingRequests.find((r) => r.canvasDocId === canvasDocId && !r.delivered);
+    const knockId = existing?.knockId ?? crypto.randomUUID();
+
+    // write the outbox entry FIRST — durable record that survives a failed
+    // send below, same as the canvas-invite outbox (`draft.shares`).
+    if (this.messagezDocHandle && !existing) {
+      this.messagezDocHandle.change((draft: any) => {
+        if (!draft.accessRequests) draft.accessRequests = [];
+        draft.accessRequests.push({
+          knockId,
+          canvasDocId,
+          ownerNodeId,
+          sentAt: new Date().toISOString(),
+          delivered: false,
+        });
+      });
     }
 
     // asking to access someone's canvas is also a natural moment to ask to
     // be their friend, if not already — a knock alone doesn't establish a
     // friend relationship, and other gating elsewhere (e.g. the
-    // friend-only blob-fetch gate) depends on one existing.
+    // friend-only blob-fetch gate) depends on one existing. `sendFriendRequest()`
+    // (friendz-bridge.ts) already persists this into the social doc's
+    // `outboundRequests` outbox and gets retried on peer-online — no
+    // separate durable tracking needed here.
     if (!isFriend(ownerNodeId)) {
       try {
         await sendFriendRequest(ownerNodeId);
@@ -1788,9 +2066,21 @@ class SkeinRouter {
       }
     }
 
+    // a prior join/invite attempt against this same peer may have left a
+    // stale, already-open stream that the adapter would otherwise
+    // silently reuse (see IrohNetworkAdapter.addPeer()'s doc comment) —
+    // forget it first so this actually attempts a fresh connection.
+    this.irohAdapter.forgetPeer(ownerNodeId);
+    try {
+      await this.irohAdapter.addPeer(ownerNodeId);
+    } catch (err) {
+      log.warn(TAG, "failed to connect for knock:", ownerNodeId.slice(0, 16) + "...", err);
+      return;
+    }
+
     try {
       await this.friendzProtocol.sendCanvasKnock(ownerNodeId, {
-        knockId: crypto.randomUUID(),
+        knockId,
         canvasDocId,
         requesterNodeId: identity.node_id,
         requesterUsername: this.friendzProtocol.getLocalUsername() ?? "",
@@ -1798,9 +2088,56 @@ class SkeinRouter {
       });
       log.debug(TAG, "sent canvas knock to:", ownerNodeId.slice(0, 16) + "...");
     } catch (err) {
-      log.warn(TAG, "failed to send canvas knock:", err);
+      log.warn(TAG, "failed to send canvas knock to:", ownerNodeId.slice(0, 16) + "...", err);
     }
   }
+
+  /**
+   * send a friend request to a hub whose node id was discovered from a
+   * canvas share link (see share-string.ts's `hubNodeIds`), and attempt to
+   * connect to it. used by the narthex card's "connect via hub" pill
+   * (`canvas-card.ts`) — always an explicit click, never dispatched
+   * automatically on decoding a share link, since silently friending an
+   * arbitrary node id embedded in a pasted link would be a real trust
+   * surprise.
+   *
+   * the hub auto-accepts the friend request if (and only if) this peer's
+   * own node id already appears in the shared canvas's `acl` or
+   * `pendingInvites` — i.e. the canvas owner already explicitly invited
+   * this peer, the hub just happens to be who's reachable right now (see
+   * tumulus's `HubPeerService::is_vouched_by_any_canvas`). once accepted,
+   * the hub's regular gossip digest delivers the pending canvas invite (and
+   * the canvas doc itself) the same way it would from any other friend —
+   * no separate machinery needed here beyond the friend request itself.
+   */
+  private async connectViaHub(hubNodeId: string): Promise<void> {
+    if (!this.friendzProtocol) {
+      log.warn(TAG, "cannot connect via hub — friendz protocol not ready");
+      return;
+    }
+    const identity = await getStoredIdentity();
+    if (!identity) {
+      log.debug(TAG, "no identity — generate one first (profile widget)");
+      return;
+    }
+
+    if (!isFriend(hubNodeId)) {
+      try {
+        await sendFriendRequest(hubNodeId);
+        log.debug(TAG, "sent friend request to hub:", hubNodeId.slice(0, 16) + "...");
+      } catch (err) {
+        log.warn(TAG, "failed to send friend request to hub:", err);
+      }
+    }
+
+    try {
+      await this.irohAdapter.addPeer(hubNodeId);
+      log.debug(TAG, "connected to hub:", hubNodeId.slice(0, 16) + "...");
+    } catch (err) {
+      log.warn(TAG, "failed to connect to hub:", hubNodeId.slice(0, 16) + "...", err);
+    }
+  }
+
 
   /**
    * join a remote canvas via share string.
@@ -1819,6 +2156,7 @@ class SkeinRouter {
     canvasColor: number;
     canvasPreviewUrl: string;
     fromUsername: string;
+    fromAvatarDataUrl?: string;
     /** node id of the hub (or other peer) that relayed this invite via
      *  gossip, if any — see `canvasInviteSchema`'s `relayedBy` field.
      *  used as a connection fallback below when `fromNodeId` (the
@@ -1897,21 +2235,26 @@ class SkeinRouter {
     // canvas this peer already has a copy of) resolves via `repo.find()`
     // from local storage with no network involved at all, so requiring a
     // successful dial first would needlessly skip the durable write in
-    // that case too. bounded with a short timeout instead, so a doc that's
-    // genuinely unreachable from any known peer can't hang this handler.
+    // that case too. bounded with `CanvasStore.open()`'s own `timeoutMs`
+    // option (an `AbortSignal` that actually cancels the internal wait)
+    // rather than an external `Promise.race` — racing against a bare
+    // `CanvasStore.open()` call abandons it running in the background once
+    // the race's own timer wins, and it can still reject on its own, much
+    // later, unhandled (automerge-repo's internal ~60-120s default) — a
+    // confirmed source of stray "uncaught (in promise) TimeoutError"
+    // console spam completely disconnected from whatever the user is doing
+    // by the time it fires.
     if (identity) {
       try {
-        const canvasStore = await Promise.race([
-          CanvasStore.open(this.repo, detail.canvasDocId as DocumentId),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("canvas doc open timed out")), 5000)
-          ),
-        ]);
+        const canvasStore = await CanvasStore.open(this.repo, detail.canvasDocId as DocumentId, {
+          timeoutMs: 5000,
+        });
         canvasStore.markInviteAccepted(identity.node_id);
       } catch (err) {
         log.warn(TAG, "failed to record invite acceptance on canvas doc:", err);
       }
     }
+
 
     // check if a canvas-card already exists for this docId on the narthex.
     //
@@ -1964,6 +2307,7 @@ class SkeinRouter {
             isRemote: true,
             ownerNodeId: detail.fromNodeId,
             ownerUsername: detail.fromUsername || "",
+            ownerAvatarDataUrl: detail.fromAvatarDataUrl || "",
             role: detail.role ?? "member",
             accessRevoked: false,
             accessPending: false,
@@ -2002,6 +2346,7 @@ class SkeinRouter {
             isRemote: true,
             ownerNodeId: detail.fromNodeId,
             ownerUsername: detail.fromUsername || "",
+            ownerAvatarDataUrl: detail.fromAvatarDataUrl || "",
             // NOTE: this is a cosmetic display field on the *local* narthex
             // canvas-card only — it is NOT the actual access control. the
             // real ACL lives in the shared canvas doc's `.acl` map (see
@@ -2064,12 +2409,36 @@ class SkeinRouter {
       return;
     }
 
-    // connect to the peer via the iroh adapter
-    try {
-      await this.irohAdapter.addPeer(decoded.nodeId);
-    } catch (err) {
-      log.error(TAG, "failed to connect to peer:", err);
-      // continue anyway — the peer might become reachable later
+    // a canvas's sync eligibility is gated to friends only (see
+    // canvas-scoped-share-policy.ts's `createCanvasScopedSharePolicy`) — if
+    // the share link's owner isn't already a friend, actually opening the
+    // canvas is doomed: the owner's side will simply never sync the doc to
+    // an unrecognized peer, so navigating in would just hang on the
+    // "loading canvas" spinner until automerge-repo's own internal
+    // ~60-120s timeout (or COLD_OPEN_TIMEOUT_MS on a cold open) elapses.
+    // `isFriend()` is a synchronous, no-network lookup against the local
+    // social doc, so checking it here costs nothing and tells us instantly
+    // — skip the peer connect attempt and the canvas navigation entirely
+    // below, and stay on the narthex with an access-pending card instead.
+    // the user can send a friend + canvas-access request from that card's
+    // "request access" pill (dispatches skein:request-canvas-access,
+    // handled by requestCanvasAccess()).
+    const isKnownFriend = isFriend(decoded.nodeId);
+
+    if (isKnownFriend) {
+      // connect to the peer via the iroh adapter
+      try {
+        await this.irohAdapter.addPeer(decoded.nodeId);
+      } catch (err) {
+        log.error(TAG, "failed to connect to peer:", err);
+        // continue anyway — the peer might become reachable later
+      }
+    } else {
+      log.debug(
+        TAG,
+        "share link owner isn't a friend yet — staying on narthex:",
+        decoded.nodeId.slice(0, 16) + "..."
+      );
     }
 
     // remove the join wizard widget if it was used
@@ -2099,6 +2468,12 @@ class SkeinRouter {
           cardHeight
         );
 
+        // a known friend's username/avatar are already in the local
+        // social doc — use them right away instead of leaving the card's
+        // owner badge blank (falling back to a bare node id + no avatar)
+        // until some later event happens to refresh it.
+        const friendInfo = isKnownFriend ? getFriendInfo(decoded.nodeId) : null;
+
         this.currentCanvas.store.addWidget({
           id: crypto.randomUUID(),
           type: "canvas-card",
@@ -2109,8 +2484,10 @@ class SkeinRouter {
           zIndex: existingCount + 1,
           props: {
             canvasDocId: decoded.docId,
-            title: "syncing...",
-            description: "connecting to peer",
+            title: decoded.canvasTitle || "syncing...",
+            description: isKnownFriend
+              ? "connecting to peer"
+              : "not a friend yet — use \"request access\" below",
             authorName: "",
             color: 0x06b6d4, // cyan accent for remote canvases
             previewUrl: "",
@@ -2119,17 +2496,50 @@ class SkeinRouter {
             // remote card fields — joining via share string
             isRemote: true,
             ownerNodeId: decoded.nodeId,
-            ownerUsername: "",
+            ownerUsername: friendInfo?.username || "",
+            ownerAvatarDataUrl: friendInfo?.avatarDataUrl || "",
             role: "viewer", // share-string joiners default to viewer
             accessRevoked: false,
             accessPending: true,
+            accessRequestedAt: "",
             lastVisitedAt: "",
+            // hub node ids from the share link, if any — offered as a
+            // "connect via hub" pill (see canvas-card.ts) so a brand-new
+            // invitee can befriend a hub and receive this canvas via
+            // gossip even if the owner is offline right now.
+            hubNodeIds: decoded.hubNodeIds ?? [],
           },
           collapsed: false,
           docId: null,
           parentId: null,
         });
+      } else if (isKnownFriend) {
+        // a placeholder card already exists (e.g. left behind by an
+        // earlier join attempt made before this peer was a friend, or
+        // before their profile had an avatar set) — refresh its owner
+        // badge fields now that we have current friend info, rather than
+        // leaving a stale blank avatar/username forever.
+        const friendInfo = getFriendInfo(decoded.nodeId);
+        if (friendInfo?.username || friendInfo?.avatarDataUrl) {
+          const existingCard = existing.find((w) => {
+            if (w.type !== "canvas-card") return false;
+            return (w.props as Record<string, unknown>)?.canvasDocId === decoded.docId;
+          });
+          if (existingCard) {
+            await this.currentCanvas.store.updateWidgetProps(existingCard.id, {
+              ownerUsername: friendInfo.username || "",
+              ownerAvatarDataUrl: friendInfo.avatarDataUrl || "",
+            });
+          }
+        }
       }
+    }
+
+    if (!isKnownFriend) {
+      // bail out here — no point navigating into a canvas we already know
+      // we can't sync yet. the card created above already shows the
+      // "request access" pill for the user to act on instead.
+      return;
     }
 
     // stash the remote peer's nodeId so navigateToCanvas can write it

@@ -162,6 +162,17 @@ export async function initFriendzWiring(
       const friends = sDoc.current.friends ?? [];
       return friends.some((f: any) => f.nodeIds?.some((n: any) => n.nodeId === nodeId));
     },
+    // relaxes the profileVisibility === "friends" gate on incoming
+    // profile-request messages so a peer with a still-pending (not yet
+    // accepted) friend request can also pull our profile — without opening
+    // "friends"-visibility to arbitrary strangers who haven't requested
+    // anything at all.
+    hasPendingRelationship: (nodeId: string) => {
+      const pending = sDoc.current.pendingRequests ?? [];
+      if (pending.some((r: any) => r.fromNodeId === nodeId)) return true;
+      const outbound = sDoc.current.outboundRequests ?? [];
+      return outbound.some((r: any) => r.toNodeId === nodeId);
+    },
     profileVisibility,
     friendRequestsFrom,
     canvasInvitesFrom,
@@ -308,6 +319,30 @@ export async function initFriendzWiring(
           friend.isHub = true;
         }
       }
+      // also refresh a pending (inbound) or outbound request's display
+      // fields, in case this profile-response was to a pending-relationship
+      // probe rather than a confirmed friend (see hasPendingRelationship).
+      for (const r of draft.pendingRequests ?? []) {
+        if (r.fromNodeId !== fromNodeId) continue;
+        if (msg.username) r.fromUsername = msg.username;
+        if (msg.bio !== undefined) r.fromBio = msg.bio;
+        if (msg.avatarDataUrl !== undefined) r.fromAvatarDataUrl = msg.avatarDataUrl;
+        if (msg.accentColor !== undefined) r.fromAccentColor = msg.accentColor;
+      }
+      for (const r of draft.outboundRequests ?? []) {
+        if (r.toNodeId !== fromNodeId) continue;
+        if (msg.username) r.toUsername = msg.username;
+        if (msg.avatarDataUrl !== undefined) r.toAvatarDataUrl = msg.avatarDataUrl;
+      }
+    });
+    // also refresh any canvas-share outbox entries sent to this node id —
+    // separate doc from the social doc above, so a separate change() call.
+    messagezHandle?.change((draft: any) => {
+      for (const share of draft.shares ?? []) {
+        if (share.toNodeId !== fromNodeId) continue;
+        if (msg.username) share.toUsername = msg.username;
+        if (msg.avatarDataUrl !== undefined) share.toAvatarDataUrl = msg.avatarDataUrl;
+      }
     });
   };
 
@@ -324,6 +359,50 @@ export async function initFriendzWiring(
         }
       }
     });
+  };
+
+  // proactive identity push (see friends-protocol.ts's sendIdentityUpdate) —
+  // a peer sends this right after editing their own profile so friends and
+  // pending-relationship peers refresh immediately instead of waiting for a
+  // profile-request/gossip round-trip. refreshes whichever local record(s)
+  // reference this node id: a friend's nodeIds entry, an inbound pending
+  // request, and/or an outbound request we sent them.
+  protocol.onIdentityUpdate = (msg, fromNodeId) => {
+    sDoc.change((draft: any) => {
+      for (const friend of draft.friends ?? []) {
+        for (const n of friend.nodeIds ?? []) {
+          if (n.nodeId !== fromNodeId) continue;
+          if (msg.username !== undefined) n.username = msg.username;
+          if (msg.bio !== undefined) n.bio = msg.bio;
+          if (msg.avatarDataUrl !== undefined) n.avatarDataUrl = msg.avatarDataUrl;
+          if (msg.accentColor !== undefined) n.accentColor = msg.accentColor;
+          n.lastSeenAt = new Date().toISOString();
+          if (msg.username) friend.username = msg.username;
+        }
+      }
+      for (const r of draft.pendingRequests ?? []) {
+        if (r.fromNodeId !== fromNodeId) continue;
+        if (msg.username !== undefined) r.fromUsername = msg.username;
+        if (msg.bio !== undefined) r.fromBio = msg.bio;
+        if (msg.avatarDataUrl !== undefined) r.fromAvatarDataUrl = msg.avatarDataUrl;
+        if (msg.accentColor !== undefined) r.fromAccentColor = msg.accentColor;
+      }
+      for (const r of draft.outboundRequests ?? []) {
+        if (r.toNodeId !== fromNodeId) continue;
+        if (msg.username !== undefined) r.toUsername = msg.username;
+        if (msg.avatarDataUrl !== undefined) r.toAvatarDataUrl = msg.avatarDataUrl;
+      }
+    });
+    // also refresh any canvas-share outbox entries sent to this node id —
+    // separate doc from the social doc above, so a separate change() call.
+    messagezHandle?.change((draft: any) => {
+      for (const share of draft.shares ?? []) {
+        if (share.toNodeId !== fromNodeId) continue;
+        if (msg.username !== undefined) share.toUsername = msg.username;
+        if (msg.avatarDataUrl !== undefined) share.toAvatarDataUrl = msg.avatarDataUrl;
+      }
+    });
+    log.debug(TAG, "applied identity-update from:", fromNodeId.slice(0, 16) + "...");
   };
 
   // canvas invite handling
@@ -350,14 +429,21 @@ export async function initFriendzWiring(
     messagezHandle.change((draft: any) => {
       if (!draft.invites) draft.invites = [];
 
-      // check for existing invite for same canvas from same origin
+      // check for existing invite for same canvas from same origin — a
+      // resend after the sender edits their profile updates identity
+      // fields on the existing entry in place instead of duplicating it
+      // (same de-dupe-and-refresh pattern as onFriendRequest below).
       const currentInbox = (draft.invites ?? []) as any[];
-      const alreadyHave = currentInbox.some(
+      const existing = currentInbox.find(
         (inv: any) => inv.canvasDocId === msg.canvasDocId && inv.fromNodeId === msg.originNodeId
       );
 
-      if (alreadyHave) {
-        log.debug(TAG, "duplicate invite — already in inbox, skipping");
+      if (existing) {
+        existing.fromUsername = msg.originUsername ?? existing.fromUsername;
+        if (msg.originBio !== undefined) existing.fromBio = msg.originBio;
+        if (msg.originAvatarDataUrl !== undefined) existing.fromAvatarDataUrl = msg.originAvatarDataUrl;
+        if (msg.originAccentColor !== undefined) existing.fromAccentColor = msg.originAccentColor;
+        log.debug(TAG, "duplicate invite — refreshed identity fields on existing entry");
         return;
       }
 
@@ -370,6 +456,9 @@ export async function initFriendzWiring(
         canvasPreviewUrl: msg.canvasPreviewUrl ?? "",
         fromNodeId: msg.originNodeId,
         fromUsername: msg.originUsername ?? "unknown",
+        fromBio: msg.originBio ?? "",
+        fromAvatarDataUrl: msg.originAvatarDataUrl ?? "",
+        ...(msg.originAccentColor !== undefined ? { fromAccentColor: msg.originAccentColor } : {}),
         relayedBy: fromNodeId !== msg.originNodeId ? fromNodeId : "",
         role: msg.role,
         receivedAt: new Date().toISOString(),
@@ -546,7 +635,7 @@ export async function initFriendzWiring(
   // exported as a standalone function (rather than inlined here) so it can
   // also be exercised directly in tests without needing the full narthex/
   // social/messagez setup this function requires.
-  wireKnockHandlers({ protocol, repo, irohAdapter, localNodeId });
+  wireKnockHandlers({ protocol, repo, irohAdapter, localNodeId, narthexDocId });
 
 
   // wire outbound requests through the bridge
@@ -692,12 +781,21 @@ export async function initFriendzWiring(
   const unsubSocial = sDoc.on("change", onSocialChange);
   unsubs.push(unsubSocial);
 
-  // push a gossip digest to online friends whenever our own profile fields
-  // change (username, bio, avatarDataUrl, accentColor). the digest carries
-  // the current profile-doc pointer + updatedAt; receivers apply newer-wins
-  // merging and pull the full profile doc if the pointer is fresher than
-  // what they already hold. debounced 2s so a username+bio+avatar burst
-  // sends one digest instead of three.
+  // push identity updates to online friends and pending-relationship peers
+  // whenever our own profile fields change (username, bio, avatarDataUrl,
+  // accentColor). `sendIdentityUpdate` delivers the new values directly in
+  // one message, so peers refresh immediately rather than waiting on the
+  // gossip digest's pointer to prompt a follow-up profile fetch — that
+  // slower path (below) still runs too, and is what eventually covers a
+  // peer that's offline right now. debounced 2s so a username+bio+avatar
+  // edit burst sends one push instead of three.
+  //
+  // TODO: this fans out one message per online friend/pending peer with no
+  // rate limit beyond the 2s debounce — fine at today's friend-list scale,
+  // but a circuit-breaker-style cap (e.g. max pushes per minute, or backing
+  // off a peer that's repeatedly unreachable) is a wider connection-
+  // protection concern worth revisiting once gossip/identity-push traffic
+  // grows.
   {
     const profileSnapshot = () => {
       const p = sDoc.current.profile;
@@ -719,6 +817,35 @@ export async function initFriendzWiring(
       if (profilePushTimer !== null) clearTimeout(profilePushTimer);
       profilePushTimer = setTimeout(() => {
         profilePushTimer = null;
+
+        const targetNodeIds = new Set<string>();
+        for (const friend of (sDoc.current.friends ?? []) as any[]) {
+          for (const n of friend.nodeIds ?? []) {
+            if (n.nodeId && n.nodeId !== localNodeId) targetNodeIds.add(n.nodeId);
+          }
+        }
+        for (const r of (sDoc.current.pendingRequests ?? []) as any[]) {
+          if (r.fromNodeId) targetNodeIds.add(r.fromNodeId);
+        }
+        for (const r of (sDoc.current.outboundRequests ?? []) as any[]) {
+          if (r.toNodeId) targetNodeIds.add(r.toNodeId);
+        }
+
+        for (const nodeId of targetNodeIds) {
+          if (!protocol.isOnline(nodeId)) continue;
+          protocol.sendIdentityUpdate(nodeId).catch((err) => {
+            log.debug(
+              TAG,
+              "profile push: sendIdentityUpdate failed for:",
+              nodeId.slice(0, 16) + "...",
+              err
+            );
+          });
+        }
+
+        // gossip digest still covers friends specifically — it carries the
+        // profile-doc pointer alongside other digest content (canvas
+        // updates, pending invites), which sendIdentityUpdate doesn't touch.
         const friends = sDoc.current.friends ?? [];
         for (const friend of friends as any[]) {
           for (const n of friend.nodeIds ?? []) {
@@ -1055,6 +1182,56 @@ export async function initFriendzWiring(
           log.warn(TAG, "retry requestProfile failed for", peerNodeId.slice(0, 16) + "...", err);
         });
       }
+    }
+
+    // (3) same idea for a pending (inbound) relationship — the request
+    // itself already carries identity info, but a first request received
+    // while we're offline may predate that, so cover the gap. allowed by
+    // the hasPendingRelationship gate on the peer's side even though we're
+    // not friends yet.
+    const pendingEntry = (sDoc.current.pendingRequests ?? []).find(
+      (r: any) => r.fromNodeId === peerNodeId
+    );
+    if (pendingEntry && !pendingEntry.fromBio && !pendingEntry.fromAvatarDataUrl) {
+      log.debug(TAG, "retrying profile-request to pending peer:", peerNodeId.slice(0, 16) + "...");
+      protocol.requestProfile(peerNodeId).catch((err) => {
+        log.warn(
+          TAG,
+          "retry requestProfile (pending) failed for",
+          peerNodeId.slice(0, 16) + "...",
+          err
+        );
+      });
+    }
+
+    // (4) retry any undelivered canvas-knock (access request) targeting
+    // this peer as the canvas owner — see `requestCanvasAccess()`
+    // (boot.ts) for where these are written into the messagez doc's
+    // `accessRequests` outbox. deliberately checked even when
+    // `!isFriend` — a knock is exactly the case where the requester and
+    // the owner aren't friends yet.
+    const accessRequests = (messagezHandle?.doc()?.accessRequests ?? []) as any[];
+    for (const req of accessRequests) {
+      if (req.delivered) continue;
+      if (req.ownerNodeId !== peerNodeId) continue;
+      log.debug(
+        TAG,
+        "retrying pending canvas-knock to:",
+        peerNodeId.slice(0, 16) + "...",
+        "canvas:",
+        req.canvasDocId.slice(0, 16) + "..."
+      );
+      protocol
+        .sendCanvasKnock(peerNodeId, {
+          knockId: req.knockId,
+          canvasDocId: req.canvasDocId,
+          requesterNodeId: localNodeId,
+          requesterUsername: protocol.getLocalUsername() ?? "",
+          message: "",
+        })
+        .catch((err) => {
+          log.warn(TAG, "retry sendCanvasKnock failed for", peerNodeId.slice(0, 16) + "...", err);
+        });
     }
 
     if (!isFriend) return;
@@ -1609,13 +1786,26 @@ export function wireFriendHandlers(deps: FriendHandlersDeps): void {
         draft.pendingRequests.push({
           fromNodeId,
           fromUsername: msg.fromUsername ?? "unknown",
+          fromBio: msg.bio ?? "",
+          fromAvatarDataUrl: msg.avatarDataUrl ?? "",
+          ...(msg.accentColor !== undefined ? { fromAccentColor: msg.accentColor } : {}),
           receivedAt: new Date().toISOString(),
           status: reciprocal ? "accepted" : "pending",
         });
         didAdd = true;
-      } else if (reciprocal && draft.pendingRequests[idx].status === "pending") {
-        // upgrade an existing pending entry to accepted on reciprocal match
-        draft.pendingRequests[idx].status = "accepted";
+      } else {
+        // a resend of an already-pending request (e.g. the sender edited
+        // their profile) — refresh identity fields on the existing entry
+        // in place instead of creating a duplicate, and re-render reflects
+        // the update automatically via the doc-change subscription.
+        const existing = draft.pendingRequests[idx];
+        existing.fromUsername = msg.fromUsername ?? existing.fromUsername;
+        if (msg.bio !== undefined) existing.fromBio = msg.bio;
+        if (msg.avatarDataUrl !== undefined) existing.fromAvatarDataUrl = msg.avatarDataUrl;
+        if (msg.accentColor !== undefined) existing.fromAccentColor = msg.accentColor;
+        if (reciprocal && existing.status === "pending") {
+          existing.status = "accepted";
+        }
       }
       // mirror status on outbound request if present
       if (reciprocal && draft.outboundRequests) {
@@ -1804,6 +1994,17 @@ export interface KnockHandlersDeps {
   repo: Repo;
   irohAdapter: IrohNetworkAdapter;
   localNodeId: string;
+  /** the narthex doc's id, if known — used to find and clear the matching
+   *  canvas-card widget's `accessRequestedAt` when a `canvas-knock-decline`
+   *  arrives, mirroring `wireAclChangeHandlers()`'s narthex-widget lookup
+   *  above. optional so tests exercising the ack/relay paths don't need a
+   *  full narthex doc set up. */
+  narthexDocId?: string;
+  /** the messagez doc's handle, if ready — used to mark a matching
+   *  `accessRequests` outbox entry (see `requestCanvasAccess()`, boot.ts)
+   *  delivered once its `canvas-knock-ack` arrives, mirroring the existing
+   *  canvas-invite outbox's `onCanvasInviteAck` handling above. */
+  messagezHandle?: DocHandle<any> | null;
   /** see `KnockRelayInfo`'s doc comment. only fires for the *direct*
    *  `canvas-knock` relay case (sender != requester); gossip-digest-merged
    *  knocks fire it via `mergeGossipDigestKnocks()`'s own parameter instead,
@@ -1817,6 +2018,12 @@ export interface KnockHandlersDeps {
    *  need a deterministic "the knock was actually processed" signal
    *  instead of an arbitrary wait. */
   onKnockAcked?: (info: { knockId: string; canvasDocId: string; ackerNodeId: string }) => void;
+  /** fires on the requester's side when a `canvas-knock-approve` arrives —
+   *  i.e. access was actually granted (see `onCanvasKnockApprove` below for
+   *  why this is a notification, not the grant itself). lets a caller
+   *  retry opening the canvas automatically instead of leaving the user to
+   *  notice and manually retry — see boot.ts's `handleKnockApproved()`. */
+  onKnockApproved?: (info: { canvasDocId: string; role: InvitableRole }) => void;
 }
 
 /**
@@ -1826,7 +2033,17 @@ export interface KnockHandlersDeps {
  * sections 4-6 for the full message/behavior spec.
  */
 export function wireKnockHandlers(deps: KnockHandlersDeps): void {
-  const { protocol, repo, irohAdapter, localNodeId, onKnockRelayed, onKnockAcked } = deps;
+  const {
+    protocol,
+    repo,
+    irohAdapter,
+    localNodeId,
+    narthexDocId,
+    messagezHandle,
+    onKnockRelayed,
+    onKnockAcked,
+    onKnockApproved,
+  } = deps;
 
   // admin (or relay peer)'s side: record the knock into whichever canvas
   // doc it refers to, then ack whoever actually sent us this message — that
@@ -1879,9 +2096,10 @@ export function wireKnockHandlers(deps: KnockHandlersDeps): void {
     })();
   };
 
-  // requester's side: a delivery confirmation. no UI to update yet (see
-  // section 7.1 — the requester's status view is a later phase), so this
-  // just logs for now.
+  // requester's side: a delivery confirmation. mark the matching
+  // `accessRequests` outbox entry delivered (mirrors `onCanvasInviteAck`'s
+  // outbox update above) so `onPeerBecameOnline`'s retry logic below stops
+  // resending it, then notify any live UI listener.
   protocol.onCanvasKnockAck = (msg, fromNodeId) => {
     log.debug(
       TAG,
@@ -1892,6 +2110,16 @@ export function wireKnockHandlers(deps: KnockHandlersDeps): void {
       "canvas:",
       msg.canvasDocId.slice(0, 16) + "..."
     );
+    if (messagezHandle) {
+      messagezHandle.change((draft: any) => {
+        for (const req of draft.accessRequests ?? []) {
+          if (req.knockId === msg.knockId) {
+            req.delivered = true;
+            req.ackerNodeId = msg.ackerNodeId;
+          }
+        }
+      });
+    }
     onKnockAcked?.({ knockId: msg.knockId, canvasDocId: msg.canvasDocId, ackerNodeId: msg.ackerNodeId });
   };
 
@@ -1938,13 +2166,15 @@ export function wireKnockHandlers(deps: KnockHandlersDeps): void {
     repo.find(msg.canvasDocId as DocumentId).catch(() => {
       // best effort — sync will catch up once a connection lands
     });
+
+    onKnockApproved?.({ canvasDocId: msg.canvasDocId, role: msg.role });
   };
 
-  // requester's side: per tomb's silent-rejection policy (section 3.2/7.1),
-  // the requester's UI deliberately does not distinguish "declined" from
-  // "still pending" — so there's nothing to write here yet. this handler
-  // exists so a future UI task has somewhere to hook a (privacy-preserving)
-  // status update.
+  // requester's side: the owner explicitly declined the request. mark the
+  // outbox entry declined (mirrors the ack update above) and clear the
+  // matching canvas-card's `accessRequestedAt` so its pill drops the
+  // clickable guard — the requester sees "access declined" and can send a
+  // fresh knock rather than being stuck on "request sent" forever.
   protocol.onCanvasKnockDecline = (msg, fromNodeId) => {
     log.debug(
       TAG,
@@ -1953,6 +2183,39 @@ export function wireKnockHandlers(deps: KnockHandlersDeps): void {
       "canvas:",
       msg.canvasDocId.slice(0, 16) + "..."
     );
+
+    if (messagezHandle) {
+      messagezHandle.change((draft: any) => {
+        for (const req of draft.accessRequests ?? []) {
+          if (req.knockId === msg.knockId) {
+            req.declined = true;
+          }
+        }
+      });
+    }
+
+    if (!narthexDocId) return;
+    try {
+      const narthexHandle = repo.handles[narthexDocId as any];
+      const narthexDoc = narthexHandle?.doc();
+      if (!narthexDoc?.widgets) return;
+
+      for (const [, card] of Object.entries(narthexDoc.widgets) as any[]) {
+        if (card?.type !== "canvas-card") continue;
+        if ((card.props as any)?.canvasDocId !== msg.canvasDocId) continue;
+        if (!card.docId) continue;
+
+        const cardHandle = repo.handles[card.docId as any];
+        if (!cardHandle) continue;
+
+        cardHandle.change((draft: any) => {
+          draft.accessRequestedAt = "";
+          draft.accessDeclined = true;
+        });
+      }
+    } catch (err) {
+      log.warn(TAG, "failed to update canvas card after knock decline:", err);
+    }
   };
 }
 

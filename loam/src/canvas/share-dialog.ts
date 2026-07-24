@@ -13,6 +13,8 @@ import { Container, Graphics, Text, type Application } from "pixi.js";
 import type { CanvasRole, InvitableRole } from "./canvas-doc";
 import type { SkeinTheme } from "../theme/skein-theme";
 import { log } from "@freqhole/reliquary/utils";
+import { renderAvatar } from "../../widgets/narthex/social/avatar-renderer";
+import { truncate } from "../../widgets/narthex/social/helpers";
 
 const TAG = "canvas.share";
 
@@ -26,6 +28,8 @@ export interface FriendInfo {
   nodeId: string;
   avatarDataUrl?: string;
   isOnline: boolean;
+  /** truncated and shown under the username, when there's room on the row. */
+  bio?: string;
   /** true if this friend is a known reliquary hub (see docs/hub-and-profile-plan.md). */
   isHub?: boolean;
   /** true if this is still an in-progress friend request (inbound or
@@ -42,7 +46,13 @@ export interface ShareDialogOptions {
   theme: SkeinTheme;
   shareUrl: string;
   /** list of peer node IDs this canvas is shared with (from canvas doc) */
-  peers?: Array<{ nodeId: string; joinedAt: string; role?: CanvasRole }>;
+  peers?: Array<{
+    nodeId: string;
+    joinedAt: string;
+    role?: CanvasRole;
+    avatarDataUrl?: string;
+    isOnline?: boolean;
+  }>;
   /** called when user clicks "remove" on a peer */
   onRemovePeer?: (nodeId: string) => void;
   /** called when user clicks "add friend" on a peer — sends a friend request */
@@ -102,6 +112,26 @@ export interface ShareDialogOptions {
    * defaults to false (the full admin dialog).
    */
   readOnly?: boolean;
+  /**
+   * node ids of hubs this canvas has been explicitly shared with (from
+   * canvas doc's `hubNodeIds`) — when non-empty, a small toggle row is
+   * shown letting the sharer opt out of including them in the link.
+   * omit/leave empty to hide the toggle entirely (no hubs to offer).
+   */
+  hubNodeIds?: string[];
+  /**
+   * whether `hubNodeIds` are currently included in `shareUrl` — reflects
+   * the toggle's on/off state. only meaningful (and only rendered) when
+   * `hubNodeIds` is non-empty. defaults to true (include by default) when
+   * omitted.
+   */
+  includeHubsInLink?: boolean;
+  /**
+   * called when the user flips the "include hub(s) in link" toggle — the
+   * caller is expected to recompute `shareUrl` accordingly and rebuild the
+   * dialog with the new options.
+   */
+  onToggleIncludeHubs?: (include: boolean) => void;
 }
 
 export interface ShareDialogHandle {
@@ -149,10 +179,9 @@ const BUTTON_PAD_V = 6;
 const COPY_FEEDBACK_MS = 1500;
 const DIALOG_Z = 10002;
 const DOM_Z = "10003";
-
-const AVATAR_COLORS = [
-  0x6366f1, 0x8b5cf6, 0xec4899, 0xf43f5e, 0xf97316, 0xeab308, 0x22c55e, 0x14b8a6, 0x3b82f6,
-];
+// extra row height given to a friend-invite row when it also shows a
+// truncated bio line underneath the name (see buildFriendInviteRow).
+const FRIEND_ROW_BIO_EXTRA = 14;
 
 // ---------------------------------------------------------------------------
 // helpers — pixi
@@ -320,7 +349,9 @@ function buildPeerRow(
   displayName?: string,
   role?: CanvasRole,
   onChangeRole?: (nodeId: string, role: InvitableRole) => void,
-  isAlreadyFriend?: boolean
+  isAlreadyFriend?: boolean,
+  avatarDataUrl?: string,
+  isOnline?: boolean
 ): Container {
   const row = new Container();
 
@@ -330,8 +361,23 @@ function buildPeerRow(
     log.warn(TAG, "buildPeerRow: coerced non-string nodeId:", typeof nodeId, nodeId);
   }
 
-  // peer display: show name if known, otherwise truncated node ID
+  // avatar circle with initial-letter fallback, async image overlay, and
+  // an online/offline status dot — see avatar-renderer.ts.
+  const avatarSize = Math.min(20, copyBtnH);
   const truncated = safeNodeId.slice(0, 8) + "..." + safeNodeId.slice(-8);
+  renderAvatar({
+    parent: row,
+    cacheKey: `share-peer-avatar-${safeNodeId}`,
+    centerX: avatarSize / 2,
+    centerY: copyBtnH / 2,
+    size: avatarSize,
+    displayName: displayName || truncated,
+    colorSeed: 0,
+    avatarUrl: avatarDataUrl,
+    online: isOnline,
+  });
+
+  // peer display: show name if known, otherwise truncated node ID
   const label = displayName ? displayName : truncated;
   const idText = new Text({
     text: label,
@@ -344,6 +390,7 @@ function buildPeerRow(
     resolution: theme.textResolution,
   });
   idText.eventMode = "none";
+  idText.x = avatarSize + 8;
   idText.y = (copyBtnH - idText.height) / 2;
   row.addChild(idText);
 
@@ -528,42 +575,21 @@ function buildFriendInviteRow(
 ): { container: Container; nameText: Text } {
   const row = new Container();
 
-  // avatar circle — colored based on username hash
+  // avatar circle with initial-letter fallback, async image overlay, and
+  // an online/offline status dot — see avatar-renderer.ts.
   const avatarSize = 22;
-  const charSum = friend.username.split("").reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
-  const avatarColor = AVATAR_COLORS[charSum % AVATAR_COLORS.length];
-
-  const avatarBg = new Graphics();
-  avatarBg.circle(avatarSize / 2, avatarSize / 2, avatarSize / 2);
-  avatarBg.fill({ color: avatarColor });
-  avatarBg.y = (rowHeight - avatarSize) / 2;
-  row.addChild(avatarBg);
-
-  // initial letter centered in avatar
-  const initial = (friend.username[0] ?? "?").toUpperCase();
-  const initialText = new Text({
-    text: initial,
-    style: {
-      fontFamily: theme.fontFamily,
-      fontSize: 11,
-      fontWeight: "bold",
-      fill: 0xffffff,
-    },
-    resolution: theme.textResolution,
+  const displayNameForAvatar = friend.username || friend.nodeId;
+  renderAvatar({
+    parent: row,
+    cacheKey: `share-friend-avatar-${friend.nodeId}`,
+    centerX: avatarSize / 2,
+    centerY: rowHeight / 2,
+    size: avatarSize,
+    displayName: displayNameForAvatar,
+    colorSeed: 0,
+    avatarUrl: friend.avatarDataUrl,
+    online: friend.isOnline,
   });
-  initialText.eventMode = "none";
-  initialText.x = (avatarSize - initialText.width) / 2;
-  initialText.y = avatarBg.y + (avatarSize - initialText.height) / 2;
-  row.addChild(initialText);
-
-  // online status dot — 6px circle at bottom-right of avatar
-  const dotSize = 6;
-  const statusDot = new Graphics();
-  statusDot.circle(dotSize / 2, dotSize / 2, dotSize / 2);
-  statusDot.fill({ color: friend.isOnline ? 0x22c55e : 0x6b7280 });
-  statusDot.x = avatarSize - dotSize + 1;
-  statusDot.y = avatarBg.y + avatarSize - dotSize + 1;
-  row.addChild(statusDot);
 
   // username text — a still-pending friend request gets a "(pending)"
   // suffix so the invite is honest about the relationship not being
@@ -582,8 +608,27 @@ function buildFriendInviteRow(
   });
   nameText.eventMode = "none";
   nameText.x = avatarSize + 8;
-  nameText.y = (rowHeight - nameText.height) / 2;
+  nameText.y = friend.bio ? avatarSize / 2 - nameText.height - 1 : (rowHeight - nameText.height) / 2;
   row.addChild(nameText);
+
+  // bio, truncated — shown under the name when there's room (the row
+  // grows a little taller for this, see the caller's per-row height calc)
+  if (friend.bio) {
+    const bioText = new Text({
+      text: truncate(friend.bio, 40),
+      style: {
+        fontFamily: theme.fontFamily,
+        fontSize: theme.fontSizeSmall - 1,
+        fill: 0x6b7280,
+      },
+      resolution: theme.textResolution,
+    });
+    bioText.eventMode = "none";
+    bioText.x = avatarSize + 8;
+    bioText.y = nameText.y + nameText.height + 2;
+    row.addChild(bioText);
+  }
+
 
   // role toggle — chooses member (default) or viewer before inviting.
   let selectedRole: InvitableRole = "member";
@@ -955,6 +1000,79 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   const shareUrlRow = buildRow("share URL", shareUrl);
 
   // -------------------------------------------------------------------------
+  // "include hub(s) in link" toggle — only shown when this canvas has been
+  // explicitly shared with at least one hub (see canvas-doc.ts's
+  // `hubNodeIds`). lets the sharer opt out of including hub node ids in the
+  // link; default (when the toggle isn't touched) is to include them, so a
+  // brand-new invitee can befriend a hub and receive the invite/canvas via
+  // gossip even if the sharer goes offline right after sending the link —
+  // see share-string.ts's top doc comment for the full rationale.
+  const hubNodeIds = options.hubNodeIds ?? [];
+  const includeHubsSection = new Container();
+  if (hubNodeIds.length > 0) {
+    const includeHubs = options.includeHubsInLink !== false;
+    const hubCount = hubNodeIds.length;
+
+    const toggleLabel = makeLabel("include hub(s) in link", theme);
+    includeHubsSection.addChild(toggleLabel);
+
+    const toggleText = new Text({
+      text: includeHubs ? "on" : "off",
+      style: {
+        fontFamily: theme.fontFamily,
+        fontSize: theme.fontSizeSmall,
+        fill: includeHubs ? 0x86efac : 0x9ca3af,
+      },
+      resolution: theme.textResolution,
+    });
+    toggleText.eventMode = "none";
+
+    const toggleBg = new Graphics();
+    const drawToggle = (on: boolean) => {
+      const w = Math.max(toggleText.width, 32) + BUTTON_PAD_H * 2;
+      const h = toggleText.height + BUTTON_PAD_V * 2;
+      toggleBg.clear();
+      toggleBg.roundRect(0, 0, w, h, 4);
+      toggleBg.fill({ color: on ? 0x14532d : 0x27272a });
+      toggleBg.stroke({ color: on ? 0x22c55e : 0x3f3f46, width: 1 });
+      toggleText.x = (w - toggleText.width) / 2;
+      toggleText.y = BUTTON_PAD_V;
+      return { w, h };
+    };
+    const { w: toggleW } = drawToggle(includeHubs);
+
+    const toggleView = new Container();
+    toggleView.addChild(toggleBg);
+    toggleView.addChild(toggleText);
+
+    const toggleBtn = new ButtonContainer(toggleView);
+    toggleBtn.cursor = "pointer";
+    toggleBtn.x = scrollBoxWidth - toggleW;
+    toggleBtn.y = toggleLabel.height / 2 - (toggleText.height + BUTTON_PAD_V * 2) / 2;
+    toggleBtn.onPress.connect(() => {
+      options.onToggleIncludeHubs?.(!includeHubs);
+    });
+    includeHubsSection.addChild(toggleBtn);
+
+    const description = new Text({
+      text:
+        hubCount === 1
+          ? "this canvas has been shared with a hub — including its node id lets a new invitee connect to it and receive this invite even while you're offline."
+          : `this canvas has been shared with ${hubCount} hubs — including their node ids lets a new invitee connect to one and receive this invite even while you're offline.`,
+      style: {
+        fontFamily: theme.fontFamily,
+        fontSize: theme.fontSizeSmall - 1,
+        fill: 0x6b7280,
+        wordWrap: true,
+        wordWrapWidth: scrollBoxWidth,
+      },
+      resolution: theme.textResolution,
+    });
+    description.y = toggleLabel.height + LABEL_GAP;
+    includeHubsSection.addChild(description);
+  }
+
+  // -------------------------------------------------------------------------
   // peer list section
   // -------------------------------------------------------------------------
 
@@ -994,7 +1112,9 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
         nameMap?.get(peer.nodeId),
         peer.role,
         options.onChangeRole,
-        knownFriends.has(peer.nodeId)
+        knownFriends.has(peer.nodeId),
+        peer.avatarDataUrl,
+        peer.isOnline
       );
       peerRow.y = peerY;
       peerSection.addChild(peerRow);
@@ -1039,18 +1159,19 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
     } else {
       let friendY = friendLabel.height + LABEL_GAP;
       for (const friend of friendList) {
+        const rowHeight = friend.bio ? copyBtnH + FRIEND_ROW_BIO_EXTRA : copyBtnH;
         const { container: friendRow, nameText } = buildFriendInviteRow(
           friend,
           theme,
           scrollBoxWidth,
-          copyBtnH,
+          rowHeight,
           isRemoved,
           options.onInviteFriend
         );
         friendRow.y = friendY;
         friendSection.addChild(friendRow);
         friendRowNameTexts.set(friend.nodeId, nameText);
-        friendY += copyBtnH + 4;
+        friendY += rowHeight + 4;
       }
     }
   }
@@ -1067,18 +1188,19 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
 
     let hubFriendY = hubFriendLabel.height + LABEL_GAP;
     for (const friend of hubFriendList) {
+      const rowHeight = friend.bio ? copyBtnH + FRIEND_ROW_BIO_EXTRA : copyBtnH;
       const { container: friendRow, nameText } = buildFriendInviteRow(
         friend,
         theme,
         scrollBoxWidth,
-        copyBtnH,
+        rowHeight,
         isRemoved,
         options.onInviteFriend
       );
       friendRow.y = hubFriendY;
       hubFriendSection.addChild(friendRow);
       friendRowNameTexts.set(friend.nodeId, nameText);
-      hubFriendY += copyBtnH + 4;
+      hubFriendY += rowHeight + 4;
     }
   }
 
@@ -1225,6 +1347,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   // `readOnly` hides some of them).
   const contentSections: Container[] = [
     shareUrlRow.container,
+    ...(hubNodeIds.length > 0 ? [includeHubsSection] : []),
     peerSection,
     ...(readOnly ? [] : [friendSection]),
     ...(!readOnly && hubFriendList.length > 0 ? [hubFriendSection] : []),
@@ -1235,13 +1358,24 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   const rowHeight = titleText.height + LABEL_GAP + INPUT_HEIGHT; // approximate single row
   const peerSectionHeight =
     peerLabel.height + LABEL_GAP + Math.max(1, peerList.length) * (copyBtnH + 4);
+  // sum actual per-row heights (not a flat multiply) since a friend row
+  // with a bio grows taller than the base copyBtnH — see FRIEND_ROW_BIO_EXTRA.
+  const friendRowsHeight = (list: FriendInfo[]) =>
+    list.length === 0
+      ? copyBtnH + 4
+      : list.reduce((sum, f) => sum + (f.bio ? copyBtnH + FRIEND_ROW_BIO_EXTRA : copyBtnH) + 4, 0);
   const friendSectionHeight = readOnly
     ? 0
-    : friendLabel.height + LABEL_GAP + Math.max(1, friendList.length) * (copyBtnH + 4);
+    : friendLabel.height + LABEL_GAP + friendRowsHeight(friendList);
   const hubFriendSectionHeight =
     !readOnly && hubFriendList.length > 0
-      ? hubFriendSection.getChildAt(0).height + LABEL_GAP + hubFriendList.length * (copyBtnH + 4)
+      ? hubFriendSection.getChildAt(0).height + LABEL_GAP + friendRowsHeight(hubFriendList)
       : 0;
+  // measured after the section is fully built above (label + toggle row +
+  // wrapped description) — getBounds()/getLocalBounds() reflects the real
+  // wrapped text height, unlike a fixed estimate.
+  const includeHubsSectionHeight =
+    hubNodeIds.length > 0 ? includeHubsSection.getLocalBounds().height : 0;
   const pendingSectionHeight =
     pendingLabel.height + LABEL_GAP + Math.max(1, pendingList.length) * (copyBtnH + 4);
   const declinedSectionHeight = readOnly
@@ -1250,6 +1384,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   const contentNeeded =
     rowHeight +
     SECTION_GAP * Math.max(0, contentSections.length - 1) +
+    includeHubsSectionHeight +
     peerSectionHeight +
     friendSectionHeight +
     hubFriendSectionHeight +

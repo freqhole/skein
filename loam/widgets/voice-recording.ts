@@ -35,7 +35,7 @@ import {
   BlobAccessDeniedError,
   type PeersMap,
 } from "../src/widgets/file-utils";
-import { sendFriendRequest } from "../src/p2p/friendz-bridge";
+import { getLocalAccentColor, sendFriendRequest } from "../src/p2p/friendz-bridge";
 import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import {
   isTransparent,
@@ -148,13 +148,23 @@ function mimeToExt(mime: string): string {
   return "webm";
 }
 
-/** pick a random vivid lip color on init — mirrors doodle.ts's randomDoodleColor approach */
+/** pick a random vivid lip color — fallback for when the user's social
+ *  identity profile accent color isn't available yet (see
+ *  `defaultLipColor()`). mirrors doodle.ts's randomDoodleColor approach. */
 function randomLipColor(): number {
   const palette = [
     0xc2455a, 0xdb2777, 0xe11d48, 0xf43f5e, 0xec4899, 0xd946ef, 0xef4444, 0xf97316, 0xfb7185,
     0xbe185d, 0x9d174d, 0xa21caf, 0xc026d3, 0xe879f9, 0xfb923c,
   ];
   return palette[Math.floor(Math.random() * palette.length)];
+}
+
+/** default a new widget's lip color to the user's own social identity
+ *  profile accent color (profile-tab.ts's palette picker) — falls back to
+ *  a random vivid color only if the social doc isn't registered yet (e.g.
+ *  no identity set up). */
+function defaultLipColor(): number {
+  return getLocalAccentColor() ?? randomLipColor();
 }
 
 /** pick a random lip thickness (1..10) on init */
@@ -190,10 +200,10 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
   },
   schema: voiceRecordingSchema,
   editableProps: [
-    { key: "lipsColor", label: "lips color", type: "color" as const, default: 0xc2455a },
     { key: "bgColor", label: "background", type: "color" as const, default: -1 },
     { key: "borderColor", label: "border", type: "color" as const, default: -1 },
     { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
+    { key: "lipsColor", label: "lips color", type: "color" as const, default: 0xc2455a },
   ],
 
   getCompactInfo: (state: VoiceRecordingState): CompactInfo => ({
@@ -277,11 +287,12 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
 
     void enumerateDevices();
 
-    // randomize lip color/thickness once, the first time this widget is ever
-    // mounted — subsequent mounts (reload, reconnect) keep whatever was seeded.
+    // seed lip color/thickness once, the first time this widget is ever
+    // mounted — subsequent mounts (reload, reconnect) keep whatever was
+    // seeded. lip color defaults to the user's own profile accent color.
     if (!ctx.doc.current.lipsSeeded) {
       ctx.doc.change((d) => {
-        d.lipsColor = randomLipColor();
+        d.lipsColor = defaultLipColor();
         d.lipThickness = randomLipThickness();
         d.lipsSeeded = true;
       });
@@ -1005,6 +1016,9 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       headerActions: makeHeaderActions(),
       widgetActions,
       editableProps: [
+        { key: "bgColor", label: "background", type: "color" as const, default: -1 },
+        { key: "borderColor", label: "border", type: "color" as const, default: -1 },
+        { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
         { key: "lipsColor", label: "lips color", type: "color" as const, default: 0xc2455a },
         {
           key: "lipThickness",
@@ -1014,9 +1028,6 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           min: 1,
           max: 10,
         },
-        { key: "bgColor", label: "background", type: "color" as const, default: -1 },
-        { key: "borderColor", label: "border", type: "color" as const, default: -1 },
-        { key: "borderWidth", label: "border width", type: "number" as const, min: 0, default: 0 },
         {
           key: "mouthMood",
           label: "mouth mood",

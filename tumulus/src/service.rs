@@ -448,6 +448,12 @@ impl Service {
                     v: 1,
                     from_node_id: self.node_id_str.clone(),
                     from_username: self.local_username.clone(),
+                    // this desktop-peer router doesn't track its own bio/
+                    // avatar/accent color today - a profile fetch still
+                    // covers those once the recipient calls requestProfile().
+                    bio: None,
+                    avatar_data_url: None,
+                    accent_color: None,
                     // this router is the tauri-desktop outbound-only peer, NOT
                     // a hub (see docs/hub-and-profile-plan.md section 3.2) — never
                     // set the hub flag here, matching an ordinary browser peer.
