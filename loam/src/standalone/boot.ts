@@ -2944,6 +2944,7 @@ class SkeinRouter {
       widgetId: "canvas-info-overlay",
       canvasElement: canvas.app.canvas as HTMLCanvasElement,
       canvasStore: canvas.store,
+      connectionState: this.connectionStateSource,
     };
 
     try {

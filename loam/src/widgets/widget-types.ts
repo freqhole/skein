@@ -1,6 +1,7 @@
 import type { Container } from "pixi.js";
 import { z } from "zod";
 import type { CanvasStore } from "../canvas/canvas-store";
+import type { ConnectionStateSource } from "../canvas/connection-status";
 import type { ProfileStore } from "../canvas/profile-doc";
 import type { KeyboardDriver } from "./keyboard-driver";
 
@@ -193,6 +194,14 @@ export interface WidgetMountContext<S extends z.ZodType = z.ZodType> {
    *  boot.ts tried to resolve it and failed (no narthex doc yet, or the
    *  open failed) — distinct from `undefined` (never wired in at all). */
   narthexStore?: CanvasStore | null;
+  /** transport-level connection state (peer count, reconnect status) and a
+   *  `retryFailed()` escape hatch — lets a widget offer its own reconnect
+   *  affordance (e.g. canvas-info's connection banner) instead of relying on
+   *  the connection-status pill's click handler, which only opens canvas info
+   *  and never triggers a reconnect itself. only wired in for the canvas-info
+   *  widget's overlay mount (boot.ts); undefined for other widgets and for
+   *  headless/test contexts. */
+  connectionState?: ConnectionStateSource | null;
   /** dynamically update the custom header actions shown in the widget frame.
    *  call this whenever the action labels or set of actions changes (e.g. item
    *  count updated, snatch progress). provided by the widget manager at mount time. */

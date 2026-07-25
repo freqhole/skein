@@ -439,6 +439,84 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
       }
     };
 
+    // -- connection status -----------------------------------------------------
+    //
+    // the connection-status pill (bottom-left of the canvas) always opens
+    // canvas info on click, regardless of connection state, so a reconnect
+    // affordance is offered here instead. shown only while there's actually
+    // something to report (disconnected or reconnecting); hidden otherwise.
+
+    const connectionBanner = new Container();
+    connectionBanner.visible = false;
+    detailsContainer.addChild(connectionBanner);
+
+    const connectionBannerBg = new Graphics();
+    connectionBanner.addChild(connectionBannerBg);
+
+    const connectionStatusText = new Text({
+      text: "",
+      resolution: typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2,
+      style: {
+        fontFamily: "'Atkinson Hyperlegible Next', sans-serif",
+        fontSize: 11,
+        fill: 0xff8c42,
+      },
+    });
+    connectionStatusText.x = 8;
+    connectionStatusText.y = 6;
+    connectionBanner.addChild(connectionStatusText);
+
+    const reconnectLink = new Text({
+      text: "reconnect",
+      resolution: typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2,
+      style: {
+        fontFamily: "'Atkinson Hyperlegible Next', sans-serif",
+        fontSize: 11,
+        fontWeight: "bold",
+        fill: ACCENT_COLOR,
+      },
+    });
+    reconnectLink.y = 6;
+    reconnectLink.eventMode = "static";
+    reconnectLink.cursor = "pointer";
+    reconnectLink.on("pointertap", () => {
+      ctx.connectionState?.retryFailed();
+    });
+    connectionBanner.addChild(reconnectLink);
+
+    const refreshConnectionBanner = () => {
+      const cs = ctx.connectionState;
+      if (!cs) {
+        connectionBanner.visible = false;
+        layoutDetails();
+        return;
+      }
+
+      const summary = cs.getConnectionSummary();
+      if (summary.failed > 0) {
+        connectionBanner.visible = true;
+        connectionStatusText.text = `${summary.failed} peer${summary.failed !== 1 ? "s" : ""} disconnected`;
+        reconnectLink.visible = true;
+      } else if (summary.reconnecting > 0) {
+        connectionBanner.visible = true;
+        connectionStatusText.text = "reconnecting...";
+        reconnectLink.visible = false;
+      } else {
+        connectionBanner.visible = false;
+      }
+
+      reconnectLink.x = connectionStatusText.x + connectionStatusText.width + 10;
+      layoutDetails();
+    };
+
+    let unsubConnectionState: (() => void) | null = null;
+    if (ctx.connectionState) {
+      unsubConnectionState = ctx.connectionState.onStateChange(() => {
+        if (destroyed) return;
+        refreshConnectionBanner();
+      });
+    }
+
     // -- deleted status -------------------------------------------------------
 
     const deletedBanner = new Container();
@@ -501,6 +579,16 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
       const availW = currentWidth - PADDING * 2;
       let y = 0;
 
+      // connection banner at the very top when visible — a reconnect option
+      // should never be hidden behind other banners
+      if (connectionBanner.visible) {
+        connectionBanner.y = y;
+        connectionBannerBg.clear();
+        connectionBannerBg.roundRect(0, 0, availW, 28, 4);
+        connectionBannerBg.fill({ color: 0x442200, alpha: 0.5 });
+        y += 28 + 8;
+      }
+
       // deleted banner at the top when visible
       if (deletedBanner.visible) {
         deletedBanner.y = y;
@@ -538,6 +626,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
 
     // initial swatch draw and preview load
     drawSwatches();
+    refreshConnectionBanner();
     layoutDetails();
     if (meta.previewUrl) {
       loadPreview(meta.previewUrl);
@@ -964,6 +1053,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
         }
         unsubCanvas();
         unsubDoc();
+        unsubConnectionState?.();
         destroyPreview();
         container.destroy({ children: true });
       },
