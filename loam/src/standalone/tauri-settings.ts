@@ -3,37 +3,34 @@
 // → `src/standalone/settings-entry.ts` → `mountTauriSettingsWindow()`.
 //
 // fully self-contained: builds its own pixi `Application`, fills the viewport,
-// resizes with the window. all rust communication goes through `dispatch()`
-// from `tauri-transport.ts`. no coupling to the main canvas / widget system /
+// resizes with the window. no coupling to the main canvas / widget system /
 // automerge repo.
 
 import { Application, Container, Graphics, Text } from "pixi.js";
+import { getVersion } from "@tauri-apps/api/app";
 
-import { dispatch, isTauriMode } from "../p2p/tauri-transport";
+import { isTauriMode } from "../p2p/tauri-transport";
 
 const TAG = "[tauri-settings]";
 
 const PANEL_PADDING = 20;
 const PANEL_GAP = 12;
-const TOGGLE_W = 96;
-const TOGGLE_H = 32;
-const POLL_MS = 5000;
+const HEART_SIZE = 13;
 
 const COLOR_BG = 0x0d0d0d;
 const COLOR_PANEL = 0x1a1a1a;
 const COLOR_BORDER = 0x333333;
 const COLOR_TEXT = 0xeeeeee;
 const COLOR_DIM = 0x999999;
-const COLOR_ERROR = 0xff8a8a;
-const COLOR_RUNNING = 0x5a2222; // stop = red
-const COLOR_STOPPED = 0x22442a; // start = green
+const COLOR_LINK = 0xdda6ff;
 const FONT_FAMILY = "ui-monospace, SFMono-Regular, monospace";
 
-interface HubStatus {
-  running: boolean;
-  node_id?: string;
-  uptime_s?: number;
-}
+const REPO_URL = "https://github.com/freqhole/skein";
+const COPIED_MESSAGE_MS = 5000;
+
+// same heart glyph used in tomb's about window (client/charnel/public/about.html)
+const HEART_SVG =
+  '<svg viewBox="0 0 24 24"><path d="M12 4.248C8.852-1.154 0 .423 0 7.192 0 11.853 5.571 16.619 12 23c6.43-6.381 12-11.147 12-15.808C24 .423 15.125-1.154 12 4.248z" fill="#ff00ff" /></svg>';
 
 /**
  * mount the settings UI into the given parent (defaults to document.body),
@@ -54,13 +51,11 @@ export function mountTauriSettingsWindow(parent?: HTMLElement): () => void {
 
   const app = new Application();
   let disposed = false;
-  let pollHandle: number | null = null;
   let onResize: (() => void) | null = null;
 
   const teardown = () => {
     if (disposed) return;
     disposed = true;
-    if (pollHandle !== null) clearInterval(pollHandle);
     if (onResize) window.removeEventListener("resize", onResize);
     try {
       app.destroy({ removeView: true }, { children: true });
@@ -92,37 +87,17 @@ export function mountTauriSettingsWindow(parent?: HTMLElement): () => void {
 
       const ui = buildPanel(app);
 
-      const refresh = async () => {
-        if (disposed) return;
-        try {
-          const status = (await dispatch("hub_status")) as HubStatus;
-          ui.applyStatus(status);
-        } catch (err) {
-          console.warn(TAG, "hub_status failed:", err);
-          ui.applyError(String(err));
-        }
-      };
-
-      ui.onToggleHub = async () => {
-        ui.setBusy(true);
-        try {
-          const current = (await dispatch("hub_status")) as HubStatus;
-          await dispatch(current.running ? "hub_stop" : "hub_start");
-          await refresh();
-        } catch (err) {
-          console.error(TAG, "hub toggle failed:", err);
-          ui.applyError(String(err));
-        } finally {
-          ui.setBusy(false);
-        }
-      };
+      getVersion()
+        .then((version) => {
+          if (!disposed) ui.setVersion(version);
+        })
+        .catch((err) => {
+          console.warn(TAG, "getVersion failed:", err);
+        });
 
       onResize = () => ui.relayout(app.renderer.width, app.renderer.height);
       window.addEventListener("resize", onResize);
       ui.relayout(app.renderer.width, app.renderer.height);
-
-      refresh();
-      pollHandle = window.setInterval(refresh, POLL_MS);
     })
     .catch((err) => {
       console.error(TAG, "pixi init failed:", err);
@@ -136,11 +111,8 @@ export function mountTauriSettingsWindow(parent?: HTMLElement): () => void {
 // -- pixi panel --------------------------------------------------------------
 
 interface PanelUi {
-  applyStatus(status: HubStatus): void;
-  applyError(msg: string): void;
-  setBusy(busy: boolean): void;
+  setVersion(version: string): void;
   relayout(viewW: number, viewH: number): void;
-  onToggleHub: () => void;
 }
 
 function buildPanel(app: Application): PanelUi {
@@ -156,89 +128,70 @@ function buildPanel(app: Application): PanelUi {
   });
   root.addChild(headingText);
 
-  const subheadingText = new Text({
-    text: "settings",
-    style: { fontFamily: FONT_FAMILY, fontSize: 11, fill: COLOR_DIM },
-  });
-  root.addChild(subheadingText);
-
-  const nodeIdLabel = new Text({
-    text: "node id",
-    style: { fontFamily: FONT_FAMILY, fontSize: 11, fill: COLOR_DIM },
-  });
-  root.addChild(nodeIdLabel);
-
-  const nodeIdValue = new Text({
-    text: "—",
-    style: {
-      fontFamily: FONT_FAMILY,
-      fontSize: 12,
-      fill: COLOR_TEXT,
-      wordWrap: true,
-      wordWrapWidth: 100, // updated in relayout
-      breakWords: true,
-    },
-  });
-  root.addChild(nodeIdValue);
-
-  const hubLabel = new Text({
-    text: "hub peer",
-    style: { fontFamily: FONT_FAMILY, fontSize: 14, fill: COLOR_TEXT },
-  });
-  root.addChild(hubLabel);
-
-  const hubSubLabel = new Text({
-    text: "in-process iroh hub for self-hosting",
-    style: { fontFamily: FONT_FAMILY, fontSize: 11, fill: COLOR_DIM },
-  });
-  root.addChild(hubSubLabel);
-
-  const toggleContainer = new Container();
-  toggleContainer.eventMode = "static";
-  toggleContainer.cursor = "pointer";
-  root.addChild(toggleContainer);
-  const toggleBg = new Graphics();
-  toggleContainer.addChild(toggleBg);
-  const toggleLabel = new Text({
-    text: "—",
-    style: { fontFamily: FONT_FAMILY, fontSize: 13, fill: COLOR_TEXT },
-  });
-  toggleLabel.anchor.set(0.5);
-  toggleContainer.addChild(toggleLabel);
-
-  const statusLine = new Text({
+  const versionText = new Text({
     text: "",
+    style: { fontFamily: FONT_FAMILY, fontSize: 12, fill: COLOR_DIM },
+  });
+  root.addChild(versionText);
+
+  // "made with <heart> in NYC" row
+  const taglineRow = new Container();
+  root.addChild(taglineRow);
+
+  const taglineBefore = new Text({
+    text: "made with",
+    style: { fontFamily: FONT_FAMILY, fontSize: 12, fill: COLOR_DIM },
+  });
+  taglineRow.addChild(taglineBefore);
+
+  const heart = new Graphics().svg(HEART_SVG);
+  heart.scale.set(HEART_SIZE / 24); // svg viewBox is 0 0 24 24
+  taglineRow.addChild(heart);
+
+  const taglineAfter = new Text({
+    text: "in NYC",
+    style: { fontFamily: FONT_FAMILY, fontSize: 12, fill: COLOR_DIM },
+  });
+  taglineRow.addChild(taglineAfter);
+
+  const linkText = new Text({
+    text: "github.com/freqhole/skein",
+    style: { fontFamily: FONT_FAMILY, fontSize: 12, fill: COLOR_LINK },
+  });
+  linkText.eventMode = "static";
+  linkText.cursor = "pointer";
+  linkText.on("pointerover", () => {
+    linkText.style.fill = COLOR_TEXT;
+  });
+  linkText.on("pointerout", () => {
+    linkText.style.fill = COLOR_LINK;
+  });
+  root.addChild(linkText);
+
+  const copiedText = new Text({
+    text: "copied to clipboard!",
     style: { fontFamily: FONT_FAMILY, fontSize: 11, fill: COLOR_DIM },
   });
-  root.addChild(statusLine);
+  copiedText.visible = false;
+  root.addChild(copiedText);
 
-  const errorLine = new Text({
-    text: "",
-    style: {
-      fontFamily: FONT_FAMILY,
-      fontSize: 11,
-      fill: COLOR_ERROR,
-      wordWrap: true,
-      wordWrapWidth: 100, // updated in relayout
-      breakWords: true,
-    },
-  });
-  errorLine.visible = false;
-  root.addChild(errorLine);
-
-  let toggleColor = COLOR_STOPPED;
-  let busy = false;
   let viewW = 0;
   let viewH = 0;
+  let copiedTimeout: number | null = null;
 
-  const drawToggle = () => {
-    toggleBg.clear();
-    toggleBg.roundRect(0, 0, TOGGLE_W, TOGGLE_H, 5);
-    toggleBg.fill({ color: busy ? COLOR_BORDER : toggleColor });
-    toggleBg.stroke({ color: COLOR_BORDER, width: 1 });
-    toggleLabel.x = TOGGLE_W / 2;
-    toggleLabel.y = TOGGLE_H / 2;
-  };
+  linkText.on("pointertap", () => {
+    navigator.clipboard.writeText(REPO_URL).catch((err) => {
+      console.warn(TAG, "clipboard write failed:", err);
+    });
+    if (copiedTimeout !== null) window.clearTimeout(copiedTimeout);
+    copiedText.visible = true;
+    relayout(viewW, viewH);
+    copiedTimeout = window.setTimeout(() => {
+      copiedTimeout = null;
+      copiedText.visible = false;
+      relayout(viewW, viewH);
+    }, COPIED_MESSAGE_MS);
+  });
 
   const relayout = (w: number, h: number) => {
     viewW = w;
@@ -246,47 +199,34 @@ function buildPanel(app: Application): PanelUi {
 
     const margin = 24;
     const panelW = Math.max(280, viewW - margin * 2);
-    const innerW = panelW - PANEL_PADDING * 2;
-    nodeIdValue.style.wordWrapWidth = innerW;
-    errorLine.style.wordWrapWidth = innerW;
 
     let y = PANEL_PADDING;
     headingText.x = PANEL_PADDING;
     headingText.y = y;
     y += headingText.height + 2;
 
-    subheadingText.x = PANEL_PADDING;
-    subheadingText.y = y;
-    y += subheadingText.height + PANEL_GAP * 1.5;
+    versionText.x = PANEL_PADDING;
+    versionText.y = y;
+    y += versionText.height + PANEL_GAP * 1.5;
 
-    nodeIdLabel.x = PANEL_PADDING;
-    nodeIdLabel.y = y;
-    y += nodeIdLabel.height + 4;
+    taglineBefore.x = 0;
+    taglineBefore.y = 0;
+    heart.x = taglineBefore.width + 5;
+    heart.y = (taglineBefore.height - HEART_SIZE) / 2;
+    taglineAfter.x = heart.x + HEART_SIZE + 5;
+    taglineAfter.y = 0;
+    taglineRow.x = PANEL_PADDING;
+    taglineRow.y = y;
+    y += taglineBefore.height + PANEL_GAP;
 
-    nodeIdValue.x = PANEL_PADDING;
-    nodeIdValue.y = y;
-    y += nodeIdValue.height + PANEL_GAP * 1.5;
+    linkText.x = PANEL_PADDING;
+    linkText.y = y;
+    y += linkText.height;
 
-    hubLabel.x = PANEL_PADDING;
-    hubLabel.y = y;
-    toggleContainer.x = panelW - PANEL_PADDING - TOGGLE_W;
-    toggleContainer.y = y;
-
-    y += hubLabel.height + 4;
-    hubSubLabel.x = PANEL_PADDING;
-    hubSubLabel.y = y;
-
-    const rowEnd = Math.max(y + hubSubLabel.height, (toggleContainer.y as number) + TOGGLE_H);
-    y = rowEnd + PANEL_GAP;
-
-    statusLine.x = PANEL_PADDING;
-    statusLine.y = y;
-    y += statusLine.height + 4;
-
-    if (errorLine.visible) {
-      errorLine.x = PANEL_PADDING;
-      errorLine.y = y;
-      y += errorLine.height + 4;
+    if (copiedText.visible) {
+      copiedText.x = PANEL_PADDING;
+      copiedText.y = y + 4;
+      y += copiedText.height + 4;
     }
 
     const panelH = y + PANEL_PADDING;
@@ -300,42 +240,13 @@ function buildPanel(app: Application): PanelUi {
     root.y = Math.max(margin, (viewH - panelH) / 2);
   };
 
-  drawToggle();
-
   const ui: PanelUi = {
-    applyStatus(status) {
-      errorLine.visible = false;
-      if (status.node_id) nodeIdValue.text = status.node_id;
-      if (status.running) {
-        toggleLabel.text = "stop";
-        toggleColor = COLOR_RUNNING;
-        const uptime = typeof status.uptime_s === "number" ? `${status.uptime_s}s` : "—";
-        statusLine.text = `hub running · uptime ${uptime}`;
-      } else {
-        toggleLabel.text = "start";
-        toggleColor = COLOR_STOPPED;
-        statusLine.text = "hub stopped";
-      }
-      drawToggle();
+    setVersion(version) {
+      versionText.text = `v${version}`;
       relayout(viewW, viewH);
-    },
-    applyError(msg) {
-      errorLine.text = msg;
-      errorLine.visible = true;
-      relayout(viewW, viewH);
-    },
-    setBusy(b) {
-      busy = b;
-      toggleContainer.cursor = b ? "default" : "pointer";
-      drawToggle();
     },
     relayout,
-    onToggleHub: () => {},
   };
-
-  toggleContainer.on("pointertap", () => {
-    if (!busy) ui.onToggleHub();
-  });
 
   return ui;
 }
