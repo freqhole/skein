@@ -4,6 +4,7 @@ import {
   colorForName,
   friendDisplayName,
   friendDisplayNameFull,
+  friendHasPendingOutboundRequest,
   HUB_GROUP_KEY,
   isValidNodeId,
   truncate,
@@ -17,6 +18,7 @@ import {
   profileSchema,
   socialSchema,
   type FriendEntry,
+  type OutboundFriendRequest,
 } from "./schema";
 import { socialWidget } from "./social-widget";
 
@@ -40,6 +42,8 @@ describe("socialSchema", () => {
       shareGroups: [],
       pendingRequests: [],
       outboundRequests: [],
+      relayedFriendRequests: [],
+      relayedFriendRequestOutcomes: [],
       profileVisibility: "friends",
       friendRequestsFrom: "everyone",
     });
@@ -85,17 +89,23 @@ describe("socialSchema", () => {
           fromAvatarDataUrl: "data:image/png;base64,charlie",
           receivedAt: "2025-06-01",
           status: "pending" as const,
+          relayedBy: "",
+          expiresAt: "",
         },
       ],
       outboundRequests: [
         {
           toNodeId: "d".repeat(64),
           toUsername: "dave",
+          toBio: "",
           toAvatarDataUrl: "",
           sentAt: "2025-06-01",
+          expiresAt: "",
           status: "pending" as const,
         },
       ],
+      relayedFriendRequests: [],
+      relayedFriendRequestOutcomes: [],
       shareGroups: [
         {
           id: "share-group-1",
@@ -445,6 +455,70 @@ describe("friendDisplayName", () => {
   it("returns alias when username is empty", () => {
     const friend = makeFriend({ alias: "bestie" });
     expect(friendDisplayName(friend)).toBe("bestie");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// friendHasPendingOutboundRequest
+// ---------------------------------------------------------------------------
+
+describe("friendHasPendingOutboundRequest", () => {
+  const makeFriend = (overrides: Partial<FriendEntry> = {}): FriendEntry => ({
+    id: "test-id",
+    alias: "",
+    username: "",
+    group: "",
+    nodeIds: [],
+    createdAt: "",
+    ...overrides,
+  });
+
+  const makeOutboundRequest = (
+    overrides: Partial<OutboundFriendRequest> = {}
+  ): OutboundFriendRequest => ({
+    toNodeId: "b".repeat(64),
+    toUsername: "unknown",
+    sentAt: "",
+    expiresAt: "",
+    status: "pending",
+    ...overrides,
+  });
+
+  it("returns true when a friend's nodeId has a pending outbound request", () => {
+    const nodeId = "a".repeat(64);
+    const friend = makeFriend({
+      nodeIds: [{ nodeId, addedAt: "", lastSeenAt: "", username: "", bio: "", avatarDataUrl: "" }],
+    });
+    const outboundRequests = [makeOutboundRequest({ toNodeId: nodeId, status: "pending" })];
+    expect(friendHasPendingOutboundRequest(friend, outboundRequests)).toBe(true);
+  });
+
+  it("returns false when the outbound request has already been accepted", () => {
+    const nodeId = "a".repeat(64);
+    const friend = makeFriend({
+      nodeIds: [{ nodeId, addedAt: "", lastSeenAt: "", username: "", bio: "", avatarDataUrl: "" }],
+    });
+    const outboundRequests = [makeOutboundRequest({ toNodeId: nodeId, status: "accepted" })];
+    expect(friendHasPendingOutboundRequest(friend, outboundRequests)).toBe(false);
+  });
+
+  it("returns false when no outbound request matches any of the friend's nodeIds", () => {
+    const friend = makeFriend({
+      nodeIds: [
+        { nodeId: "a".repeat(64), addedAt: "", lastSeenAt: "", username: "", bio: "", avatarDataUrl: "" },
+      ],
+    });
+    const outboundRequests = [makeOutboundRequest({ toNodeId: "c".repeat(64) })];
+    expect(friendHasPendingOutboundRequest(friend, outboundRequests)).toBe(false);
+  });
+
+  it("returns false when outboundRequests is empty", () => {
+    const friend = makeFriend({
+      nodeIds: [
+        { nodeId: "a".repeat(64), addedAt: "", lastSeenAt: "", username: "", bio: "", avatarDataUrl: "" },
+      ],
+    });
+    expect(friendHasPendingOutboundRequest(friend, [])).toBe(false);
   });
 });
 

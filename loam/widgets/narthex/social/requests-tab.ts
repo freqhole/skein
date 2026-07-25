@@ -7,6 +7,7 @@ import { log } from "@freqhole/reliquary/utils";
 import {
   acceptFriendRequest,
   isOnline as bridgeIsOnline,
+  recordFriendRequestOutcome,
   rejectFriendRequest,
   requestProfile,
 } from "../../../src/p2p/friendz-bridge";
@@ -255,6 +256,19 @@ export function createRequestsTab(ctx: TabContext): TabController {
         acceptFriendRequest(request.fromNodeId).catch((err) => {
           log.warn("social.requests", "failed to accept friend request:", err);
         });
+        // relay the outcome back to the requester in case they're offline
+        // right now - see recordFriendRequestOutcome's doc comment.
+        const myProfile = ctx.doc.current.profile;
+        recordFriendRequestOutcome(ctx.doc, {
+          fromNodeId: request.fromNodeId,
+          resolverNodeId: myProfile.nodeId,
+          outcome: "accepted",
+          resolverUsername: myProfile.username,
+          resolverBio: myProfile.bio,
+          resolverAvatarDataUrl: myProfile.avatarDataUrl,
+          resolverAccentColor: myProfile.accentColor,
+          expiresAt: request.expiresAt,
+        });
         ctx.doc.change((draft) => {
           const req = draft.pendingRequests.find(
             (r: PendingFriendRequest) =>
@@ -332,6 +346,16 @@ export function createRequestsTab(ctx: TabContext): TabController {
         e.stopPropagation();
         rejectFriendRequest(request.fromNodeId).catch((err) => {
           log.warn("social.requests", "failed to reject friend request:", err);
+        });
+        // relay the outcome back to the requester in case they're offline
+        // right now - see recordFriendRequestOutcome's doc comment.
+        const myProfile = ctx.doc.current.profile;
+        recordFriendRequestOutcome(ctx.doc, {
+          fromNodeId: request.fromNodeId,
+          resolverNodeId: myProfile.nodeId,
+          outcome: "rejected",
+          resolverUsername: myProfile.username,
+          expiresAt: request.expiresAt,
         });
         ctx.doc.change((draft) => {
           const req = draft.pendingRequests.find(
