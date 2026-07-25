@@ -5,9 +5,7 @@
 //! bound eagerly at boot only for a returning user who already has a
 //! keypair on disk, and otherwise deferred until the frontend actually
 //! needs P2P (see `commands::ensure_network`) — never generated just
-//! because the process started. the hub peer can be started / stopped at
-//! runtime via `hub_start` / `hub_stop` IPC actions once the endpoint
-//! exists.
+//! because the process started.
 
 mod commands;
 mod pdf;
@@ -21,13 +19,12 @@ use std::time::Instant;
 
 #[cfg(desktop)]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
-use tauri::Listener;
 use tauri::Manager;
 use tauri::WindowEvent;
 use tokio::sync::Mutex;
 use tumulus::{db, friendz, userz};
 
-use commands::{AppConfig, AppState};
+use commands::AppState;
 
 const APP_IDENTIFIER: &str = "net.freqhole.skein";
 const APP_CONFIG_FILENAME: &str = "skein-app.toml";
@@ -61,8 +58,7 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from("./skein-data")
 }
 
-/// build the always-on `AppState`: endpoint, pool, stores, and an empty hub
-/// slot. the hub is started later if the persisted app config says so.
+/// build the always-on `AppState`: endpoint, pool, and stores.
 ///
 /// the iroh endpoint is NOT created here unconditionally -- that would
 /// generate a brand-new P2P identity the very first time the app is ever
@@ -73,8 +69,8 @@ fn default_data_dir() -> PathBuf {
 /// `None` and stays that way until the frontend actually needs it --
 /// [`commands::ensure_network`] lazily builds it (generating a keypair for
 /// the first time, if needed) the moment the user shares/joins a canvas,
-/// starts the hub, fetches a blob from a peer, or clicks "generate
-/// identity" in the profile widget.
+/// fetches a blob from a peer, or clicks "generate identity" in the profile
+/// widget.
 async fn build_state() -> anyhow::Result<AppState> {
     let data_dir = std::env::var("SKEIN_DATA_DIR")
         .map(PathBuf::from)
@@ -87,7 +83,7 @@ async fn build_state() -> anyhow::Result<AppState> {
     let blobz_store: std::sync::Arc<dyn freqhole_reliquary::blobz::BlobStore> = std::sync::Arc::new(
         freqhole_reliquary::blobz::SqliteBlobStore::new(pool.clone(), &data_dir),
     );
-    let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
+    let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool);
     let userz_dir = userz::Directory::new(haruspex_pool);
     let app_config_path = data_dir.join(APP_CONFIG_FILENAME);
 
@@ -110,7 +106,6 @@ async fn build_state() -> anyhow::Result<AppState> {
 
     let app_state = AppState {
         network: Arc::new(Mutex::new(None)),
-        pool,
         data_dir,
         username,
         storage,
@@ -119,7 +114,6 @@ async fn build_state() -> anyhow::Result<AppState> {
         userz: userz_dir,
         process_started_at: Instant::now(),
         app_config_path,
-        hub: Arc::new(Mutex::new(None)),
     };
 
     if freqhole_reliquary::identity::keypair_path(
@@ -151,18 +145,6 @@ pub fn run() {
     let app_state = runtime
         .block_on(build_state())
         .expect("build tauri app state");
-
-    // honour the persisted toggle: if the last run had the hub on, start it.
-    let startup_cfg = AppConfig::load(&app_state.app_config_path);
-    if startup_cfg.hub_enabled {
-        tracing::info!("persisted hub_enabled=true — starting hub on boot");
-        if let Err(e) = runtime.block_on(commands::hub_start(&app_state)) {
-            tracing::warn!(error = %e, "failed to start hub on boot");
-        }
-    }
-
-    // arc-clone the hub slot so the close-requested handler can shut it down.
-    let hub_slot = app_state.hub.clone();
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -253,20 +235,6 @@ pub fn run() {
                 });
             }
 
-            // -- existing hub teardown on app close ------------------------
-            let rt: tauri::State<'_, tokio::runtime::Runtime> = app.state();
-            let rt_handle = rt.inner().handle().clone();
-            let hub_slot = hub_slot.clone();
-            app.listen_any("tauri://close-requested", move |_| {
-                let hub_slot = hub_slot.clone();
-                let rt_handle = rt_handle.clone();
-                rt_handle.spawn(async move {
-                    if let Some(hub) = hub_slot.lock().await.take() {
-                        hub.cancel.cancel();
-                        let _ = hub.join.await;
-                    }
-                });
-            });
             Ok(())
         })
         .run(tauri::generate_context!())

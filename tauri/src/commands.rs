@@ -20,11 +20,9 @@ use freqhole_reliquary::identity;
 use iroh::Endpoint;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
-use tumulus::{friendz, service, userz};
+use tumulus::{friendz, userz};
 
 // ---------------------------------------------------------------------------
 // cancel registry for in-flight blob downloads
@@ -93,11 +91,9 @@ impl Drop for BlobsInFlightGuard {
 /// only come up once an identity exists, which only ever happens in
 /// response to something the user explicitly asked for (see
 /// [`ensure_network`]/[`build_network_state`]) — never merely because the
-/// process started. `hub` is optional and can be toggled on and off at
-/// runtime via `hub_start` / `hub_stop`.
+/// process started.
 pub struct AppState {
     pub network: Arc<Mutex<Option<NetworkState>>>,
-    pub pool: SqlitePool,
     pub data_dir: PathBuf,
     pub username: String,
 
@@ -117,8 +113,6 @@ pub struct AppState {
 
     pub process_started_at: Instant,
     pub app_config_path: PathBuf,
-
-    pub hub: Arc<Mutex<Option<HubState>>>,
 }
 
 /// the "network is up" half of `AppState`: the bound iroh endpoint, our own
@@ -131,22 +125,11 @@ pub struct NetworkState {
     pub streams: Arc<crate::streams::StreamRegistry>,
 }
 
-/// bookkeeping for a running hub. kept in `Option<_>` — `Some` means the
-/// hub is up, `None` means it's stopped.
-pub struct HubState {
-    pub cancel: CancellationToken,
-    pub join: tokio::task::JoinHandle<()>,
-    pub started_at: Instant,
-}
-
 /// persistent app config — written to `<data_dir>/skein-app.toml`. tracks
-/// hub auto-start plus the user's social settings (visibility / who can send
-/// friend requests). add fields with `#[serde(default)]` so older toml files
-/// still load.
+/// the user's social settings (visibility / who can send friend requests).
+/// add fields with `#[serde(default)]` so older toml files still load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    #[serde(default)]
-    pub hub_enabled: bool,
     #[serde(default = "default_profile_visibility")]
     pub profile_visibility: String,
     #[serde(default = "default_friend_requests_from")]
@@ -164,7 +147,6 @@ fn default_friend_requests_from() -> String {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            hub_enabled: false,
             profile_visibility: default_profile_visibility(),
             friend_requests_from: default_friend_requests_from(),
         }
@@ -249,8 +231,6 @@ pub(crate) enum DispatchError {
     },
     #[error("stream: {0}")]
     Stream(String),
-    #[error("hub: {0}")]
-    Hub(String),
     #[error("blob: {0}")]
     Blob(#[from] freqhole_reliquary::blobz::BlobStoreError),
     #[error("friend: {0}")]
@@ -292,9 +272,9 @@ async fn current_node_id(state: &AppState) -> String {
 /// only calls it when a keypair file already exists (a returning user, who
 /// already consented to P2P in an earlier session); [`ensure_network`]
 /// calls it lazily, the first time the frontend actually needs the
-/// network (sharing/joining a canvas, starting the hub, fetching a blob
-/// from a peer, or the user clicking "generate identity" in the profile
-/// widget) — never merely because the process started.
+/// network (sharing/joining a canvas, fetching a blob from a peer, or the
+/// user clicking "generate identity" in the profile widget) — never merely
+/// because the process started.
 /// bind (or rebind) the storage node's downloader to `endpoint`, and keep
 /// `AppState::downloader_cell` in sync with it. every code path that ends up
 /// with a live endpoint funnels through `build_network_state` (the boot-time
@@ -479,7 +459,9 @@ async fn dispatch(
         // startup capability probe for the peedeeeff widget — the flyout
         // hides the widget type entirely when `magick` isn't available so
         // users aren't offered a widget that can't render anything.
-        "pdf_check_available" => Ok(json!({ "available": crate::pdf::magick_available().await })),
+        "pdf_check_available" => {
+            Ok(json!({ "available": crate::pdf::pdf_backend_available().await }))
+        }
 
         // generate a thumbnail for a stored blob. supports image/*, application/pdf,
         // and video/* source types. returns { data: <base64>, mime } or { data: null }.
@@ -489,11 +471,6 @@ async fn dispatch(
         // unlike the browser-mode fallback in loam/src/widgets/link-unfurl.ts)
         // and extract a small opengraph-ish summary.
         "link_unfurl" => crate::unfurl::link_unfurl(decode("link_unfurl", payload)?).await,
-
-        // hub control
-        "hub_start" => hub_start_inner(state).await,
-        "hub_stop" => hub_stop_inner(state).await,
-        "hub_status" => hub_status(state).await,
 
         // bi-stream IPC — all of these need a live endpoint/streams, so
         // they all lazily ensure the network first (see `ensure_network`).
@@ -573,7 +550,6 @@ struct StatusResponse {
     node_id: String,
     friend_count: usize,
     uptime_s: u64,
-    hub_running: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -626,12 +602,10 @@ impl From<BlobRecord> for BlobDto {
 
 async fn status(state: &AppState) -> Result<Value, DispatchError> {
     let friends = state.friendz_store.list(false).await?;
-    let hub_running = state.hub.lock().await.is_some();
     let resp = StatusResponse {
         node_id: current_node_id(state).await,
         friend_count: friends.len(),
         uptime_s: state.process_started_at.elapsed().as_secs(),
-        hub_running,
     };
     Ok(serde_json::to_value(resp).expect("status serialize"))
 }
@@ -1812,103 +1786,6 @@ async fn blob_iroh_probe(
 }
 
 // ---------------------------------------------------------------------------
-// hub control
-// ---------------------------------------------------------------------------
-
-/// start the hub. noop (with ok response) if already running. used both
-/// from the dispatch action and from boot.
-pub async fn hub_start(state: &AppState) -> Result<Value, String> {
-    hub_start_inner(state).await.map_err(|e| e.to_string())
-}
-
-async fn hub_start_inner(state: &AppState) -> Result<Value, DispatchError> {
-    let slot = state.hub.lock().await;
-    if slot.is_some() {
-        return Ok(json!({ "running": true, "already_running": true }));
-    }
-    drop(slot);
-
-    // starting the hub is itself an explicit, user-initiated action (the
-    // user flipped the "run hub" toggle) — legitimate to generate an
-    // identity here if none exists yet, same as sharing/joining a canvas.
-    let (endpoint, _, _) = ensure_network(state).await?;
-
-    let mut slot = state.hub.lock().await;
-    if slot.is_some() {
-        return Ok(json!({ "running": true, "already_running": true }));
-    }
-
-    let svc = service::Service::start(
-        endpoint,
-        state.pool.clone(),
-        service::ServiceConfig {
-            data_dir: state.data_dir.clone(),
-            username: state.username.clone(),
-            bio: String::new(),
-            avatar_path: None,
-        },
-        state.storage.fs_store,
-    )
-    .await
-    .map_err(|e| DispatchError::Hub(format!("service start: {e}")))?;
-
-    let cancel = CancellationToken::new();
-    let run_cancel = cancel.clone();
-    let join = tokio::spawn(async move {
-        svc.run_keep_endpoint(run_cancel).await;
-    });
-    let started_at = Instant::now();
-    *slot = Some(HubState {
-        cancel,
-        join,
-        started_at,
-    });
-    drop(slot);
-
-    persist_hub_state(state, true);
-    Ok(json!({ "running": true, "already_running": false }))
-}
-
-/// stop the hub. noop if already stopped.
-async fn hub_stop_inner(state: &AppState) -> Result<Value, DispatchError> {
-    let taken = state.hub.lock().await.take();
-    let Some(hub) = taken else {
-        return Ok(json!({ "running": false, "already_stopped": true }));
-    };
-    hub.cancel.cancel();
-    // run_keep_endpoint shuts down the router internally; await the spawn.
-    if let Err(e) = hub.join.await {
-        tracing::warn!(error = ?e, "hub run task join error");
-    }
-    persist_hub_state(state, false);
-    Ok(json!({ "running": false, "already_stopped": false }))
-}
-
-async fn hub_status(state: &AppState) -> Result<Value, DispatchError> {
-    let node_id = current_node_id(state).await;
-    let slot = state.hub.lock().await;
-    match &*slot {
-        Some(hub) => Ok(json!({
-            "running": true,
-            "node_id": node_id,
-            "uptime_s": hub.started_at.elapsed().as_secs(),
-        })),
-        None => Ok(json!({ "running": false, "node_id": node_id })),
-    }
-}
-
-/// write `hub_enabled` into `<data_dir>/skein-app.toml`. errors are logged
-/// but not surfaced — persistence is best-effort. preserves the rest of
-/// AppConfig (e.g. social settings) by load-modify-save.
-fn persist_hub_state(state: &AppState, hub_enabled: bool) {
-    let mut cfg = AppConfig::load(&state.app_config_path);
-    cfg.hub_enabled = hub_enabled;
-    if let Err(e) = cfg.save(&state.app_config_path) {
-        tracing::warn!(error = %e, path = ?state.app_config_path, "failed to persist hub state");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // pdf rendering
 // ---------------------------------------------------------------------------
 
@@ -2057,12 +1934,11 @@ mod tests {
         let haruspex_pool = tumulus::db::open_haruspex(&data_dir)
             .await
             .expect("open haruspex db");
-        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
+        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool);
         let userz_dir = userz::Directory::new(haruspex_pool);
 
         let state = AppState {
             network: Arc::new(Mutex::new(None)),
-            pool,
             data_dir: data_dir.clone(),
             username: "test-user".to_string(),
             storage: Arc::new(storage),
@@ -2071,7 +1947,6 @@ mod tests {
             userz: userz_dir,
             process_started_at: Instant::now(),
             app_config_path: data_dir.join("skein-app.toml"),
-            hub: Arc::new(Mutex::new(None)),
         };
 
         (state, tmp)

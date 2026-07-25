@@ -1,9 +1,6 @@
 import { Container, Graphics, Text } from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { PresenceManager } from "./presence-manager";
-import { log } from "@freqhole/reliquary/utils";
-
-const TAG = "canvas.connection";
 
 // stoplight colors
 const COLOR_CONNECTED = 0x22c55e;
@@ -27,8 +24,13 @@ export interface ConnectionStateSource {
  *
  * - green dot + "N peers" when peers are online
  * - yellow dot + "connecting..." when reconnection is in progress
- * - red dot + "N disconnected" when reconnection gave up (click to retry)
+ * - red dot + "N disconnected" when reconnection gave up
  * - gray dot + "solo" when no peers are known
+ *
+ * clicking the pill always opens canvas info, regardless of connection
+ * state — reconnecting is offered as its own button inside canvas info
+ * instead (see canvas-info.ts's connection banner), since intercepting the
+ * click to retry made it impossible to open canvas info while disconnected.
  *
  * added directly to app.stage (not the world container) so it stays
  * fixed regardless of pan/zoom.
@@ -46,7 +48,6 @@ export class ConnectionStatus {
   private readonly label: Text;
 
   private readonly unsubs: (() => void)[] = [];
-  private isErrorState = false;
 
   constructor(
     presenceManager: PresenceManager,
@@ -92,14 +93,9 @@ export class ConnectionStatus {
       this.unsubs.push(this.connectionState.onStateChange(() => this.refresh()));
     }
 
-    // handle click — retry on error, otherwise open canvas info
+    // handle click — always opens canvas info
     this.root.on("pointertap", () => {
-      if (this.isErrorState && this.connectionState) {
-        log.debug(TAG, "retrying failed connections");
-        this.connectionState.retryFailed();
-      } else {
-        this.onCanvasInfoClick?.();
-      }
+      this.onCanvasInfoClick?.();
     });
 
     // hover tooltip — show extra info
@@ -152,32 +148,26 @@ export class ConnectionStatus {
     // determine display state (priority: error > connecting > connected > solo)
     let dotColor: number;
     let labelText: string;
-    let interactive: boolean;
 
     if (summary.failed > 0) {
       // error state — some peers gave up reconnecting
       dotColor = COLOR_ERROR;
       labelText = `${summary.failed} disconnected`;
-      interactive = true;
     } else if (summary.reconnecting > 0) {
       // connecting state — actively trying to reconnect
       dotColor = COLOR_CONNECTING;
       labelText = "connecting...";
-      interactive = false;
     } else if (onlineCount > 0) {
       // connected state — peers are online and chatting
       dotColor = COLOR_CONNECTED;
       labelText = `${onlineCount} peer${onlineCount !== 1 ? "s" : ""}`;
-      interactive = false;
     } else {
       // solo — no peers at all
       dotColor = COLOR_SOLO;
       labelText = "solo";
-      interactive = false;
     }
 
-    this.isErrorState = interactive;
-    this.root.eventMode = "static"; // always interactive for hover tooltip
+    this.root.eventMode = "static"; // always interactive for click + hover tooltip
     this.root.interactiveChildren = true;
     this.root.cursor = "pointer";
 

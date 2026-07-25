@@ -705,6 +705,15 @@ class SkeinRouter {
    */
   private showNavSpinner(onCancel?: () => void): void {
     if (this.navSpinnerEl) return;
+    // on a cold open straight to a canvas hash (e.g. a page reload while
+    // viewing a canvas), the css-only boot spinner (index.html) is still
+    // showing at this point — `initCanvas()`'s own removal of it doesn't
+    // run until well after this, once the pixi canvas actually mounts. both
+    // overlays share the same centered, transparent-background layout, so
+    // leaving the boot spinner in place here would visually overlap this
+    // one instead of being cleanly replaced by it. safe to call
+    // unconditionally: a no-op once the element is already gone.
+    document.getElementById("boot-spinner")?.remove();
     const el = document.createElement("div");
     el.id = "canvas-nav-spinner";
     el.style.cssText =
@@ -2944,6 +2953,7 @@ class SkeinRouter {
       widgetId: "canvas-info-overlay",
       canvasElement: canvas.app.canvas as HTMLCanvasElement,
       canvasStore: canvas.store,
+      connectionState: this.connectionStateSource,
     };
 
     try {
