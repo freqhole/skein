@@ -479,7 +479,9 @@ async fn dispatch(
         // startup capability probe for the peedeeeff widget — the flyout
         // hides the widget type entirely when `magick` isn't available so
         // users aren't offered a widget that can't render anything.
-        "pdf_check_available" => Ok(json!({ "available": crate::pdf::magick_available().await })),
+        "pdf_check_available" => {
+            Ok(json!({ "available": crate::pdf::pdf_backend_available().await }))
+        }
 
         // generate a thumbnail for a stored blob. supports image/*, application/pdf,
         // and video/* source types. returns { data: <base64>, mime } or { data: null }.

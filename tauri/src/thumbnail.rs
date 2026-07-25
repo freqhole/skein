@@ -73,6 +73,7 @@ async fn thumbnail_pdf(path: &Path, size: u32) -> Result<Value, ThumbnailError> 
     let input_arg = format!("{}[0]", path.to_string_lossy());
 
     let output = Command::new("magick")
+        .env("PATH", crate::pdf::magick_delegate_path_env())
         .arg("-density")
         .arg("72")
         .arg(&input_arg)
