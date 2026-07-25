@@ -1,4 +1,4 @@
-import type { FriendEntry, FriendGroup } from "./schema";
+import type { FriendEntry, FriendGroup, OutboundFriendRequest } from "./schema";
 
 // ---------------------------------------------------------------------------
 // visual constants used by helpers
@@ -60,6 +60,22 @@ export function friendDisplayNameFull(friend: FriendEntry): string {
     return `${friend.username} (${friend.alias})`;
   }
   return friendDisplayName(friend);
+}
+
+/**
+ * check whether a friend still has a pending outbound (sent-by-us) friend
+ * request that hasn't been accepted/rejected/expired yet - used to show a
+ * "pending" badge in the friends list for a friend entry that was created
+ * optimistically (see friends-tab.ts's "add friend" flow) before the
+ * recipient has responded.
+ */
+export function friendHasPendingOutboundRequest(
+  friend: FriendEntry,
+  outboundRequests: OutboundFriendRequest[]
+): boolean {
+  return friend.nodeIds.some((n) =>
+    outboundRequests.some((r) => r.toNodeId === n.nodeId && r.status === "pending")
+  );
 }
 
 /**

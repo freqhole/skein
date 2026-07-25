@@ -100,18 +100,81 @@ export const pendingFriendRequestSchema = z.object({
   fromAccentColor: z.number().optional(),
   receivedAt: z.string().default(""),
   status: z.enum(["pending", "accepted", "accepted-pending-ack", "rejected"]).default("pending"),
+  // node id of the mutual friend/hub that relayed this request to us,
+  // rather than the requester dialing us directly - "" for a directly-
+  // received request. mirrors CanvasInviteMessage's relayedBy attribution.
+  relayedBy: z.string().default(""),
+  // absolute cutoff for gossiping our eventual accept/decline back to the
+  // requester if they're offline when we decide - see
+  // relayedFriendRequestOutcomeSchema below. carried through unchanged from
+  // whichever gossip-digest entry (or direct request, sentAt + 60 days)
+  // first taught us about this request, so every relay hop agrees on the
+  // same deadline regardless of how many hops it took to arrive.
+  expiresAt: z.string().default(""),
 });
 
 export const outboundFriendRequestSchema = z.object({
   toNodeId: z.string(),
   toUsername: z.string().default(""),
-  /** filled in once known, via a profile-response or identity-update from
-   *  the recipient (never known at send time — an outbound friend request
-   *  is often the very first contact with this node id) — see
-   *  friendz-wiring.ts's onProfileResponse/onIdentityUpdate handlers. */
+  /** filled in once known, via a profile-response, identity-update, or
+   *  gossip-relayed friend-request-outcome/pending-request from the
+   *  recipient (never known at send time — an outbound friend request is
+   *  often the very first contact with this node id) — see
+   *  friendz-wiring.ts's onProfileResponse/onIdentityUpdate/onGossipDigest
+   *  handlers. */
+  toBio: z.string().default(""),
   toAvatarDataUrl: z.string().default(""),
+  toAccentColor: z.number().optional(),
   sentAt: z.string().default(""),
-  status: z.enum(["pending", "accepted", "accepted-pending-ack", "rejected"]).default("pending"),
+  // absolute cutoff (sentAt + 60 days) past which mutual friends/hubs stop
+  // gossiping this request onward to the target - see
+  // computeAndSendGossipDigest's pendingFriendRequests gathering.
+  expiresAt: z.string().default(""),
+  status: z
+    .enum(["pending", "accepted", "accepted-pending-ack", "rejected", "expired"])
+    .default("pending"),
+});
+
+/**
+ * a friend request this peer is holding purely to relay onward - neither
+ * the original requester (`fromNodeId`) nor the target (`toNodeId`) is the
+ * local user. populated from a gossip digest's `pendingFriendRequests`
+ * entries (see friendz-wiring.ts's onGossipDigest) and re-gossiped to every
+ * online friend on every subsequent digest exchange until it expires, so
+ * the request keeps propagating through the friend graph even if the peer
+ * holding it is never simultaneously online with both the requester and
+ * the target.
+ */
+export const relayedFriendRequestSchema = z.object({
+  fromNodeId: z.string(),
+  fromUsername: z.string().default(""),
+  fromBio: z.string().default(""),
+  fromAvatarDataUrl: z.string().default(""),
+  fromAccentColor: z.number().optional(),
+  toNodeId: z.string(),
+  requestedAt: z.string().default(""),
+  expiresAt: z.string().default(""),
+});
+
+/**
+ * a resolved (accepted/rejected) friend request this peer is holding
+ * purely to relay the outcome back to the original requester - either
+ * because the local user themselves resolved the request (see
+ * requests-tab.ts's accept/reject handlers, which push an entry here
+ * alongside the direct friend-accept/friend-reject message) or because
+ * it arrived via someone else's gossip digest and is being relayed
+ * further.
+ */
+export const relayedFriendRequestOutcomeSchema = z.object({
+  fromNodeId: z.string(), // the original requester - who this outcome is for
+  resolverNodeId: z.string(), // who accepted/rejected the request
+  outcome: z.enum(["accepted", "rejected"]),
+  resolverUsername: z.string().default(""),
+  resolverBio: z.string().default(""),
+  resolverAvatarDataUrl: z.string().default(""),
+  resolverAccentColor: z.number().optional(),
+  resolvedAt: z.string().default(""),
+  expiresAt: z.string().default(""),
 });
 
 // ---------------------------------------------------------------------------
@@ -152,6 +215,11 @@ export const socialSchema = z.object({
   pendingRequests: z.array(pendingFriendRequestSchema).default([]),
   outboundRequests: z.array(outboundFriendRequestSchema).default([]),
 
+  /** third-party friend-request relay state - see relayedFriendRequestSchema/
+   *  relayedFriendRequestOutcomeSchema above for what each array holds. */
+  relayedFriendRequests: z.array(relayedFriendRequestSchema).default([]),
+  relayedFriendRequestOutcomes: z.array(relayedFriendRequestOutcomeSchema).default([]),
+
   /** privacy settings */
   profileVisibility: z.enum(["friends", "everyone", "nobody"]).default("friends"),
   friendRequestsFrom: z.enum(["everyone", "nobody"]).default("everyone"),
@@ -167,5 +235,7 @@ export type FriendGroup = z.infer<typeof friendGroupSchema>;
 export type ShareGroup = z.infer<typeof shareGroupSchema>;
 export type PendingFriendRequest = z.infer<typeof pendingFriendRequestSchema>;
 export type OutboundFriendRequest = z.infer<typeof outboundFriendRequestSchema>;
+export type RelayedFriendRequest = z.infer<typeof relayedFriendRequestSchema>;
+export type RelayedFriendRequestOutcome = z.infer<typeof relayedFriendRequestOutcomeSchema>;
 export type ProfileState = z.infer<typeof profileSchema>;
 export type SocialState = z.infer<typeof socialSchema>;

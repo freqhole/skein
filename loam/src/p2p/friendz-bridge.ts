@@ -27,6 +27,7 @@ import type { MiddenStreamNode } from "./iroh-network-adapter";
 let protocol: FriendzProtocol | null = null;
 let bridgeReadyListeners: Array<() => void> = [];
 let outboundRequestHook: ((toNodeId: string) => void) | null = null;
+let gossipNowHook: (() => void) | null = null;
 
 // ---------------------------------------------------------------------------
 // knock (access-request) bridge state — docs/knock-and-hub-relay-plan.md
@@ -95,6 +96,7 @@ export function destroyBridge(): void {
   protocol = null;
   bridgeReadyListeners = [];
   outboundRequestHook = null;
+  gossipNowHook = null;
   acceptAndJoinHandler = null;
   knockSocialDoc = null;
   unsubscribeFriendsChange?.();
@@ -189,6 +191,13 @@ export async function sendFriendRequest(peerNodeId: string): Promise<void> {
   if (!protocol) throw new Error("friendz bridge not initialized");
   await protocol.sendFriendRequest(peerNodeId);
   outboundRequestHook?.(peerNodeId);
+  // the peer isn't currently known-online (most brand-new node ids we've
+  // never exchanged a heartbeat with) - ask any mutual friends who are
+  // online right now to relay the request and hand back identity info,
+  // rather than waiting for the recipient's next online-transition.
+  if (!isOnline(peerNodeId)) {
+    gossipFriendRequestsNow();
+  }
 }
 
 /**
@@ -198,6 +207,27 @@ export async function sendFriendRequest(peerNodeId: string): Promise<void> {
  */
 export function setOutboundRequestHook(hook: ((toNodeId: string) => void) | null): void {
   outboundRequestHook = hook;
+}
+
+/**
+ * register a callback that, when invoked, asks every currently-online friend
+ * for a fresh gossip digest right now (rather than waiting for one of them
+ * to transition online). friendz-wiring.ts registers this since it's the
+ * one holding the heavy iroh/canvas-store dependencies; this bridge just
+ * forwards the call. call with null to unregister.
+ */
+export function setGossipNowHook(hook: (() => void) | null): void {
+  gossipNowHook = hook;
+}
+
+/**
+ * ask every currently-online friend to relay gossip right now - used after
+ * sending a friend request to an offline-looking peer, and when opening the
+ * profile of a friend who hasn't accepted our request yet. no-op if the
+ * bridge or the hook isn't ready.
+ */
+export function gossipFriendRequestsNow(): void {
+  gossipNowHook?.();
 }
 
 /**
@@ -220,6 +250,73 @@ export async function acceptFriendRequest(fromNodeId: string): Promise<void> {
 export async function rejectFriendRequest(fromNodeId: string): Promise<void> {
   if (!protocol) throw new Error("friendz bridge not initialized");
   return protocol.sendFriendReject(fromNodeId);
+}
+
+/** how long a friend-request outcome keeps getting gossiped back toward
+ *  the original requester before relay holders give up on it - mirrors
+ *  friendz-wiring.ts's FRIEND_REQUEST_TTL_DAYS (kept as a small local
+ *  constant here rather than a shared import, to avoid pulling
+ *  friendz-wiring.ts's much heavier dependency graph into widget bundles
+ *  that only need this one pure helper). */
+const FRIEND_REQUEST_TTL_DAYS = 60;
+
+function addDays(iso: string, days: number): string {
+  const base = iso ? new Date(iso).getTime() : Date.now();
+  return new Date(base + days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+/**
+ * record that the local user accepted or rejected a pending friend
+ * request, so the outcome can gossip-relay back to the requester if
+ * they're offline right now. call this from wherever the accept/reject
+ * decision is actually made (e.g. requests-tab.ts's button handlers)
+ * alongside sending the direct `friend-accept`/`friend-reject` message -
+ * this only records the relay-outcome side, it does not send anything
+ * itself. friendz-wiring.ts's onGossipDigest/computeAndSendGossipDigest is
+ * what actually reads and re-gossips the resulting doc entries.
+ */
+export function recordFriendRequestOutcome(
+  sDoc: SocialDoc,
+  params: {
+    fromNodeId: string;
+    resolverNodeId: string;
+    outcome: "accepted" | "rejected";
+    resolverUsername?: string;
+    resolverBio?: string;
+    resolverAvatarDataUrl?: string;
+    resolverAccentColor?: number;
+    /** carried from the resolved pendingRequests entry's own `expiresAt`
+     *  when known, so every relay hop agrees on the same deadline - falls
+     *  back to `now + 60 days` when the original request predates this
+     *  field (or arrived before this feature existed). */
+    expiresAt?: string;
+  }
+): void {
+  const resolvedAt = new Date().toISOString();
+  sDoc.change((draft: any) => {
+    if (!draft.relayedFriendRequestOutcomes) draft.relayedFriendRequestOutcomes = [];
+    const idx = draft.relayedFriendRequestOutcomes.findIndex(
+      (o: any) => o.fromNodeId === params.fromNodeId && o.resolverNodeId === params.resolverNodeId
+    );
+    const entry = {
+      fromNodeId: params.fromNodeId,
+      resolverNodeId: params.resolverNodeId,
+      outcome: params.outcome,
+      resolverUsername: params.resolverUsername ?? "",
+      resolverBio: params.resolverBio ?? "",
+      resolverAvatarDataUrl: params.resolverAvatarDataUrl ?? "",
+      ...(params.resolverAccentColor !== undefined
+        ? { resolverAccentColor: params.resolverAccentColor }
+        : {}),
+      resolvedAt,
+      expiresAt: params.expiresAt || addDays(resolvedAt, FRIEND_REQUEST_TTL_DAYS),
+    };
+    if (idx === -1) {
+      draft.relayedFriendRequestOutcomes.push(entry);
+    } else {
+      draft.relayedFriendRequestOutcomes[idx] = entry;
+    }
+  });
 }
 
 /**

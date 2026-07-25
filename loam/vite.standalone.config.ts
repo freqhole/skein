@@ -49,6 +49,24 @@ export default defineConfig({
           ? { settings: path.resolve(dirname, "settings.html") }
           : { gallery: path.resolve(dirname, "widget-gallery.html") }),
       },
+      output: {
+        manualChunks(id) {
+          // `@automerge/automerge-repo`'s index.js re-exports `Repo` from
+          // `Repo.js`, and several of our own modules import `Repo` as a
+          // value (not just a type) from the package's barrel specifier
+          // (src/dev/gallery.ts, src/canvas/init.ts, src/harness/skein-
+          // harness.ts). with more than one rollup entry point (skein +
+          // gallery/settings), rollup's default chunking can split
+          // `Repo.js` and `index.js` into two different output chunks that
+          // import from each other - an actual circular dependency between
+          // chunks, which rollup warns about and which can break module
+          // execution order. keeping the whole package's dist output in one
+          // dedicated chunk avoids the split entirely.
+          if (id.includes("node_modules/@automerge/automerge-repo/")) {
+            return "automerge-repo-vendor";
+          }
+        },
+      },
     },
     sourcemap: true,
   },

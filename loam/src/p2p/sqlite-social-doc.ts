@@ -243,6 +243,11 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
       fromAvatarDataUrl: "",
       receivedAt: unixToIso(r.created_at),
       status: r.status as "pending" | "accepted" | "accepted-pending-ack" | "rejected",
+      // friend-request relay (browser/automerge-only for now, same
+      // limitation as fromBio/fromAvatarDataUrl above) has no equivalent
+      // columns yet either.
+      relayedBy: "",
+      expiresAt: "",
     })),
 
     outboundRequests: raw.outbound_requests.map((r) => ({
@@ -250,10 +255,22 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
       toUsername: r.remote_display_name || r.remote_alias || r.remote_username,
       // same tauri/sqlite limitation as pendingRequests' fromAvatarDataUrl
       // above — no column to source this from yet.
+      toBio: "",
       toAvatarDataUrl: "",
       sentAt: unixToIso(r.created_at),
+      // no relay-deadline column yet either (see pendingRequests above) —
+      // an empty expiresAt means computeAndSendGossipDigest treats it as
+      // never-expiring rather than already-expired.
+      expiresAt: "",
       status: r.status as "pending" | "accepted" | "accepted-pending-ack" | "rejected",
     })),
+
+    // third-party friend-request relay state (see
+    // widgets/narthex/social/schema.ts's relayedFriendRequestSchema/
+    // relayedFriendRequestOutcomeSchema) isn't backed by grimoire/sqlite
+    // yet — same follow-up-work situation as shareGroups above.
+    relayedFriendRequests: [],
+    relayedFriendRequestOutcomes: [],
 
     profileVisibility: raw.settings.profile_visibility as "friends" | "everyone" | "nobody",
     friendRequestsFrom: raw.settings.friend_requests_from as "everyone" | "nobody",

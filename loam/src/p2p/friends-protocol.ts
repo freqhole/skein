@@ -314,10 +314,50 @@ export interface GossipDigestProfileEntry {
   updatedAt: string;
 }
 
+/** a friend request being relayed through mutual friends/hubs so it
+ *  eventually reaches `toNodeId` even if the requester and the target are
+ *  never online at the same time - carried in `appPayload` alongside
+ *  `pendingInvites`/`canvasUpdates`. `toUsername`/`toBio`/`toAvatarDataUrl`/
+ *  `toAccentColor` are filled in opportunistically by whichever relay
+ *  holder (or the original requester, once it loops back to them) already
+ *  has the target's identity cached from an existing friendship - this is
+ *  how "populate profile info for a pending request" and "relay the
+ *  request itself" share one mechanism instead of two. */
+export interface GossipDigestPendingFriendRequest {
+  fromNodeId: string;
+  fromUsername: string;
+  fromBio?: string;
+  fromAvatarDataUrl?: string;
+  fromAccentColor?: number;
+  toNodeId: string;
+  toUsername?: string;
+  toBio?: string;
+  toAvatarDataUrl?: string;
+  toAccentColor?: number;
+  requestedAt: string;
+  expiresAt: string;
+}
+
+/** the outcome (accept/reject) of a friend request, relayed back to the
+ *  original requester (`fromNodeId`) the same way the request itself was
+ *  relayed out - carried in `appPayload`. */
+export interface GossipDigestFriendRequestOutcome {
+  fromNodeId: string;
+  resolverNodeId: string;
+  outcome: "accepted" | "rejected";
+  resolverUsername?: string;
+  resolverBio?: string;
+  resolverAvatarDataUrl?: string;
+  resolverAccentColor?: number;
+  resolvedAt: string;
+  expiresAt: string;
+}
+
 /** gossip digest sent when a peer comes online. `canvasUpdates`/
- *  `pendingInvites`/`sharedCanvasIds` have no core-protocol equivalent and
- *  ride in the wire message's generic `appPayload` field; `pendingKnocks`/
- *  `profiles` are translated to/from the shared protocol's own shapes. */
+ *  `pendingInvites`/`sharedCanvasIds`/`pendingFriendRequests`/
+ *  `friendRequestOutcomes` have no core-protocol equivalent and ride in the
+ *  wire message's generic `appPayload` field; `pendingKnocks`/`profiles`
+ *  are translated to/from the shared protocol's own shapes. */
 export interface GossipDigestMessage {
   type: "gossip-digest";
   canvasUpdates: GossipDigestCanvasUpdate[];
@@ -325,6 +365,8 @@ export interface GossipDigestMessage {
   pendingKnocks: GossipDigestPendingKnock[];
   sharedCanvasIds?: string[];
   profiles?: GossipDigestProfileEntry[];
+  pendingFriendRequests?: GossipDigestPendingFriendRequest[];
+  friendRequestOutcomes?: GossipDigestFriendRequestOutcome[];
 }
 
 /** batch blob availability query - sent/received as the shared protocol's
@@ -742,6 +784,8 @@ export class FriendzProtocol {
             canvasUpdates?: GossipDigestCanvasUpdate[];
             pendingInvites?: GossipDigestPendingInvite[];
             sharedCanvasIds?: string[];
+            pendingFriendRequests?: GossipDigestPendingFriendRequest[];
+            friendRequestOutcomes?: GossipDigestFriendRequestOutcome[];
           })
         : {};
 
@@ -766,6 +810,12 @@ export class FriendzProtocol {
         pendingKnocks,
         ...(extra.sharedCanvasIds ? { sharedCanvasIds: extra.sharedCanvasIds } : {}),
         ...(msg.profiles && msg.profiles.length > 0 ? { profiles: msg.profiles } : {}),
+        ...(extra.pendingFriendRequests && extra.pendingFriendRequests.length > 0
+          ? { pendingFriendRequests: extra.pendingFriendRequests }
+          : {}),
+        ...(extra.friendRequestOutcomes && extra.friendRequestOutcomes.length > 0
+          ? { friendRequestOutcomes: extra.friendRequestOutcomes }
+          : {}),
       },
       fromNodeId
     );
@@ -1102,10 +1152,10 @@ export class FriendzProtocol {
   }
 
   /** send a gossip digest - `canvasUpdates`/`pendingInvites`/
-   *  `sharedCanvasIds` ride in the wire message's generic `appPayload`
-   *  field (omitted entirely when there's nothing to say); `pendingKnocks`
-   *  entries are translated to the shared protocol's `knockId`/`scope`
-   *  shape. */
+   *  `sharedCanvasIds`/`pendingFriendRequests`/`friendRequestOutcomes` ride
+   *  in the wire message's generic `appPayload` field (omitted entirely
+   *  when there's nothing to say); `pendingKnocks` entries are translated
+   *  to the shared protocol's `knockId`/`scope` shape. */
   async sendGossipDigest(
     peerNodeId: string,
     digest: Omit<GossipDigestMessage, "type">
@@ -1113,11 +1163,15 @@ export class FriendzProtocol {
     const appPayload =
       digest.canvasUpdates.length > 0 ||
       digest.pendingInvites.length > 0 ||
-      (digest.sharedCanvasIds?.length ?? 0) > 0
+      (digest.sharedCanvasIds?.length ?? 0) > 0 ||
+      (digest.pendingFriendRequests?.length ?? 0) > 0 ||
+      (digest.friendRequestOutcomes?.length ?? 0) > 0
         ? {
             canvasUpdates: digest.canvasUpdates,
             pendingInvites: digest.pendingInvites,
             sharedCanvasIds: digest.sharedCanvasIds ?? [],
+            pendingFriendRequests: digest.pendingFriendRequests ?? [],
+            friendRequestOutcomes: digest.friendRequestOutcomes ?? [],
           }
         : undefined;
 

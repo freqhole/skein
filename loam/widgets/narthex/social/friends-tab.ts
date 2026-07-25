@@ -9,6 +9,7 @@ import { CanvasBinStore } from "../../../src/canvas/canvas-bin-doc";
 import { ProfileStore } from "../../../src/canvas/profile-doc";
 import {
   getHubAdminTransport,
+  gossipFriendRequestsNow,
   isOnline as bridgeIsOnline,
   isProtocolReady as bridgeIsProtocolReady,
   onOnlineChange,
@@ -80,6 +81,7 @@ import {
   colorForName,
   friendDisplayName,
   friendDisplayNameFull,
+  friendHasPendingOutboundRequest,
   generateUniqueGroupName,
   HUB_GROUP_KEY,
   HUB_GROUP_LABEL,
@@ -798,6 +800,10 @@ export function createFriendsTab(ctx: TabContext): TabController {
         const avatarY = effectiveRowHeight / 2;
         const avatarUrl = friend.nodeIds.find((n) => n.avatarDataUrl)?.avatarDataUrl;
         const isAnyNodeOnline = friend.nodeIds.some((n) => bridgeIsOnline(n.nodeId));
+        const hasPendingOutbound = friendHasPendingOutboundRequest(
+          friend,
+          ctx.doc.current.outboundRequests ?? []
+        );
 
         renderAvatar({
           parent: rowContainer,
@@ -832,6 +838,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
         nameText.x = textX;
         nameText.y = nameY;
         rowContainer.addChild(nameText);
+        let nameLineEndX = textX + nameText.width;
 
         // if the friend has both a username and an alias, show the alias
         // after the name in italic parentheses: "bob (bestie)"
@@ -850,6 +857,38 @@ export function createFriendsTab(ctx: TabContext): TabController {
           aliasText.x = textX + nameText.width;
           aliasText.y = nameY;
           rowContainer.addChild(aliasText);
+          nameLineEndX = aliasText.x + aliasText.width;
+        }
+
+        // small "pending" badge for a friend whose sent request hasn't been
+        // accepted yet — the friend entry itself already shows up in this
+        // list right away (see the "add friend" submit handler below, which
+        // pushes a friend entry immediately rather than waiting for
+        // acceptance), so surface the outstanding status here too rather
+        // than only in the requests tab's separate "sent requests" section.
+        if (hasPendingOutbound) {
+          const badgeText = new Text({
+            text: "pending",
+            style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE - 1, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          badgeText.eventMode = "none";
+          const badgePadX = 6;
+          const badgeH = ROW_SUB_SIZE + 5;
+          const badgeW = badgeText.width + badgePadX * 2;
+          const badgeBg = new Graphics();
+          badgeBg.eventMode = "none";
+          badgeBg.roundRect(0, 0, badgeW, badgeH, badgeH / 2);
+          badgeBg.stroke({ color: MUTED_TEXT, width: 1 });
+          const badge = new Container();
+          badge.eventMode = "none";
+          badge.addChild(badgeBg);
+          badgeText.x = badgePadX;
+          badgeText.y = (badgeH - badgeText.height) / 2;
+          badge.addChild(badgeText);
+          badge.x = nameLineEndX + 8;
+          badge.y = nameY + (ROW_NAME_SIZE - badgeH) / 2;
+          rowContainer.addChild(badge);
         }
 
         // bio line — second row of text under the name
@@ -926,7 +965,13 @@ export function createFriendsTab(ctx: TabContext): TabController {
           const result = endDrag(gx, gy);
 
           if (result === "tap") {
-            // normal tap — open detail view
+            // normal tap — open detail view. if this friend hasn't accepted
+            // our request yet, ask any currently-online mutual friends to
+            // relay it and hand back profile info sooner, rather than
+            // waiting for the recipient's next online-transition.
+            if (hasPendingOutbound) {
+              gossipFriendRequestsNow();
+            }
             selectedFriendId = friendId;
             viewMode = "detail";
             scrollY = 0;

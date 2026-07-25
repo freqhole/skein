@@ -9,7 +9,7 @@ import {
   type GossipDigestMessage,
   type GossipDigestProfileEntry,
 } from "../p2p/friends-protocol";
-import { initBridge, setOutboundRequestHook } from "../p2p/friendz-bridge";
+import { initBridge, setOutboundRequestHook, setGossipNowHook } from "../p2p/friendz-bridge";
 import { getMiddenNode, getStoredIdentity } from "../p2p/identity";
 import { trashCanvasCard } from "../../widgets/narthex/trash-widget";
 import {
@@ -53,6 +53,59 @@ export interface FriendzWiringResult {
 }
 
 const TAG = "friendz.wiring";
+
+/** how long a friend request (and its eventual outcome) keeps getting
+ *  gossiped through mutual friends/hubs before relay holders give up on
+ *  it - an absolute cutoff computed from the original request's send time,
+ *  not extended per relay hop. */
+const FRIEND_REQUEST_TTL_DAYS = 60;
+
+/** add `days` days to an ISO timestamp, returning a new ISO timestamp. */
+function addDays(iso: string, days: number): string {
+  const base = iso ? new Date(iso).getTime() : Date.now();
+  return new Date(base + days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+/**
+ * flip any of the local user's own outbound friend requests that have
+ * passed their 60-day relay deadline to "expired" (stopping them from
+ * being gathered into further gossip digests), and drop any relay-only
+ * entries (requests/outcomes held purely on behalf of someone else) past
+ * their deadline - there's no reason to keep re-gossiping something no one
+ * still cares about.
+ */
+export function pruneExpiredFriendRequestRelay(sDoc: SocialDoc): void {
+  const nowIso = new Date().toISOString();
+  const hasExpiredOutbound = (sDoc.current.outboundRequests ?? []).some(
+    (r: any) => r.status === "pending" && r.expiresAt && r.expiresAt < nowIso
+  );
+  const hasExpiredRelay = (sDoc.current.relayedFriendRequests ?? []).some(
+    (r: any) => r.expiresAt && r.expiresAt < nowIso
+  );
+  const hasExpiredOutcome = (sDoc.current.relayedFriendRequestOutcomes ?? []).some(
+    (o: any) => o.expiresAt && o.expiresAt < nowIso
+  );
+  if (!hasExpiredOutbound && !hasExpiredRelay && !hasExpiredOutcome) return;
+
+  sDoc.change((draft: any) => {
+    for (const r of draft.outboundRequests ?? []) {
+      if (r.status === "pending" && r.expiresAt && r.expiresAt < nowIso) {
+        r.status = "expired";
+      }
+    }
+    if (draft.relayedFriendRequests) {
+      draft.relayedFriendRequests = draft.relayedFriendRequests.filter(
+        (r: any) => !r.expiresAt || r.expiresAt >= nowIso
+      );
+    }
+    if (draft.relayedFriendRequestOutcomes) {
+      draft.relayedFriendRequestOutcomes = draft.relayedFriendRequestOutcomes.filter(
+        (o: any) => !o.expiresAt || o.expiresAt >= nowIso
+      );
+    }
+  });
+}
+
 
 /** wrap an automerge DocHandle as a SocialDoc (for browser/standalone mode) */
 export function docHandleAsSocialDoc(handle: DocHandle<any>): SocialDoc {
@@ -332,7 +385,9 @@ export async function initFriendzWiring(
       for (const r of draft.outboundRequests ?? []) {
         if (r.toNodeId !== fromNodeId) continue;
         if (msg.username) r.toUsername = msg.username;
+        if (msg.bio !== undefined) r.toBio = msg.bio;
         if (msg.avatarDataUrl !== undefined) r.toAvatarDataUrl = msg.avatarDataUrl;
+        if (msg.accentColor !== undefined) r.toAccentColor = msg.accentColor;
       }
     });
     // also refresh any canvas-share outbox entries sent to this node id —
@@ -390,7 +445,9 @@ export async function initFriendzWiring(
       for (const r of draft.outboundRequests ?? []) {
         if (r.toNodeId !== fromNodeId) continue;
         if (msg.username !== undefined) r.toUsername = msg.username;
+        if (msg.bio !== undefined) r.toBio = msg.bio;
         if (msg.avatarDataUrl !== undefined) r.toAvatarDataUrl = msg.avatarDataUrl;
+        if (msg.accentColor !== undefined) r.toAccentColor = msg.accentColor;
       }
     });
     // also refresh any canvas-share outbox entries sent to this node id —
@@ -647,10 +704,12 @@ export async function initFriendzWiring(
       if (!draft.outboundRequests) draft.outboundRequests = [];
       const exists = draft.outboundRequests.some((r: any) => r.toNodeId === targetNodeId);
       if (!exists) {
+        const sentAt = new Date().toISOString();
         draft.outboundRequests.push({
           toNodeId: targetNodeId,
           toUsername: "unknown",
-          sentAt: new Date().toISOString(),
+          sentAt,
+          expiresAt: addDays(sentAt, FRIEND_REQUEST_TTL_DAYS),
           status: "pending",
         });
       }
@@ -971,11 +1030,83 @@ export async function initFriendzWiring(
   /** compute and send a gossip digest to a peer that just came online.
    *  scans local canvas docs for shared canvases with updates and pending invites. */
   async function computeAndSendGossipDigest(peerNodeId: string): Promise<void> {
+    pruneExpiredFriendRequestRelay(sDoc);
+
     const canvasUpdates: GossipDigestMessage["canvasUpdates"] = [];
     const pendingInvites: GossipDigestMessage["pendingInvites"] = [];
     const pendingKnocks: GossipDigestMessage["pendingKnocks"] = [];
     const profiles: GossipDigestMessage["profiles"] = [];
     const sharedCanvasIds: string[] = [];
+    const pendingFriendRequests: NonNullable<GossipDigestMessage["pendingFriendRequests"]> = [];
+    const friendRequestOutcomes: NonNullable<GossipDigestMessage["friendRequestOutcomes"]> = [];
+    const nowIso = new Date().toISOString();
+
+    // look up a cached profile snapshot for a node id from our own friends
+    // list, so a relay holder who already knows a request's target can
+    // hand over identity info without a separate query round-trip - this
+    // is what lets profile info for a still-pending target "catch up" with
+    // the original requester purely by riding along on the same relayed
+    // request entry.
+    const lookupKnownProfile = (nodeId: string) => {
+      for (const friend of sDoc.current.friends ?? []) {
+        const n = friend.nodeIds?.find((n: any) => n.nodeId === nodeId);
+        if (n) return n;
+      }
+      return undefined;
+    };
+
+    // our own still-pending outbound requests — gossiped unconditionally to
+    // every online friend so any mutual friend/hub can relay them onward
+    // toward the target and/or hand back identity info they already know.
+    for (const r of sDoc.current.outboundRequests ?? []) {
+      if (r.status !== "pending") continue;
+      if (r.expiresAt && r.expiresAt < nowIso) continue;
+      const known = lookupKnownProfile(r.toNodeId);
+      pendingFriendRequests.push({
+        fromNodeId: localNodeId,
+        fromUsername: sDoc.current.profile.username ?? "",
+        fromBio: sDoc.current.profile.bio ?? "",
+        fromAvatarDataUrl: sDoc.current.profile.avatarDataUrl ?? "",
+        fromAccentColor: sDoc.current.profile.accentColor,
+        toNodeId: r.toNodeId,
+        toUsername: known?.username,
+        toBio: known?.bio,
+        toAvatarDataUrl: known?.avatarDataUrl,
+        toAccentColor: known?.accentColor,
+        requestedAt: r.sentAt ?? "",
+        expiresAt: r.expiresAt || addDays(r.sentAt ?? nowIso, FRIEND_REQUEST_TTL_DAYS),
+      });
+    }
+
+    // requests we're purely relaying on behalf of someone else — keep
+    // re-gossiping them to every online friend until they expire. no
+    // hop-count/bounded-relay-holder-set limiting beyond the existing
+    // friends-only gate around this whole function (see onPeerBecameOnline).
+    for (const r of sDoc.current.relayedFriendRequests ?? []) {
+      if (r.expiresAt && r.expiresAt < nowIso) continue;
+      const known = lookupKnownProfile(r.toNodeId);
+      pendingFriendRequests.push({
+        fromNodeId: r.fromNodeId,
+        fromUsername: r.fromUsername,
+        fromBio: r.fromBio,
+        fromAvatarDataUrl: r.fromAvatarDataUrl,
+        fromAccentColor: r.fromAccentColor,
+        toNodeId: r.toNodeId,
+        toUsername: known?.username,
+        toBio: known?.bio,
+        toAvatarDataUrl: known?.avatarDataUrl,
+        toAccentColor: known?.accentColor,
+        requestedAt: r.requestedAt,
+        expiresAt: r.expiresAt,
+      });
+    }
+
+    // outcomes (accept/reject) we resolved ourselves or are relaying onward
+    // toward the original requester.
+    for (const o of sDoc.current.relayedFriendRequestOutcomes ?? []) {
+      if (o.expiresAt && o.expiresAt < nowIso) continue;
+      friendRequestOutcomes.push({ ...o });
+    }
 
     // our own profile-doc pointer (docs/hub-and-profile-plan.md section 6)
     // — sent directly here too (not just via profile-request/response) so
@@ -1109,7 +1240,9 @@ export async function initFriendzWiring(
       pendingInvites.length === 0 &&
       pendingKnocks.length === 0 &&
       profiles.length === 0 &&
-      sharedCanvasIds.length === 0
+      sharedCanvasIds.length === 0 &&
+      pendingFriendRequests.length === 0 &&
+      friendRequestOutcomes.length === 0
     )
       return;
 
@@ -1126,7 +1259,11 @@ export async function initFriendzWiring(
       "profiles:",
       profiles.length,
       "canvases:",
-      sharedCanvasIds.length
+      sharedCanvasIds.length,
+      "friend-requests:",
+      pendingFriendRequests.length,
+      "friend-request-outcomes:",
+      friendRequestOutcomes.length
     );
 
     await protocol.sendGossipDigest(peerNodeId, {
@@ -1135,8 +1272,33 @@ export async function initFriendzWiring(
       pendingKnocks,
       ...(sharedCanvasIds.length > 0 ? { sharedCanvasIds } : {}),
       ...(profiles.length > 0 ? { profiles } : {}),
+      ...(pendingFriendRequests.length > 0 ? { pendingFriendRequests } : {}),
+      ...(friendRequestOutcomes.length > 0 ? { friendRequestOutcomes } : {}),
     });
   }
+
+  // ask every currently-online friend for a fresh digest right now, rather
+  // than waiting for one of them to transition online (see
+  // `onPeerBecameOnline` below for the passive version of this). used right
+  // after sending a friend request to a peer who isn't currently reachable,
+  // and when viewing the profile of a friend who hasn't accepted yet — a
+  // mutual friend/hub who's already online can relay the request and hand
+  // back identity info sooner. wired into `friendz-bridge.ts` via
+  // `setGossipNowHook()` so widgets can trigger it without depending on the
+  // heavy iroh/canvas-store wiring in this module.
+  setGossipNowHook(() => {
+    const friends = sDoc.current.friends ?? [];
+    const onlinePeers = protocol.getOnlinePeers();
+    for (const peerNodeId of onlinePeers) {
+      const isFriend = friends.some((f: any) =>
+        f.nodeIds?.some((n: any) => n.nodeId === peerNodeId)
+      );
+      if (!isFriend) continue;
+      computeAndSendGossipDigest(peerNodeId).catch((err) => {
+        log.warn(TAG, "on-demand gossip digest failed for:", peerNodeId.slice(0, 16) + "...", err);
+      });
+    }
+  });
 
   // send a gossip digest when a friend peer transitions to online.
   // this fires on BOTH sides of the heartbeat handshake, making the exchange
@@ -1362,6 +1524,8 @@ export async function initFriendzWiring(
     if (!Array.isArray(msg.pendingInvites)) msg.pendingInvites = [];
     if (!Array.isArray(msg.pendingKnocks)) msg.pendingKnocks = [];
     if (!Array.isArray(msg.profiles)) msg.profiles = [];
+    if (!Array.isArray(msg.pendingFriendRequests)) msg.pendingFriendRequests = [];
+    if (!Array.isArray(msg.friendRequestOutcomes)) msg.friendRequestOutcomes = [];
 
     // process canvas update notifications
     for (const update of msg.canvasUpdates) {
@@ -1503,6 +1667,164 @@ export async function initFriendzWiring(
     mergeGossipDigestProfiles(repo, sDoc, msg, fromNodeId).catch((err) => {
       log.warn(TAG, "failed to merge gossip-relayed profiles:", err);
     });
+
+    // process relayed friend requests. three cases per entry:
+    //   1. toNodeId is us: someone we've never directly connected to sent
+    //      us a friend request via a mutual friend/hub - materialize it the
+    //      same way a direct friend-request message would.
+    //   2. fromNodeId is us: this is our OWN outstanding request looping
+    //      back to us, possibly now carrying identity info about the target
+    //      that a relay holder already knew - fold it into our outbound
+    //      request entry.
+    //   3. neither: we're just a relay hop - hold onto it and keep
+    //      re-gossiping it to every online friend until it expires.
+    for (const entry of msg.pendingFriendRequests) {
+      if (entry.toNodeId === localNodeId) {
+        applyIncomingFriendRequest(
+          { protocol, sDoc, profileStore },
+          entry.fromNodeId,
+          {
+            fromUsername: entry.fromUsername,
+            bio: entry.fromBio,
+            avatarDataUrl: entry.fromAvatarDataUrl,
+            accentColor: entry.fromAccentColor,
+            expiresAt: entry.expiresAt,
+          },
+          fromNodeId
+        );
+        continue;
+      }
+
+      if (entry.fromNodeId === localNodeId) {
+        if (
+          !entry.toUsername &&
+          !entry.toBio &&
+          !entry.toAvatarDataUrl &&
+          entry.toAccentColor === undefined
+        ) {
+          continue; // nothing new learned about the target yet
+        }
+        sDoc.change((draft: any) => {
+          const req = (draft.outboundRequests ?? []).find(
+            (r: any) => r.toNodeId === entry.toNodeId
+          );
+          if (!req) return;
+          if (entry.toUsername) req.toUsername = entry.toUsername;
+          if (entry.toBio !== undefined) req.toBio = entry.toBio;
+          if (entry.toAvatarDataUrl !== undefined) req.toAvatarDataUrl = entry.toAvatarDataUrl;
+          if (entry.toAccentColor !== undefined) req.toAccentColor = entry.toAccentColor;
+        });
+        continue;
+      }
+
+      sDoc.change((draft: any) => {
+        if (!draft.relayedFriendRequests) draft.relayedFriendRequests = [];
+        const idx = draft.relayedFriendRequests.findIndex(
+          (r: any) => r.fromNodeId === entry.fromNodeId && r.toNodeId === entry.toNodeId
+        );
+        const relayEntry = {
+          fromNodeId: entry.fromNodeId,
+          fromUsername: entry.fromUsername,
+          fromBio: entry.fromBio ?? "",
+          fromAvatarDataUrl: entry.fromAvatarDataUrl ?? "",
+          ...(entry.fromAccentColor !== undefined ? { fromAccentColor: entry.fromAccentColor } : {}),
+          toNodeId: entry.toNodeId,
+          requestedAt: entry.requestedAt,
+          expiresAt: entry.expiresAt,
+        };
+        if (idx === -1) {
+          draft.relayedFriendRequests.push(relayEntry);
+        } else {
+          draft.relayedFriendRequests[idx] = relayEntry;
+        }
+      });
+    }
+
+    // process relayed friend-request outcomes (accept/reject). same three
+    // cases: fromNodeId is us (this is the outcome of our own request -
+    // resolve it and materialize the new friend on "accepted"), otherwise
+    // hold and keep relaying toward the original requester.
+    for (const outcome of msg.friendRequestOutcomes) {
+      if (outcome.fromNodeId === localNodeId) {
+        let alreadyResolved = false;
+        sDoc.change((draft: any) => {
+          const req = (draft.outboundRequests ?? []).find(
+            (r: any) => r.toNodeId === outcome.resolverNodeId
+          );
+          if (req) {
+            alreadyResolved = req.status !== "pending";
+            req.status = outcome.outcome;
+            if (outcome.resolverUsername) req.toUsername = outcome.resolverUsername;
+            if (outcome.resolverBio !== undefined) req.toBio = outcome.resolverBio;
+            if (outcome.resolverAvatarDataUrl !== undefined) {
+              req.toAvatarDataUrl = outcome.resolverAvatarDataUrl;
+            }
+            if (outcome.resolverAccentColor !== undefined) {
+              req.toAccentColor = outcome.resolverAccentColor;
+            }
+          }
+          if (outcome.outcome === "accepted") {
+            if (!draft.friends) draft.friends = [];
+            const exists = draft.friends.some((f: any) =>
+              f.nodeIds?.some((n: any) => n.nodeId === outcome.resolverNodeId)
+            );
+            if (!exists) {
+              draft.friends.push({
+                id: crypto.randomUUID(),
+                alias: "",
+                username: outcome.resolverUsername ?? "",
+                group: "",
+                nodeIds: [
+                  {
+                    nodeId: outcome.resolverNodeId,
+                    addedAt: new Date().toISOString(),
+                    lastSeenAt: "",
+                    username: outcome.resolverUsername ?? "",
+                    bio: outcome.resolverBio ?? "",
+                    avatarDataUrl: outcome.resolverAvatarDataUrl ?? "",
+                    profileDocId: "",
+                    profileUpdatedAt: "",
+                  },
+                ],
+                createdAt: new Date().toISOString(),
+                isHub: false,
+              });
+            }
+          }
+        });
+        if (outcome.outcome === "accepted" && !alreadyResolved) {
+          profileStore?.grantViewerRole(outcome.resolverNodeId);
+          protocol.requestProfile(outcome.resolverNodeId).catch(() => {});
+        }
+        continue;
+      }
+
+      sDoc.change((draft: any) => {
+        if (!draft.relayedFriendRequestOutcomes) draft.relayedFriendRequestOutcomes = [];
+        const idx = draft.relayedFriendRequestOutcomes.findIndex(
+          (o: any) =>
+            o.fromNodeId === outcome.fromNodeId && o.resolverNodeId === outcome.resolverNodeId
+        );
+        const outcomeEntry = {
+          fromNodeId: outcome.fromNodeId,
+          resolverNodeId: outcome.resolverNodeId,
+          outcome: outcome.outcome,
+          resolverUsername: outcome.resolverUsername ?? "",
+          resolverBio: outcome.resolverBio ?? "",
+          resolverAvatarDataUrl: outcome.resolverAvatarDataUrl ?? "",
+          ...(outcome.resolverAccentColor !== undefined
+            ? { resolverAccentColor: outcome.resolverAccentColor }
+            : {}),
+          resolvedAt: outcome.resolvedAt,
+          expiresAt: outcome.expiresAt,
+        };
+        if (idx === -1) {
+          draft.relayedFriendRequestOutcomes.push(outcomeEntry);
+        } else {
+          draft.relayedFriendRequestOutcomes[idx] = outcomeEntry;
+        }
+      });
+    }
   };
 
   // handle incoming blob-seek queries from the hub — check local blob
@@ -1756,6 +2078,157 @@ export interface FriendHandlersDeps {
 }
 
 /**
+ * a friend request's identity snapshot - the fields a `friend-request`
+ * message and a relayed `pendingFriendRequests` gossip-digest entry have in
+ * common. both `wireFriendHandlers`'s direct `onFriendRequest` handler and
+ * `onGossipDigest`'s relay-materialization branch funnel through
+ * {@link applyIncomingFriendRequest} with this shape, so the dedupe/
+ * reciprocal-auto-accept/friend-materialization logic only lives once.
+ */
+export interface IncomingFriendRequestInfo {
+  fromUsername?: string;
+  bio?: string;
+  avatarDataUrl?: string;
+  accentColor?: number;
+  isHub?: boolean;
+  /** absolute cutoff carried onto the resulting `pendingRequests` entry -
+   *  used only to seed a later `relayedFriendRequestOutcomes` entry if/when
+   *  the local user resolves this request while the requester is offline.
+   *  falls back to `receivedAt + 60 days` when omitted (a directly-received
+   *  request has no prior digest to carry an expiry from). */
+  expiresAt?: string;
+}
+
+/**
+ * apply an incoming friend request (received directly over the wire, or
+ * materialized from a gossip digest's `pendingFriendRequests` entry) to the
+ * social doc: dedupe/refresh the `pendingRequests` entry, auto-accept if
+ * reciprocal (already a friend, or we have a matching pending outbound
+ * request), and materialize the friend entry + grant profile-doc access
+ * when auto-accepting. `relayedBy` is the mutual friend/hub that forwarded
+ * this request to us - omitted ("") for a request the requester sent us
+ * directly.
+ */
+export function applyIncomingFriendRequest(
+  deps: FriendHandlersDeps,
+  fromNodeId: string,
+  msg: IncomingFriendRequestInfo,
+  relayedBy = ""
+): void {
+  const { protocol, sDoc, profileStore } = deps;
+
+  const friends = sDoc.current.friends ?? [];
+  const isAlreadyFriend = friends.some((f: any) =>
+    f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
+  );
+  const outbound = sDoc.current.outboundRequests ?? [];
+  const hasPendingOutbound = outbound.some(
+    (r: any) => r.toNodeId === fromNodeId && r.status === "pending"
+  );
+  const reciprocal = isAlreadyFriend || hasPendingOutbound;
+  const expiresAt = msg.expiresAt || addDays(new Date().toISOString(), FRIEND_REQUEST_TTL_DAYS);
+
+  let didAdd = false;
+  sDoc.change((draft: any) => {
+    if (!draft.pendingRequests) draft.pendingRequests = [];
+    const idx = draft.pendingRequests.findIndex((r: any) => r.fromNodeId === fromNodeId);
+    if (idx === -1) {
+      draft.pendingRequests.push({
+        fromNodeId,
+        fromUsername: msg.fromUsername ?? "unknown",
+        fromBio: msg.bio ?? "",
+        fromAvatarDataUrl: msg.avatarDataUrl ?? "",
+        ...(msg.accentColor !== undefined ? { fromAccentColor: msg.accentColor } : {}),
+        receivedAt: new Date().toISOString(),
+        status: reciprocal ? "accepted" : "pending",
+        relayedBy,
+        expiresAt,
+      });
+      didAdd = true;
+    } else {
+      // a resend of an already-pending request (e.g. the sender edited
+      // their profile) — refresh identity fields on the existing entry
+      // in place instead of creating a duplicate, and re-render reflects
+      // the update automatically via the doc-change subscription.
+      const existing = draft.pendingRequests[idx];
+      existing.fromUsername = msg.fromUsername ?? existing.fromUsername;
+      if (msg.bio !== undefined) existing.fromBio = msg.bio;
+      if (msg.avatarDataUrl !== undefined) existing.fromAvatarDataUrl = msg.avatarDataUrl;
+      if (msg.accentColor !== undefined) existing.fromAccentColor = msg.accentColor;
+      if (!existing.relayedBy && relayedBy) existing.relayedBy = relayedBy;
+      existing.expiresAt = expiresAt;
+      if (reciprocal && existing.status === "pending") {
+        existing.status = "accepted";
+      }
+    }
+    // mirror status on outbound request if present
+    if (reciprocal && draft.outboundRequests) {
+      for (const r of draft.outboundRequests) {
+        if (r.toNodeId === fromNodeId && r.status === "pending") {
+          r.status = "accepted";
+        }
+      }
+    }
+    // sticky hub flag (section 3.3): a duplicate/retried request from an
+    // already-known friend can still be the first message that reveals
+    // they're a hub — update it in place. never reset to false/undefined
+    // on a later message that simply omits the flag.
+    if (msg.isHub === true) {
+      const existing = draft.friends?.find((f: any) =>
+        f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
+      );
+      if (existing && existing.isHub !== true) existing.isHub = true;
+    }
+  });
+  const pendingCount = (sDoc.current.pendingRequests ?? []).filter(
+    (r: any) => r.status === "pending"
+  ).length;
+  log.debug(
+    TAG,
+    `onFriendRequest from ${fromNodeId.slice(0, 16)}... didAdd=${didAdd} reciprocal=${reciprocal} pending-count=${pendingCount}`
+  );
+
+  if (reciprocal) {
+    // auto-accept: tell the peer we accept and add them to friends if needed
+    protocol.sendFriendAccept(fromNodeId).catch((err) => {
+      log.warn(TAG, "auto-accept friend-request failed for", fromNodeId.slice(0, 16) + "...", err);
+    });
+    if (!isAlreadyFriend) {
+      sDoc.change((draft: any) => {
+        if (!draft.friends) draft.friends = [];
+        draft.friends.push({
+          id: crypto.randomUUID(),
+          alias: "",
+          username: msg.fromUsername ?? "",
+          group: "default",
+          nodeIds: [
+            {
+              nodeId: fromNodeId,
+              addedAt: new Date().toISOString(),
+              lastSeenAt: new Date().toISOString(),
+              username: msg.fromUsername ?? "",
+              bio: "",
+              avatarDataUrl: "",
+            },
+          ],
+          createdAt: new Date().toISOString(),
+          isHub: msg.isHub === true,
+        });
+      });
+    }
+    // friendship is now mutually confirmed on this side too (we just sent
+    // our own accept back) — grant them access to our profile doc. this
+    // is the ONLY place `grantViewerRole` gets called for this direction
+    // of friend-establishment; without it, a profile doc's `.acl` never
+    // gains an entry and (under canvas-scoped-share-policy.ts's rule 1,
+    // which profile docs share) can never sync to anyone, ever — a real
+    // regression confirmed 2026-07-03 ("can't get 'manage hub' after
+    // adding as friend": that panel needs the hub's own profile doc).
+    profileStore?.grantViewerRole(fromNodeId);
+  }
+}
+
+/**
  * wire the `friend-request`/`friend-accept` message handlers onto `protocol`.
  */
 export function wireFriendHandlers(deps: FriendHandlersDeps): void {
@@ -1768,116 +2241,9 @@ export function wireFriendHandlers(deps: FriendHandlersDeps): void {
   //   3. we have a still-pending outbound request to this peer: auto-accept
   //      (their request races our request — both sides add each other)
   protocol.onFriendRequest = (msg, fromNodeId) => {
-    const friends = sDoc.current.friends ?? [];
-    const isAlreadyFriend = friends.some((f: any) =>
-      f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
-    );
-    const outbound = sDoc.current.outboundRequests ?? [];
-    const hasPendingOutbound = outbound.some(
-      (r: any) => r.toNodeId === fromNodeId && r.status === "pending"
-    );
-    const reciprocal = isAlreadyFriend || hasPendingOutbound;
-
-    let didAdd = false;
-    sDoc.change((draft: any) => {
-      if (!draft.pendingRequests) draft.pendingRequests = [];
-      const idx = draft.pendingRequests.findIndex((r: any) => r.fromNodeId === fromNodeId);
-      if (idx === -1) {
-        draft.pendingRequests.push({
-          fromNodeId,
-          fromUsername: msg.fromUsername ?? "unknown",
-          fromBio: msg.bio ?? "",
-          fromAvatarDataUrl: msg.avatarDataUrl ?? "",
-          ...(msg.accentColor !== undefined ? { fromAccentColor: msg.accentColor } : {}),
-          receivedAt: new Date().toISOString(),
-          status: reciprocal ? "accepted" : "pending",
-        });
-        didAdd = true;
-      } else {
-        // a resend of an already-pending request (e.g. the sender edited
-        // their profile) — refresh identity fields on the existing entry
-        // in place instead of creating a duplicate, and re-render reflects
-        // the update automatically via the doc-change subscription.
-        const existing = draft.pendingRequests[idx];
-        existing.fromUsername = msg.fromUsername ?? existing.fromUsername;
-        if (msg.bio !== undefined) existing.fromBio = msg.bio;
-        if (msg.avatarDataUrl !== undefined) existing.fromAvatarDataUrl = msg.avatarDataUrl;
-        if (msg.accentColor !== undefined) existing.fromAccentColor = msg.accentColor;
-        if (reciprocal && existing.status === "pending") {
-          existing.status = "accepted";
-        }
-      }
-      // mirror status on outbound request if present
-      if (reciprocal && draft.outboundRequests) {
-        for (const r of draft.outboundRequests) {
-          if (r.toNodeId === fromNodeId && r.status === "pending") {
-            r.status = "accepted";
-          }
-        }
-      }
-      // sticky hub flag (section 3.3): a duplicate/retried request from an
-      // already-known friend can still be the first message that reveals
-      // they're a hub — update it in place. never reset to false/undefined
-      // on a later message that simply omits the flag.
-      if (msg.isHub === true) {
-        const existing = draft.friends?.find((f: any) =>
-          f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
-        );
-        if (existing && existing.isHub !== true) existing.isHub = true;
-      }
-    });
-    const pendingCount = (sDoc.current.pendingRequests ?? []).filter(
-      (r: any) => r.status === "pending"
-    ).length;
-    log.debug(
-      TAG,
-      `onFriendRequest from ${fromNodeId.slice(0, 16)}... didAdd=${didAdd} reciprocal=${reciprocal} pending-count=${pendingCount}`
-    );
-
-    if (reciprocal) {
-      // auto-accept: tell the peer we accept and add them to friends if needed
-      protocol.sendFriendAccept(fromNodeId).catch((err) => {
-        log.warn(
-          TAG,
-          "auto-accept friend-request failed for",
-          fromNodeId.slice(0, 16) + "...",
-          err
-        );
-      });
-      if (!isAlreadyFriend) {
-        sDoc.change((draft: any) => {
-          if (!draft.friends) draft.friends = [];
-          draft.friends.push({
-            id: crypto.randomUUID(),
-            alias: "",
-            username: msg.fromUsername ?? "",
-            group: "default",
-            nodeIds: [
-              {
-                nodeId: fromNodeId,
-                addedAt: new Date().toISOString(),
-                lastSeenAt: new Date().toISOString(),
-                username: msg.fromUsername ?? "",
-                bio: "",
-                avatarDataUrl: "",
-              },
-            ],
-            createdAt: new Date().toISOString(),
-            isHub: msg.isHub === true,
-          });
-        });
-      }
-      // friendship is now mutually confirmed on this side too (we just sent
-      // our own accept back) — grant them access to our profile doc. this
-      // is the ONLY place `grantViewerRole` gets called for this direction
-      // of friend-establishment; without it, a profile doc's `.acl` never
-      // gains an entry and (under canvas-scoped-share-policy.ts's rule 1,
-      // which profile docs share) can never sync to anyone, ever — a real
-      // regression confirmed 2026-07-03 ("can't get 'manage hub' after
-      // adding as friend": that panel needs the hub's own profile doc).
-      profileStore?.grantViewerRole(fromNodeId);
-    }
+    applyIncomingFriendRequest(deps, fromNodeId, msg);
   };
+
 
   // incoming friend accept -> add to friends list
   protocol.onFriendAccept = (msg, fromNodeId) => {

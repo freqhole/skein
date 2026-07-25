@@ -8,6 +8,7 @@ import {
   acceptFriendRequest,
   destroyBridge,
   getOnlinePeers,
+  gossipFriendRequestsNow,
   initBridge,
   isOnline,
   isProtocolReady,
@@ -18,6 +19,7 @@ import {
   requestProfile,
   sendFriendRequest,
   setFriendRequestsFrom,
+  setGossipNowHook,
   setOutboundRequestHook,
   setProfileVisibility,
 } from "./friendz-bridge";
@@ -388,4 +390,87 @@ describe("friendz-bridge", () => {
       expect(hook).not.toHaveBeenCalled();
     });
   });
+
+  // -------------------------------------------------------------------------
+  // 12. gossip-now hook
+  // -------------------------------------------------------------------------
+
+  describe("gossip-now hook", () => {
+    it("gossipFriendRequestsNow() is a no-op when no hook is registered", () => {
+      expect(() => gossipFriendRequestsNow()).not.toThrow();
+    });
+
+    it("gossipFriendRequestsNow() fires the registered hook", () => {
+      const hook = vi.fn();
+      setGossipNowHook(hook);
+
+      gossipFriendRequestsNow();
+      expect(hook).toHaveBeenCalledOnce();
+    });
+
+    it("can unregister the hook by passing null", () => {
+      const hook = vi.fn();
+      setGossipNowHook(hook);
+      setGossipNowHook(null);
+
+      gossipFriendRequestsNow();
+      expect(hook).not.toHaveBeenCalled();
+    });
+
+    it("sendFriendRequest() triggers gossipFriendRequestsNow() when the peer isn't online", async () => {
+      const mock = createMockProtocol();
+      mock.isOnline.mockReturnValue(false);
+      initBridge(asFriendzProtocol(mock));
+
+      const hook = vi.fn();
+      setGossipNowHook(hook);
+
+      await sendFriendRequest("peer-42");
+      expect(hook).toHaveBeenCalledOnce();
+    });
+
+    it("sendFriendRequest() does not trigger gossip when the peer is already online", async () => {
+      const mock = createMockProtocol();
+      mock.isOnline.mockReturnValue(true);
+      initBridge(asFriendzProtocol(mock));
+
+      const hook = vi.fn();
+      setGossipNowHook(hook);
+
+      await sendFriendRequest("peer-42");
+      expect(hook).not.toHaveBeenCalled();
+    });
+
+    it("sendFriendRequest() does not trigger gossip if the send itself rejects", async () => {
+      const mock = createMockProtocol();
+      mock.isOnline.mockReturnValue(false);
+      mock.sendFriendRequest.mockRejectedValue(new Error("connection failed"));
+      initBridge(asFriendzProtocol(mock));
+
+      const hook = vi.fn();
+      setGossipNowHook(hook);
+
+      await expect(sendFriendRequest("peer-42")).rejects.toThrow("connection failed");
+      expect(hook).not.toHaveBeenCalled();
+    });
+
+    it("clears the hook on destroyBridge", async () => {
+      const mock = createMockProtocol();
+      mock.isOnline.mockReturnValue(false);
+      initBridge(asFriendzProtocol(mock));
+
+      const hook = vi.fn();
+      setGossipNowHook(hook);
+
+      destroyBridge();
+
+      const mock2 = createMockProtocol();
+      mock2.isOnline.mockReturnValue(false);
+      initBridge(asFriendzProtocol(mock2));
+
+      await sendFriendRequest("peer-99");
+      expect(hook).not.toHaveBeenCalled();
+    });
+  });
 });
+
