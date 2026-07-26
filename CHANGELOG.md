@@ -1,5 +1,16 @@
 # skein
 
+## 0.1.4
+
+### Patch Changes
+
+- ecb9bf1: try to improve peedeeeff magick + gs bin path lookupz
+- 4873abb: fix audio + voice recording file blob sync between tauri <-> browser
+- a6e8e33: fix click handler on lower left corner peer count that opens canvas info
+- c3af5af: use identity info (like avatar + online status) throughout ui; improve share + hub flowz;
+- f9f346a: gossip about pending friend requestz to get profile info from friendz and help deliver friend req
+- abb78b1: yank hub stuff from tauri app + rework settingz window; fix canvas loading ui;
+
 ## 0.1.3
 
 ### Patch Changes
