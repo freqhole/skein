@@ -367,6 +367,59 @@ export async function readProfileDoc(
   );
 }
 
+/** seed a still-pending outbound friend request on this page to `toNodeId`. */
+export async function addOutboundFriendRequest(page: Page, toNodeId: string): Promise<void> {
+  return page.evaluate(
+    (id) => (window as any).__skeinTest.profileGossip.addOutboundRequest(id),
+    toNodeId
+  );
+}
+
+/** this page's currently-held `toUsername`/`toBio`/`toAvatarDataUrl` for its
+ *  own outbound request to `toNodeId`, or null if no such request exists. */
+export async function getOutboundRequestToInfo(
+  page: Page,
+  toNodeId: string
+): Promise<{ toUsername: string; toBio: string; toAvatarDataUrl: string } | null> {
+  return page.evaluate(
+    (id) => (window as any).__skeinTest.profileGossip.getOutboundRequestToInfo(id),
+    toNodeId
+  );
+}
+
+/** this page's currently-held `username`/`bio`/`avatarDataUrl` for a friend
+ *  (pending or confirmed) matching `nodeId`, or null if not a friend at all. */
+export async function getFriendInfoForNodeId(
+  page: Page,
+  nodeId: string
+): Promise<{ username: string; bio: string; avatarDataUrl: string } | null> {
+  return page.evaluate(
+    (id) => (window as any).__skeinTest.profileGossip.getFriendInfoForNodeId(id),
+    nodeId
+  );
+}
+
+/** send a gossip digest from this page to `peerNodeId`, carrying a single
+ *  relayed `pendingFriendRequests` entry - simulates a mutual friend/hub
+ *  handing back identity info it already knows about the target of
+ *  someone else's still-pending outbound friend request. */
+export async function sendFriendRequestGossipDigest(
+  page: Page,
+  peerNodeId: string,
+  entry: {
+    fromNodeId: string;
+    toNodeId: string;
+    toUsername?: string;
+    toBio?: string;
+    toAvatarDataUrl?: string;
+  }
+): Promise<void> {
+  return page.evaluate(
+    ([peer, e]) => (window as any).__skeinTest.profileGossip.sendFriendRequestGossipDigest(peer, e),
+    [peerNodeId, entry] as const
+  );
+}
+
 // --- canvas-doc direct assertions ---
 
 /** the raw automerge doc snapshot (snapshot, not live) */
