@@ -11,6 +11,7 @@ import {
   declineKnock,
   mergeGossipDigestKnocks,
   mergeGossipDigestProfiles,
+  applyRelayedOutboundRequestUpdate,
   wireKnockHandlers,
   type KnockRelayInfo,
   type ProfileRelayInfo,
@@ -1002,6 +1003,39 @@ export interface SkeinProfileGossipTestBridge {
    *  this peer doesn't already hold it. returns null if unreachable —
    *  proves the actual doc content (not just the pointer) arrived. */
   readProfileDoc(profileDocId: string): Promise<{ username: string; bio: string } | null>;
+  /** seed a still-pending outbound friend request to `toNodeId` — mirrors
+   *  what a real "add friend" click already leaves behind, so a relayed
+   *  `pendingFriendRequests` gossip-digest entry has somewhere to write
+   *  identity info about the target into. */
+  addOutboundRequest(toNodeId: string): void;
+  /** the `toUsername`/`toBio`/`toAvatarDataUrl` info this peer currently
+   *  holds for its own outbound request to `toNodeId`, or null if no such
+   *  outbound request exists. */
+  getOutboundRequestToInfo(
+    toNodeId: string
+  ): { toUsername: string; toBio: string; toAvatarDataUrl: string } | null;
+  /** the `username`/`bio`/`avatarDataUrl` this peer's `friends` list
+   *  currently holds for a node id, or null if not a (pending or
+   *  confirmed) friend at all — proves whether relayed identity info
+   *  reached the friends-list entry itself, not just the outbound-request
+   *  inbox. */
+  getFriendInfoForNodeId(
+    nodeId: string
+  ): { username: string; bio: string; avatarDataUrl: string } | null;
+  /** send a gossip digest to `peerNodeId` carrying a single relayed
+   *  `pendingFriendRequests` entry - simulates a mutual friend/hub handing
+   *  back identity info it already knows about the target of someone
+   *  else's still-pending outbound friend request. */
+  sendFriendRequestGossipDigest(
+    peerNodeId: string,
+    entry: {
+      fromNodeId: string;
+      toNodeId: string;
+      toUsername?: string;
+      toBio?: string;
+      toAvatarDataUrl?: string;
+    }
+  ): Promise<void>;
 }
 
 /**
@@ -1052,6 +1086,15 @@ export function buildProfileGossipTestBridge(options: {
     ).catch(() => {
       // best effort — logged inside mergeGossipDigestProfiles already
     });
+    for (const entry of msg.pendingFriendRequests ?? []) {
+      if (entry.fromNodeId !== localNodeId) continue;
+      applyRelayedOutboundRequestUpdate(socialDoc, entry.toNodeId, {
+        toUsername: entry.toUsername,
+        toBio: entry.toBio,
+        toAvatarDataUrl: entry.toAvatarDataUrl,
+        toAccentColor: entry.toAccentColor,
+      });
+    }
   };
 
   return {
@@ -1144,6 +1187,67 @@ export function buildProfileGossipTestBridge(options: {
       } catch {
         return null;
       }
+    },
+
+    addOutboundRequest(toNodeId) {
+      socialDoc.change((draft: any) => {
+        if (!draft.outboundRequests) draft.outboundRequests = [];
+        draft.outboundRequests.push({
+          toNodeId,
+          status: "pending",
+          sentAt: new Date().toISOString(),
+          toUsername: "",
+          toBio: "",
+          toAvatarDataUrl: "",
+        });
+      });
+    },
+
+    getOutboundRequestToInfo(toNodeId) {
+      const req = (socialState.outboundRequests ?? []).find((r: any) => r.toNodeId === toNodeId);
+      if (!req) return null;
+      return {
+        toUsername: req.toUsername ?? "",
+        toBio: req.toBio ?? "",
+        toAvatarDataUrl: req.toAvatarDataUrl ?? "",
+      };
+    },
+
+    getFriendInfoForNodeId(nodeId) {
+      for (const friend of socialState.friends ?? []) {
+        for (const n of friend.nodeIds ?? []) {
+          if (n.nodeId === nodeId) {
+            return {
+              username: friend.username ?? "",
+              bio: n.bio ?? "",
+              avatarDataUrl: n.avatarDataUrl ?? "",
+            };
+          }
+        }
+      }
+      return null;
+    },
+
+    async sendFriendRequestGossipDigest(peerNodeId, entry) {
+      await protocol.sendGossipDigest(peerNodeId, {
+        canvasUpdates: [],
+        pendingInvites: [],
+        pendingKnocks: [],
+        pendingFriendRequests: [
+          {
+            fromNodeId: entry.fromNodeId,
+            fromUsername: "",
+            fromBio: "",
+            fromAvatarDataUrl: "",
+            toNodeId: entry.toNodeId,
+            toUsername: entry.toUsername,
+            toBio: entry.toBio,
+            toAvatarDataUrl: entry.toAvatarDataUrl,
+            requestedAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+          },
+        ],
+      });
     },
   };
 }

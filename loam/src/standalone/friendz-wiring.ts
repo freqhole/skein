@@ -725,6 +725,17 @@ export async function initFriendzWiring(
     { canvasDocId: string; lastModified: string; widgetCount: number }
   >();
 
+  // signature of the last digest actually sent to each peer (JSON of the
+  // payload) - `computeAndSendGossipDigest` is now also called immediately
+  // on receipt of an incoming digest (see `protocol.onGossipDigest` below),
+  // so a peer's relay/enrichment can reach the original requester within
+  // one round trip instead of waiting for the next online-transition. this
+  // cache is what keeps that reply-on-receipt from turning into an
+  // unbounded reply-to-a-reply loop: once both sides' payloads stop
+  // changing, the second side's `computeAndSendGossipDigest` call is a
+  // no-op.
+  const lastSentDigestSignature = new Map<string, string>();
+
   /** attach a change listener to the canvas doc behind a canvas-card widget. */
   function watchCanvasForFederation(widgetDocId: string): void {
     if (watchedCanvasWidgets.has(widgetDocId)) return;
@@ -1246,6 +1257,23 @@ export async function initFriendzWiring(
     )
       return;
 
+    const payload = {
+      canvasUpdates,
+      pendingInvites,
+      pendingKnocks,
+      ...(sharedCanvasIds.length > 0 ? { sharedCanvasIds } : {}),
+      ...(profiles.length > 0 ? { profiles } : {}),
+      ...(pendingFriendRequests.length > 0 ? { pendingFriendRequests } : {}),
+      ...(friendRequestOutcomes.length > 0 ? { friendRequestOutcomes } : {}),
+    };
+
+    // skip re-sending a digest whose content is identical to the last one
+    // this peer was sent - see `lastSentDigestSignature`'s doc comment for
+    // why this matters now that a digest receipt also triggers an
+    // immediate reply.
+    const signature = JSON.stringify(payload);
+    if (lastSentDigestSignature.get(peerNodeId) === signature) return;
+
     log.debug(
       TAG,
       "sending gossip digest to:",
@@ -1266,15 +1294,8 @@ export async function initFriendzWiring(
       friendRequestOutcomes.length
     );
 
-    await protocol.sendGossipDigest(peerNodeId, {
-      canvasUpdates,
-      pendingInvites,
-      pendingKnocks,
-      ...(sharedCanvasIds.length > 0 ? { sharedCanvasIds } : {}),
-      ...(profiles.length > 0 ? { profiles } : {}),
-      ...(pendingFriendRequests.length > 0 ? { pendingFriendRequests } : {}),
-      ...(friendRequestOutcomes.length > 0 ? { friendRequestOutcomes } : {}),
-    });
+    await protocol.sendGossipDigest(peerNodeId, payload);
+    lastSentDigestSignature.set(peerNodeId, signature);
   }
 
   // ask every currently-online friend for a fresh digest right now, rather
@@ -1696,23 +1717,11 @@ export async function initFriendzWiring(
       }
 
       if (entry.fromNodeId === localNodeId) {
-        if (
-          !entry.toUsername &&
-          !entry.toBio &&
-          !entry.toAvatarDataUrl &&
-          entry.toAccentColor === undefined
-        ) {
-          continue; // nothing new learned about the target yet
-        }
-        sDoc.change((draft: any) => {
-          const req = (draft.outboundRequests ?? []).find(
-            (r: any) => r.toNodeId === entry.toNodeId
-          );
-          if (!req) return;
-          if (entry.toUsername) req.toUsername = entry.toUsername;
-          if (entry.toBio !== undefined) req.toBio = entry.toBio;
-          if (entry.toAvatarDataUrl !== undefined) req.toAvatarDataUrl = entry.toAvatarDataUrl;
-          if (entry.toAccentColor !== undefined) req.toAccentColor = entry.toAccentColor;
+        applyRelayedOutboundRequestUpdate(sDoc, entry.toNodeId, {
+          toUsername: entry.toUsername,
+          toBio: entry.toBio,
+          toAvatarDataUrl: entry.toAvatarDataUrl,
+          toAccentColor: entry.toAccentColor,
         });
         continue;
       }
@@ -1823,6 +1832,24 @@ export async function initFriendzWiring(
         } else {
           draft.relayedFriendRequestOutcomes[idx] = outcomeEntry;
         }
+      });
+    }
+
+    // hand our own current digest straight back to whoever just gossiped
+    // to us, rather than waiting for the next online-transition/heartbeat
+    // to happen to fire in that direction - this is what actually lets
+    // newly-learned info (e.g. profile identity for a still-pending friend
+    // request, enriched by this exact peer's own friends list) reach the
+    // original requester within one round trip. `computeAndSendGossipDigest`
+    // itself is a no-op if nothing has changed since the last digest sent
+    // to this peer, which is what keeps this from becoming an unbounded
+    // reply-to-a-reply loop.
+    const isFriendPeer = (sDoc.current.friends ?? []).some((f: any) =>
+      f.nodeIds?.some((n: any) => n.nodeId === fromNodeId)
+    );
+    if (isFriendPeer) {
+      computeAndSendGossipDigest(fromNodeId).catch((err) => {
+        log.warn(TAG, "reply gossip digest failed for:", fromNodeId.slice(0, 16) + "...", err);
       });
     }
   };
@@ -2226,6 +2253,76 @@ export function applyIncomingFriendRequest(
     // adding as friend": that panel needs the hub's own profile doc).
     profileStore?.grantViewerRole(fromNodeId);
   }
+}
+
+/**
+ * identity info a `pendingFriendRequests` gossip-digest entry carries about
+ * the TARGET of our own outstanding outbound request (`toUsername`/
+ * `toBio`/`toAvatarDataUrl`/`toAccentColor`), learned by whichever relay
+ * holder already knows that target.
+ */
+export interface RelayedOutboundRequestInfo {
+  toUsername?: string;
+  toBio?: string;
+  toAvatarDataUrl?: string;
+  toAccentColor?: number;
+}
+
+/**
+ * fold newly-learned identity info about our own outbound friend request's
+ * target (relayed back to us via a mutual friend/hub's gossip digest) into
+ * the `outboundRequests` entry, and - if a `friends` entry already exists
+ * for that target - into that entry's matching nodeIds fields too. the
+ * "add friend" flow creates a `friends` entry immediately, before the
+ * target has accepted, and the friends-list UI (friends-tab.ts) reads
+ * `friend.username`/nodeIds for display, not `outboundRequests` - without
+ * this second half, a relayed profile for a still-pending target would
+ * update the outbound-requests inbox but never become visible in the
+ * friends list itself. same field-by-field update `onProfileResponse`
+ * uses for a direct response, above.
+ *
+ * exported (not just inlined into `onGossipDigest`) so it can be exercised
+ * directly in tests, same pattern as `mergeGossipDigestProfiles`.
+ */
+export function applyRelayedOutboundRequestUpdate(
+  sDoc: SocialDoc,
+  toNodeId: string,
+  info: RelayedOutboundRequestInfo
+): void {
+  if (
+    !info.toUsername &&
+    info.toBio === undefined &&
+    info.toAvatarDataUrl === undefined &&
+    info.toAccentColor === undefined
+  ) {
+    return; // nothing new learned about the target yet
+  }
+
+  sDoc.change((draft: any) => {
+    const req = (draft.outboundRequests ?? []).find((r: any) => r.toNodeId === toNodeId);
+    if (req) {
+      if (info.toUsername) req.toUsername = info.toUsername;
+      if (info.toBio !== undefined) req.toBio = info.toBio;
+      if (info.toAvatarDataUrl !== undefined) req.toAvatarDataUrl = info.toAvatarDataUrl;
+      if (info.toAccentColor !== undefined) req.toAccentColor = info.toAccentColor;
+    }
+
+    for (const friend of draft.friends ?? []) {
+      if (!friend.nodeIds) continue;
+      let matched = false;
+      for (const n of friend.nodeIds) {
+        if (n.nodeId !== toNodeId) continue;
+        matched = true;
+        if (info.toUsername) n.username = info.toUsername;
+        if (info.toBio !== undefined) n.bio = info.toBio;
+        if (info.toAvatarDataUrl !== undefined) n.avatarDataUrl = info.toAvatarDataUrl;
+        if (info.toAccentColor !== undefined) n.accentColor = info.toAccentColor;
+      }
+      if (matched && info.toUsername) {
+        friend.username = info.toUsername;
+      }
+    }
+  });
 }
 
 /**

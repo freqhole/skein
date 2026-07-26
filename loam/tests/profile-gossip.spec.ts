@@ -20,12 +20,16 @@
 
 import { test, expect } from "./fixtures/p2p-page";
 import {
+  addOutboundFriendRequest,
   addPeer,
   addProfileGossipFriend,
+  getFriendInfoForNodeId,
   getKnownProfilePointer,
   getMyProfileDocId,
+  getOutboundRequestToInfo,
   getRelayedProfiles,
   readProfileDoc,
+  sendFriendRequestGossipDigest,
   sendProfileGossipDigest,
   setMyProfile,
 } from "./helpers/skein-bridge";
@@ -135,5 +139,59 @@ test.describe("profile-doc gossip relay", () => {
     await expect
       .poll(async () => readProfileDoc(stranger.page, ownerProfileDocId), { timeout: 30_000 })
       .toMatchObject({ username: "bob", bio: "hello from bob" });
+  });
+});
+
+test.describe("relayed friend-request target identity (pendingFriendRequests)", () => {
+  test("a peer's own outbound request picks up the target's identity relayed via a mutual friend, and it shows up in the friends list too @p2p", async ({
+    p2pPage,
+  }) => {
+    test.setTimeout(60_000);
+
+    const requester = await p2pPage();
+    const mutual = await p2pPage();
+
+    // requester has an outstanding "add friend" click against target — the
+    // real flow creates BOTH an `outboundRequests` entry and a `friends`
+    // placeholder entry immediately, before the target has accepted (that
+    // placeholder is what `addProfileGossipFriend` seeds here). target
+    // itself is never spun up at all in this test — mutual relays identity
+    // info it already knows about target purely from its own gossip
+    // digest, proving requester never needs a direct connection to target
+    // for this to work.
+    const targetNodeId = "deadbeef".repeat(8);
+    await addOutboundFriendRequest(requester.page, targetNodeId);
+    await addProfileGossipFriend(requester.page, targetNodeId);
+
+    await addPeer(requester.page, mutual.nodeId);
+    await addPeer(mutual.page, requester.nodeId);
+
+    // sanity check: nothing learned about target yet.
+    await expect(getOutboundRequestToInfo(requester.page, targetNodeId)).resolves.toMatchObject({
+      toUsername: "",
+    });
+
+    await sendFriendRequestGossipDigest(mutual.page, requester.nodeId, {
+      fromNodeId: requester.nodeId,
+      toNodeId: targetNodeId,
+      toUsername: "carol",
+      toBio: "hello from carol",
+    });
+
+    // proof 1: the outbound-requests entry itself picks up the relayed
+    // identity info.
+    await expect
+      .poll(async () => getOutboundRequestToInfo(requester.page, targetNodeId), {
+        timeout: 15_000,
+      })
+      .toMatchObject({ toUsername: "carol", toBio: "hello from carol" });
+
+    // proof 2 (the actual bug this test guards against): the SAME relayed
+    // info also lands in the friends-list placeholder entry, since that's
+    // what the friends-list UI actually reads for display — not
+    // `outboundRequests`.
+    await expect
+      .poll(async () => getFriendInfoForNodeId(requester.page, targetNodeId), { timeout: 15_000 })
+      .toMatchObject({ username: "carol", bio: "hello from carol" });
   });
 });
