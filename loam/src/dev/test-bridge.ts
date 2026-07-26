@@ -7,6 +7,12 @@ import type { FriendzProtocol } from "../p2p/friends-protocol";
 import { restrictBlobToPeers } from "../p2p/iroh-network-adapter";
 import type { EndpointState, IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
 import {
+  initBridge as initFriendzBridge,
+  sendFriendRequest as bridgeSendFriendRequest,
+  setOutboundRequestHook,
+  setGossipNowHook,
+} from "../p2p/friendz-bridge";
+import {
   approveKnock,
   declineKnock,
   mergeGossipDigestKnocks,
@@ -180,15 +186,33 @@ export interface SkeinP2PBridge {
  * `standalone/friendz-wiring.ts` and writes into the real social automerge
  * doc; this test bridge tracks accepted friends in a plain in-memory set
  * instead, since the p2p test harness has no narthex/social doc set up.
+ *
+ * `sendFriendRequest()` below calls through the REAL `friendz-bridge.ts`
+ * module (the same singleton `friends-tab.ts`'s "add friend" flow uses) —
+ * not `protocol.sendFriendRequest()` directly — specifically so this is the
+ * one test surface that actually exercises the pending-request-hook/
+ * gossip-now-trigger ordering that lives there, not just the lower-level
+ * wire handshake.
  */
 export interface SkeinFriendzTestBridge {
-  /** send a friend request to a peer by node id. */
+  /** send a friend request to a peer by node id — the real production
+   *  `friendz-bridge.ts::sendFriendRequest()`, not a raw protocol call. */
   sendFriendRequest(peerNodeId: string): Promise<void>;
   /** whether a peer's friend request has been accepted (mutual friendship
    *  established locally, tracked since the harness page loaded). */
   isFriend(peerNodeId: string): boolean;
   /** all peer node ids currently recorded as accepted friends. */
   getFriends(): string[];
+  /** whether `sendFriendRequest(peerNodeId)` has recorded this peer's
+   *  outbound request as pending — mirrors what `friendz-wiring.ts`'s
+   *  `setOutboundRequestHook` callback would write into the real social
+   *  doc's `outboundRequests`. proves the pending-state hook fires
+   *  regardless of whether the underlying wire send to `peerNodeId`
+   *  ever actually succeeds (it may be unreachable/offline). */
+  isOutboundRequestPending(peerNodeId: string): boolean;
+  /** how many times `gossipFriendRequestsNow()` has fired since the
+   *  harness page loaded (across all `sendFriendRequest()` calls). */
+  getGossipNowCallCount(): number;
 }
 
 /**
@@ -790,9 +814,23 @@ export function buildFriendzTestBridge(
     acceptedFriends.add(fromNodeId);
   };
 
+  // wire the real friendz-bridge.ts singleton onto this protocol instance —
+  // same lifecycle boot.ts uses in production — so `sendFriendRequest`
+  // below goes through the actual `outboundRequestHook`/`gossipNowHook`
+  // ordering instead of bypassing it.
+  initFriendzBridge(protocol);
+  const pendingOutboundRequests = new Set<string>();
+  let gossipNowCallCount = 0;
+  setOutboundRequestHook((toNodeId) => {
+    pendingOutboundRequests.add(toNodeId);
+  });
+  setGossipNowHook(() => {
+    gossipNowCallCount += 1;
+  });
+
   return {
     async sendFriendRequest(peerNodeId: string): Promise<void> {
-      await protocol.sendFriendRequest(peerNodeId);
+      await bridgeSendFriendRequest(peerNodeId);
     },
 
     isFriend(peerNodeId: string): boolean {
@@ -801,6 +839,14 @@ export function buildFriendzTestBridge(
 
     getFriends(): string[] {
       return [...acceptedFriends];
+    },
+
+    isOutboundRequestPending(peerNodeId: string): boolean {
+      return pendingOutboundRequests.has(peerNodeId);
+    },
+
+    getGossipNowCallCount(): number {
+      return gossipNowCallCount;
     },
   };
 }

@@ -189,15 +189,24 @@ export function onBridgeReady(handler: () => void): () => void {
  */
 export async function sendFriendRequest(peerNodeId: string): Promise<void> {
   if (!protocol) throw new Error("friendz bridge not initialized");
-  await protocol.sendFriendRequest(peerNodeId);
+
+  // mark the outbound request as pending, and kick off a gossip-relay
+  // attempt if the peer isn't known-online, BEFORE attempting the direct
+  // wire send below - a peer we've never exchanged a heartbeat with (the
+  // common case for a brand-new node id) has no open stream yet, so
+  // `protocol.sendFriendRequest()` has to dial them first. against a
+  // genuinely offline peer that dial can take a long time to time out (or
+  // reject outright with no discovery path), and the caller (friends-tab.ts)
+  // treats this as fire-and-forget, only logging a warning on failure -
+  // if the pending-state hook only fired on success, an offline target
+  // would never get marked pending and would have nothing for gossip
+  // relay to carry, defeating the entire point of that feature.
   outboundRequestHook?.(peerNodeId);
-  // the peer isn't currently known-online (most brand-new node ids we've
-  // never exchanged a heartbeat with) - ask any mutual friends who are
-  // online right now to relay the request and hand back identity info,
-  // rather than waiting for the recipient's next online-transition.
   if (!isOnline(peerNodeId)) {
     gossipFriendRequestsNow();
   }
+
+  await protocol.sendFriendRequest(peerNodeId);
 }
 
 /**
