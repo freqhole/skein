@@ -24,11 +24,14 @@ import {
   addPeer,
   addProfileGossipFriend,
   getFriendInfoForNodeId,
+  getGossipNowCallCount,
   getKnownProfilePointer,
   getMyProfileDocId,
   getOutboundRequestToInfo,
   getRelayedProfiles,
+  isOutboundRequestPending,
   readProfileDoc,
+  sendFriendRequestFireAndForget,
   sendFriendRequestGossipDigest,
   sendProfileGossipDigest,
   setMyProfile,
@@ -193,5 +196,36 @@ test.describe("relayed friend-request target identity (pendingFriendRequests)", 
     await expect
       .poll(async () => getFriendInfoForNodeId(requester.page, targetNodeId), { timeout: 15_000 })
       .toMatchObject({ username: "carol", bio: "hello from carol" });
+  });
+});
+
+test.describe("outbound friend request pending-state (regression guard)", () => {
+  test("sendFriendRequest() marks the request pending and triggers gossip relay immediately, even against an unreachable peer @p2p", async ({
+    p2pPage,
+  }) => {
+    test.setTimeout(30_000);
+
+    const requester = await p2pPage();
+
+    // a syntactically-valid node id that was never dialed/added as a peer
+    // on this page — nothing will ever answer it. if the pending-state
+    // hook (`friendz-bridge.ts::sendFriendRequest()`'s `outboundRequestHook`/
+    // `gossipFriendRequestsNow()` calls) were gated behind the direct wire
+    // send settling — the actual bug this guards against — it would never
+    // fire within any reasonable test timeout, since that send has no path
+    // to ever succeed or even definitively fail quickly.
+    const unreachableNodeId = "beefcafe".repeat(8);
+
+    await sendFriendRequestFireAndForget(requester.page, unreachableNodeId);
+
+    await expect
+      .poll(async () => isOutboundRequestPending(requester.page, unreachableNodeId), {
+        timeout: 5_000,
+      })
+      .toBe(true);
+
+    await expect
+      .poll(async () => getGossipNowCallCount(requester.page), { timeout: 5_000 })
+      .toBeGreaterThan(0);
   });
 });

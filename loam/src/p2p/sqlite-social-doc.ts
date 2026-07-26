@@ -103,6 +103,9 @@ interface RawFriendRequest {
   remote_alias: string;
   remote_node_id: string | null;
   remote_display_name: string | null;
+  remote_bio: string | null;
+  remote_avatar_url: string | null;
+  remote_accent_color: number | null;
 }
 
 interface RawFriendGroup {
@@ -202,6 +205,7 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
             username: n.display_name,
             bio: n.bio,
             avatarDataUrl: n.avatar_url,
+            accentColor: n.accent_color || undefined,
             // profile-doc gossip (docs/hub-and-profile-plan.md section 6)
             // is browser/automerge-only for now — tauri's sqlite-backed
             // social doc has no equivalent column to source this from.
@@ -235,17 +239,13 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
     pendingRequests: raw.pending_requests.map((r) => ({
       fromNodeId: r.remote_node_id || "",
       fromUsername: r.remote_display_name || r.remote_alias || r.remote_username,
-      // identity info carried on the request itself (docs/hub-and-profile-
-      // plan.md section 6) is browser/automerge-only for now — tauri's
-      // sqlite-backed social doc has no equivalent columns to source this
-      // from yet.
-      fromBio: "",
-      fromAvatarDataUrl: "",
+      fromBio: r.remote_bio || "",
+      fromAvatarDataUrl: r.remote_avatar_url || "",
+      fromAccentColor: r.remote_accent_color || undefined,
       receivedAt: unixToIso(r.created_at),
       status: r.status as "pending" | "accepted" | "accepted-pending-ack" | "rejected",
-      // friend-request relay (browser/automerge-only for now, same
-      // limitation as fromBio/fromAvatarDataUrl above) has no equivalent
-      // columns yet either.
+      // friend-request relay (browser/automerge-only for now) has no
+      // equivalent columns yet.
       relayedBy: "",
       expiresAt: "",
     })),
@@ -253,10 +253,9 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
     outboundRequests: raw.outbound_requests.map((r) => ({
       toNodeId: r.remote_node_id || "",
       toUsername: r.remote_display_name || r.remote_alias || r.remote_username,
-      // same tauri/sqlite limitation as pendingRequests' fromAvatarDataUrl
-      // above — no column to source this from yet.
-      toBio: "",
-      toAvatarDataUrl: "",
+      toBio: r.remote_bio || "",
+      toAvatarDataUrl: r.remote_avatar_url || "",
+      toAccentColor: r.remote_accent_color || undefined,
       sentAt: unixToIso(r.created_at),
       // no relay-deadline column yet either (see pendingRequests above) —
       // an empty expiresAt means computeAndSendGossipDigest treats it as
@@ -572,13 +571,15 @@ export class SqliteSocialDoc implements SocialDoc {
       const nameChanged = prevNode.username !== nextNode.username;
       const bioChanged = prevNode.bio !== nextNode.bio;
       const avatarChanged = prevNode.avatarDataUrl !== nextNode.avatarDataUrl;
+      const colorChanged = prevNode.accentColor !== nextNode.accentColor;
       const seenChanged = prevNode.lastSeenAt !== nextNode.lastSeenAt;
 
-      if (nameChanged || bioChanged || avatarChanged || seenChanged) {
+      if (nameChanged || bioChanged || avatarChanged || colorChanged || seenChanged) {
         const payload: Record<string, unknown> = { node_id: nextNode.nodeId };
         if (nameChanged) payload.display_name = nextNode.username;
         if (bioChanged) payload.bio = nextNode.bio;
         if (avatarChanged) payload.avatar_url = nextNode.avatarDataUrl;
+        if (colorChanged) payload.accent_color = nextNode.accentColor;
         promises.push(dispatch("social_update_node_profile", payload));
       }
     }
@@ -700,11 +701,32 @@ export class SqliteSocialDoc implements SocialDoc {
     // status changes on existing outbound requests
     for (const [nodeId, nextR] of nextByNode) {
       const prevR = prevByNode.get(nodeId);
-      if (!prevR || prevR.status === nextR.status) continue;
+      if (!prevR) continue;
 
-      const requestId = this.maps.outboundNodeToRequestId.get(nodeId);
-      if (requestId) {
-        promises.push(dispatch("social_update_request", { id: requestId, status: nextR.status }));
+      if (prevR.status !== nextR.status) {
+        const requestId = this.maps.outboundNodeToRequestId.get(nodeId);
+        if (requestId) {
+          promises.push(
+            dispatch("social_update_request", { id: requestId, status: nextR.status })
+          );
+        }
+      }
+
+      // identity fields relayed in after the request was created (profile
+      // response or gossip relay) - persisted on the same per-node profile
+      // record diffFriendNodes() writes to for accepted friends, since both
+      // are keyed by node id rather than by request/friend row id.
+      const nameChanged = prevR.toUsername !== nextR.toUsername;
+      const bioChanged = prevR.toBio !== nextR.toBio;
+      const avatarChanged = prevR.toAvatarDataUrl !== nextR.toAvatarDataUrl;
+      const colorChanged = prevR.toAccentColor !== nextR.toAccentColor;
+      if (nameChanged || bioChanged || avatarChanged || colorChanged) {
+        const payload: Record<string, unknown> = { node_id: nodeId };
+        if (nameChanged) payload.display_name = nextR.toUsername;
+        if (bioChanged) payload.bio = nextR.toBio;
+        if (avatarChanged) payload.avatar_url = nextR.toAvatarDataUrl;
+        if (colorChanged) payload.accent_color = nextR.toAccentColor;
+        promises.push(dispatch("social_update_node_profile", payload));
       }
     }
   }

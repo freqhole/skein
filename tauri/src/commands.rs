@@ -752,6 +752,9 @@ async fn social_get_state(state: &AppState) -> Result<Value, DispatchError> {
                     "remote_alias": alias,
                     "remote_node_id": f.friend_node_id,
                     "remote_display_name": username,
+                    "remote_bio": bio,
+                    "remote_avatar_url": avatar,
+                    "remote_accent_color": accent,
                 });
                 if direction == "outbound" {
                     outbound.push(req);
@@ -1011,6 +1014,7 @@ struct SocialUpdateNodeProfileArgs {
     display_name: Option<String>,
     bio: Option<String>,
     avatar_url: Option<String>,
+    accent_color: Option<i64>,
 }
 
 async fn social_update_node_profile(
@@ -1020,11 +1024,12 @@ async fn social_update_node_profile(
     state.userz.touch(&args.node_id).await?;
     state
         .userz
-        .upsert_profile(
+        .upsert_profile_full(
             &args.node_id,
             args.display_name.as_deref(),
             args.bio.as_deref(),
             args.avatar_url.as_deref(),
+            args.accent_color,
         )
         .await?;
     Ok(Value::Null)

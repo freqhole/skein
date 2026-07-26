@@ -326,7 +326,12 @@ describe("friendz-bridge", () => {
       expect(mock.sendFriendRequest).toHaveBeenCalledWith("peer-42");
     });
 
-    it("does not fire the hook if protocol.sendFriendRequest rejects", async () => {
+    it("fires the hook even if protocol.sendFriendRequest rejects", async () => {
+      // the pending-state hook must fire before the direct wire-send is
+      // even attempted - a genuinely offline peer's send can take a long
+      // time to fail (or reject outright), and the whole point of the
+      // pending-request + gossip-relay system is to keep working in
+      // exactly that case, not silently skip marking the request pending.
       const mock = createMockProtocol();
       mock.sendFriendRequest.mockRejectedValue(new Error("connection failed"));
       initBridge(asFriendzProtocol(mock));
@@ -335,7 +340,7 @@ describe("friendz-bridge", () => {
       setOutboundRequestHook(hook);
 
       await expect(sendFriendRequest("peer-42")).rejects.toThrow("connection failed");
-      expect(hook).not.toHaveBeenCalled();
+      expect(hook).toHaveBeenCalledWith("peer-42");
     });
 
     it("does not fire the hook when none is registered", async () => {
@@ -441,7 +446,11 @@ describe("friendz-bridge", () => {
       expect(hook).not.toHaveBeenCalled();
     });
 
-    it("sendFriendRequest() does not trigger gossip if the send itself rejects", async () => {
+    it("sendFriendRequest() still triggers gossip even if the send itself rejects", async () => {
+      // same reasoning as the outbound-request-hook test above - gossip
+      // relay exists specifically to cover the case where the direct send
+      // to an offline peer fails, so it must fire before that send is
+      // attempted, not be skipped when it fails.
       const mock = createMockProtocol();
       mock.isOnline.mockReturnValue(false);
       mock.sendFriendRequest.mockRejectedValue(new Error("connection failed"));
@@ -451,7 +460,7 @@ describe("friendz-bridge", () => {
       setGossipNowHook(hook);
 
       await expect(sendFriendRequest("peer-42")).rejects.toThrow("connection failed");
-      expect(hook).not.toHaveBeenCalled();
+      expect(hook).toHaveBeenCalledOnce();
     });
 
     it("clears the hook on destroyBridge", async () => {

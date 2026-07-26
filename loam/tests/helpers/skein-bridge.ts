@@ -207,6 +207,42 @@ export async function waitForFriend(
 }
 
 /**
+ * send a friend request from this page to a peer, WITHOUT waiting for it
+ * to resolve — mirrors how friends-tab.ts's real "add friend" flow calls
+ * `sendFriendRequest()` (fire-and-forget), so a genuinely unreachable
+ * peer's slow/rejecting wire-send doesn't block the test. pair with
+ * `isOutboundRequestPending()` below to observe the pending-state hook
+ * firing independently of whether the wire send itself ever succeeds.
+ */
+export async function sendFriendRequestFireAndForget(
+  page: Page,
+  peerNodeId: string
+): Promise<void> {
+  return page.evaluate((id) => {
+    (window as any).__skeinTest.friendz.sendFriendRequest(id).catch(() => {});
+  }, peerNodeId);
+}
+
+/**
+ * whether this page's real `friendz-bridge.ts::sendFriendRequest()` has
+ * recorded `peerNodeId`'s outbound request as pending — mirrors what
+ * `friendz-wiring.ts`'s `setOutboundRequestHook` callback writes into the
+ * real social doc's `outboundRequests` in production.
+ */
+export async function isOutboundRequestPending(page: Page, peerNodeId: string): Promise<boolean> {
+  return page.evaluate(
+    (id) => (window as any).__skeinTest.friendz.isOutboundRequestPending(id),
+    peerNodeId
+  );
+}
+
+/** how many times `gossipFriendRequestsNow()` has fired on this page since
+ *  the harness loaded (across all `sendFriendRequest()` calls). */
+export async function getGossipNowCallCount(page: Page): Promise<number> {
+  return page.evaluate(() => (window as any).__skeinTest.friendz.getGossipNowCallCount());
+}
+
+/**
  * open a canvas doc that lives on an already-connected peer.
  *
  * call this only *after* dialing the owning peer via `addPeer()` — opening a

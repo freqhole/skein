@@ -202,4 +202,200 @@ describe("SqliteSocialDoc", () => {
     );
     expect(hubCalls).toHaveLength(0);
   });
+
+  it("maps remote_bio/remote_avatar_url/remote_accent_color into pendingRequests and outboundRequests", async () => {
+    invokeMock.mockResolvedValueOnce(
+      baseSnapshot({
+        pending_requests: [
+          {
+            id: "req-in-1",
+            user_id: "self-1",
+            remote_user_id: "peer-in-1",
+            direction: "inbound",
+            status: "pending",
+            created_at: 0,
+            updated_at: 0,
+            remote_username: "peer-in",
+            remote_alias: "",
+            remote_node_id: "peer-in-1",
+            remote_display_name: "peer-in",
+            remote_bio: "hi, i'm peer-in",
+            remote_avatar_url: "avatar-in.png",
+            remote_accent_color: 0x112233,
+          },
+        ],
+        outbound_requests: [
+          {
+            id: "req-out-1",
+            user_id: "self-1",
+            remote_user_id: "peer-out-1",
+            direction: "outbound",
+            status: "pending",
+            created_at: 0,
+            updated_at: 0,
+            remote_username: "peer-out",
+            remote_alias: "",
+            remote_node_id: "peer-out-1",
+            remote_display_name: "peer-out",
+            remote_bio: "hi, i'm peer-out",
+            remote_avatar_url: "avatar-out.png",
+            remote_accent_color: 0x445566,
+          },
+        ],
+      })
+    );
+
+    const doc = await SqliteSocialDoc.create();
+
+    expect(doc.current.pendingRequests[0]).toMatchObject({
+      fromBio: "hi, i'm peer-in",
+      fromAvatarDataUrl: "avatar-in.png",
+      fromAccentColor: 0x112233,
+    });
+    expect(doc.current.outboundRequests[0]).toMatchObject({
+      toBio: "hi, i'm peer-out",
+      toAvatarDataUrl: "avatar-out.png",
+      toAccentColor: 0x445566,
+    });
+  });
+
+  it("maps a friend node's accent_color column into accentColor", async () => {
+    invokeMock.mockResolvedValueOnce(
+      baseSnapshot({
+        friends: [
+          {
+            id: "friend-6",
+            group_name: "",
+            created_at: 0,
+            friend_user_id: "friend-6",
+            username: "colorful-friend",
+            alias: "",
+            bio: "",
+            avatar_url: "",
+            accent_color: 0x998877,
+            is_hub: false,
+            node_ids: [
+              {
+                node_id: "node-6",
+                display_name: "colorful-friend",
+                bio: "",
+                avatar_url: "",
+                accent_color: 0x998877,
+                instance_name: null,
+                last_seen_at: null,
+                created_at: 0,
+              },
+            ],
+          },
+        ],
+      })
+    );
+
+    const doc = await SqliteSocialDoc.create();
+    expect(doc.current.friends[0]?.nodeIds[0]?.accentColor).toBe(0x998877);
+  });
+
+  it("dispatches social_update_node_profile when an outbound request's identity fields are filled in", async () => {
+    invokeMock.mockResolvedValueOnce(
+      baseSnapshot({
+        outbound_requests: [
+          {
+            id: "req-out-2",
+            user_id: "self-1",
+            remote_user_id: "peer-out-2",
+            direction: "outbound",
+            status: "pending",
+            created_at: 0,
+            updated_at: 0,
+            remote_username: "",
+            remote_alias: "",
+            remote_node_id: "peer-out-2",
+            remote_display_name: null,
+            remote_bio: null,
+            remote_avatar_url: null,
+            remote_accent_color: null,
+          },
+        ],
+      })
+    );
+    invokeMock.mockResolvedValue(undefined);
+
+    const doc = await SqliteSocialDoc.create();
+    invokeMock.mockClear();
+
+    doc.change((draft) => {
+      const req = draft.outboundRequests.find((r) => r.toNodeId === "peer-out-2");
+      if (req) {
+        req.toUsername = "peer-out";
+        req.toBio = "hi, i'm peer-out";
+        req.toAvatarDataUrl = "avatar-out.png";
+        req.toAccentColor = 0x445566;
+      }
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(invokeMock).toHaveBeenCalledWith("skein_dispatch", {
+      action: "social_update_node_profile",
+      payload: {
+        node_id: "peer-out-2",
+        display_name: "peer-out",
+        bio: "hi, i'm peer-out",
+        avatar_url: "avatar-out.png",
+        accent_color: 0x445566,
+      },
+    });
+  });
+
+  it("dispatches social_update_node_profile with accent_color when a friend node's accent color changes", async () => {
+    invokeMock.mockResolvedValueOnce(
+      baseSnapshot({
+        friends: [
+          {
+            id: "friend-7",
+            group_name: "",
+            created_at: 0,
+            friend_user_id: "friend-7",
+            username: "friend-7",
+            alias: "",
+            bio: "",
+            avatar_url: "",
+            accent_color: 0,
+            is_hub: false,
+            node_ids: [
+              {
+                node_id: "node-7",
+                display_name: "friend-7",
+                bio: "",
+                avatar_url: "",
+                accent_color: 0,
+                instance_name: null,
+                last_seen_at: null,
+                created_at: 0,
+              },
+            ],
+          },
+        ],
+      })
+    );
+    invokeMock.mockResolvedValue(undefined);
+
+    const doc = await SqliteSocialDoc.create();
+    invokeMock.mockClear();
+
+    doc.change((draft) => {
+      const friend = draft.friends.find((f) => f.id === "friend-7");
+      const node = friend?.nodeIds.find((n) => n.nodeId === "node-7");
+      if (node) node.accentColor = 0xaabbcc;
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(invokeMock).toHaveBeenCalledWith("skein_dispatch", {
+      action: "social_update_node_profile",
+      payload: { node_id: "node-7", accent_color: 0xaabbcc },
+    });
+  });
 });

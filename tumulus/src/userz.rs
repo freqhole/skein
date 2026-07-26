@@ -132,6 +132,20 @@ impl Directory {
         bio: Option<&str>,
         avatar_blake3: Option<&str>,
     ) -> Result<(), UserError> {
+        self.upsert_profile_full(node_id, display_name, bio, avatar_blake3, None)
+            .await
+    }
+
+    /// update a peer's profile with all optional fields, including accent
+    /// color. any None fields are left untouched (COALESCE-based merge).
+    pub async fn upsert_profile_full(
+        &self,
+        node_id: &str,
+        display_name: Option<&str>,
+        bio: Option<&str>,
+        avatar_blake3: Option<&str>,
+        accent_color: Option<i64>,
+    ) -> Result<(), UserError> {
         let now = now_secs();
         let profile = PeerProfile {
             node_id: node_id.to_string(),
@@ -139,7 +153,7 @@ impl Directory {
             alias: None,
             bio: bio.map(str::to_string),
             avatar_blake3: avatar_blake3.map(str::to_string),
-            accent_color: None,
+            accent_color: accent_color.map(accent_color_to_hex),
             is_self: false,
             is_hub: false,
             first_seen: now,
