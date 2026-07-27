@@ -14,6 +14,27 @@ import type { BreadcrumbItem, Toolbar } from "./toolbar";
 import type { Viewport } from "./viewport";
 import { WidgetFrame } from "./widget-frame";
 
+/**
+ * stamp `ownerCanvasId` onto a widget doc that predates this stamping
+ * mechanism (see canvas-scoped-share-policy.ts's module doc comment,
+ * "rule 2"). a widget doc missing this field permanently fails that
+ * policy's rule 3 ("ready, no .acl, no ownerCanvasId — denied, no
+ * fallback") and can never sync to a peer who doesn't already have it —
+ * calling this once, whenever the doc is next opened by a peer who already
+ * has it, permanently repairs it (the write syncs to every other peer via
+ * the normal automerge propagation, same as any other doc change).
+ *
+ * a no-op if the field is already present.
+ */
+export function backfillOwnerCanvasId(widgetDocHandle: DocHandle<any>, canvasDocumentId: DocumentId): void {
+  const rawDoc = widgetDocHandle.doc();
+  if (rawDoc && !("ownerCanvasId" in rawDoc)) {
+    widgetDocHandle.change((d: Record<string, unknown>) => {
+      d.ownerCanvasId = canvasDocumentId;
+    });
+  }
+}
+
 /** snapshot of positions at the start of a batch drag */
 interface BatchDragState {
   /** the widget that initiated the drag */
@@ -461,6 +482,14 @@ export class WidgetManager {
           );
           return;
         }
+
+        // backfill `ownerCanvasId` on a pre-existing widget doc that predates
+        // this stamping mechanism (see the "new widget" branch below and
+        // canvas-scoped-share-policy.ts's module doc comment) — without it,
+        // the doc permanently fails that policy's rule 3 ("ready, no .acl,
+        // no ownerCanvasId — denied, no fallback") and can never sync to a
+        // peer who doesn't already have it.
+        backfillOwnerCanvasId(widgetDocHandle, this.store.handle.documentId);
       } else {
         // new widget with no existing document — create one and persist the
         // docId back into the canvas document so other peers can sync it.
@@ -487,7 +516,7 @@ export class WidgetManager {
         this.store.setDocId(entry.id, widgetDocHandle.documentId);
       }
 
-      doc = createWidgetDoc(factory.schema, widgetDocHandle);
+      doc = createWidgetDoc(factory.schema, widgetDocHandle, factory.migrate);
     } else {
       // stateless widget: no-op document facade
       doc = {

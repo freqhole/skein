@@ -12,10 +12,17 @@ import type { WidgetDoc } from "./widget-types";
  * - falls back to schema defaults if validation fails (graceful degradation)
  * - exposes change() for mutations and on("change") for subscriptions
  * - never exposes the underlying DocHandle to widget code
+ *
+ * `migrate`, if given, is a one-time repair pass for known-legacy document
+ * shapes (e.g. a field renamed since the document was created) — it's only
+ * invoked when the initial parse fails, and writes directly into the raw
+ * automerge doc via `handle.change()` so the fix is permanent and syncs to
+ * every peer, rather than being re-applied on every read.
  */
 export function createWidgetDoc<S extends z.ZodType>(
   schema: S,
-  handle: DocHandle<any>
+  handle: DocHandle<any>,
+  migrate?: (raw: any) => void
 ): WidgetDoc<S> {
   type State = z.infer<S>;
 
@@ -26,6 +33,14 @@ export function createWidgetDoc<S extends z.ZodType>(
     try {
       return schema.parse(raw ?? {});
     } catch (err) {
+      if (migrate) {
+        try {
+          handle.change(migrate);
+          return schema.parse(handle.doc() ?? {});
+        } catch {
+          // migration didn't fix it — fall through to the default fallback below.
+        }
+      }
       // graceful degradation: if peer data is corrupt, use defaults.
       // log the error so schema mismatches are visible during development.
       console.warn(

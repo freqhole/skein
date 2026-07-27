@@ -79,6 +79,27 @@ export const canvasCardSchema = z.object({
 
 export type CanvasCardState = z.infer<typeof canvasCardSchema>;
 
+/** pre-rename role names, from before the admin/member/viewer rename —
+ *  canvas-card docs written before that rename can still carry one of
+ *  these as their stored `role`, since automerge docs are never migrated
+ *  in place on their own. rewritten to the modern name by `migrateCanvasCard`
+ *  below the first time such a doc fails to parse. */
+const legacyRoleNames: Record<string, CanvasCardState["role"]> = {
+  owner: "admin",
+  editor: "member",
+};
+
+/** one-time repair pass for canvas-card docs written before the
+ *  admin/member/viewer role rename — see `legacyRoleNames` above. writes
+ *  directly into the raw automerge doc so the fix is permanent and syncs
+ *  to every peer, rather than being silently defaulted away on every read
+ *  (see `widget-doc.ts`'s `createWidgetDoc`). */
+function migrateCanvasCard(raw: any): void {
+  if (typeof raw.role === "string" && raw.role in legacyRoleNames) {
+    raw.role = legacyRoleNames[raw.role];
+  }
+}
+
 // layout constants
 const CARD_RADIUS = 8;
 const ACCENT_HEIGHT = 4;
@@ -202,6 +223,7 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
     maximizable: false,
   },
   schema: canvasCardSchema,
+  migrate: migrateCanvasCard,
   editableProps: [
     { key: "description", label: "description", type: "string" as const, default: "" },
     { key: "color", label: "color tag", type: "color" as const, default: 0xd946ef },

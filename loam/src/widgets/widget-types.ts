@@ -347,6 +347,15 @@ export interface WidgetFactory<S extends z.ZodType = z.ZodType> {
   metadata: WidgetMetadata;
   /** Zod schema for the widget's internal state. omit for stateless widgets. */
   schema?: S;
+  /**
+   * one-time repair pass for documents written under an earlier version of
+   * `schema` that the current schema no longer accepts (e.g. a renamed enum
+   * value) — invoked, via `createWidgetDoc`, only when the initial parse of
+   * an existing document fails. mutates the raw automerge doc directly so
+   * the fix is permanent and syncs to every peer, instead of being silently
+   * re-applied (or discarded to defaults) on every read.
+   */
+  migrate?: (raw: any) => void;
   /** editable properties shown in the property editor panel when this widget is selected in edit mode */
   editableProps?: WidgetPropDef[];
   /**
