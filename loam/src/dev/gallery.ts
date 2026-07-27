@@ -40,7 +40,7 @@ async function mountGallery(): Promise<void> {
       const handle = repo.create();
       const defaults = factory.schema.parse({});
       handle.change((d: any) => Object.assign(d, defaults));
-      doc = createWidgetDoc(factory.schema, handle);
+      doc = createWidgetDoc(factory.schema, handle, factory.migrate);
     } else {
       // stateless widgets don't use the doc, so provide a no-op facade
       doc = {

@@ -28,6 +28,10 @@ use commands::AppState;
 
 const APP_IDENTIFIER: &str = "net.freqhole.skein";
 const APP_CONFIG_FILENAME: &str = "skein-app.toml";
+/** log file name, written alongside the app's sqlite databases in the data dir. */
+const LOG_FILE_NAME: &str = "skein.log";
+/** log file is truncated (keeping the newest lines) once it exceeds this many lines. */
+const MAX_LOG_LINES: usize = 10_000;
 
 fn default_data_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
@@ -58,6 +62,92 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from("./skein-data")
 }
 
+/// resolve the data directory the same way `build_state()` does, without
+/// needing an `AppState` - tracing has to be set up before anything else
+/// runs, including `build_state()` itself.
+fn resolve_data_dir() -> PathBuf {
+    std::env::var("SKEIN_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_data_dir())
+}
+
+/// truncate a log file to its newest `max_lines` lines, if it's grown past
+/// that - keeps a first-run (or long-running) log from growing unbounded.
+fn truncate_log_file_if_needed(path: &std::path::Path, max_lines: usize) {
+    use std::io::{BufRead, BufReader, Write};
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let reader = BufReader::new(file);
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+
+    if lines.len() <= max_lines {
+        return;
+    }
+
+    let keep_from = lines.len() - max_lines;
+    if let Ok(mut file) = std::fs::File::create(path) {
+        for line in &lines[keep_from..] {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+/// set up tracing to write to both stdout and a log file in the data dir
+/// (`<data_dir>/skein.log`), and install a panic hook that logs panics
+/// through the same subscriber - a plain Rust panic only prints to stderr
+/// by default, which is invisible on a packaged desktop build with no
+/// attached terminal (the common way a first-load crash on Linux would
+/// otherwise leave no trace at all). returns the log file path if file
+/// logging was set up successfully, for a one-time startup log message.
+fn setup_tracing() -> Option<PathBuf> {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let data_dir = resolve_data_dir();
+    let _ = std::fs::create_dir_all(&data_dir);
+    let log_path = data_dir.join(LOG_FILE_NAME);
+    truncate_log_file_if_needed(&log_path, MAX_LOG_LINES);
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok();
+
+    let result = if let Some(file) = log_file {
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false);
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+        Some(log_path)
+    } else {
+        // fall back to stdout-only logging rather than failing to start -
+        // a read-only/missing data dir shouldn't prevent the app from
+        // running, just from persisting logs.
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+        None
+    };
+
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!("panic: {info}");
+    }));
+
+    result
+}
+
 /// build the always-on `AppState`: endpoint, pool, and stores.
 ///
 /// the iroh endpoint is NOT created here unconditionally -- that would
@@ -72,9 +162,7 @@ fn default_data_dir() -> PathBuf {
 /// fetches a blob from a peer, or clicks "generate identity" in the profile
 /// widget.
 async fn build_state() -> anyhow::Result<AppState> {
-    let data_dir = std::env::var("SKEIN_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| default_data_dir());
+    let data_dir = resolve_data_dir();
     tokio::fs::create_dir_all(&data_dir).await?;
 
     let pool = db::open(&data_dir).await?;
@@ -134,12 +222,10 @@ async fn build_state() -> anyhow::Result<AppState> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let log_path = setup_tracing();
+    if let Some(path) = &log_path {
+        tracing::info!(log_file = %path.display(), "logging to file");
+    }
 
     let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
     let app_state = runtime

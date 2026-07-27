@@ -1,4 +1,6 @@
+import { Repo } from "@automerge/automerge-repo";
 import { describe, expect, it } from "vitest";
+import { createWidgetDoc } from "../../src/widgets/widget-doc";
 import { canvasCardSchema, canvasCardWidget } from "./canvas-card";
 
 describe("canvasCardSchema", () => {
@@ -171,11 +173,32 @@ describe("remote canvas card schema", () => {
   });
 
   it("rejects invalid role values", () => {
-    // "owner" was the pre-rename role name (admin/member/viewer replaced
-    // owner/editor/viewer) — confirms old values are properly rejected, not
-    // silently accepted.
     expect(() => canvasCardSchema.parse({ role: "owner" })).toThrow();
     expect(() => canvasCardSchema.parse({ role: 42 })).toThrow();
+  });
+
+  it("migrates pre-rename role names on an existing doc instead of blanking it", () => {
+    // "owner"/"editor" were the pre-rename role names (replaced by
+    // admin/member/viewer) - canvas-card docs written before the rename can
+    // still carry one of these, and automerge docs are never migrated in
+    // place on their own. without a repair pass, widget-doc.ts would discard
+    // the entire cached state (not just role) the moment this field fails
+    // to parse - canvasCardWidget.migrate fixes the raw doc directly instead.
+    const repo = new Repo({});
+    const handle = repo.create<Record<string, unknown>>({
+      canvasDocId: "legacy-doc-123",
+      title: "legacy canvas",
+      isRemote: true,
+      role: "owner",
+    });
+
+    const widgetDoc = createWidgetDoc(canvasCardSchema, handle, canvasCardWidget.migrate);
+
+    expect(widgetDoc.current.canvasDocId).toBe("legacy-doc-123");
+    expect(widgetDoc.current.title).toBe("legacy canvas");
+    expect(widgetDoc.current.role).toBe("admin");
+    // the underlying doc itself was repaired, not just the parsed view.
+    expect((handle.doc() as { role: string }).role).toBe("admin");
   });
 
   it("parses hub node ids carried over from a share link", () => {
