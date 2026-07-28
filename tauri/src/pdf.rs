@@ -63,8 +63,9 @@ pub(crate) fn magick_delegate_path_env() -> std::ffi::OsString {
 /// a terminal-launched dev build), then falls back to the common install
 /// directories above, which a GUI-launched app's `PATH` commonly omits.
 /// returns `None` if nothing is found anywhere. shared by `resolve_magick`
-/// and `resolve_gs` since both need identical fallback logic.
-async fn resolve_binary(name: &str, version_flag: &str) -> Option<String> {
+/// and `resolve_gs` (and, from `thumbnail.rs`, `ffmpeg`/`ffprobe`) since they
+/// all need identical fallback logic.
+pub(crate) async fn resolve_binary(name: &str, version_flag: &str) -> Option<String> {
     if Command::new(name).arg(version_flag).output().await.is_ok() {
         return Some(name.to_string());
     }

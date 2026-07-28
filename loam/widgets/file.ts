@@ -30,6 +30,7 @@ import { sendFriendRequest } from "../src/p2p/friendz-bridge";
 import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import { createInlinePlayer, type InlinePlayerHandle } from "../src/widgets/inline-media";
 import { createMediaOverlay, type MediaOverlayHandle } from "../src/widgets/media-overlay";
+import { createGifHoverOverlay, type GifHoverOverlayHandle } from "../src/widgets/gif-hover-overlay";
 import { peerNameFor } from "../src/canvas/peer-names";
 import type {
   CompactInfo,
@@ -305,6 +306,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     let activePlayer: InlinePlayerHandle | null = null;
     let hoverOverlay: Container | null = null;
     let hoverOverlayVisible = false;
+    let activeGifHover: GifHoverOverlayHandle | null = null;
     // friend-gated snatch: the peer known to have the blob but not (yet) a
     // friend, and the pending-retry-on-friend-accept unregister function —
     // see requestFriendAndRetry() and file-utils.ts's BlobAccessDeniedError.
@@ -352,11 +354,33 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       if (actionState !== "local" && actionState !== "snatched") return;
       hoverOverlayVisible = true;
       if (hoverOverlay) hoverOverlay.visible = true;
+
+      // a gif thumbnail is normally a pre-rendered static image (see
+      // thumbnail.rs) — fetch the real bytes and animate them while hovered.
+      if (state.domain === "photo" && state.mime === "image/gif" && state.blobId) {
+        const blobId = state.blobId;
+        const blake3 = state.blake3;
+        void getLocalBlobUrl(blobId, blake3).then((src) => {
+          if (!src || !hoverOverlayVisible || activeGifHover) return;
+          if (ctx.doc.current.blobId !== blobId) return;
+          const extra = actionBarExtra();
+          const thumbAreaH = Math.max(0, currentHeight - INFO_BAR_HEIGHT - extra);
+          activeGifHover = createGifHoverOverlay({
+            container,
+            canvasElement: ctx.canvasElement,
+            width: currentWidth,
+            height: thumbAreaH,
+            src,
+          });
+        });
+      }
     });
 
     thumbHitArea.on("pointerleave", () => {
       hoverOverlayVisible = false;
       if (hoverOverlay) hoverOverlay.visible = false;
+      activeGifHover?.remove();
+      activeGifHover = null;
     });
 
     thumbHitArea.on("pointertap", (e: any) => {
@@ -1077,6 +1101,23 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
         if (abort.signal.aborted || lastRequestedBlobId !== blobId) {
           return;
+        }
+
+        // persist a freshly-computed thumbnail (video/audio/pdf need ffmpeg
+        // or magick, so it's rarely ready at upload time) back into the doc.
+        // without this, only this mounted instance's in-memory texture ever
+        // sees it — any other consumer that reads the persisted state
+        // directly instead of mounting the full widget (e.g. a bin's card
+        // preview via getCompactInfo) would never see a thumbnail at all.
+        if (
+          dataUrl &&
+          !destroyed &&
+          ctx.doc.current.blobId === blobId &&
+          ctx.doc.current.thumbnailDataUrl !== dataUrl
+        ) {
+          ctx.doc.change((draft) => {
+            draft.thumbnailDataUrl = dataUrl;
+          });
         }
 
         destroySprite();
@@ -2610,6 +2651,8 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           hoverOverlay.destroy({ children: true });
           hoverOverlay = null;
         }
+        activeGifHover?.remove();
+        activeGifHover = null;
         container.destroy({ children: true });
       },
       resize(width: number, height: number) {
@@ -2624,6 +2667,10 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         fitSprite(width, height);
         drawHoverOverlay(width, height);
         drawThumbHitArea(width, height);
+        // a stale-sized hover overlay would show the gif at the wrong rect —
+        // simplest to drop it; the pointer re-entering redraws it correctly.
+        activeGifHover?.remove();
+        activeGifHover = null;
         if (loadState === "loaded") {
           syncActionButtons();
           positionInfoBar(width, height);
