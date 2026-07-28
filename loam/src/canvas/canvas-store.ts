@@ -10,6 +10,16 @@ import type {
   WidgetEntry,
 } from "./canvas-doc";
 import { canvasRoleSchema, emptyCanvasDoc } from "./canvas-doc";
+import { resolveDocReady } from "../p2p/doc-ready";
+
+/**
+ * default bound for `CanvasStore.open()` when a caller passes no
+ * `opts.timeoutMs` at all — matches automerge-repo's own historical
+ * internal `whenReady()` default (~60s) so migrating `open()` onto
+ * `resolveDocReady()` doesn't silently change how long ordinary in-app
+ * navigation waits before giving up.
+ */
+const DEFAULT_OPEN_TIMEOUT_MS = 60_000;
 
 /** handler signature for ephemeral message listeners */
 export type EphemeralHandler = (senderId: string, data: Uint8Array) => void;
@@ -87,74 +97,41 @@ export class CanvasStore {
    * whole app down). automerge-repo's own `DocHandle` state machine
    * already models the real recovery path event-drivenly: an
    * "unavailable" handle still transitions to "ready" the moment real
-   * content actually arrives (`DOC_READY`, fired by the handle's own
-   * change-detection) — `whenReady()` below is what actually waits on
-   * that, backed by the library's own internal timeout, not a
-   * hand-rolled setTimeout/poll loop here.
-   */
-  /**
-   * `opts.timeoutMs`, when given, bounds the wait with an `AbortSignal`
-   * instead of automerge-repo's own internal ~60-120s default — used for a
-   * cold open with no known peer to dial at all (a bare canvas-id URL with
-   * no prior session), where waiting out the library's full default is
-   * pointless: the doc either resolves fast (already local, or a peer
-   * responds quickly) or it never will from this entry point. left
-   * unspecified for ordinary in-app navigation, where a real, slower sync
-   * over the network shouldn't get cut off early.
+   * content actually arrives, so this is built on `resolveDocReady()` (see
+   * `p2p/doc-ready.ts`) rather than a one-off `repo.find()`/`whenReady()`
+   * pair — it keeps listening for the same handle to flip to "ready" for
+   * the rest of the bound below, instead of throwing immediately the way
+   * automerge-repo's own default `repo.find()` behavior would.
+   *
+   * `opts.timeoutMs`, when given, bounds the wait instead of the default
+   * ~60s (`DEFAULT_OPEN_TIMEOUT_MS`, matching automerge-repo's own
+   * historical internal default so this refactor doesn't silently change
+   * how long ordinary in-app navigation waits before giving up) — pass an
+   * explicit shorter bound for a cold open with no known peer to dial at
+   * all (a bare canvas-id URL with no prior session), where waiting out
+   * the full default is pointless: the doc either resolves fast (already
+   * local, or a peer responds quickly) or it never will from this entry
+   * point.
    *
    * `opts.signal`, when given, lets a caller cancel the wait on demand —
    * e.g. a user clicking a "cancel" button on a loading screen while this
-   * is still in flight. combined with `opts.timeoutMs`'s own internal
-   * controller (whichever fires first wins), rather than replacing it.
+   * is still in flight. combined with the timeout (whichever fires first
+   * wins), rather than replacing it.
    */
   static async open(
     repo: Repo,
     docId: DocumentId,
     opts?: { timeoutMs?: number; signal?: AbortSignal }
   ): Promise<CanvasStore> {
-    let signal: AbortSignal | undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let onExternalAbort: (() => void) | undefined;
-    if (opts?.timeoutMs !== undefined || opts?.signal) {
-      const controller = new AbortController();
-      if (opts?.timeoutMs !== undefined) {
-        timer = setTimeout(() => controller.abort(), opts.timeoutMs);
-      }
-      if (opts?.signal) {
-        if (opts.signal.aborted) {
-          controller.abort();
-        } else {
-          onExternalAbort = () => controller.abort();
-          opts.signal.addEventListener("abort", onExternalAbort);
-        }
-      }
-      signal = controller.signal;
+    const timeoutMs = opts?.timeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS;
+    const handle = await resolveDocReady<CanvasDocument>(repo, docId, {
+      timeoutMs,
+      signal: opts?.signal,
+    });
+    if (!handle) {
+      throw new Error(`canvas doc ${docId} did not become ready within ${timeoutMs}ms`);
     }
-    try {
-      const handle = await repo.find<CanvasDocument>(docId, {
-        allowableStates: ["ready", "unavailable"],
-        signal,
-      });
-      if (!handle.isReady()) {
-        // throws (via `signal`'s abort if `opts.timeoutMs`/`opts.signal` was
-        // given, else the library's own internal timeout) if the doc
-        // genuinely never arrives — that's a real failure the caller
-        // should handle, not swallow. `signal` must be threaded through
-        // here too, not just into `repo.find()` above: a doc that resolves
-        // to "unavailable" quickly (an allowable state above, so
-        // `repo.find()` itself doesn't wait out its own timeout for it)
-        // still needs to become "ready" from here, and without `signal`
-        // this second wait would silently fall back to automerge-repo's
-        // own internal ~60-120s default regardless of `opts.timeoutMs` —
-        // exactly the case a newly-shared canvas hits on the requester's
-        // first open (see this method's doc comment above).
-        await handle.whenReady(["ready"], { signal });
-      }
-      return new CanvasStore(repo, handle);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-      if (opts?.signal && onExternalAbort) opts.signal.removeEventListener("abort", onExternalAbort);
-    }
+    return new CanvasStore(repo, handle);
   }
 
   /** get the current document state. */
@@ -504,6 +481,24 @@ export class CanvasStore {
     return this.localRole() === "admin";
   }
 
+  /**
+   * true if the local peer may interact with `widgetId`'s "click to add"
+   * initial step (upload a file/image/pdf, start a recording, etc).
+   *
+   * widgets without a recorded `createdBy` (created before this field
+   * existed, or missing entirely) are unrestricted — everyone passes. once a
+   * widget has a `createdBy`, only that peer passes; this does NOT gate
+   * ongoing interaction with content that already exists (playback, viewing,
+   * etc) — only the initial "set this widget's content up" step, so callers
+   * should combine this with `isLocalViewer()` rather than use it alone for
+   * anything beyond that first step.
+   */
+  isLocalWidgetCreator(widgetId: string): boolean {
+    const entry = this.getWidget(widgetId);
+    if (!entry?.createdBy) return true;
+    return entry.createdBy === this._localNodeId;
+  }
+
   // -- metadata --------------------------------------------------------------
 
   /** get the canvas metadata (title, description, timestamps, color, preview). */
@@ -579,10 +574,20 @@ export class CanvasStore {
   /**
    * add a widget to the canvas. returns the widget's ID.
    * the entry must include an `id` field.
+   *
+   * stamps `createdBy` from the local node id unless the caller already set
+   * one (e.g. narthex-seed.ts constructing widgets before a local node id
+   * is known) — see `isLocalWidgetCreator()`.
    */
   addWidget(entry: WidgetEntry): string {
+    const createdBy = entry.createdBy || this._localNodeId || undefined;
     this.handle.change((doc) => {
       doc.widgets[entry.id] = { ...entry };
+      // only set the key when there's a real value — automerge drafts
+      // don't need (and shouldn't get) an explicit `undefined` property.
+      if (createdBy) {
+        doc.widgets[entry.id].createdBy = createdBy;
+      }
       this.touchModified(doc);
     });
     return entry.id;

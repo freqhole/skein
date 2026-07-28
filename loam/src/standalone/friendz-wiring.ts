@@ -11,6 +11,7 @@ import {
 } from "../p2p/friends-protocol";
 import { initBridge, setOutboundRequestHook, setGossipNowHook } from "../p2p/friendz-bridge";
 import { getMiddenNode, getStoredIdentity } from "../p2p/identity";
+import { resolveDocReadyCached, watchDocReady } from "../p2p/doc-ready";
 import { trashCanvasCard } from "../../widgets/narthex/trash-widget";
 import {
   FRIENDZ_ALPN,
@@ -744,45 +745,52 @@ export async function initFriendzWiring(
     // resolve canvas doc id from the per-widget doc (async, fire-and-forget)
     (async () => {
       try {
-        const cardHandle = await repo.find<any>(widgetDocId as DocumentId);
-        await cardHandle.whenReady();
-        const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
+        const cardHandle = await resolveDocReadyCached<Record<string, unknown>>(
+          repo,
+          widgetDocId as DocumentId
+        );
+        const cardDoc = cardHandle?.doc();
         const canvasDocId = cardDoc?.canvasDocId as string | undefined;
         if (!canvasDocId) return;
 
-        let canvasHandle: DocHandle<any>;
-        try {
-          canvasHandle = await repo.find<CanvasDocument>(canvasDocId as DocumentId);
-        } catch {
-          return; // canvas not available
-        }
+        // this listener lives for as long as the canvas card is watched,
+        // so it uses the unbounded, event-driven watcher rather than a
+        // bounded one-shot resolve: a canvas that's unreachable right now
+        // should still start gossiping the moment it becomes reachable
+        // later.
+        const readyUnsub = watchDocReady<CanvasDocument>(
+          repo,
+          canvasDocId as DocumentId,
+          (canvasHandle) => {
+            const onChange = () => {
+              const canvasDoc = canvasHandle.doc();
+              if (!canvasDoc) return;
 
-        const onChange = () => {
-          const canvasDoc = canvasHandle.doc() as CanvasDocument | undefined;
-          if (!canvasDoc) return;
+              // only gossip our own edits — prevents amplification of remote syncs
+              if (canvasDoc.lastModifiedBy && canvasDoc.lastModifiedBy !== localNodeId) return;
 
-          // only gossip our own edits — prevents amplification of remote syncs
-          if (canvasDoc.lastModifiedBy && canvasDoc.lastModifiedBy !== localNodeId) return;
+              // count widgets and find latest modification timestamp
+              let widgetCount = 0;
+              let lastMod = canvasDoc.lastModified ?? "";
+              for (const [, w] of Object.entries(canvasDoc.widgets ?? {}) as any[]) {
+                widgetCount++;
+                if (w.lastModifiedAt && w.lastModifiedAt > lastMod) {
+                  lastMod = w.lastModifiedAt;
+                }
+              }
 
-          // count widgets and find latest modification timestamp
-          let widgetCount = 0;
-          let lastMod = canvasDoc.lastModified ?? "";
-          for (const [, w] of Object.entries(canvasDoc.widgets ?? {}) as any[]) {
-            widgetCount++;
-            if (w.lastModifiedAt && w.lastModifiedAt > lastMod) {
-              lastMod = w.lastModifiedAt;
-            }
+              dirtyCanvases.set(canvasDocId, {
+                canvasDocId,
+                lastModified: lastMod,
+                widgetCount,
+              });
+            };
+
+            canvasHandle.on("change", onChange);
+            unsubs.push(() => canvasHandle.off("change", onChange));
           }
-
-          dirtyCanvases.set(canvasDocId, {
-            canvasDocId,
-            lastModified: lastMod,
-            widgetCount,
-          });
-        };
-
-        canvasHandle.on("change", onChange);
-        unsubs.push(() => canvasHandle.off("change", onChange));
+        );
+        unsubs.push(readyUnsub);
       } catch (err) {
         log.warn(TAG, "failed to watch canvas for federation:", err);
       }

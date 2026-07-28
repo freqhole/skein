@@ -97,6 +97,11 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
     // local page index — may diverge from doc.currentPage when syncPage is false
     let localPage = ctx.doc.current.currentPage;
 
+    // only the peer who created this widget can use the initial "click to
+    // upload PDF" step — widgets with no recorded creator (pre-existing
+    // widgets from before this field existed) are unrestricted.
+    const iAmCreator = !ctx.canvasStore || ctx.canvasStore.isLocalWidgetCreator(ctx.widgetId);
+
     // page texture cache (extracted module)
     const pageCache = createPageCache();
 
@@ -151,12 +156,12 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
     };
     drawPlaceholderBorder(currentWidth, currentHeight);
     placeholderBorder.eventMode = "static";
-    placeholderBorder.cursor = "pointer";
+    placeholderBorder.cursor = iAmCreator ? "pointer" : "default";
     placeholderBorder.visible = false;
     container.addChild(placeholderBorder);
 
     const placeholderText = new Text({
-      text: "click to upload PDF",
+      text: iAmCreator ? "click to upload PDF" : "waiting for document",
       style: {
         fontFamily: "system-ui, sans-serif",
         fontSize: 13,
@@ -167,7 +172,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
     });
     placeholderText.anchor.set(0.5);
     placeholderText.eventMode = "static";
-    placeholderText.cursor = "pointer";
+    placeholderText.cursor = iAmCreator ? "pointer" : "default";
     placeholderText.x = currentWidth / 2;
     placeholderText.y = currentHeight / 2;
     placeholderText.visible = false;
@@ -263,7 +268,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
       },
       resolution: 2,
     });
-    pageInfoText.anchor.set(0.5, 1);
+    pageInfoText.anchor.set(0.5, 0.5);
     pageInfoText.visible = false;
     container.addChild(pageInfoText);
 
@@ -376,6 +381,10 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
         statusText.visible = false;
         snatchBtn.setVisible(false);
       }
+
+      // click-to-upload spans the whole widget only while the placeholder
+      // prompt is showing — the bg fill already covers the full content area.
+      bg.cursor = placeholderBorder.visible && iAmCreator ? "pointer" : "default";
 
       positionSnatchBtn();
     };
@@ -583,14 +592,16 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
 
       pageInfoText.text = display;
       pageInfoText.x = currentWidth / 2;
-      pageInfoText.y = currentHeight - 10;
       pageInfoText.visible = navVisible;
 
-      // draw a small pill behind the text
+      // draw a small pill behind the text, then center the text within it
       const tw = pageInfoText.width + 12;
       const th = pageInfoText.height + 6;
+      const bgBottom = currentHeight - 10;
+      const bgTop = bgBottom - th;
+      pageInfoText.y = bgTop + th / 2;
       pageInfoBg.clear();
-      pageInfoBg.roundRect(currentWidth / 2 - tw / 2, currentHeight - 10 - th, tw, th, 4);
+      pageInfoBg.roundRect(currentWidth / 2 - tw / 2, bgTop, tw, th, 4);
       pageInfoBg.fill({ color: 0x000000, alpha: 0.5 });
       pageInfoBg.visible = navVisible;
     };
@@ -909,6 +920,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
       const state = ctx.doc.current;
       if (state.pageBlobIds.length > 0 || state.blobId) return;
       if (ctx.canvasStore?.isLocalViewer()) return;
+      if (!iAmCreator) return;
 
       try {
         const picked = await pickPdfFile();
@@ -1008,6 +1020,10 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
     // placeholder click — upload
     placeholderText.on("pointertap", handleUpload);
     placeholderBorder.on("pointertap", handleUpload);
+    // click anywhere in the widget (not just the placeholder text/border) to
+    // upload a PDF — bg already spans the full content area and is only
+    // shown the pointer cursor while the placeholder prompt is visible.
+    bg.on("pointertap", handleUpload);
 
     // show nav on pointer move
     container.eventMode = "static";

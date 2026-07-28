@@ -1,7 +1,7 @@
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
-import { Container, Graphics, Text } from "pixi.js";
+import { Container, Graphics, Sprite, Text, Texture, Assets } from "pixi.js";
 
-import { log } from "@freqhole/reliquary/utils";
+import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import { pickFiles, uploadFile } from "../../src/widgets/file-utils";
 import { fileSchema } from "../file";
 import { snatchAllInBin } from "./bin-actions";
@@ -13,8 +13,7 @@ import type {
   WidgetFactory,
   WidgetMountContext,
 } from "../../src/widgets/widget-types";
-import type { SlotScale } from "./bin-constants";
-import { BIN_PADDING, TEXT_MUTED } from "./bin-constants";
+import { BIN_PADDING, TEXT_MUTED, type SlotScale } from "./bin-constants";
 import { createBinDragHandler } from "./bin-drag";
 import {
   autoFitCols,
@@ -75,12 +74,30 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       default: "top",
       visibleWhen: { key: "mode", value: "shelf" },
     },
+    {
+      key: "borderWidth",
+      label: "border width",
+      type: "number",
+      default: 0,
+    },
+    {
+      key: "borderColor",
+      label: "border color",
+      type: "color",
+      default: -1,
+    },
+    {
+      key: "cellBorders",
+      label: "cell borders",
+      type: "boolean",
+      default: false,
+    },
   ],
 
   getCompactInfo: (state: BinState): CompactInfo => {
     const count = state.items.length;
     const label = state.title || `bin (${count} item${count !== 1 ? "s" : ""})`;
-    return { label };
+    return { label, thumbnailUrl: state.coverThumbnailDataUrl || undefined };
   },
 
   create(ctx: WidgetMountContext<typeof binSchema>): WidgetController {
@@ -100,6 +117,72 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
     const store = ctx.canvasStore ?? null;
     const repo: Repo | null = store?.repo ?? null;
+
+    // -- outer border ---------------------------------------------------------
+    // drawn behind everything else — visible whenever borderWidth > 0 and
+    // borderColor isn't -1 ("none"). independent of the empty-state dashed
+    // border, which is only shown while the bin has no children.
+
+    const outerBorder = new Graphics();
+    container.addChildAt(outerBorder, 0);
+
+    function drawOuterBorder(width: number, height: number) {
+      const state = ctx.doc.current;
+      outerBorder.clear();
+      if (state.borderWidth <= 0 || state.borderColor === -1) return;
+      const w = state.borderWidth;
+      outerBorder
+        .rect(w / 2, w / 2, width - w, height - w)
+        .stroke({ width: w, color: state.borderColor });
+    }
+
+    // -- cover thumbnail -------------------------------------------------------
+    // an optional background image for the bin, drawn behind everything else
+    // (including the outer border). set via a widget action (pick a file,
+    // auto-copy the first eligible child's thumbnail, or remove). also used as
+    // this bin's own compact-card thumbnail (see getCompactInfo above).
+
+    const coverSprite = new Sprite(Texture.EMPTY);
+    coverSprite.visible = false;
+    container.addChildAt(coverSprite, 0);
+    let lastCoverUrl = "";
+
+    function fitCoverSprite(width: number, height: number) {
+      const tex = coverSprite.texture;
+      if (!tex || tex === Texture.EMPTY || !tex.width || !tex.height) return;
+      const scale = Math.max(width / tex.width, height / tex.height);
+      coverSprite.width = tex.width * scale;
+      coverSprite.height = tex.height * scale;
+      coverSprite.x = (width - coverSprite.width) / 2;
+      coverSprite.y = (height - coverSprite.height) / 2;
+    }
+
+    async function updateCoverSprite(width: number, height: number) {
+      const url = ctx.doc.current.coverThumbnailDataUrl;
+      if (!url) {
+        coverSprite.visible = false;
+        lastCoverUrl = "";
+        return;
+      }
+
+      if (url !== lastCoverUrl) {
+        lastCoverUrl = url;
+        try {
+          const texture = await Assets.load<Texture>(url);
+          // bail if the doc moved on to a different cover (or the widget was
+          // destroyed) while the texture was decoding
+          if (destroyed || ctx.doc.current.coverThumbnailDataUrl !== url) return;
+          coverSprite.texture = texture;
+        } catch (err) {
+          log.warn("bin", "failed to load cover thumbnail", err);
+          coverSprite.visible = false;
+          return;
+        }
+      }
+
+      coverSprite.visible = true;
+      fitCoverSprite(width, height);
+    }
 
     // we need the widget registry to call getCompactInfo on child factories.
     // the registry isn't on the mount context, so we reconstruct a lightweight
@@ -223,6 +306,9 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
     function layout(width: number, height: number) {
       if (destroyed) return;
 
+      drawOuterBorder(width, height);
+      void updateCoverSprite(width, height);
+
       const state = ctx.doc.current;
       const items = state.items;
       const mode = state.mode as BinMode;
@@ -261,6 +347,9 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
       if (renderer) {
         renderer.shelfTextOrigin = (state.shelfTextOrigin as "top" | "bottom") ?? "top";
+        renderer.cellBordersEnabled = state.cellBorders ?? false;
+        renderer.cellBorderWidth = state.borderWidth ?? 0;
+        renderer.cellBorderColor = state.borderColor ?? -1;
         const visibleHeight = height - BIN_PADDING * 2;
         renderer.render(items, mode, cols, rows, contentWidth, visibleHeight, scale);
       }
@@ -388,6 +477,53 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
         snatchLabel = "snatch all";
         ctx.setHeaderActions?.(buildHeaderActions());
       }
+    }
+
+    // -- cover thumbnail actions -----------------------------------------------
+
+    async function handleSetCoverFromFile() {
+      if (!ctx.canvasStore || ctx.canvasStore.isLocalViewer()) return;
+      const dataUrl = await pickImageAsDataUrl({ maxWidth: 500, maxHeight: 500 });
+      if (!dataUrl) return;
+      ctx.doc.change((draft) => {
+        draft.coverThumbnailDataUrl = dataUrl;
+      });
+    }
+
+    function handleSetCoverFromChild() {
+      if (ctx.canvasStore?.isLocalViewer()) return;
+      if (!repo || !registry || !store) return;
+
+      for (const item of ctx.doc.current.items) {
+        const entry = store.getWidget(item.widgetId);
+        if (!entry?.docId) continue;
+        const factory = registry.get(entry.type);
+        if (!factory?.getCompactInfo) continue;
+
+        try {
+          const handle = repo.handles[entry.docId as DocumentId];
+          const rawDoc = handle?.doc();
+          if (!rawDoc) continue;
+          const childState = factory.schema ? factory.schema.parse(rawDoc) : rawDoc;
+          const info = factory.getCompactInfo(childState);
+          if (info.thumbnailUrl) {
+            const thumbnailUrl = info.thumbnailUrl;
+            ctx.doc.change((draft) => {
+              draft.coverThumbnailDataUrl = thumbnailUrl;
+            });
+            return;
+          }
+        } catch (err) {
+          log.warn("bin", "handleSetCoverFromChild: failed to read child doc", err);
+        }
+      }
+    }
+
+    function handleRemoveCover() {
+      if (ctx.canvasStore?.isLocalViewer()) return;
+      ctx.doc.change((draft) => {
+        draft.coverThumbnailDataUrl = "";
+      });
     }
 
     // -- init ----------------------------------------------------------------
@@ -628,7 +764,12 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
       headerActions: buildHeaderActions(),
 
-      widgetActions: [{ id: "tidy", label: "tidy", onClick: handleTidy }],
+      widgetActions: [
+        { id: "tidy", label: "tidy", onClick: handleTidy },
+        { id: "cover-pick", label: "cover: choose image", onClick: handleSetCoverFromFile },
+        { id: "cover-auto", label: "cover: from first item", onClick: handleSetCoverFromChild },
+        { id: "cover-remove", label: "cover: remove", onClick: handleRemoveCover },
+      ],
 
       resize(width: number, height: number) {
         currentWidth = width;

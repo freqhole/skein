@@ -66,6 +66,10 @@ export interface WidgetEntry {
   /** if set, this widget is nested inside another widget (e.g. a bin).
    *  the parent widget handles rendering; the widget manager skips mounting. */
   parentId?: string | null;
+  /** node id of the peer who created this widget, stamped by
+   *  `CanvasStore.addWidget()`. undefined for widgets created before this
+   *  field existed — treat as "no creator restriction" rather than backfilling. */
+  createdBy?: string;
 }
 
 /** a peer that has connected to this canvas via P2P. */

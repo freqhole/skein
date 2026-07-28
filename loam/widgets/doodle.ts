@@ -28,6 +28,7 @@ import {
   type WidgetFactory,
   type WidgetMountContext,
 } from "../src/widgets/widget-types";
+import { fnv1aHash, renderSnapshot } from "../src/widgets/offscreen-snapshot";
 
 // ---------------------------------------------------------------------------
 // helpers (schema-level)
@@ -102,6 +103,13 @@ export const doodleSchema = z.object({
    *  unlocked again. persisted so the lock state survives reload and syncs
    *  to other peers viewing the same widget. */
   locked: z.boolean().default(false),
+  /** small thumbnail image of the committed strokes, used as the bin
+   *  compact card image — regenerated whenever the strokes/background change */
+  doodleSnapshotDataUrl: z.string().default(""),
+  /** cache key the snapshot above was rendered from (stroke ids + bgColor) —
+   *  lets any peer detect a stale snapshot without every peer re-rendering
+   *  on every doc change */
+  doodleSnapshotKey: z.string().default(""),
 });
 
 export type DoodleState = z.infer<typeof doodleSchema>;
@@ -208,6 +216,89 @@ function makeStrokeNode(stroke: DoodleStroke): Graphics {
 }
 
 // ---------------------------------------------------------------------------
+// bin compact-card snapshot
+// ---------------------------------------------------------------------------
+
+const DOODLE_SNAPSHOT_SIZE = 128;
+const DOODLE_SNAPSHOT_PADDING = 8;
+
+/** bounding box of every point across all strokes, in the doodle's own
+ *  local coordinate space (padded by each stroke's own width so thick
+ *  strokes near the edge aren't clipped). null if there are no points. */
+function computeStrokesBounds(
+  strokes: DoodleStroke[]
+): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const stroke of strokes) {
+    const halfW = (stroke.width ?? 3) / 2;
+    for (const p of stroke.points) {
+      minX = Math.min(minX, p.x - halfW);
+      minY = Math.min(minY, p.y - halfW);
+      maxX = Math.max(maxX, p.x + halfW);
+      maxY = Math.max(maxY, p.y + halfW);
+    }
+  }
+  if (!Number.isFinite(minX)) return null;
+  return { minX, minY, maxX, maxY };
+}
+
+/**
+ * render a small thumbnail of the doodle's committed strokes for use as a
+ * bin compact card image. the strokes' own bounding box is scaled and
+ * centered to fit a fixed square canvas — independent of the widget's
+ * current on-canvas size, so a resized widget still thumbnails correctly.
+ * reuses paintStroke/makeStrokeNode directly so the thumbnail always
+ * matches the live rendering exactly (same stroke geometry, brush shapes,
+ * eraser blend mode).
+ */
+async function renderDoodleSnapshot(
+  strokes: DoodleStroke[],
+  bgColor: number
+): Promise<string | null> {
+  const bounds = computeStrokesBounds(strokes);
+  if (!bounds) return null;
+
+  const contentW = Math.max(1, bounds.maxX - bounds.minX);
+  const contentH = Math.max(1, bounds.maxY - bounds.minY);
+  const available = DOODLE_SNAPSHOT_SIZE - DOODLE_SNAPSHOT_PADDING * 2;
+  const scale = Math.min(available / contentW, available / contentH, 1);
+
+  const stage = new Container();
+
+  if (!isTransparent(bgColor)) {
+    const bg = new Graphics();
+    bg.rect(0, 0, DOODLE_SNAPSHOT_SIZE, DOODLE_SNAPSHOT_SIZE).fill({ color: bgColor });
+    stage.addChild(bg);
+  }
+
+  // isRenderGroup=true so eraser strokes' blendMode="erase" punches holes in
+  // this layer only, matching the live widget's rendering architecture.
+  const strokeLayer = new Container();
+  strokeLayer.isRenderGroup = true;
+  strokeLayer.x = DOODLE_SNAPSHOT_SIZE / 2 - ((bounds.minX + bounds.maxX) / 2) * scale;
+  strokeLayer.y = DOODLE_SNAPSHOT_SIZE / 2 - ((bounds.minY + bounds.maxY) / 2) * scale;
+  strokeLayer.scale.set(scale);
+  for (const stroke of strokes) {
+    strokeLayer.addChild(makeStrokeNode(stroke));
+  }
+  stage.addChild(strokeLayer);
+
+  const dataUrl = await renderSnapshot(stage, DOODLE_SNAPSHOT_SIZE, DOODLE_SNAPSHOT_SIZE, "webp");
+  stage.destroy({ children: true });
+  return dataUrl;
+}
+
+/** cache key the doodle snapshot was rendered from — stroke ids (order and
+ *  membership) plus bgColor, hashed down to a short string so it's cheap to
+ *  store even for doodles with many strokes. */
+function doodleSnapshotKey(state: DoodleState): string {
+  return fnv1aHash(state.strokes.map((s) => s.id).join(",") + "|" + state.bgColor);
+}
+
+// ---------------------------------------------------------------------------
 // widget factory
 // ---------------------------------------------------------------------------
 
@@ -251,11 +342,13 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       state.strokes.length > 0
         ? `doodle · ${state.strokes.length} stroke${state.strokes.length === 1 ? "" : "s"}`
         : "empty doodle",
+    thumbnailUrl: state.doodleSnapshotDataUrl || undefined,
   }),
 
   create(ctx: WidgetMountContext<typeof doodleSchema>): WidgetController {
     let cw = ctx.width;
     let ch = ctx.height;
+    let destroyed = false;
 
     // ── seed random colors once ──────────────────────────────────────────────
     // schema defaults are stable fixed values; we write random colors to the
@@ -359,6 +452,28 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
 
     // initial sync
     syncStrokes(ctx.doc.current);
+
+    // ── bin compact-card snapshot ────────────────────────────────────────────
+    // regenerated whenever the strokes or background change; keyed so only
+    // the first peer to observe a given change renders + writes it back, and
+    // every other peer's doc-change handler sees a matching key and skips it.
+    const maybeRegenerateSnapshot = (): void => {
+      const state = ctx.doc.current;
+      const key = doodleSnapshotKey(state);
+      if (state.doodleSnapshotKey === key) return;
+      void renderDoodleSnapshot(state.strokes, state.bgColor).then((dataUrl) => {
+        if (destroyed) return;
+        // bail if superseded by a newer change, or another peer already wrote
+        // this exact snapshot, while we were rendering
+        if (doodleSnapshotKey(ctx.doc.current) !== key) return;
+        if (ctx.doc.current.doodleSnapshotKey === key) return;
+        ctx.doc.change((d) => {
+          d.doodleSnapshotDataUrl = dataUrl ?? "";
+          d.doodleSnapshotKey = key;
+        });
+      });
+    };
+    maybeRegenerateSnapshot();
 
     // ── local drawing state ─────────────────────────────────────────────────
     let drawing = false;
@@ -876,6 +991,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       drawBackground();
       syncStrokes(state);
       updateCursor();
+      maybeRegenerateSnapshot();
       if (state.locked && drawing) {
         // locked mid-stroke (e.g. by a peer) — abort the in-progress stroke
         // rather than let it commit after the fact.
@@ -915,6 +1031,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       headerActions: makeHeaderActions(),
       widgetActions,
       destroy() {
+        destroyed = true;
         document.removeEventListener("keydown", handleKeyDown);
         if (colorCleanupTimer !== null) clearTimeout(colorCleanupTimer);
         if (liveColorInput && document.body.contains(liveColorInput)) {

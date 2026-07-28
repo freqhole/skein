@@ -72,10 +72,9 @@ export interface InitCanvasOptions {
   restrictBlobToPeers?: (blake3Hash: string, peerNodeIds: string[]) => Promise<void>;
   /**
    * bounds `CanvasStore.open()`'s wait with a short `AbortSignal`-based
-   * timeout instead of automerge-repo's own internal ~60-120s default — see
-   * `CanvasStore.open()`'s doc comment for when this is appropriate (a cold
-   * open with no known peer to dial at all). omitted for ordinary in-app
-   * navigation.
+   * timeout instead of its own default ~60s bound — see `CanvasStore.open()`'s
+   * doc comment for when this is appropriate (a cold open with no known peer
+   * to dial at all). omitted for ordinary in-app navigation.
    */
   openTimeoutMs?: number;
   /**
@@ -325,6 +324,47 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
   // can save and restore camera state
   widgetManager.setViewport(viewport);
 
+  // step 11c: persist the narthex's pan/zoom across visits, keyed by canvas
+  // doc id, via localStorage (deliberately not synced through automerge —
+  // each peer keeps their own camera position, not a shared one). regular
+  // canvases don't get this treatment, only the narthex home screen.
+  let unsubViewportPersist: (() => void) | null = null;
+  let viewportSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  if (options.isNarthex && canvasDocId) {
+    const viewportStorageKey = `skein-narthex-viewport:${canvasDocId}`;
+    try {
+      const saved = localStorage.getItem(viewportStorageKey);
+      if (saved) {
+        const parsed = JSON.parse(saved) as { x: number; y: number; zoom: number };
+        if (
+          typeof parsed.x === "number" &&
+          typeof parsed.y === "number" &&
+          typeof parsed.zoom === "number"
+        ) {
+          viewport.zoomTo(parsed.zoom);
+          viewport.panTo(parsed.x, parsed.y);
+        }
+      }
+    } catch {
+      // malformed/missing localStorage entry — just start at the default view
+    }
+
+    unsubViewportPersist = viewport.onViewChange(() => {
+      if (viewportSaveTimer !== null) clearTimeout(viewportSaveTimer);
+      viewportSaveTimer = setTimeout(() => {
+        viewportSaveTimer = null;
+        try {
+          localStorage.setItem(
+            viewportStorageKey,
+            JSON.stringify({ x: viewport.cameraX, y: viewport.cameraY, zoom: viewport.zoom })
+          );
+        } catch {
+          // localStorage unavailable/full — not critical, just skip persisting
+        }
+      }, 400);
+    });
+  }
+
   // step 12: create the presence manager for multiplayer awareness.
   // uses the repo's peer id so ephemeral message sender ids match.
   const peerId = repo.peerId as string;
@@ -497,6 +537,11 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
         resizeRaf = null;
       }
       unsubTrayLiveMove();
+      unsubViewportPersist?.();
+      if (viewportSaveTimer !== null) {
+        clearTimeout(viewportSaveTimer);
+        viewportSaveTimer = null;
+      }
 
       if (onPointerMove) {
         canvasEl.removeEventListener("pointermove", onPointerMove);

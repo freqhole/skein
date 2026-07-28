@@ -191,8 +191,9 @@ async function initSkeinP2PForTest(options: P2PTestInitOptions = {}): Promise<P2
  *
  * no retry loop here: `CanvasStore.open()` (used internally by
  * `initCanvas()`) already waits out a transient "unavailable" verdict via
- * automerge-repo's own event-driven `whenReady()` recovery — see its doc
- * comment in canvas-store.ts. a manual retry loop used to live here,
+ * `resolveDocReady()`'s event-driven recovery (`p2p/doc-ready.ts`) — see
+ * `CanvasStore.open()`'s doc comment in canvas-store.ts. a manual retry loop
+ * used to live here,
  * silently working around the exact same failure mode as a real,
  * user-reported production crash (2026-07-03) — which is exactly why e2e
  * coverage never caught it before now.

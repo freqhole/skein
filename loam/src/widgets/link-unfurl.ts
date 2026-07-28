@@ -30,18 +30,30 @@ export interface UnfurlResult {
 
 const EMPTY_RESULT: UnfurlResult = { title: "", description: "", imageUrl: "" };
 
+/** named HTML entities likely to show up in a page title or meta description. */
+const NAMED_ENTITIES: Record<string, string> = {
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: "\u00a0",
+  mdash: "\u2014",
+  ndash: "\u2013",
+  hellip: "\u2026",
+  amp: "&",
+};
+
 /**
- * decode the small set of HTML entities likely to show up in a title or
- * meta description. `&amp;` is decoded last so `&amp;lt;` round-trips to
- * `&lt;` rather than being double-unescaped into `<`.
+ * decode HTML entities likely to show up in a title or meta description:
+ * numeric references (`&#38;`, `&#x26;`) and a handful of named ones.
+ * `&amp;` is decoded last so `&amp;lt;` round-trips to `&lt;` rather than
+ * being double-unescaped into `<`.
  */
 function decodeEntities(value: string): string {
   return value
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#0?39;/g, "'")
-    .replace(/&apos;/g, "'")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&(lt|gt|quot|apos|nbsp|mdash|ndash|hellip);/g, (_, name: string) => NAMED_ENTITIES[name])
     .replace(/&amp;/g, "&")
     .trim();
 }

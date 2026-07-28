@@ -1,6 +1,6 @@
 import { Assets, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
-import { log } from "@freqhole/reliquary/utils";
+import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import { getMediaPlaybackUrl } from "../src/media";
 import { isTauriMode } from "../src/p2p/tauri-transport";
 import {
@@ -295,6 +295,10 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     let uploadCancelled = false;
     // browser capability check — computed once, doesn't change at runtime.
     const diskSnatchSupported = canSnatchToDisk();
+    // only the peer who created this widget can use the initial "click to
+    // upload" step — widgets with no recorded creator (pre-existing widgets
+    // from before this field existed) are unrestricted.
+    const iAmCreator = !ctx.canvasStore || ctx.canvasStore.isLocalWidgetCreator(ctx.widgetId);
     let lastRequestedBlobId = "";
     let loadedAssetKey = "";
     let activeOverlay: MediaOverlayHandle | null = null;
@@ -377,11 +381,11 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     };
     drawPlaceholderBorder(currentWidth, currentHeight);
     placeholderBorder.eventMode = "static";
-    placeholderBorder.cursor = "pointer";
+    placeholderBorder.cursor = iAmCreator ? "pointer" : "default";
     container.addChild(placeholderBorder);
 
     const placeholderText = new Text({
-      text: "click to upload file",
+      text: iAmCreator ? "click to upload file" : "waiting for file",
       style: {
         fontFamily: "system-ui, sans-serif",
         fontSize: 13,
@@ -394,7 +398,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     placeholderText.x = currentWidth / 2;
     placeholderText.y = currentHeight / 2;
     placeholderText.eventMode = "static";
-    placeholderText.cursor = "pointer";
+    placeholderText.cursor = iAmCreator ? "pointer" : "default";
     container.addChild(placeholderText);
 
     // -- loading text ---------------------------------------------------------
@@ -1381,6 +1385,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     const handleUpload = async () => {
       if (loadState !== "empty") return;
       if (ctx.canvasStore?.isLocalViewer()) return;
+      if (!iAmCreator) return;
 
       // respect another peer's fresh upload lock — no competing uploads.
       // stale locks (crashed uploader) are ignored via the staleness window.
@@ -2462,6 +2467,30 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     // -- return controller ----------------------------------------------------
 
+    /** user-chosen thumbnail override — replaces whatever auto-generated
+     *  thumbnail (embedded on upload, or tauri video-frame/pdf-first-page
+     *  capture) would otherwise show, both on this widget's own face and as
+     *  its compact-card thumbnail when nested inside a bin. */
+    async function handleChooseThumbnail() {
+      if (ctx.canvasStore?.isLocalViewer()) return;
+      const dataUrl = await pickImageAsDataUrl({ maxWidth: 500, maxHeight: 500 });
+      if (!dataUrl) return;
+      ctx.doc.change((draft) => {
+        draft.thumbnailDataUrl = dataUrl;
+      });
+    }
+
+    /** clear a user-chosen thumbnail override, falling back to whatever
+     *  auto-generated thumbnail is available (cache/local only — never
+     *  contacts peers, same as the normal load path). */
+    function handleRemoveThumbnail() {
+      if (ctx.canvasStore?.isLocalViewer()) return;
+      ctx.doc.change((draft) => {
+        draft.thumbnailDataUrl = "";
+      });
+      loadThumbnail(ctx.doc.current.blobId);
+    }
+
     /** delete the LOCAL copy of the blob to reclaim disk space — the widget
      *  stays on the canvas and the blob flips back to "remote" (snatchable
      *  from whoever still has it, e.g. a hub peer). browser-only. */
@@ -2499,19 +2528,24 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     return {
       container,
-      // property-tray extras: "purge local copy" (browser only — tauri blob
-      // storage is the durable native store) + who-has-this-file info rows
-      widgetActions: isTauriMode()
-        ? []
-        : [
-            {
-              id: "purge-local-copy",
-              label: "purge local copy",
-              onClick: () => {
-                void handleFreeUpSpace();
+      // property-tray extras: thumbnail override actions (all file types —
+      // audio/video/pdf/whatever), "purge local copy" (browser only — tauri
+      // blob storage is the durable native store), and who-has-this-file info rows
+      widgetActions: [
+        { id: "choose-thumbnail", label: "choose thumbnail", onClick: () => void handleChooseThumbnail() },
+        { id: "remove-thumbnail", label: "remove thumbnail", onClick: handleRemoveThumbnail },
+        ...(isTauriMode()
+          ? []
+          : [
+              {
+                id: "purge-local-copy",
+                label: "purge local copy",
+                onClick: () => {
+                  void handleFreeUpSpace();
+                },
               },
-            },
-          ],
+            ]),
+      ],
       widgetInfoRows: () => {
         const state = ctx.doc.current;
         if (!state.blobId) return [];

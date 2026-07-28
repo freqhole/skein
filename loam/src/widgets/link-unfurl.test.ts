@@ -55,6 +55,18 @@ describe("parseHtmlMeta", () => {
     expect(result.title).toBe("Tom & Jerry <classic>");
   });
 
+  it("decodes numeric HTML entities (decimal and hex)", () => {
+    const html = `<title>Tom &#38; Jerry &#x26; friends</title>`;
+    const result = parseHtmlMeta(html);
+    expect(result.title).toBe("Tom & Jerry & friends");
+  });
+
+  it("leaves malformed numeric entities (no terminating semicolon) untouched", () => {
+    const html = `<title>no semicolon &#38 here</title>`;
+    const result = parseHtmlMeta(html);
+    expect(result.title).toBe("no semicolon &#38 here");
+  });
+
   it("handles malformed/partial meta tags gracefully", () => {
     const html = `<meta property="og:title"><meta content="no key here">`;
     const result = parseHtmlMeta(html);
