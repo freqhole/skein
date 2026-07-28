@@ -72,10 +72,9 @@ export interface InitCanvasOptions {
   restrictBlobToPeers?: (blake3Hash: string, peerNodeIds: string[]) => Promise<void>;
   /**
    * bounds `CanvasStore.open()`'s wait with a short `AbortSignal`-based
-   * timeout instead of automerge-repo's own internal ~60-120s default — see
-   * `CanvasStore.open()`'s doc comment for when this is appropriate (a cold
-   * open with no known peer to dial at all). omitted for ordinary in-app
-   * navigation.
+   * timeout instead of its own default ~60s bound — see `CanvasStore.open()`'s
+   * doc comment for when this is appropriate (a cold open with no known peer
+   * to dial at all). omitted for ordinary in-app navigation.
    */
   openTimeoutMs?: number;
   /**

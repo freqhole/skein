@@ -1,7 +1,14 @@
-import type { DocumentId, Repo } from "@automerge/automerge-repo";
+import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { moveCardToTrash } from "../../widgets/narthex/trash-widget";
 import type { CanvasDocument } from "../canvas/canvas-doc";
 import { CanvasStore } from "../canvas/canvas-store";
+import {
+  isRecentlyUnavailable,
+  markResolved,
+  markUnavailable,
+  resolveDocReadyCached,
+  watchDocReady,
+} from "../p2p/doc-ready";
 import { log } from "@freqhole/reliquary/utils";
 
 const TAG = "canvas.watchers";
@@ -25,13 +32,28 @@ export async function syncCanvasMetadataToCards(
 
     try {
       // read the card's per-widget doc to get the canvasDocId
-      const cardHandle = await repo.find(entry.docId as DocumentId);
-      await cardHandle.whenReady();
-      const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
+      const cardHandle = await resolveDocReadyCached<Record<string, unknown>>(
+        repo,
+        entry.docId as DocumentId
+      );
+      if (!cardHandle) continue;
+      const cardDoc = cardHandle.doc();
       if (!cardDoc?.canvasDocId || typeof cardDoc.canvasDocId !== "string") continue;
 
-      // open the linked canvas document and read its metadata
-      const canvasStore = await CanvasStore.open(repo, cardDoc.canvasDocId as DocumentId);
+      // open the linked canvas document and read its metadata. CanvasStore.open()
+      // doesn't have its own negative cache, so gate it with the same
+      // isRecentlyUnavailable/markResolved/markUnavailable helpers directly.
+      if (isRecentlyUnavailable(cardDoc.canvasDocId)) continue;
+      let canvasStore: CanvasStore;
+      try {
+        canvasStore = await CanvasStore.open(repo, cardDoc.canvasDocId as DocumentId, {
+          timeoutMs: 15_000,
+        });
+        markResolved(cardDoc.canvasDocId);
+      } catch (err) {
+        markUnavailable(cardDoc.canvasDocId);
+        throw err;
+      }
       const meta = canvasStore.metadata();
 
       // purge: auto-remove the card and all linked docs immediately.
@@ -190,25 +212,20 @@ export async function watchCanvasDocsForUpdates(
     const cardDocId = entry.docId;
 
     try {
-      const cardHandle = await repo.find<any>(cardDocId as DocumentId);
-      await cardHandle.whenReady();
-      const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
+      const cardHandle = await resolveDocReadyCached<Record<string, unknown>>(
+        repo,
+        cardDocId as DocumentId
+      );
+      if (!cardHandle) continue;
+      const cardDoc = cardHandle.doc();
       if (!cardDoc?.canvasDocId || typeof cardDoc.canvasDocId !== "string") continue;
 
       const canvasDocId = cardDoc.canvasDocId as string;
 
-      // open the canvas doc and watch for changes
-      let canvasHandle: any;
-      try {
-        canvasHandle = repo.find<CanvasDocument>(canvasDocId as DocumentId);
-      } catch {
-        continue; // canvas not available
-      }
-
       let lastSeenModified = (cardDoc.modifiedAt as string) || "";
 
-      const onChange = () => {
-        const canvasDoc = canvasHandle.doc() as CanvasDocument | undefined;
+      const onChange = (canvasHandle: DocHandle<CanvasDocument>, detach: () => void) => {
+        const canvasDoc = canvasHandle.doc();
         if (!canvasDoc) return;
 
         // detect tombstone changes from remote peers — sync deletion
@@ -224,7 +241,7 @@ export async function watchCanvasDocsForUpdates(
               "— auto-removing card"
             );
             narthexStore.removeWidget(entry.id);
-            canvasHandle.off("change", onChange);
+            detach();
             return;
           }
 
@@ -277,9 +294,21 @@ export async function watchCanvasDocsForUpdates(
         });
       };
 
-      canvasHandle.on("change", onChange);
+      // this listener lives for as long as the narthex is mounted, so it
+      // uses the unbounded, event-driven watcher rather than a bounded
+      // one-shot resolve: a canvas that's unreachable right now should
+      // still start getting update pills the moment it becomes reachable
+      // later, without waiting for the next narthex visit to notice.
+      let detachChangeListener: (() => void) | undefined;
+      const readyUnsub = watchDocReady<CanvasDocument>(repo, canvasDocId as DocumentId, (canvasHandle) => {
+        const listener = () => onChange(canvasHandle, detachChangeListener!);
+        canvasHandle.on("change", listener);
+        detachChangeListener = () => canvasHandle.off("change", listener);
+      });
+
       unsubs.push(() => {
-        canvasHandle.off("change", onChange);
+        readyUnsub();
+        detachChangeListener?.();
       });
     } catch {
       // skip unavailable docs

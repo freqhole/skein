@@ -3,6 +3,7 @@ import { Container, Graphics } from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { KeyboardDriver } from "../widgets/keyboard-driver";
 import { createWidgetDoc } from "../widgets/widget-doc";
+import { resolveDocReadyCached } from "../p2p/doc-ready";
 import type { WidgetRegistry } from "../widgets/widget-registry";
 import type { WidgetController, WidgetDoc, WidgetMountContext } from "../widgets/widget-types";
 import type { CanvasDocument, WidgetEntry } from "./canvas-doc";
@@ -471,8 +472,9 @@ export class WidgetManager {
         // peer, or restored from persistence). find it in the repo and wait
         // for it to be available.
         try {
-          widgetDocHandle = await this.repo.find<any>(entry.docId as DocumentId);
-          await widgetDocHandle.whenReady();
+          const found = await resolveDocReadyCached<any>(this.repo, entry.docId as DocumentId);
+          if (!found) throw new Error("timed out waiting for widget doc to become ready");
+          widgetDocHandle = found;
         } catch (err) {
           console.warn(`failed to find widget doc ${entry.docId} for widget ${entry.id}:`, err);
           this.mountingIds.delete(entry.id);

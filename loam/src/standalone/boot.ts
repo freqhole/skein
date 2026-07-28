@@ -1,5 +1,6 @@
 import { Repo, type DocHandle, type DocumentId } from "@automerge/automerge-repo";
 import { registerEndpointAdapter } from "../p2p/endpoint-control";
+import { resolveDocReadyCached } from "../p2p/doc-ready";
 import { createTestRegistry } from "../../widgets/index";
 import { createNarthexRegistry } from "../../widgets/narthex/index";
 import type { SocialDoc } from "../../widgets/narthex/social/types";
@@ -634,8 +635,11 @@ class SkeinRouter {
     if (!currentHash || currentHash === this.narthexDocId) return;
 
     try {
-      const narthexHandle = await this.repo.find<CanvasDocument>(this.narthexDocId as DocumentId);
-      await narthexHandle.whenReady();
+      const narthexHandle = await resolveDocReadyCached<CanvasDocument>(
+        this.repo,
+        this.narthexDocId as DocumentId
+      );
+      if (!narthexHandle) return;
       const narthexDoc = narthexHandle.doc();
       if (!narthexDoc?.widgets) return;
 
@@ -645,8 +649,8 @@ class SkeinRouter {
           (entry.props as any)?.canvasDocId === currentHash &&
           entry.docId
         ) {
-          const cardHandle = await this.repo.find<any>(entry.docId as DocumentId);
-          await cardHandle.whenReady();
+          const cardHandle = await resolveDocReadyCached<any>(this.repo, entry.docId as DocumentId);
+          if (!cardHandle) break;
           cardHandle.change((draft: any) => {
             draft.lastVisitedAt = new Date().toISOString();
             draft.hasUpdates = false;
@@ -779,13 +783,11 @@ class SkeinRouter {
     if (!this.narthexDocId) return;
     const effectiveId = this.effectiveLocalNodeId();
 
-    let narthexHandle;
-    try {
-      narthexHandle = await this.repo.find<CanvasDocument>(this.narthexDocId as DocumentId);
-      await narthexHandle.whenReady();
-    } catch {
-      return;
-    }
+    const narthexHandle = await resolveDocReadyCached<CanvasDocument>(
+      this.repo,
+      this.narthexDocId as DocumentId
+    );
+    if (!narthexHandle) return;
 
     const narthexStore = await CanvasStore.open(this.repo, this.narthexDocId as DocumentId);
     narthexStore.stampAdmin(effectiveId);
@@ -923,15 +925,21 @@ class SkeinRouter {
       canvas.widgetManager.setBeforeRemoveHook(async (entry, repo) => {
         if (entry.type !== "canvas-card" || !entry.docId) return;
         try {
-          const cardHandle = await repo.find(entry.docId as DocumentId);
-          await cardHandle.whenReady();
-          const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
+          const cardHandle = await resolveDocReadyCached<Record<string, unknown>>(
+            repo,
+            entry.docId as DocumentId
+          );
+          if (!cardHandle) return;
+          const cardDoc = cardHandle.doc();
           const canvasDocId = cardDoc?.canvasDocId;
           if (!canvasDocId || typeof canvasDocId !== "string") return;
 
           // open the linked canvas and delete all its widget docs
-          const canvasHandle = await repo.find<CanvasDocument>(canvasDocId as DocumentId);
-          await canvasHandle.whenReady();
+          const canvasHandle = await resolveDocReadyCached<CanvasDocument>(
+            repo,
+            canvasDocId as DocumentId
+          );
+          if (!canvasHandle) return;
           const canvasDoc = canvasHandle.doc();
           if (canvasDoc?.widgets) {
             for (const w of Object.values(canvasDoc.widgets)) {
@@ -1506,11 +1514,11 @@ class SkeinRouter {
               let canvasPreviewUrl = "";
               if (this.narthexDocId) {
                 try {
-                  const narthexHandle = await this.repo.find<CanvasDocument>(
+                  const narthexHandle = await resolveDocReadyCached<CanvasDocument>(
+                    this.repo,
                     this.narthexDocId as DocumentId
                   );
-                  await narthexHandle.whenReady();
-                  const narthexDoc = narthexHandle.doc();
+                  const narthexDoc = narthexHandle?.doc();
                   if (narthexDoc?.widgets) {
                     for (const entry of Object.values(narthexDoc.widgets)) {
                       if (
@@ -1518,9 +1526,11 @@ class SkeinRouter {
                         (entry.props as any)?.canvasDocId === docId &&
                         entry.docId
                       ) {
-                        const cardHandle = await this.repo.find<any>(entry.docId as DocumentId);
-                        await cardHandle.whenReady();
-                        const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
+                        const cardHandle = await resolveDocReadyCached<Record<string, unknown>>(
+                          this.repo,
+                          entry.docId as DocumentId
+                        );
+                        const cardDoc = cardHandle?.doc();
                         canvasColor = (cardDoc?.color as number) ?? 0;
                         canvasPreviewUrl = (cardDoc?.previewUrl as string) ?? "";
                         break;
@@ -1776,11 +1786,11 @@ class SkeinRouter {
       // update lastVisitedAt on the canvas card
       if (this.narthexDocId) {
         try {
-          const narthexHandle = await this.repo.find<CanvasDocument>(
+          const narthexHandle = await resolveDocReadyCached<CanvasDocument>(
+            this.repo,
             this.narthexDocId as DocumentId
           );
-          await narthexHandle.whenReady();
-          const narthexDoc = narthexHandle.doc();
+          const narthexDoc = narthexHandle?.doc();
           if (narthexDoc?.widgets) {
             for (const entry of Object.values(narthexDoc.widgets)) {
               if (
@@ -1788,8 +1798,11 @@ class SkeinRouter {
                 (entry.props as any)?.canvasDocId === docId &&
                 entry.docId
               ) {
-                const cardHandle = await this.repo.find<any>(entry.docId as DocumentId);
-                await cardHandle.whenReady();
+                const cardHandle = await resolveDocReadyCached<any>(
+                  this.repo,
+                  entry.docId as DocumentId
+                );
+                if (!cardHandle) break;
                 cardHandle.change((draft: any) => {
                   draft.lastVisitedAt = new Date().toISOString();
                   draft.hasUpdates = false;
@@ -1940,8 +1953,11 @@ class SkeinRouter {
   private async offerAccessRequestForUnreachableCanvas(docId: string): Promise<void> {
     if (!this.narthexDocId) return;
     try {
-      const narthexHandle = await this.repo.find<CanvasDocument>(this.narthexDocId as DocumentId);
-      await narthexHandle.whenReady();
+      const narthexHandle = await resolveDocReadyCached<CanvasDocument>(
+        this.repo,
+        this.narthexDocId as DocumentId
+      );
+      if (!narthexHandle) return;
       const narthexDoc = narthexHandle.doc();
       if (!narthexDoc?.widgets) return;
 
@@ -2249,10 +2265,9 @@ class SkeinRouter {
     // rather than an external `Promise.race` — racing against a bare
     // `CanvasStore.open()` call abandons it running in the background once
     // the race's own timer wins, and it can still reject on its own, much
-    // later, unhandled (automerge-repo's internal ~60-120s default) — a
-    // confirmed source of stray "uncaught (in promise) TimeoutError"
-    // console spam completely disconnected from whatever the user is doing
-    // by the time it fires.
+    // later, unhandled (its own default ~60s bound) — a confirmed source of
+    // stray "uncaught (in promise) TimeoutError" console spam completely
+    // disconnected from whatever the user is doing by the time it fires.
     if (identity) {
       try {
         const canvasStore = await CanvasStore.open(this.repo, detail.canvasDocId as DocumentId, {
@@ -2423,8 +2438,8 @@ class SkeinRouter {
     // the share link's owner isn't already a friend, actually opening the
     // canvas is doomed: the owner's side will simply never sync the doc to
     // an unrecognized peer, so navigating in would just hang on the
-    // "loading canvas" spinner until automerge-repo's own internal
-    // ~60-120s timeout (or COLD_OPEN_TIMEOUT_MS on a cold open) elapses.
+    // "loading canvas" spinner until `CanvasStore.open()`'s own default
+    // ~60s bound (or COLD_OPEN_TIMEOUT_MS on a cold open) elapses.
     // `isFriend()` is a synchronous, no-network lookup against the local
     // social doc, so checking it here costs nothing and tells us instantly
     // — skip the peer connect attempt and the canvas navigation entirely
