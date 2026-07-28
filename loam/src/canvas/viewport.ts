@@ -33,6 +33,9 @@ export class Viewport {
   // zoom change listeners
   private zoomListeners: Array<(zoom: number) => void> = [];
 
+  // view (pan or zoom) change listeners
+  private viewListeners: Array<() => void> = [];
+
   static readonly MIN_ZOOM = 0.25;
   static readonly MAX_ZOOM = 2.0;
 
@@ -72,6 +75,7 @@ export class Viewport {
   panTo(x: number, y: number): void {
     this.world.x = -x * this._zoom;
     this.world.y = -y * this._zoom;
+    this.notifyViewListeners();
   }
 
   /**
@@ -80,6 +84,7 @@ export class Viewport {
   panBy(dx: number, dy: number): void {
     this.world.x -= dx * this._zoom;
     this.world.y -= dy * this._zoom;
+    this.notifyViewListeners();
   }
 
   /**
@@ -97,6 +102,7 @@ export class Viewport {
     this.world.y = (this.world.y * this._zoom) / oldZoom;
     this.world.scale.set(this._zoom);
     this.notifyZoomListeners();
+    this.notifyViewListeners();
   }
 
   /**
@@ -117,6 +123,7 @@ export class Viewport {
     this.world.y = screenY - worldY * this._zoom;
     this.world.scale.set(this._zoom);
     this.notifyZoomListeners();
+    this.notifyViewListeners();
   }
 
   /** reset camera to origin at 1x zoom */
@@ -136,6 +143,21 @@ export class Viewport {
     };
   }
 
+  /**
+   * subscribe to any pan or zoom change (wheel, middle-mouse drag, touch
+   * pinch/pan, or the programmatic `panTo`/`panBy`/`zoomTo`/`zoomAtPoint`
+   * methods). deliberately NOT fired by `resetView()` — that's used
+   * internally for the transient "widget maximized" viewport state, which
+   * `WidgetManager.restore()` already re-syncs via `zoomTo`/`panTo` afterward.
+   * returns an unsubscribe function.
+   */
+  onViewChange(listener: () => void): () => void {
+    this.viewListeners.push(listener);
+    return () => {
+      this.viewListeners = this.viewListeners.filter((l) => l !== listener);
+    };
+  }
+
   /** clean up all event listeners */
   destroy(): void {
     this.canvasEl.removeEventListener("wheel", this.onWheel);
@@ -146,6 +168,7 @@ export class Viewport {
     this.canvasEl.removeEventListener("touchmove", this.onTouchMove);
     this.canvasEl.removeEventListener("touchend", this.onTouchEnd);
     this.zoomListeners = [];
+    this.viewListeners = [];
   }
 
   // --- wheel handler (pan + ctrl-zoom) ---
@@ -174,6 +197,7 @@ export class Viewport {
       // regular scroll = pan (in screen pixels)
       this.world.x -= e.deltaX;
       this.world.y -= e.deltaY;
+      this.notifyViewListeners();
     }
   };
 
@@ -201,6 +225,7 @@ export class Viewport {
     const dy = e.clientY - this.panStart.y;
     this.world.x = this.worldStartPos.x + dx;
     this.world.y = this.worldStartPos.y + dy;
+    this.notifyViewListeners();
   };
 
   private onPointerUp = (): void => {
@@ -244,6 +269,7 @@ export class Viewport {
     // also handle two-finger pan (movement of the pinch center)
     this.world.x += center.x - this.lastPinchCenter.x;
     this.world.y += center.y - this.lastPinchCenter.y;
+    this.notifyViewListeners();
 
     this.lastPinchDist = dist;
     this.lastPinchCenter = center;
@@ -261,6 +287,12 @@ export class Viewport {
   private notifyZoomListeners(): void {
     for (const listener of this.zoomListeners) {
       listener(this._zoom);
+    }
+  }
+
+  private notifyViewListeners(): void {
+    for (const listener of this.viewListeners) {
+      listener();
     }
   }
 }

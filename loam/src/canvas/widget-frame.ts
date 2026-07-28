@@ -457,6 +457,24 @@ export class WidgetFrame {
 
   // --- drawing ---
 
+  /**
+   * whether frame chrome (header, border, buttons) should be shown. this is
+   * hover/selection driven, but also stays true while the hamburger flyout
+   * (z-order controls) is open — the flyout is reparented onto `world` (see
+   * showHamburgerFlyout()), so moving the pointer off `root` to interact
+   * with it would otherwise let the hover grace timer close the flyout out
+   * from under the user before they can click a z-order action.
+   */
+  private isChromeVisible(): boolean {
+    return (
+      this._collapsed ||
+      this._hovered ||
+      this._selected ||
+      this._multiSelected ||
+      this.hamburgerFlyout !== null
+    );
+  }
+
   private draw(): void {
     this.drawHeader();
     this.drawBorder();
@@ -469,7 +487,7 @@ export class WidgetFrame {
 
   private drawHeader(): void {
     if (this._maximized) {
-      if (!this._hovered) {
+      if (!this._hovered && this.hamburgerFlyout === null) {
         this.headerBg.clear();
         return;
       }
@@ -483,7 +501,7 @@ export class WidgetFrame {
     }
     const w = this._width;
     const h = this.theme.frameHeaderHeight;
-    const showChrome = this._collapsed || this._hovered || this._selected || this._multiSelected;
+    const showChrome = this.isChromeVisible();
     const r = showChrome ? this.theme.frameCornerRadius : 0;
 
     this.headerBg.clear();
@@ -511,7 +529,7 @@ export class WidgetFrame {
     }
     const w = this._width;
     const hdr = this.theme.frameHeaderHeight;
-    const showChrome = this._collapsed || this._hovered || this._selected || this._multiSelected;
+    const showChrome = this.isChromeVisible();
     const r = showChrome ? this.theme.frameCornerRadius : 0;
 
     this.border.clear();
@@ -559,7 +577,7 @@ export class WidgetFrame {
   /** redraw the content mask to match current dimensions and state. */
   private drawContentMask(): void {
     const y = 0;
-    const showChrome = this._collapsed || this._hovered || this._selected || this._multiSelected;
+    const showChrome = this.isChromeVisible();
     const r = showChrome ? this.theme.frameCornerRadius : 0;
     this.contentMask.clear();
     if (r > 0) {
@@ -1410,6 +1428,12 @@ export class WidgetFrame {
     this.hamburgerFlyout.parent?.removeChild(this.hamburgerFlyout);
     this.hamburgerFlyout.destroy({ children: true });
     this.hamburgerFlyout = null;
+    // chrome may have been kept visible solely because the flyout was open
+    // (see isChromeVisible()) while hover/selection already lapsed — resync
+    // now that the flyout gate is gone, rather than waiting for the next
+    // unrelated pointer event to notice.
+    this.updateVisualState();
+    this.draw();
   }
 
   // --- visual state management ---
@@ -1426,7 +1450,8 @@ export class WidgetFrame {
     if (this._maximized) {
       // on touch devices, treat selection as hover so the header is accessible
       // (there's no cursor to trigger pointerenter on touch)
-      const showHeader = this._hovered || (isTouchDevice() && this._selected);
+      const showHeader =
+        this._hovered || (isTouchDevice() && this._selected) || this.hamburgerFlyout !== null;
 
       // explicit hitArea so hover events fire even when widget content
       // has no interactive pixi elements (e.g., image widget, label)
@@ -1483,7 +1508,7 @@ export class WidgetFrame {
     }
 
     // collapsed widgets always show chrome (no content to hover over)
-    const showChrome = this._collapsed || this._hovered || this._selected || this._multiSelected;
+    const showChrome = this.isChromeVisible();
 
     // restore header position and opacity (may have been changed during maximize hover)
     this.header.y = -this.theme.frameHeaderHeight;

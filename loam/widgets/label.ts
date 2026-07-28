@@ -181,6 +181,10 @@ export const labelWidget: WidgetFactory<typeof labelSchema> = {
 
   getCompactInfo: (state: LabelState): CompactInfo => ({
     label: state.text || "label",
+    bgColor: state.bgColor,
+    textColor: state.textColor,
+    borderColor: state.borderColor,
+    borderWidth: state.borderWidth,
   }),
 
   create(ctx: WidgetMountContext<typeof labelSchema>): WidgetController {

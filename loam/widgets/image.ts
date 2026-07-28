@@ -67,6 +67,11 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
     let lastRequestedUrl = "";
     let loadedAssetKey = "";
 
+    // only the peer who created this widget can use the initial "click to
+    // add image" step — widgets with no recorded creator (pre-existing
+    // widgets from before this field existed) are unrestricted.
+    const iAmCreator = !ctx.canvasStore || ctx.canvasStore.isLocalWidgetCreator(ctx.widgetId);
+
     // background graphics
     const bg = new Graphics();
     container.addChild(bg);
@@ -86,7 +91,7 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
 
     // placeholder text — shown when no URL is set
     const placeholderText = new Text({
-      text: "click to add image",
+      text: iAmCreator ? "click to add image" : "waiting for image",
       style: {
         fontFamily: "system-ui, sans-serif",
         fontSize: 13,
@@ -99,7 +104,7 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
     placeholderText.x = currentWidth / 2;
     placeholderText.y = currentHeight / 2;
     placeholderText.eventMode = "static";
-    placeholderText.cursor = "pointer";
+    placeholderText.cursor = iAmCreator ? "pointer" : "default";
     container.addChild(placeholderText);
 
     // placeholder dashed border overlay
@@ -112,13 +117,14 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
     };
     drawPlaceholderBorder(currentWidth, currentHeight);
     placeholderBorder.eventMode = "static";
-    placeholderBorder.cursor = "pointer";
+    placeholderBorder.cursor = iAmCreator ? "pointer" : "default";
     container.addChild(placeholderBorder);
 
     // click placeholder to upload an image
     const handlePlaceholderClick = async () => {
       if (loadState !== "empty") return;
       if (ctx.canvasStore?.isLocalViewer()) return;
+      if (!iAmCreator) return;
       const dataUrl = await pickImageAsDataUrl({
         maxWidth: 800,
         maxHeight: 800,
@@ -129,6 +135,10 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
         });
       }
     };
+    // click anywhere in the widget (not just the placeholder text/border) to
+    // upload an image — the bg fill already spans the full content area.
+    bg.eventMode = "static";
+    bg.on("pointertap", handlePlaceholderClick);
     placeholderText.on("pointertap", handlePlaceholderClick);
     placeholderBorder.on("pointertap", handlePlaceholderClick);
 
@@ -175,6 +185,10 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
       if (sprite) {
         sprite.visible = loadState === "loaded";
       }
+      // only show the pointer cursor (and accept clicks) while empty and the
+      // local peer is the widget's creator — otherwise there's nothing to
+      // upload (either content already exists, or it's someone else's step).
+      bg.cursor = loadState === "empty" && iAmCreator ? "pointer" : "default";
     };
 
     // fit the sprite within the widget bounds according to the current fit mode

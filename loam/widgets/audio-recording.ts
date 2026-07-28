@@ -392,6 +392,11 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     let capturedSamples: number[] = [...(ctx.doc.current.waveformSamples ?? [])];
     let waveRafId: number | null = null;
 
+    // only the peer who created this widget can use the initial "tap to
+    // record" step — widgets with no recorded creator (pre-existing widgets
+    // from before this field existed) are unrestricted.
+    const iAmCreator = !ctx.canvasStore || ctx.canvasStore.isLocalWidgetCreator(ctx.widgetId);
+
     // ── transient playback state ─────────────────────────────────────────────
     let audioEl: HTMLAudioElement | null = null;
     /** object URL for the most recently stored/loaded blob */
@@ -723,7 +728,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
 
       switch (recState) {
         case "idle":
-          statusText.text = "tap to record";
+          statusText.text = iAmCreator ? "tap to record" : "waiting for recording";
           infoText.text = "";
           errorText.text = "";
           break;
@@ -760,7 +765,9 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         case "error":
           statusText.text = "";
           infoText.text = "";
-          errorText.text = "mic access denied\ntap to try again";
+          errorText.text = iAmCreator
+            ? "mic access denied\ntap to try again"
+            : "mic access denied";
           break;
         case "needs-friend":
           statusText.text = "";
@@ -1257,10 +1264,12 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         case "idle":
         case "error":
           if (ctx.canvasStore?.isLocalViewer()) return;
+          if (!iAmCreator) return;
           void startRecording();
           break;
         case "recording":
           if (ctx.canvasStore?.isLocalViewer()) return;
+          if (!iAmCreator) return;
           stopRecording();
           break;
         case "ready":

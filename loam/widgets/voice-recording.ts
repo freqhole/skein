@@ -57,6 +57,7 @@ import {
   MouthRenderer,
   volumeToRawOpenness,
   computeRmsEnvelope,
+  renderMouthSnapshot,
   ENVELOPE_HZ,
   type Mood,
   type TeethStyle,
@@ -105,6 +106,14 @@ export const voiceRecordingSchema = z.object({
   /** true once lipsColor/lipThickness have been randomized on first mount —
    *  prevents re-randomizing on every later mount/reconnect */
   lipsSeeded: z.boolean().default(false),
+  /** static "resting face" snapshot of the mouth, used as the bin compact
+   *  card thumbnail (no live animation there) */
+  mouthSnapshotDataUrl: z.string().default(""),
+  /** lipsColor|lipThickness|mouthMood|teethStyle|cupidBowAmount|bgColor|
+   *  borderColor|borderWidth the snapshot above was rendered from — lets any
+   *  peer detect a stale snapshot and regenerate it, without every peer
+   *  re-rendering on every doc change */
+  mouthSnapshotKey: z.string().default(""),
 });
 
 export type VoiceRecordingState = z.infer<typeof voiceRecordingSchema>;
@@ -209,6 +218,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
   getCompactInfo: (state: VoiceRecordingState): CompactInfo => ({
     label: state.filename ? state.filename.replace(/\.[^.]+$/, "") : "voice recording",
     domain: "audio",
+    thumbnailUrl: state.mouthSnapshotDataUrl || undefined,
     blobId: state.blobId || undefined,
     mime: state.mime || undefined,
     filename: state.filename || undefined,
@@ -230,6 +240,11 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     let audioCtx: AudioContext | null = null;
     let analyser: AnalyserNode | null = null;
     let recStartTime = 0;
+
+    // only the peer who created this widget can use the initial "record"
+    // step — widgets with no recorded creator (pre-existing widgets from
+    // before this field existed) are unrestricted.
+    const iAmCreator = !ctx.canvasStore || ctx.canvasStore.isLocalWidgetCreator(ctx.widgetId);
 
     // -- transient playback state --
     let audioEl: HTMLAudioElement | null = null;
@@ -322,6 +337,41 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       ctx.doc.current.cupidBowAmount
     );
 
+    // -- bin compact-card snapshot: a static "resting face" image, regenerated
+    // whenever the mouth's appearance changes. keyed so only the first peer to
+    // observe a given appearance renders + writes it back; everyone else's
+    // doc-change handler sees a matching key and skips redundant work. --
+    const mouthSnapshotKey = (s: VoiceRecordingState): string =>
+      `${s.lipsColor}|${s.lipThickness}|${s.mouthMood}|${s.teethStyle}|${s.cupidBowAmount}|${s.bgColor}|${s.borderColor}|${s.borderWidth}`;
+
+    const maybeRegenerateSnapshot = (): void => {
+      const state = ctx.doc.current;
+      const key = mouthSnapshotKey(state);
+      if (state.mouthSnapshotKey === key && state.mouthSnapshotDataUrl) return;
+      void renderMouthSnapshot({
+        lipsColor: state.lipsColor,
+        lipThickness: state.lipThickness,
+        mood: state.mouthMood as Mood,
+        teethStyle: state.teethStyle as TeethStyle,
+        cupidBowAmount: state.cupidBowAmount,
+        bgColor: state.bgColor,
+        borderColor: state.borderColor,
+        borderWidth: state.borderWidth,
+      }).then((dataUrl) => {
+        if (destroyed || !dataUrl) return;
+        // bail if superseded by a newer appearance change, or another peer
+        // already wrote this exact snapshot, while we were rendering
+        if (mouthSnapshotKey(ctx.doc.current) !== key) return;
+        if (ctx.doc.current.mouthSnapshotKey === key) return;
+        ctx.doc.change((d) => {
+          d.mouthSnapshotDataUrl = dataUrl;
+          d.mouthSnapshotKey = key;
+        });
+      });
+    };
+
+    maybeRegenerateSnapshot();
+
     // pill button (hidden after first recording)
     const btnGfx = new Graphics();
     btnGfx.eventMode = "static";
@@ -403,7 +453,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         case "error": {
           btnGfx.roundRect(cw / 2 - PILL_W / 2, by - PILL_H / 2, PILL_W, PILL_H, PILL_R);
           btnGfx.fill({ color: COLOR_RECORD });
-          btnLabel.text = "record";
+          btnLabel.text = iAmCreator ? "record" : "waiting";
           btnLabel.x = cw / 2;
           btnLabel.y = by;
           btnLabel.visible = true;
@@ -458,7 +508,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           statusText.visible = true;
           break;
         case "error":
-          statusText.text = "mic access denied\ntap to try again";
+          statusText.text = iAmCreator ? "mic access denied\ntap to try again" : "mic access denied";
           statusText.style.fill = COLOR_ERROR;
           statusText.visible = true;
           break;
@@ -942,10 +992,12 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
         case "idle":
         case "error":
           if (ctx.canvasStore?.isLocalViewer()) return;
+          if (!iAmCreator) return;
           void startRecording();
           break;
         case "recording":
           if (ctx.canvasStore?.isLocalViewer()) return;
+          if (!iAmCreator) return;
           stopRecording();
           break;
       }
@@ -969,6 +1021,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       mouth.setMood(mouthMood as Mood);
       mouth.setTeethStyle(teethStyle as TeethStyle);
       mouth.setCupidBowAmount(cupidBowAmount);
+      maybeRegenerateSnapshot();
 
       if ((recState === "idle" || recState === "error") && blobId) {
         recState = "ready";

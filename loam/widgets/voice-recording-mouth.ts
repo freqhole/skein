@@ -4,6 +4,8 @@
 // pure helper functions are exported for unit testing.
 
 import { Container, Graphics } from "pixi.js";
+import { renderSnapshot } from "../src/widgets/offscreen-snapshot";
+import { isTransparent } from "../src/widgets/widget-types";
 
 // ---------------------------------------------------------------------------
 // exported pure helpers
@@ -472,3 +474,81 @@ export class MouthRenderer {
     this.maskGfx.destroy();
   }
 }
+
+// ---------------------------------------------------------------------------
+// static snapshot rendering — a resting-face image for bin compact cards
+// ---------------------------------------------------------------------------
+
+// square, so it fits a bin grid cell without any cover-fit cropping — the
+// mouth is noticeably wider than tall, and a non-square source frame gets
+// its sides cropped away when scaled to cover a square cell.
+const SNAPSHOT_SIZE = 140;
+
+// MouthRenderer always draws to fill the exact width/height it's given (by
+// design, for the live widget) — so for a thumbnail we draw it into a
+// smaller, centered inner frame rather than the full snapshot canvas, which
+// leaves visible margin and makes the mouth read as "contained" rather than
+// zoomed in/cropped.
+const SNAPSHOT_MOUTH_FRAME = Math.round(SNAPSHOT_SIZE * 0.85);
+const SNAPSHOT_MOUTH_OFFSET = Math.round((SNAPSHOT_SIZE - SNAPSHOT_MOUTH_FRAME) / 2);
+
+/** appearance inputs needed to render a resting mouth snapshot. */
+export interface MouthSnapshotOptions {
+  lipsColor: number;
+  lipThickness: number;
+  mood: Mood;
+  teethStyle: TeethStyle;
+  cupidBowAmount: number;
+  /** widget background color; -1 = transparent */
+  bgColor: number;
+  /** border color; -1 = transparent */
+  borderColor: number;
+  /** border width in pixels; 0 = no border */
+  borderWidth: number;
+}
+
+/**
+ * render a single static "resting face" image of the mouth (openness stays
+ * at 0 — no recording/playback audio to react to) for use as a bin compact
+ * card thumbnail. returns a data url, or null if offscreen rendering isn't
+ * available in the current environment.
+ */
+export async function renderMouthSnapshot(options: MouthSnapshotOptions): Promise<string | null> {
+  try {
+    const stage = new Container();
+
+    const bgGfx = new Graphics();
+    if (!isTransparent(options.bgColor)) {
+      bgGfx.rect(0, 0, SNAPSHOT_SIZE, SNAPSHOT_SIZE);
+      bgGfx.fill({ color: options.bgColor });
+    }
+    const bw = options.borderWidth ?? 0;
+    if (bw > 0 && !isTransparent(options.borderColor)) {
+      bgGfx.rect(bw / 2, bw / 2, SNAPSHOT_SIZE - bw, SNAPSHOT_SIZE - bw);
+      bgGfx.stroke({ color: options.borderColor, width: bw });
+    }
+    stage.addChild(bgGfx);
+
+    const frame = new Container();
+    frame.x = SNAPSHOT_MOUTH_OFFSET;
+    frame.y = SNAPSHOT_MOUTH_OFFSET;
+    stage.addChild(frame);
+    const mouth = new MouthRenderer(
+      frame,
+      SNAPSHOT_MOUTH_FRAME,
+      SNAPSHOT_MOUTH_FRAME,
+      options.lipsColor,
+      options.lipThickness,
+      options.mood,
+      options.teethStyle,
+      options.cupidBowAmount
+    );
+    const dataUrl = await renderSnapshot(stage, SNAPSHOT_SIZE, SNAPSHOT_SIZE, "webp");
+    mouth.destroy();
+    stage.destroy({ children: true });
+    return dataUrl;
+  } catch {
+    return null;
+  }
+}
+

@@ -120,6 +120,20 @@ export interface CompactInfo {
   thumbnailUrl?: string;
   /** accent color for spine/border tinting (pixi hex number) */
   accentColor?: number;
+  /**
+   * solid background fill for the fallback (no-thumbnail) card face. when
+   * set, replaces the generic accentColor-tinted-rect fallback with a solid
+   * fill + optional border showing the widget's real appearance (e.g. a
+   * label widget's card looks like a mini version of the label itself).
+   * -1 means transparent, same convention as the widgets' own bg colors.
+   */
+  bgColor?: number;
+  /** text color for the fallback card face's label text (used with bgColor) */
+  textColor?: number;
+  /** border color for the fallback card face border stroke, or -1 for none */
+  borderColor?: number;
+  /** border width in px for the fallback card face border stroke */
+  borderWidth?: number;
   /** media domain hint for media-aware card rendering (e.g. "audio", "video", "photo") */
   domain?: string;
   /** blob ID for media playback (used by bin media controller) */

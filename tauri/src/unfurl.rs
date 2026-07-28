@@ -99,19 +99,61 @@ fn extract_link_meta(html: &str) -> LinkMeta {
     meta
 }
 
-/// decode the small set of HTML entities likely to show up in a title or
-/// meta description. `&amp;` is decoded last so `&amp;lt;` round-trips to
-/// `&lt;` rather than being double-unescaped into `<`.
+/// decode HTML entities likely to show up in a title or meta description:
+/// numeric references (`&#38;`, `&#x26;`) and a handful of named ones.
+/// `&amp;` is decoded last so `&amp;lt;` round-trips to `&lt;` rather than
+/// being double-unescaped into `<`.
 fn decode_entities(s: &str) -> String {
+    let s = decode_numeric_entities(s);
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
         .replace("&apos;", "'")
+        .replace("&nbsp;", "\u{00a0}")
+        .replace("&mdash;", "\u{2014}")
+        .replace("&ndash;", "\u{2013}")
+        .replace("&hellip;", "\u{2026}")
         .replace("&amp;", "&")
         .trim()
         .to_string()
+}
+
+/// decode `&#NNN;` (decimal) and `&#xHHH;` (hex) numeric character
+/// references. malformed references (no terminating `;`, out-of-range or
+/// invalid code points) are left untouched rather than dropped.
+///
+/// operates on `char`s (not bytes) so multi-byte UTF-8 text is copied
+/// through unchanged rather than being reinterpreted byte-by-byte.
+fn decode_numeric_entities(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '&' && chars.get(i + 1) == Some(&'#') {
+            let is_hex = chars.get(i + 2).is_some_and(|&c| c == 'x' || c == 'X');
+            let digits_start = i + if is_hex { 3 } else { 2 };
+            let mut j = digits_start;
+            while chars.get(j).is_some_and(|c| c.is_ascii_hexdigit()) {
+                j += 1;
+            }
+            if j > digits_start && chars.get(j) == Some(&';') {
+                let digits: String = chars[digits_start..j].iter().collect();
+                let code_point = if is_hex {
+                    u32::from_str_radix(&digits, 16).ok()
+                } else {
+                    digits.parse::<u32>().ok()
+                };
+                if let Some(ch) = code_point.and_then(char::from_u32) {
+                    out.push(ch);
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// find the byte index of the `>` that closes a tag opened at `start`,
@@ -316,6 +358,20 @@ mod link_unfurl_tests {
         let html = r#"<title>Tom &amp; Jerry &lt;classic&gt;</title>"#;
         let meta = extract_link_meta(html);
         assert_eq!(meta.title.as_deref(), Some("Tom & Jerry <classic>"));
+    }
+
+    #[test]
+    fn extract_link_meta_decodes_numeric_entities() {
+        let html = r#"<title>Tom &#38; Jerry &#x26; friends</title>"#;
+        let meta = extract_link_meta(html);
+        assert_eq!(meta.title.as_deref(), Some("Tom & Jerry & friends"));
+    }
+
+    #[test]
+    fn extract_link_meta_leaves_malformed_numeric_entities_untouched() {
+        let html = r#"<title>no semicolon &#38 here</title>"#;
+        let meta = extract_link_meta(html);
+        assert_eq!(meta.title.as_deref(), Some("no semicolon &#38 here"));
     }
 
     #[test]

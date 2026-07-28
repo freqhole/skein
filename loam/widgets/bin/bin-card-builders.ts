@@ -11,6 +11,7 @@ import {
 } from "../../src/widgets/file-utils";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import { drawRevealIcon, drawSaveIcon } from "../../src/widgets/icons";
+import { isTransparent, type CompactInfo } from "../../src/widgets/widget-types";
 import {
   CRATE_FONT_SIZE,
   DEFAULT_ACCENT_COLOR,
@@ -288,6 +289,63 @@ function extraCardFields(info: {
 }
 
 // -----------------------------------------------------------------------
+// solid label face / caption backdrop helpers
+// -----------------------------------------------------------------------
+
+/**
+ * fill+stroke a card's fallback face (no thumbnail) using a widget's own
+ * bg/border colors when its CompactInfo exposes them (e.g. the label
+ * widget) — makes the card face read as a small mirror of the real widget
+ * instead of a generic accent-tinted placeholder. -1 means transparent,
+ * matching the widgets' own bg/border color convention.
+ */
+function drawSolidLabelFace(
+  target: Graphics,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  radius: number,
+  info: CompactInfo
+): void {
+  if (info.bgColor !== undefined && !isTransparent(info.bgColor)) {
+    target.roundRect(x, y, w, h, radius).fill({ color: info.bgColor });
+  }
+  const borderWidth = info.borderWidth ?? 0;
+  if (borderWidth > 0 && info.borderColor !== undefined && !isTransparent(info.borderColor)) {
+    target.roundRect(x, y, w, h, radius).stroke({ color: info.borderColor, width: borderWidth });
+  }
+}
+
+const LABEL_BACKDROP_COLOR = 0x000000;
+const LABEL_BACKDROP_ALPHA = 0.55;
+const LABEL_BACKDROP_PAD_X = 4;
+const LABEL_BACKDROP_PAD_Y = 2;
+
+/**
+ * draw a small semi-transparent backdrop rect behind a caption Text so it
+ * stays legible over a thumbnail image. computed analytically from the
+ * text's own anchor/rotation/position (rather than getBounds()) so it
+ * works the same for grid/crate/drawer's unrotated captions and shelf's
+ * ±90°-rotated caption — a ±90° rotation swaps which axis the text's
+ * width/height occupy on screen.
+ */
+function addLabelBackdrop(parent: Container, label: Text, radius = 2): void {
+  const rotated = Math.abs(Math.round((label.rotation * 2) / Math.PI)) % 2 === 1;
+  const w = (rotated ? label.height : label.width) + LABEL_BACKDROP_PAD_X * 2;
+  const h = (rotated ? label.width : label.height) + LABEL_BACKDROP_PAD_Y * 2;
+  const x =
+    label.x - label.anchor.x * (rotated ? label.height : label.width) - LABEL_BACKDROP_PAD_X;
+  const y =
+    label.y - label.anchor.y * (rotated ? label.width : label.height) - LABEL_BACKDROP_PAD_Y;
+  const backdrop = new Graphics();
+  backdrop
+    .roundRect(x, y, w, h, radius)
+    .fill({ color: LABEL_BACKDROP_COLOR, alpha: LABEL_BACKDROP_ALPHA });
+  parent.addChild(backdrop);
+}
+
+// -----------------------------------------------------------------------
 // grid mode
 // -----------------------------------------------------------------------
 
@@ -344,13 +402,18 @@ function buildGridCard(state: CardRenderState, ctx: CardBuildContext): RenderedC
       ctx.updateThumbSprite(widgetId, sprite);
     });
   } else {
-    // fallback: colored rect with first letter
-    const accent = info.accentColor ?? DEFAULT_ACCENT_COLOR;
+    // fallback: mirrors the widget's own bg/border colors when exposed
+    // (e.g. label widget), else a generic accent-tinted placeholder
     const fallback = new Graphics();
-    fallback.roundRect(4, 4, cellSize - 8, cellSize - 8, 3).fill({
-      color: accent,
-      alpha: 0.4,
-    });
+    if (info.bgColor !== undefined) {
+      drawSolidLabelFace(fallback, 4, 4, cellSize - 8, cellSize - 8, 3, info);
+    } else {
+      const accent = info.accentColor ?? DEFAULT_ACCENT_COLOR;
+      fallback.roundRect(4, 4, cellSize - 8, cellSize - 8, 3).fill({
+        color: accent,
+        alpha: 0.4,
+      });
+    }
     card.addChild(fallback);
 
     const letter = info.label.charAt(0).toUpperCase() || "?";
@@ -359,7 +422,7 @@ function buildGridCard(state: CardRenderState, ctx: CardBuildContext): RenderedC
       style: {
         fontFamily: FONT_FAMILY,
         fontSize: 28,
-        fill: TEXT_COLOR,
+        fill: info.textColor ?? TEXT_COLOR,
         align: "center",
       },
       resolution: TEXT_RESOLUTION,
@@ -419,6 +482,7 @@ function buildGridCard(state: CardRenderState, ctx: CardBuildContext): RenderedC
   label.anchor.set(0.5, 0);
   label.x = cellSize / 2;
   label.y = cellSize + 2;
+  addLabelBackdrop(card, label);
   card.addChild(label);
 
   // pointer interactions
@@ -502,14 +566,20 @@ function buildShelfCard(state: CardRenderState, ctx: CardBuildContext): Rendered
       ctx.updateThumbSprite(widgetId, sprite);
     });
   } else {
-    // fallback: accent letter in the endcap area
+    // fallback: mirrors the widget's own bg/border colors when exposed
+    // (e.g. label widget), rendered over the endcap area
+    if (info.bgColor !== undefined) {
+      const face = new Graphics();
+      drawSolidLabelFace(face, 0, 0, spineW, endcapH, 0, info);
+      card.addChild(face);
+    }
     const letter = info.label.charAt(0).toUpperCase() || "?";
     const letterText = new Text({
       text: letter,
       style: {
         fontFamily: FONT_FAMILY,
         fontSize: 14,
-        fill: TEXT_COLOR,
+        fill: info.textColor ?? TEXT_COLOR,
         align: "center",
       },
       resolution: TEXT_RESOLUTION,
@@ -555,6 +625,7 @@ function buildShelfCard(state: CardRenderState, ctx: CardBuildContext): Rendered
   label.rotation = ctx.shelfTextOrigin === "top" ? Math.PI / 2 : -Math.PI / 2;
   label.x = spineW / 2;
   label.y = endcapH + 1 + textAreaH / 2;
+  addLabelBackdrop(card, label);
   card.addChild(label);
 
   // media overlay — play/pause icon for audio/video, expand icon for photos
@@ -645,14 +716,20 @@ function buildCrateCard(state: CardRenderState, ctx: CardBuildContext): Rendered
       ctx.updateThumbSprite(widgetId, sprite);
     });
   } else {
-    // fallback: letter in endcap
+    // fallback: mirrors the widget's own bg/border colors when exposed
+    // (e.g. label widget), else the generic accent-tinted endcap placeholder
+    if (info.bgColor !== undefined) {
+      thumbBg.clear();
+      drawSolidLabelFace(thumbBg, 0, 0, endcapW, slotH, 0, info);
+    }
+
     const letter = info.label.charAt(0).toUpperCase() || "?";
     const letterText = new Text({
       text: letter,
       style: {
         fontFamily: FONT_FAMILY,
         fontSize: 14,
-        fill: TEXT_COLOR,
+        fill: info.textColor ?? TEXT_COLOR,
       },
       resolution: TEXT_RESOLUTION,
     });
@@ -709,6 +786,7 @@ function buildCrateCard(state: CardRenderState, ctx: CardBuildContext): Rendered
   });
   label.x = textX;
   label.y = (slotH - label.height) / 2;
+  addLabelBackdrop(card, label);
   card.addChild(label);
 
   // media overlay — play/pause icon for audio/video, expand icon for photos
@@ -799,14 +877,20 @@ function buildDrawerCard(state: CardRenderState, ctx: CardBuildContext): Rendere
       ctx.updateThumbSprite(widgetId, sprite);
     });
   } else {
-    // fallback: letter in endcap
+    // fallback: mirrors the widget's own bg/border colors when exposed
+    // (e.g. label widget), else the generic accent-tinted endcap placeholder
+    if (info.bgColor !== undefined) {
+      thumbBg.clear();
+      drawSolidLabelFace(thumbBg, 0, 0, endcapW, slotH, 0, info);
+    }
+
     const letter = info.label.charAt(0).toUpperCase() || "?";
     const letterText = new Text({
       text: letter,
       style: {
         fontFamily: FONT_FAMILY,
         fontSize: 16,
-        fill: TEXT_COLOR,
+        fill: info.textColor ?? TEXT_COLOR,
       },
       resolution: TEXT_RESOLUTION,
     });
@@ -863,6 +947,7 @@ function buildDrawerCard(state: CardRenderState, ctx: CardBuildContext): Rendere
   });
   label.x = textX;
   label.y = (slotH - label.height) / 2;
+  addLabelBackdrop(container, label);
   container.addChild(label);
 
   // media overlay — play/pause icon for audio/video, expand icon for photos

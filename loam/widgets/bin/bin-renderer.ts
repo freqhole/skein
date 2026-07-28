@@ -4,8 +4,9 @@ import type { CanvasStore } from "../../src/canvas/canvas-store";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import type { CompactInfo } from "../../src/widgets/widget-types";
 import { buildCard } from "./bin-card-builders";
+import { SLOT_BORDER_COLOR } from "./bin-constants";
 import type { BinMode, SlotPosition, SlotSizeOptions } from "./bin-layout";
-import { contentDimensions, slotRect } from "./bin-layout";
+import { computeCellBorderLines, contentDimensions, slotRect } from "./bin-layout";
 import type { BinMediaController } from "./bin-media";
 import type {
   CardBuildContext,
@@ -59,6 +60,9 @@ export class BinRenderer {
   /** grid slot outlines — visible on hover to show drop targets */
   private gridOutlines: Graphics;
 
+  /** shared table-like border lines drawn across all occupied cells */
+  private cellBordersOverlay: Graphics;
+
   /** current layout state — set via render() */
   private mode: BinMode = "grid";
   private contentWidth = 200;
@@ -68,6 +72,13 @@ export class BinRenderer {
 
   /** shelf text direction — top = text reads top-to-bottom, bottom = bottom-to-top */
   shelfTextOrigin: "top" | "bottom" = "top";
+
+  /** whether to draw the shared table-like grid of border lines between cells */
+  cellBordersEnabled = false;
+  /** stroke width (px) for the cell border grid lines — reuses the bin's own borderWidth */
+  cellBorderWidth = 0;
+  /** stroke color for the cell border grid lines — reuses the bin's own borderColor (-1 = unset) */
+  cellBorderColor = -1;
 
   /** current scroll offset — used by drop target to convert world coords to content coords in drawer mode */
   getScrollOffset(): number {
@@ -106,6 +117,12 @@ export class BinRenderer {
     this.gridOutlines.visible = false;
     this.gridOutlines.label = "grid-outlines";
     this.container.addChild(this.gridOutlines);
+
+    // cell border grid lines — shared table-like borders between cells,
+    // drawn once per render() pass rather than per-card
+    this.cellBordersOverlay = new Graphics();
+    this.cellBordersOverlay.label = "cell-borders";
+    this.container.addChild(this.cellBordersOverlay);
 
     // slot highlight overlay — drawn on top of cards
     this.slotHighlight = new Graphics();
@@ -177,6 +194,13 @@ export class BinRenderer {
       this.cardParent.addChild(this.gridOutlines);
     }
 
+    // ensure the cell borders overlay is in the correct parent, and drawn
+    // behind the cards added below
+    if (this.cellBordersOverlay.parent !== this.cardParent) {
+      this.cellBordersOverlay.parent?.removeChild(this.cellBordersOverlay);
+      this.cardParent.addChildAt(this.cellBordersOverlay, 0);
+    }
+
     // determine which cards to add, update, or remove
     const newIds = new Set(mappedItems.map((i) => i.widgetId));
     const oldIds = new Set(this.cards.keys());
@@ -235,6 +259,9 @@ export class BinRenderer {
       this.positionScrollInner();
     }
 
+    // redraw the shared cell-border grid lines for the new layout
+    this.drawCellBorders(Math.max(1, _cols), effectiveRows);
+
     // redraw grid outlines for the new layout
     this.drawGridOutlines(Math.max(1, _cols), _rows);
 
@@ -292,6 +319,33 @@ export class BinRenderer {
     }
   }
 
+  /**
+   * redraw the shared cell-border grid lines for the current layout — one
+   * line per shared boundary between neighboring cells, plus a rect around
+   * the whole occupied region, rather than each card drawing its own box.
+   */
+  private drawCellBorders(cols: number, rows: number): void {
+    this.cellBordersOverlay.clear();
+    if (!this.cellBordersEnabled || this.cellBorderWidth <= 0) return;
+
+    const opts: SlotSizeOptions = { scale: this.scale };
+    const color = this.cellBorderColor !== -1 ? this.cellBorderColor : SLOT_BORDER_COLOR;
+    const width = this.cellBorderWidth;
+    const half = width / 2;
+    const { lines, outer } = computeCellBorderLines(this.mode, cols, rows, this.contentWidth, opts);
+
+    this.cellBordersOverlay
+      .rect(outer.x - half, outer.y - half, outer.width + width, outer.height + width)
+      .stroke({ width, color });
+
+    for (const line of lines) {
+      this.cellBordersOverlay
+        .moveTo(line.x1, line.y1)
+        .lineTo(line.x2, line.y2)
+        .stroke({ width, color });
+    }
+  }
+
   /** the container that cards are added to (scrollInner in drawer mode, main container otherwise) */
   private get cardParent(): Container {
     return this.scrollInner ?? this.container;
@@ -340,6 +394,7 @@ export class BinRenderer {
     }
 
     this.gridOutlines.destroy();
+    this.cellBordersOverlay.destroy();
     this.slotHighlight.destroy();
     this.container.destroy({ children: true });
   }

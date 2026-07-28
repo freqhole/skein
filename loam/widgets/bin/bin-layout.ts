@@ -287,3 +287,49 @@ export function resolveScale(scaleName?: SlotScale | string): number {
   if (!scaleName) return 1.0;
   return SLOT_SCALE_MULTIPLIERS[scaleName as SlotScale] ?? 1.0;
 }
+
+/** a single divider line segment, in content-area-relative coordinates */
+export interface CellBorderLine {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+/**
+ * compute a "table cell fill" border layout across all occupied cells
+ * (cols x rows): one shared divider line per internal boundary (centered in
+ * the gap between neighboring cells), plus a single rect enclosing the
+ * whole occupied region — rather than each cell drawing its own separate
+ * box, which double-borders at every shared edge and reads as a stack of
+ * individual boxes instead of a connected table/spreadsheet grid.
+ */
+export function computeCellBorderLines(
+  mode: BinMode,
+  cols: number,
+  rows: number,
+  contentWidth: number,
+  options?: SlotSizeOptions
+): { lines: CellBorderLine[]; outer: SlotRect } {
+  const size = slotSize(mode, options);
+  const gap = slotGap(mode);
+  const effCols = mode === "drawer" ? 1 : Math.max(1, cols);
+  const effRows = Math.max(1, rows);
+  const cellW = mode === "drawer" ? contentWidth : size.width;
+  const cellH = size.height;
+
+  const totalW = mode === "drawer" ? contentWidth : effCols * (cellW + gap) - gap;
+  const totalH = effRows * (cellH + gap) - gap;
+
+  const lines: CellBorderLine[] = [];
+  for (let c = 1; c < effCols; c++) {
+    const x = c * (cellW + gap) - gap / 2;
+    lines.push({ x1: x, y1: 0, x2: x, y2: totalH });
+  }
+  for (let r = 1; r < effRows; r++) {
+    const y = r * (cellH + gap) - gap / 2;
+    lines.push({ x1: 0, y1: y, x2: totalW, y2: y });
+  }
+
+  return { lines, outer: { x: 0, y: 0, width: totalW, height: totalH } };
+}

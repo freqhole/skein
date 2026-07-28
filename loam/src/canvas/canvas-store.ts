@@ -481,6 +481,24 @@ export class CanvasStore {
     return this.localRole() === "admin";
   }
 
+  /**
+   * true if the local peer may interact with `widgetId`'s "click to add"
+   * initial step (upload a file/image/pdf, start a recording, etc).
+   *
+   * widgets without a recorded `createdBy` (created before this field
+   * existed, or missing entirely) are unrestricted — everyone passes. once a
+   * widget has a `createdBy`, only that peer passes; this does NOT gate
+   * ongoing interaction with content that already exists (playback, viewing,
+   * etc) — only the initial "set this widget's content up" step, so callers
+   * should combine this with `isLocalViewer()` rather than use it alone for
+   * anything beyond that first step.
+   */
+  isLocalWidgetCreator(widgetId: string): boolean {
+    const entry = this.getWidget(widgetId);
+    if (!entry?.createdBy) return true;
+    return entry.createdBy === this._localNodeId;
+  }
+
   // -- metadata --------------------------------------------------------------
 
   /** get the canvas metadata (title, description, timestamps, color, preview). */
@@ -556,10 +574,20 @@ export class CanvasStore {
   /**
    * add a widget to the canvas. returns the widget's ID.
    * the entry must include an `id` field.
+   *
+   * stamps `createdBy` from the local node id unless the caller already set
+   * one (e.g. narthex-seed.ts constructing widgets before a local node id
+   * is known) — see `isLocalWidgetCreator()`.
    */
   addWidget(entry: WidgetEntry): string {
+    const createdBy = entry.createdBy || this._localNodeId || undefined;
     this.handle.change((doc) => {
       doc.widgets[entry.id] = { ...entry };
+      // only set the key when there's a real value — automerge drafts
+      // don't need (and shouldn't get) an explicit `undefined` property.
+      if (createdBy) {
+        doc.widgets[entry.id].createdBy = createdBy;
+      }
       this.touchModified(doc);
     });
     return entry.id;
