@@ -179,7 +179,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
     tabBar.addChild(detailsTabText);
 
     const historyTabText = new Text({
-      text: "history",
+      text: "info",
       style: { ...TAB_LABEL_FONT, fill: TEXT_INACTIVE },
     });
     historyTabText.x = PADDING + detailsTabText.width + 20;

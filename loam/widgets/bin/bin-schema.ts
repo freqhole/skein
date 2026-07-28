@@ -25,6 +25,9 @@ export const binSchema = z.object({
   shelfTextOrigin: z.enum(["top", "bottom"]).default("top"),
   /** slot size preset — controls density of the grid */
   slotScale: z.enum(["s", "m", "l", "xl"]).default("m"),
+  /** background color for the bin itself, as a 0xRRGGBB number — -1 means
+   *  transparent/none, matching the -1 convention used elsewhere */
+  bgColor: z.number().default(-1),
   /** border width around the whole bin, in px — 0 means no border */
   borderWidth: z.number().default(0),
   /** border color, as a 0xRRGGBB number — -1 means no border regardless of width */

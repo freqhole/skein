@@ -2,6 +2,7 @@ import {
   Assets,
   Container,
   Graphics,
+  Rectangle,
   Sprite,
   Text,
   Texture,
@@ -1132,7 +1133,6 @@ export class PropertyTray {
     _fieldWidth: number
   ): PropControl {
     const container = new Container();
-    container.eventMode = "static";
 
     const label = this.createLabel(prop.label);
     container.addChild(label);
@@ -1145,10 +1145,16 @@ export class PropertyTray {
 
     let value = initialValue;
 
+    // track and thumb are purely decorative (eventMode "none") — a single
+    // hit area on the parent container below handles all clicks uniformly,
+    // so the toggle's "dot" is exactly as clickable as the rest of the row
+    // instead of depending on which shape happens to be hit-tested first.
     const track = new Graphics();
+    track.eventMode = "none";
     container.addChild(track);
 
     const thumb = new Graphics();
+    thumb.eventMode = "none";
     container.addChild(thumb);
 
     const drawToggle = () => {
@@ -1165,17 +1171,27 @@ export class PropertyTray {
 
     drawToggle();
 
-    track.eventMode = "static";
-    track.cursor = "pointer";
-    track.on("pointerdown", (e: FederatedPointerEvent) => {
+    const totalHeight = fieldY + trackHeight;
+
+    // one hit area covering the label, the toggle, and the padding around
+    // both — clicking anywhere on the row (including exactly on the thumb)
+    // toggles the value.
+    const HIT_PAD = 10;
+    container.eventMode = "static";
+    container.cursor = "pointer";
+    container.hitArea = new Rectangle(
+      -HIT_PAD,
+      -HIT_PAD,
+      Math.max(trackWidth, label.width) + HIT_PAD * 2,
+      totalHeight + HIT_PAD * 2
+    );
+    container.on("pointerdown", (e: FederatedPointerEvent) => {
       e.stopPropagation();
       this.closeActivePopup();
       value = !value;
       onChange(value);
       drawToggle();
     });
-
-    const totalHeight = fieldY + trackHeight;
 
     return {
       key: prop.key,

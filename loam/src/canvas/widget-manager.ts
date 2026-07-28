@@ -102,6 +102,11 @@ export class WidgetManager {
   /** the widget ID of the drop target currently being hovered during a drag, or null */
   private activeDropTarget: string | null = null;
 
+  /** last known pointer world position during a drag — used for drop-target
+   *  hit testing instead of the dragged widget's own (possibly oversized)
+   *  center point, see widget-frame.ts's onDragPointerMove */
+  private lastDragPointer: { x: number; y: number } | null = null;
+
   /** focus stack for maximize / restore navigation */
   private readonly focusStack = new FocusStack();
 
@@ -728,7 +733,6 @@ export class WidgetManager {
       },
       onDragDelta: (dx: number, dy: number) => {
         this.handleBatchDragDelta(widgetId, dx, dy);
-        this.checkDropTargetHover(widgetId);
         // the dragged widget's own frame already moved (widget-frame.ts's
         // updateDrag()) — notify anything anchored to its live position.
         const live = this.liveWidgets.get(widgetId);
@@ -739,8 +743,13 @@ export class WidgetManager {
         }
         this.notifyLiveMove();
       },
+      onDragPointerMove: (worldX: number, worldY: number) => {
+        this.lastDragPointer = { x: worldX, y: worldY };
+        this.checkDropTargetHover(widgetId, worldX, worldY);
+      },
       onDragEnd: () => {
         this.tryDropOnTarget(widgetId);
+        this.lastDragPointer = null;
         this.handleBatchDragEnd(widgetId);
       },
 
@@ -852,14 +861,16 @@ export class WidgetManager {
    * during a frame drag, check if the dragged widget is hovering over
    * any live widget that implements a drop target. if so, forward hover
    * events for visual feedback (e.g. bin slot highlighting).
+   *
+   * uses the pointer's own world position (from widget-frame.ts's
+   * onDragPointerMove) rather than the dragged widget's center — a widget
+   * much larger than the drop target (e.g. a doodle canvas dropped onto a
+   * bin) would otherwise need its far-off center dragged inside the target
+   * before a drop registered, which reads as "impossible to drop".
    */
-  private checkDropTargetHover(draggedId: string): void {
+  private checkDropTargetHover(draggedId: string, wx: number, wy: number): void {
     const draggedLive = this.liveWidgets.get(draggedId);
     if (!draggedLive) return;
-
-    // use the center of the dragged widget's frame as the test point
-    const wx = draggedLive.frame.root.x + draggedLive.entry.width / 2;
-    const wy = draggedLive.frame.root.y + draggedLive.entry.height / 2;
 
     let foundTarget: string | null = null;
 
@@ -898,8 +909,11 @@ export class WidgetManager {
       return false;
     }
 
-    const wx = draggedLive.frame.root.x + draggedLive.entry.width / 2;
-    const wy = draggedLive.frame.root.y + draggedLive.entry.height / 2;
+    // prefer the last known pointer position (matches what was used to
+    // find/highlight this target during the drag) — falls back to the
+    // dragged widget's center if a pointer position was never recorded
+    const wx = this.lastDragPointer?.x ?? draggedLive.frame.root.x + draggedLive.entry.width / 2;
+    const wy = this.lastDragPointer?.y ?? draggedLive.frame.root.y + draggedLive.entry.height / 2;
 
     const consumed = targetLive.ctrl.dropTarget.onDrop(draggedId, wx, wy);
 
