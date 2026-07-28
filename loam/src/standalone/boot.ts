@@ -592,6 +592,10 @@ class SkeinRouter {
     if (!hash || hash === this.narthexDocId) {
       // empty hash or explicit narthex hash → go to narthex
       await this.navigateToNarthex();
+      // only on the very first navigation of this page load — see
+      // maybeAutoOpenSocialForNewUser()'s doc comment for why this never
+      // re-triggers on a later manual visit back to the narthex.
+      if (isColdOpen) this.maybeAutoOpenSocialForNewUser();
     } else if (hash.startsWith("share/")) {
       // share URL — decode and join
       const decoded = decodeShareString(hash);
@@ -1009,6 +1013,28 @@ class SkeinRouter {
       // this navigation — consume it
       this.pendingNavToNarthex = false;
     }
+  }
+
+  /**
+   * on a brand new install — no identity generated yet, and no canvases
+   * created yet — auto-opens the social panel on the narthex so setting up
+   * a profile and generating an identity is the first thing a new user
+   * sees, rather than an empty narthex with no obvious next step. only
+   * ever called from the initial cold-boot navigation (see
+   * `isColdOpen`/`isInitialNavigation` in `onHashChange()`) — closing the
+   * panel afterward, or navigating away and back to the narthex, never
+   * reopens it on its own, even if the user still hasn't finished setup.
+   */
+  private maybeAutoOpenSocialForNewUser(): void {
+    if (this.localNodeId) return; // identity already generated
+    if (!this.currentSocialOverlay || this.currentSocialOverlay.isOpen) return;
+    const hasCanvases = this.currentCanvas?.store
+      .allWidgets()
+      .some((w) => w.type === "canvas-card");
+    if (hasCanvases) return;
+    const sw = window.visualViewport?.width ?? window.innerWidth;
+    this.currentMessagesOverlay?.close();
+    this.currentSocialOverlay.toggle(sw);
   }
 
   /**
