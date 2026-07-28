@@ -38,6 +38,12 @@ export interface WidgetFrameCallbacks {
   onDragDelta?: (dx: number, dy: number) => void;
   /** batch drag: emitted when the drag finishes */
   onDragEnd?: () => void;
+  /** emitted on every move with the pointer's own world-space position
+   *  (not the dragged widget's position/center) — drop-target hit testing
+   *  uses this so oversized widgets (e.g. doodle canvases much bigger than
+   *  a bin) can be dropped based on where the cursor actually is, rather
+   *  than requiring the widget's center point to land inside the target. */
+  onDragPointerMove?: (worldX: number, worldY: number) => void;
   /** true if the local peer has view-only access — disables drag/resize
    *  entirely (not just the persisted mutation) so there's no visual
    *  desync between the frame and the store. */
@@ -960,6 +966,14 @@ export class WidgetFrame {
 
     // emit delta for batch drag of other selected widgets
     this.callbacks.onDragDelta?.(dx, dy);
+
+    // emit the pointer's own world-space position for drop-target hit
+    // testing, so the check isn't tied to this (possibly oversized)
+    // widget's own center point
+    if (this.root.parent) {
+      const worldPoint = this.root.parent.toLocal(e.global);
+      this.callbacks.onDragPointerMove?.(worldPoint.x, worldPoint.y);
+    }
   }
 
   private finishDrag(): void {

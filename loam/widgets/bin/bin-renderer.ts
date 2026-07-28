@@ -57,9 +57,6 @@ export class BinRenderer {
   private slotHighlight: Graphics;
   private highlightedSlot: SlotPosition | null = null;
 
-  /** grid slot outlines — visible on hover to show drop targets */
-  private gridOutlines: Graphics;
-
   /** shared table-like border lines drawn across all occupied cells */
   private cellBordersOverlay: Graphics;
 
@@ -83,6 +80,12 @@ export class BinRenderer {
   /** current scroll offset — used by drop target to convert world coords to content coords in drawer mode */
   getScrollOffset(): number {
     return this.mode === "drawer" ? this.scrollY : 0;
+  }
+
+  /** effective cell-border width for layout purposes — 0 unless cell
+   *  borders are actually enabled, regardless of the stored width value. */
+  private get effectiveCellBorderWidth(): number {
+    return this.cellBordersEnabled ? this.cellBorderWidth : 0;
   }
 
   private destroyed = false;
@@ -111,12 +114,6 @@ export class BinRenderer {
 
     this.container = new Container();
     this.container.label = "bin-renderer";
-
-    // grid slot outlines — behind cards, visible on hover
-    this.gridOutlines = new Graphics();
-    this.gridOutlines.visible = false;
-    this.gridOutlines.label = "grid-outlines";
-    this.container.addChild(this.gridOutlines);
 
     // cell border grid lines — shared table-like borders between cells,
     // drawn once per render() pass rather than per-card
@@ -188,12 +185,6 @@ export class BinRenderer {
       this.teardownDrawerScroll();
     }
 
-    // ensure grid outlines are in the correct parent (scrollInner for drawer, container for others)
-    if (this.gridOutlines.parent !== this.cardParent) {
-      this.gridOutlines.parent?.removeChild(this.gridOutlines);
-      this.cardParent.addChild(this.gridOutlines);
-    }
-
     // ensure the cell borders overlay is in the correct parent, and drawn
     // behind the cards added below
     if (this.cellBordersOverlay.parent !== this.cardParent) {
@@ -241,7 +232,7 @@ export class BinRenderer {
     }
 
     // compute total content height for scroll
-    const opts: SlotSizeOptions = { scale: this.scale };
+    const opts: SlotSizeOptions = { scale: this.scale, cellBorderWidth: this.effectiveCellBorderWidth };
     // in drawer mode, items are remapped to sequential rows — use actual item count
     const effectiveRows = mode === "drawer" ? mappedItems.length : _rows;
     const contentDims = contentDimensions(
@@ -261,9 +252,6 @@ export class BinRenderer {
 
     // redraw the shared cell-border grid lines for the new layout
     this.drawCellBorders(Math.max(1, _cols), effectiveRows);
-
-    // redraw grid outlines for the new layout
-    this.drawGridOutlines(Math.max(1, _cols), _rows);
 
     // bring highlight to front
     this.container.removeChild(this.slotHighlight);
@@ -288,7 +276,7 @@ export class BinRenderer {
       return; // already highlighting this slot
     }
 
-    const opts: SlotSizeOptions = { scale: this.scale };
+    const opts: SlotSizeOptions = { scale: this.scale, cellBorderWidth: this.effectiveCellBorderWidth };
     const rect = slotRect(this.mode, slot, this.contentWidth, opts);
     this.slotHighlight.clear();
     this.slotHighlight
@@ -296,27 +284,6 @@ export class BinRenderer {
       .stroke({ width: 2, color: 0xff1a9e, alpha: 0.8 });
     this.slotHighlight.visible = true;
     this.highlightedSlot = slot;
-  }
-
-  /** show or hide the slot grid outlines */
-  setGridVisible(visible: boolean): void {
-    this.gridOutlines.visible = visible;
-  }
-
-  /** redraw the slot grid outlines for the current layout */
-  private drawGridOutlines(cols: number, rows: number): void {
-    this.gridOutlines.clear();
-
-    const opts: SlotSizeOptions = { scale: this.scale };
-
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const rect = slotRect(this.mode, { col: c, row: r }, this.contentWidth, opts);
-        this.gridOutlines
-          .roundRect(rect.x, rect.y, rect.width, rect.height, 3)
-          .stroke({ width: 1, color: 0x333333, alpha: 0.5 });
-      }
-    }
   }
 
   /**
@@ -328,7 +295,7 @@ export class BinRenderer {
     this.cellBordersOverlay.clear();
     if (!this.cellBordersEnabled || this.cellBorderWidth <= 0) return;
 
-    const opts: SlotSizeOptions = { scale: this.scale };
+    const opts: SlotSizeOptions = { scale: this.scale, cellBorderWidth: this.effectiveCellBorderWidth };
     const color = this.cellBorderColor !== -1 ? this.cellBorderColor : SLOT_BORDER_COLOR;
     const width = this.cellBorderWidth;
     const half = width / 2;
@@ -393,7 +360,6 @@ export class BinRenderer {
       this.removeCard(id);
     }
 
-    this.gridOutlines.destroy();
     this.cellBordersOverlay.destroy();
     this.slotHighlight.destroy();
     this.container.destroy({ children: true });
@@ -499,6 +465,8 @@ export class BinRenderer {
       scale: this.scale,
       shelfTextOrigin: this.shelfTextOrigin,
       visibleHeight: this.visibleHeight,
+      cellBordersEnabled: this.cellBordersEnabled,
+      cellBorderWidth: this.cellBorderWidth,
       loadCardTexture: (url) => this.loadCardTexture(url),
       isAlive: (wid) => !this.destroyed && this.cards.has(wid),
       updateThumbSprite: (wid, sprite) => {

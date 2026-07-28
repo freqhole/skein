@@ -27,6 +27,29 @@ export interface SlotPosition {
 export interface SlotSizeOptions {
   /** scale multiplier (default 1.0) — applied to base slot dimensions */
   scale?: number;
+  /** cell border stroke width (px), grid mode only — cells shrink to make
+   *  room for the shared border lines instead of the border overlapping
+   *  cell content. 0 (or omitted) means no shrinkage. */
+  cellBorderWidth?: number;
+}
+
+/** inset (px) subtracted from a cell's own footprint per side when cell
+ *  borders are enabled — capped so a very thick border still leaves a
+ *  usable cell. `maxInset` scales the cap to the mode's own (much smaller,
+ *  for shelf/crate/drawer) base slot size, so the same border width
+ *  doesn't shrink a 28px-tall row as aggressively as an 84px grid cell. */
+export function cellBorderInset(cellBorderWidth?: number, maxInset = 16): number {
+  if (!cellBorderWidth || cellBorderWidth <= 0) return 0;
+  return Math.min(cellBorderWidth, maxInset);
+}
+
+/** resolve the effective cell-border width to use for layout — 0 unless
+ *  cell borders are actually enabled. */
+export function resolveCellBorderWidth(
+  enabled: boolean | undefined,
+  width: number | undefined
+): number {
+  return enabled ? (width ?? 0) : 0;
 }
 
 /** pixel coordinates of a slot's top-left corner (relative to content area) */
@@ -44,23 +67,31 @@ export function slotSize(
 ): { width: number; height: number } {
   const s = options?.scale ?? 1.0;
   switch (mode) {
-    case "grid":
+    case "grid": {
+      const inset = cellBorderInset(options?.cellBorderWidth, 16) * 2;
       return {
-        width: Math.round(GRID_CELL_SIZE * s),
-        height: Math.round(GRID_CELL_SIZE * s) + GRID_LABEL_HEIGHT,
+        width: Math.round(GRID_CELL_SIZE * s) - inset,
+        height: Math.round(GRID_CELL_SIZE * s) - inset + GRID_LABEL_HEIGHT,
       };
-    case "shelf":
+    }
+    case "shelf": {
+      const inset = cellBorderInset(options?.cellBorderWidth, Math.floor(SHELF_SLOT_W * 0.3)) * 2;
       return {
-        width: Math.round(SHELF_SLOT_W * s),
-        height: Math.round(SHELF_SLOT_H * s),
+        width: Math.round(SHELF_SLOT_W * s) - inset,
+        height: Math.round(SHELF_SLOT_H * s) - inset,
       };
-    case "crate":
+    }
+    case "crate": {
+      const inset = cellBorderInset(options?.cellBorderWidth, Math.floor(CRATE_SLOT_H * 0.3)) * 2;
       return {
-        width: Math.round(CRATE_SLOT_W * s),
-        height: Math.round(CRATE_SLOT_H * s),
+        width: Math.round(CRATE_SLOT_W * s) - inset,
+        height: Math.round(CRATE_SLOT_H * s) - inset,
       };
-    case "drawer":
-      return { width: 0, height: Math.round(DRAWER_ROW_H * s) };
+    }
+    case "drawer": {
+      const inset = cellBorderInset(options?.cellBorderWidth, Math.floor(DRAWER_ROW_H * 0.3)) * 2;
+      return { width: 0, height: Math.round(DRAWER_ROW_H * s) - inset };
+    }
   }
 }
 
@@ -170,10 +201,11 @@ export function slotRect(
 
   if (mode === "drawer") {
     // drawer: full width rows stacked vertically
+    const inset = cellBorderInset(options?.cellBorderWidth, Math.floor(DRAWER_ROW_H * 0.3)) * 2;
     return {
       x: 0,
       y: slot.row * (size.height + gap),
-      width: contentWidth,
+      width: contentWidth - inset,
       height: size.height,
     };
   }

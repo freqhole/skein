@@ -17,7 +17,7 @@ export const SLOT_SCALE_MULTIPLIERS: Record<SlotScale, number> = {
 // -- grid mode (square tiles) ------------------------------------------------
 
 /** grid cell size in pixels (square) */
-export const GRID_CELL_SIZE = 96;
+export const GRID_CELL_SIZE = 84;
 
 /** padding between cells in grid mode */
 export const GRID_GAP = 4;

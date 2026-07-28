@@ -19,8 +19,10 @@ import {
   autoFitCols,
   computeGridBounds,
   computeRows,
+  contentDimensions,
   firstEmptySlot,
   hitTestSlot,
+  resolveCellBorderWidth,
   resolveScale,
   type BinMode,
   type SlotSizeOptions,
@@ -66,8 +68,12 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       options: ["s", "m", "l", "xl"],
       default: "m",
     },
-    {
-      key: "shelfTextOrigin",
+    {      key: "bgColor",
+      label: "background",
+      type: "color",
+      default: -1,
+    },
+    {      key: "shelfTextOrigin",
       label: "shelf text",
       type: "select",
       options: ["top", "bottom"],
@@ -118,13 +124,28 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
     const store = ctx.canvasStore ?? null;
     const repo: Repo | null = store?.repo ?? null;
 
+    // -- background ------------------------------------------------------------
+    // an optional solid fill for the bin itself, drawn behind the cover
+    // thumbnail and outer border — -1 means transparent (no fill).
+
+    const bgGfx = new Graphics();
+    container.addChildAt(bgGfx, 0);
+
+    function drawBg(width: number, height: number) {
+      const state = ctx.doc.current;
+      bgGfx.clear();
+      if (state.bgColor === -1) return;
+      bgGfx.rect(0, 0, width, height).fill({ color: state.bgColor });
+    }
+
     // -- outer border ---------------------------------------------------------
-    // drawn behind everything else — visible whenever borderWidth > 0 and
-    // borderColor isn't -1 ("none"). independent of the empty-state dashed
-    // border, which is only shown while the bin has no children.
+    // drawn behind everything else except the background fill — visible
+    // whenever borderWidth > 0 and borderColor isn't -1 ("none"). independent
+    // of the empty-state dashed border, which is only shown while the bin has
+    // no children.
 
     const outerBorder = new Graphics();
-    container.addChildAt(outerBorder, 0);
+    container.addChildAt(outerBorder, 1);
 
     function drawOuterBorder(width: number, height: number) {
       const state = ctx.doc.current;
@@ -144,7 +165,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
     const coverSprite = new Sprite(Texture.EMPTY);
     coverSprite.visible = false;
-    container.addChildAt(coverSprite, 0);
+    container.addChildAt(coverSprite, 1);
     let lastCoverUrl = "";
 
     function fitCoverSprite(width: number, height: number) {
@@ -205,7 +226,9 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       const mode = state.mode as BinMode;
       const scale = resolveScale(state.slotScale as SlotScale);
       const contentWidth = currentWidth - BIN_PADDING * 2;
-      const cols = autoFitCols(mode, contentWidth, { scale });
+      const cellBorderWidth = resolveCellBorderWidth(state.cellBorders, state.borderWidth);
+      const cols = autoFitCols(mode, contentWidth, { scale, cellBorderWidth });
+      const rows = computeRows(state.items.length, cols);
 
       ctx.doc.change((draft) => {
         for (let i = 0; i < draft.items.length; i++) {
@@ -215,8 +238,17 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
           };
         }
         draft.cols = cols;
-        draft.rows = computeRows(draft.items.length, cols);
+        draft.rows = rows;
       });
+
+      // resize the bin widget itself to the ideal size for this tidy layout —
+      // fits exactly the tidied grid instead of leaving leftover empty space
+      if (store) {
+        const dims = contentDimensions(mode, cols, rows, contentWidth, { scale, cellBorderWidth });
+        const idealWidth = Math.round(dims.width + BIN_PADDING * 2);
+        const idealHeight = Math.round(dims.height + BIN_PADDING * 2);
+        store.resizeWidget(ctx.widgetId, idealWidth, idealHeight);
+      }
     }
 
     // -- header actions ------------------------------------------------------
@@ -296,6 +328,11 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       emptyBorder.clear();
       emptyBorder
         .roundRect(BIN_PADDING, BIN_PADDING, width - BIN_PADDING * 2, contentH - BIN_PADDING * 2, 4)
+        // invisible fill (alpha 0) so the whole empty-state box is a real hit
+        // target, not just the stroke outline — otherwise hovering the
+        // interior misses pixi's bounds-based hit test (no drawn geometry
+        // there) and the widget frame's header/toolbar never shows.
+        .fill({ color: 0x000000, alpha: 0 })
         .stroke({ width: 1, color: 0x2a2a2a, alpha: 0.6 });
 
       emptyText.anchor.set(0.5);
@@ -306,6 +343,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
     function layout(width: number, height: number) {
       if (destroyed) return;
 
+      drawBg(width, height);
       drawOuterBorder(width, height);
       void updateCoverSprite(width, height);
 
@@ -315,7 +353,10 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
       const scale = resolveScale(state.slotScale as SlotScale);
       const contentWidth = width - BIN_PADDING * 2;
-      const layoutOptions: SlotSizeOptions = { scale };
+      const layoutOptions: SlotSizeOptions = {
+        scale,
+        cellBorderWidth: resolveCellBorderWidth(state.cellBorders, state.borderWidth),
+      };
 
       const minCols = autoFitCols(mode, contentWidth, layoutOptions);
       const bounds = computeGridBounds(items, minCols);
@@ -367,7 +408,10 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       const state = ctx.doc.current;
       const scale = resolveScale(state.slotScale as SlotScale);
       const contentWidth = currentWidth - BIN_PADDING * 2;
-      const cols = autoFitCols(state.mode as BinMode, contentWidth, { scale });
+      const cols = autoFitCols(state.mode as BinMode, contentWidth, {
+        scale,
+        cellBorderWidth: resolveCellBorderWidth(state.cellBorders, state.borderWidth),
+      });
       const currentItems = [...state.items];
 
       for (const file of picked) {
@@ -490,35 +534,6 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       });
     }
 
-    function handleSetCoverFromChild() {
-      if (ctx.canvasStore?.isLocalViewer()) return;
-      if (!repo || !registry || !store) return;
-
-      for (const item of ctx.doc.current.items) {
-        const entry = store.getWidget(item.widgetId);
-        if (!entry?.docId) continue;
-        const factory = registry.get(entry.type);
-        if (!factory?.getCompactInfo) continue;
-
-        try {
-          const handle = repo.handles[entry.docId as DocumentId];
-          const rawDoc = handle?.doc();
-          if (!rawDoc) continue;
-          const childState = factory.schema ? factory.schema.parse(rawDoc) : rawDoc;
-          const info = factory.getCompactInfo(childState);
-          if (info.thumbnailUrl) {
-            const thumbnailUrl = info.thumbnailUrl;
-            ctx.doc.change((draft) => {
-              draft.coverThumbnailDataUrl = thumbnailUrl;
-            });
-            return;
-          }
-        } catch (err) {
-          log.warn("bin", "handleSetCoverFromChild: failed to read child doc", err);
-        }
-      }
-    }
-
     function handleRemoveCover() {
       if (ctx.canvasStore?.isLocalViewer()) return;
       ctx.doc.change((draft) => {
@@ -573,7 +588,10 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
               const scale = resolveScale(state.slotScale as SlotScale);
               const cols = Math.max(1, state.cols);
               const contentWidth = entry.width - BIN_PADDING * 2;
-              const layoutOptions: SlotSizeOptions = { scale };
+              const layoutOptions: SlotSizeOptions = {
+                scale,
+                cellBorderWidth: resolveCellBorderWidth(state.cellBorders, state.borderWidth),
+              };
 
               // convert to content-local coordinates
               const localX = worldX - entry.x - BIN_PADDING;
@@ -648,7 +666,10 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
               const scale = resolveScale(state.slotScale as SlotScale);
               const cols = Math.max(1, state.cols);
               const contentWidth = entry.width - BIN_PADDING * 2;
-              const layoutOptions: SlotSizeOptions = { scale };
+              const layoutOptions: SlotSizeOptions = {
+                scale,
+                cellBorderWidth: resolveCellBorderWidth(state.cellBorders, state.borderWidth),
+              };
 
               const localX = worldX - entry.x - BIN_PADDING;
               let localY = worldY - entry.y - BIN_PADDING;
@@ -737,15 +758,6 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
         const peers = ctx.canvasStore?.peers();
         return peers as Record<string, { nodeId: string }> | undefined;
       });
-
-      // show slot outlines on hover so the user can see drop targets
-      container.eventMode = "static";
-      container.on("pointerenter", () => {
-        renderer?.setGridVisible(true);
-      });
-      container.on("pointerleave", () => {
-        renderer?.setGridVisible(false);
-      });
     }
 
     // initial layout
@@ -766,9 +778,8 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
       widgetActions: [
         { id: "tidy", label: "tidy", onClick: handleTidy },
-        { id: "cover-pick", label: "cover: choose image", onClick: handleSetCoverFromFile },
-        { id: "cover-auto", label: "cover: from first item", onClick: handleSetCoverFromChild },
-        { id: "cover-remove", label: "cover: remove", onClick: handleRemoveCover },
+        { id: "cover-pick", label: "choose bg image", onClick: handleSetCoverFromFile },
+        { id: "cover-remove", label: "remove bg image", onClick: handleRemoveCover },
       ],
 
       resize(width: number, height: number) {
@@ -815,7 +826,10 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
               const scale = resolveScale(state.slotScale as SlotScale);
               const cols = Math.max(1, state.cols);
               const contentWidth = entry.width - BIN_PADDING * 2;
-              const layoutOptions: SlotSizeOptions = { scale };
+              const layoutOptions: SlotSizeOptions = {
+                scale,
+                cellBorderWidth: resolveCellBorderWidth(state.cellBorders, state.borderWidth),
+              };
 
               // convert world coordinates to content-local coordinates.
               // the content area starts at (entry.x + BIN_PADDING, entry.y + BIN_PADDING).
@@ -870,7 +884,10 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
               const scale = resolveScale(state.slotScale as SlotScale);
               const cols = Math.max(1, state.cols);
               const contentWidth = entry.width - BIN_PADDING * 2;
-              const layoutOptions: SlotSizeOptions = { scale };
+              const layoutOptions: SlotSizeOptions = {
+                scale,
+                cellBorderWidth: resolveCellBorderWidth(state.cellBorders, state.borderWidth),
+              };
 
               // convert to content-local coordinates
               const localX = worldX - entry.x - BIN_PADDING;

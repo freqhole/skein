@@ -81,6 +81,12 @@ export interface CardBuildContext {
   shelfTextOrigin: "top" | "bottom";
   /** visible area height — used by shelf mode to match spine height to container */
   visibleHeight: number;
+  /** whether the bin's shared cell-border grid lines are enabled — grid mode
+   *  uses this to inset cell contents further so they don't render flush
+   *  against the shared border lines */
+  cellBordersEnabled: boolean;
+  /** the cell border stroke width (px), used to scale the content inset */
+  cellBorderWidth: number;
 
   // -- async callbacks (the builder kicks off texture loads, these update state) --
 

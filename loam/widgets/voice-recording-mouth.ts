@@ -543,7 +543,10 @@ export async function renderMouthSnapshot(options: MouthSnapshotOptions): Promis
       options.teethStyle,
       options.cupidBowAmount
     );
-    const dataUrl = await renderSnapshot(stage, SNAPSHOT_SIZE, SNAPSHOT_SIZE, "webp");
+    // rendered at 3x resolution so the thumbnail stays sharp even when the
+    // canvas is zoomed in well past 100% (the mouth is small on-screen at
+    // rest, so it gets zoomed in a lot more often than other thumbnails)
+    const dataUrl = await renderSnapshot(stage, SNAPSHOT_SIZE, SNAPSHOT_SIZE, "webp", 3);
     mouth.destroy();
     stage.destroy({ children: true });
     return dataUrl;

@@ -6,19 +6,30 @@ import { autoDetectRenderer, Rectangle, type Container, type Renderer } from "pi
 
 const renderers = new Map<string, Promise<Renderer>>();
 
-function rendererKey(width: number, height: number): string {
-  return `${width}x${height}`;
+function rendererKey(width: number, height: number, resolution: number): string {
+  return `${width}x${height}@${resolution}`;
 }
 
 /** get (or lazily create) a shared offscreen renderer for the given pixel
- *  size. renderers are cached and reused across snapshot calls — creating a
- *  new gpu context per snapshot is wasteful and risks hitting the browser's
- *  concurrent-webgl-context limit. */
-function getOffscreenRenderer(width: number, height: number): Promise<Renderer> {
-  const key = rendererKey(width, height);
+ *  size and resolution. renderers are cached and reused across snapshot
+ *  calls — creating a new gpu context per snapshot is wasteful and risks
+ *  hitting the browser's concurrent-webgl-context limit. */
+function getOffscreenRenderer(width: number, height: number, resolution: number): Promise<Renderer> {
+  const key = rendererKey(width, height, resolution);
   let existing = renderers.get(key);
   if (!existing) {
-    existing = autoDetectRenderer({ width, height, backgroundAlpha: 0, antialias: true });
+    // antialias off — antialiased edges over a transparent backdrop can
+    // read back with a dark fringe around filled shapes (premultiplied-alpha
+    // mismatch on canvas readback). a higher-resolution raster (see the
+    // `resolution` param) more than makes up for the lack of AA once the
+    // thumbnail is scaled back down for display.
+    existing = autoDetectRenderer({
+      width,
+      height,
+      resolution,
+      backgroundAlpha: 0,
+      antialias: false,
+    });
     renderers.set(key, existing);
   }
   return existing;
@@ -39,10 +50,11 @@ export async function renderSnapshot(
   container: Container,
   width: number,
   height: number,
-  format: "webp" | "png" = "webp"
+  format: "webp" | "png" = "webp",
+  resolution = 1
 ): Promise<string | null> {
   try {
-    const renderer = await getOffscreenRenderer(width, height);
+    const renderer = await getOffscreenRenderer(width, height, resolution);
     return await renderer.extract.base64({
       target: container,
       format,

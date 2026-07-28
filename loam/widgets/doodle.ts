@@ -286,7 +286,9 @@ async function renderDoodleSnapshot(
   }
   stage.addChild(strokeLayer);
 
-  const dataUrl = await renderSnapshot(stage, DOODLE_SNAPSHOT_SIZE, DOODLE_SNAPSHOT_SIZE, "webp");
+  // rendered at 3x resolution so the thumbnail stays sharp when the canvas
+  // is zoomed in well past 100%
+  const dataUrl = await renderSnapshot(stage, DOODLE_SNAPSHOT_SIZE, DOODLE_SNAPSHOT_SIZE, "webp", 3);
   stage.destroy({ children: true });
   return dataUrl;
 }
