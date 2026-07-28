@@ -1,11 +1,13 @@
 //! blob thumbnail generation for the `blob_thumbnail` dispatch action.
 //!
-//! supports three source types:
+//! supports four source types:
 //! - image/*: decoded + resized in-process via the `image` crate (through
 //!   `freqhole_reliquary::media`), returned as webp.
 //! - application/pdf: rasterizes the first page via `magick` (same subprocess
 //!   pattern as `pdf.rs`), returned as png.
 //! - video/*: extracts a frame at ~1% of the duration via ffprobe + ffmpeg,
+//!   returned as png.
+//! - audio/*: renders a waveform image via ffmpeg's `showwavespic` filter,
 //!   returned as png.
 //! - everything else: returns `{ data: null }`.
 
@@ -40,9 +42,30 @@ pub async fn generate_thumbnail(
         thumbnail_pdf(blob_path, size).await
     } else if mime.starts_with("video/") {
         thumbnail_video(blob_path, size).await
+    } else if mime.starts_with("audio/") {
+        thumbnail_audio(blob_path, size).await
     } else {
         Ok(json!({ "data": null }))
     }
+}
+
+// ---------------------------------------------------------------------------
+// ffmpeg / ffprobe resolution
+// ---------------------------------------------------------------------------
+
+/// resolve a runnable path/name for `ffmpeg`, falling back to common install
+/// directories a GUI-launched app's `PATH` typically omits (see
+/// `crate::pdf::resolve_binary`'s doc comment for why: apps launched from
+/// Finder/Dock/Spotlight inherit a minimal launchd `PATH` that doesn't see
+/// homebrew/macports install locations even though a terminal in the same
+/// session finds `ffmpeg` fine).
+async fn resolve_ffmpeg() -> Option<String> {
+    crate::pdf::resolve_binary("ffmpeg", "-version").await
+}
+
+/// resolve a runnable path/name for `ffprobe` — same fallback as `ffmpeg`.
+async fn resolve_ffprobe() -> Option<String> {
+    crate::pdf::resolve_binary("ffprobe", "-version").await
 }
 
 // ---------------------------------------------------------------------------
@@ -116,8 +139,14 @@ async fn thumbnail_pdf(path: &Path, size: u32) -> Result<Value, ThumbnailError> 
 // ---------------------------------------------------------------------------
 
 async fn thumbnail_video(path: &Path, size: u32) -> Result<Value, ThumbnailError> {
+    let Some(ffprobe) = resolve_ffprobe().await else {
+        return Err(ThumbnailError::Image(
+            "ffprobe not found — install ffmpeg".to_string(),
+        ));
+    };
+
     // probe duration first
-    let probe_out = Command::new("ffprobe")
+    let probe_out = Command::new(&ffprobe)
         .args([
             "-v",
             "error",
@@ -154,11 +183,18 @@ async fn thumbnail_video(path: &Path, size: u32) -> Result<Value, ThumbnailError
     let work_dir = std::env::temp_dir().join(format!("skein_vthumb_{run_id}"));
     tokio::fs::create_dir_all(&work_dir).await?;
 
+    let Some(ffmpeg) = resolve_ffmpeg().await else {
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+        return Err(ThumbnailError::Image(
+            "ffmpeg not found — install ffmpeg".to_string(),
+        ));
+    };
+
     let output_path = work_dir.join("frame.png");
     let scale_filter = format!("scale={size}:-2");
     let seek_str = format!("{seek_secs:.3}");
 
-    let ffmpeg_out = Command::new("ffmpeg")
+    let ffmpeg_out = Command::new(&ffmpeg)
         .args(["-ss", &seek_str, "-i"])
         .arg(path)
         .args(["-frames:v", "1", "-vf", &scale_filter, "-f", "image2"])
@@ -184,6 +220,66 @@ async fn thumbnail_video(path: &Path, size: u32) -> Result<Value, ThumbnailError
     if !ffmpeg_out.status.success() {
         let stderr = String::from_utf8_lossy(&ffmpeg_out.stderr).to_string();
         warn!(stderr = %stderr, "ffmpeg video thumbnail failed");
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+        return Err(ThumbnailError::Image(format!("ffmpeg failed: {stderr}")));
+    }
+
+    let png_bytes = tokio::fs::read(&output_path).await;
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    let png_bytes = png_bytes?;
+
+    Ok(json!({ "data": B64.encode(&png_bytes), "mime": "image/png" }))
+}
+
+// ---------------------------------------------------------------------------
+// audio (waveform image via ffmpeg's showwavespic filter)
+// ---------------------------------------------------------------------------
+
+async fn thumbnail_audio(path: &Path, size: u32) -> Result<Value, ThumbnailError> {
+    let Some(ffmpeg) = resolve_ffmpeg().await else {
+        return Err(ThumbnailError::Image(
+            "ffmpeg not found — install ffmpeg".to_string(),
+        ));
+    };
+
+    let run_id = uuid_like();
+    let work_dir = std::env::temp_dir().join(format!("skein_athumb_{run_id}"));
+    tokio::fs::create_dir_all(&work_dir).await?;
+
+    let output_path = work_dir.join("waveform.png");
+    // a 4:1 aspect ratio (matching tomb's charnel waveform renderer) reads
+    // better as a scrubber/preview strip than a square image would.
+    let width = size * 4;
+    let height = size;
+    let filter = format!(
+        "color=black:s={width}x{height}[bg];[0:a]showwavespic=s={width}x{height}:colors=0xff00ff[fg];[bg][fg]overlay=format=auto"
+    );
+
+    let ffmpeg_out = Command::new(&ffmpeg)
+        .arg("-i")
+        .arg(path)
+        .args(["-filter_complex", &filter, "-frames:v", "1", "-y"])
+        .arg(&output_path)
+        .output()
+        .await;
+
+    let ffmpeg_out = match ffmpeg_out {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let _ = tokio::fs::remove_dir_all(&work_dir).await;
+            return Err(ThumbnailError::Image(
+                "ffmpeg not found — install ffmpeg".to_string(),
+            ));
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(&work_dir).await;
+            return Err(ThumbnailError::Io(e));
+        }
+    };
+
+    if !ffmpeg_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ffmpeg_out.stderr).to_string();
+        warn!(stderr = %stderr, "ffmpeg waveform thumbnail failed");
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
         return Err(ThumbnailError::Image(format!("ffmpeg failed: {stderr}")));
     }

@@ -1,6 +1,7 @@
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { Assets, Container, Graphics, Rectangle, Texture } from "pixi.js";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
+import { isGifDataUrl } from "../../src/widgets/gif-utils";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import type { CompactInfo } from "../../src/widgets/widget-types";
 import { buildCard } from "./bin-card-builders";
@@ -435,7 +436,18 @@ export class BinRenderer {
    */
   private async loadCardTexture(url: string): Promise<Texture | null> {
     try {
-      const tex = await Assets.load<Texture>(url);
+      let tex: Texture;
+      if (isGifDataUrl(url)) {
+        // pixi's Assets loader has no gif support at all (it throws for any
+        // image/gif source, static or animated) — decode just the first frame
+        // via the browser's native gif decoder instead. bin cards are static
+        // previews, so one frame is all that's needed here.
+        const blob = await fetch(url).then((r) => r.blob());
+        const bitmap = await createImageBitmap(blob);
+        tex = Texture.from(bitmap);
+      } else {
+        tex = await Assets.load<Texture>(url);
+      }
       // guard against invalid GPU sources that cause addressModeU / alphaMode crashes
       if (!tex || !tex.source?.style) {
         // only unload non-data: URLs — data: thumbnails are shared across consumers

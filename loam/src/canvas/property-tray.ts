@@ -9,7 +9,7 @@ import {
   type FederatedPointerEvent,
 } from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
-import { pickImageAsDataUrl } from "@freqhole/reliquary/utils";
+import { pickImageOrGifAsDataUrl } from "../widgets/gif-utils";
 
 import { createSkeinInput } from "../widgets/skein-input";
 import type { WidgetRegistry } from "../widgets/widget-registry";
@@ -1920,7 +1920,7 @@ export class PropertyTray {
     uploadBtn.on("pointertap", async (e: any) => {
       e.stopPropagation();
       this.closeActivePopup();
-      const dataUrl = await pickImageAsDataUrl({
+      const dataUrl = await pickImageOrGifAsDataUrl({
         maxWidth: prop.imageMaxWidth ?? 320,
         maxHeight: prop.imageMaxHeight ?? 200,
         quality: 0.8,
