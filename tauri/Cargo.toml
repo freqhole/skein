@@ -30,7 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
-iroh = "1.0.1"
+iroh = "1.0.3"
 iroh-blobs = "0.103.0"
 n0-future = "0.3"
 base64 = "0.22"
