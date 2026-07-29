@@ -90,12 +90,8 @@ pub struct HubKnockSummary {
     /// no separate "knock id" field of its own — it's keyed directly by
     /// the requester's node id (that's what gives "one outstanding knock
     /// per node id" for free). this field is just that same map key,
-    /// exposed under its own name for this listing's convenience: this is
-    /// a read-only aggregation view (see this module's doc comment on
-    /// `AdminRequest::ListPendingKnocks`) — actually approving or
-    /// declining a knock always goes through the normal
-    /// `canvas-knock-approve`/`canvas-knock-decline` wire messages, which
-    /// carry their own real, wire-level `knockId`.
+    /// exposed under its own name for this listing's convenience, and is
+    /// also the `requester_node_id` `ApproveKnock`/`DeclineKnock` expect.
     pub knock_id: String,
     pub requester_node_id: String,
     pub requester_username: String,
@@ -165,12 +161,30 @@ pub enum AdminRequest {
     DemoteAdmin { node_id: String },
     /// list pending knocks the hub is holding across every canvas doc it
     /// holds — a cross-canvas convenience view, mirroring tomb's
-    /// `PendingKnocksView` aggregation. read-only: actually
-    /// approving/declining a knock goes through the normal
-    /// `canvas-knock-approve`/`canvas-knock-decline` wire messages and
-    /// writes directly to the canvas doc's `pendingKnocks` map, not
-    /// through this admin protocol.
+    /// `PendingKnocksView` aggregation.
     ListPendingKnocks,
+    /// approve a pending knock: grants `role` ("member" or "viewer") on the
+    /// canvas doc's `acl` map and appends an approve decision to
+    /// `pendingKnocks[requester_node_id].decisions` — the same two writes
+    /// the browser-side `approveKnock()` flow makes
+    /// (`standalone/friendz-wiring.ts`), driven remotely through the hub for
+    /// when no admin's own browser is online to act on it. unlike the
+    /// browser flow, this does not establish a friend relationship with the
+    /// requester (that's specific to a peer-to-peer admin accepting someone
+    /// into their own social graph, not the hub) — access is what actually
+    /// matters, and the requester picks up the grant through normal
+    /// automerge sync once the doc change propagates.
+    ApproveKnock {
+        canvas_doc_id: String,
+        requester_node_id: String,
+        role: String,
+    },
+    /// decline a pending knock: appends a decline decision to
+    /// `pendingKnocks[requester_node_id].decisions`. grants no access.
+    DeclineKnock {
+        canvas_doc_id: String,
+        requester_node_id: String,
+    },
     /// report total blob bytes, blob count, and best-effort disk space stats
     /// for the filesystem containing the blob-files directory.
     DiskUsage,
@@ -257,6 +271,11 @@ pub enum AdminResponse {
     /// response to `AdminRequest::ListPendingKnocks`.
     PendingKnocks {
         knocks: Vec<HubKnockSummary>,
+    },
+    /// response to `AdminRequest::ApproveKnock`/`DeclineKnock`.
+    KnockDecided {
+        canvas_doc_id: String,
+        requester_node_id: String,
     },
     /// response to `AdminRequest::DiskUsage`.
     DiskUsage {
@@ -651,6 +670,38 @@ async fn handle_request(
         AdminRequest::ListPendingKnocks => AdminResponse::PendingKnocks {
             knocks: list_pending_knocks(&handler.inner.hub_repo).await,
         },
+        AdminRequest::ApproveKnock {
+            canvas_doc_id,
+            requester_node_id,
+            role,
+        } => {
+            let canvas_doc_id = canvas_doc_id.trim().to_string();
+            let requester_node_id = requester_node_id.trim().to_string();
+            if canvas_doc_id.is_empty() || requester_node_id.is_empty() {
+                return AdminResponse::Error {
+                    message: "canvas_doc_id and requester_node_id cannot be empty".to_string(),
+                };
+            }
+            if role != "member" && role != "viewer" {
+                return AdminResponse::Error {
+                    message: "role must be \"member\" or \"viewer\"".to_string(),
+                };
+            }
+            decide_knock_request(handler, canvas_doc_id, requester_node_id, Some(role)).await
+        }
+        AdminRequest::DeclineKnock {
+            canvas_doc_id,
+            requester_node_id,
+        } => {
+            let canvas_doc_id = canvas_doc_id.trim().to_string();
+            let requester_node_id = requester_node_id.trim().to_string();
+            if canvas_doc_id.is_empty() || requester_node_id.is_empty() {
+                return AdminResponse::Error {
+                    message: "canvas_doc_id and requester_node_id cannot be empty".to_string(),
+                };
+            }
+            decide_knock_request(handler, canvas_doc_id, requester_node_id, None).await
+        }
         AdminRequest::DiskUsage => {
             let usage = match handler.inner.blobz.total_usage().await {
                 Ok(v) => v,
@@ -1122,13 +1173,157 @@ fn remove_self_from_canvas_doc(
     })
 }
 
+/// shared dispatch body for `AdminRequest::ApproveKnock`/`DeclineKnock`:
+/// finds the canvas doc handle, runs [`decide_knock`] inside `spawn_blocking`,
+/// and notifies already-connected peers of the change on success.
+/// `role` is `Some` for an approval, `None` for a decline.
+async fn decide_knock_request(
+    handler: &HubAdminHandler,
+    canvas_doc_id: String,
+    requester_node_id: String,
+    role: Option<String>,
+) -> AdminResponse {
+    let handle = match handler.inner.hub_repo.find(&canvas_doc_id).await {
+        Some(h) => h,
+        None => {
+            return AdminResponse::Error {
+                message: "canvas doc not found".to_string(),
+            }
+        }
+    };
+
+    let hub_node_id = handler.inner.hub_node_id.clone();
+    let cid = canvas_doc_id.clone();
+    let rid = requester_node_id.clone();
+    let ok = tokio::task::spawn_blocking(move || {
+        decide_knock(&handle, &hub_node_id, &cid, &rid, role.as_deref())
+    })
+    .await
+    .unwrap_or(false);
+
+    if !ok {
+        return AdminResponse::Error {
+            message: "knock not found for this requester, or doc not synced yet".to_string(),
+        };
+    }
+
+    handler.inner.hub_repo.notify_doc_changed(&canvas_doc_id);
+    AdminResponse::KnockDecided {
+        canvas_doc_id,
+        requester_node_id,
+    }
+}
+
+/// record an admin decision (approve or decline) on a pending knock, for
+/// `AdminRequest::ApproveKnock`/`DeclineKnock`. mirrors the browser-side
+/// `approveKnock()`/`declineKnock()` flow (`standalone/friendz-wiring.ts`):
+/// approving grants `role` on the canvas doc's `acl` map; both approving and
+/// declining append a decision to `pendingKnocks[requester_node_id].decisions`.
+/// `role` is `None` for a decline. returns `false` if the doc isn't synced
+/// yet or the knock entry doesn't exist (nothing to decide).
+///
+/// runs inside `spawn_blocking` because doc access holds a lock.
+fn decide_knock(
+    handle: &crate::hub_repo::DocHandle,
+    hub_node_id: &str,
+    canvas_doc_id: &str,
+    requester_node_id: &str,
+    role: Option<&str>,
+) -> bool {
+    use automerge::ReadDoc;
+
+    handle.with_document_mut(|doc| {
+        // no version/widgets/title gate here (unlike `write_self_to_canvas_doc`/
+        // `remove_self_from_canvas_doc`): a `pendingKnocks` entry for this
+        // requester existing at all already proves the doc has real synced
+        // content, so the `has_knock` check just below is gate enough.
+        let has_knock = match doc.get(automerge::ROOT, "pendingKnocks") {
+            Ok(Some((_, pending_obj))) => doc
+                .get(&pending_obj, requester_node_id)
+                .ok()
+                .flatten()
+                .is_some(),
+            _ => false,
+        };
+        if !has_knock {
+            tracing::info!(
+                canvas_doc_id,
+                requester_node_id,
+                "decide_knock: no pending knock for this requester"
+            );
+            return false;
+        }
+
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+
+        let result = doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+
+            if let Some(role) = role {
+                let acl_obj = match tx.get(automerge::ROOT, "acl")? {
+                    Some((_, obj)) => obj,
+                    None => tx.put_object(automerge::ROOT, "acl", automerge::ObjType::Map)?,
+                };
+                let entry_obj =
+                    tx.put_object(&acl_obj, requester_node_id, automerge::ObjType::Map)?;
+                tx.put(&entry_obj, "role", role)?;
+            }
+
+            if let Some((_, pending_obj)) = tx.get(automerge::ROOT, "pendingKnocks")? {
+                if let Some((_, knock_obj)) = tx.get(&pending_obj, requester_node_id)? {
+                    let decisions_obj = match tx.get(&knock_obj, "decisions")? {
+                        Some((_, obj)) => obj,
+                        None => tx.put_object(&knock_obj, "decisions", automerge::ObjType::List)?,
+                    };
+                    let index = tx.length(&decisions_obj);
+                    let decision_obj =
+                        tx.insert_object(&decisions_obj, index, automerge::ObjType::Map)?;
+                    tx.put(&decision_obj, "byNodeId", hub_node_id)?;
+                    tx.put(
+                        &decision_obj,
+                        "decision",
+                        if role.is_some() { "approve" } else { "decline" },
+                    )?;
+                    if let Some(role) = role {
+                        tx.put(&decision_obj, "role", role)?;
+                    }
+                    tx.put(&decision_obj, "at", now.as_str())?;
+                }
+            }
+
+            Ok(())
+        });
+
+        match result {
+            Ok(_) => {
+                tracing::info!(
+                    canvas_doc_id,
+                    requester_node_id,
+                    approved = role.is_some(),
+                    "decide_knock: decision recorded"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(canvas_doc_id, error = ?e, "decide_knock: transact failed");
+                false
+            }
+        }
+    })
+}
+
 /// read an avatar blob's bytes out of `blobz` and encode as a
 /// `data:<mime>;base64,...` string, for `AdminRequest::List`'s
 /// `FriendSummary.avatar_data_url`. returns `None` (never a hard error —
 /// this is best-effort presentation data, not something worth failing an
 /// entire `List` request over) if the blob row is missing, has no mime, or
 /// the bytes can't be read.
-async fn build_avatar_data_url(blobz: &Arc<dyn BlobStore>, blake3: &str) -> Option<String> {
+pub(crate) async fn build_avatar_data_url(
+    blobz: &Arc<dyn BlobStore>,
+    blake3: &str,
+) -> Option<String> {
     let blob = blobz.get(blake3).await.ok()??;
     let mime = blob.mime.clone()?;
     let bytes = blobz.read_bytes(blake3).await.ok()??;
@@ -1151,7 +1346,7 @@ async fn build_avatar_data_url(blobz: &Arc<dyn BlobStore>, blake3: &str) -> Opti
 /// fall out of the scan for free without needing to distinguish doc kinds
 /// up front — the same reasoning `send_blob_seek_to_peer` already relies
 /// on for its own root-level field probe.
-async fn list_pending_knocks(hub_repo: &HubRepo) -> Vec<HubKnockSummary> {
+pub(crate) async fn list_pending_knocks(hub_repo: &HubRepo) -> Vec<HubKnockSummary> {
     let doc_ids = hub_repo.all_doc_ids().await;
     let mut summaries = Vec::new();
 
@@ -1248,7 +1443,7 @@ fn read_pending_knocks(
 /// query bytes available to unprivileged users and total bytes on the
 /// filesystem containing `path`. returns `None` on failure or non-unix.
 #[cfg(unix)]
-fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+pub(crate) fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -1263,7 +1458,7 @@ fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
 }
 
 #[cfg(not(unix))]
-fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
+pub(crate) fn disk_space(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -2332,6 +2527,274 @@ mod tests {
         assert!(
             matches!(response, AdminResponse::NotAdmin),
             "non-admin must not receive pending-knock data"
+        );
+    }
+
+    // -- ApproveKnock / DeclineKnock --------------------------------------
+
+    /// build a handler + `HubRepo` pointed at a db path that's already been
+    /// seeded (via `seed_canvas_with_knocks` or a manual transact), so the
+    /// seeded docs are loaded into `HubRepo`'s in-memory map at construction
+    /// time — same requirement `list_pending_knocks_aggregates_across_multiple_canvas_docs`
+    /// documents: seed on disk first, then construct `HubRepo::new`.
+    async fn make_handler_over_seeded_db(
+        db_path: &std::path::Path,
+        tmp: &tempfile::TempDir,
+    ) -> (HubAdminHandler, adminz::Store) {
+        let hub_repo = HubRepo::new("hub-node".to_string(), db_path)
+            .await
+            .expect("HubRepo::new should succeed");
+        let pool = db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let adminz_store = adminz::Store::new(pool.clone());
+        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
+        let userz_dir = userz::Directory::new(haruspex_pool);
+        let blobz_store = Arc::new(SqliteBlobStore::new(pool, tmp.path())) as Arc<dyn BlobStore>;
+        let handler = HubAdminHandler::new(
+            adminz_store.clone(),
+            friendz_store,
+            userz_dir,
+            blobz_store,
+            tmp.path().join("blob-files"),
+            hub_repo,
+            "hub-node".to_string(),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            default_test_hub_profile(),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        (handler, adminz_store)
+    }
+
+    /// read a canvas doc's `acl[node_id].role` and `pendingKnocks[node_id].decisions`
+    /// directly, to assert on `decide_knock`'s writes without needing a
+    /// second admin-protocol round trip.
+    async fn read_acl_role_and_decisions(
+        hub_repo: &HubRepo,
+        canvas_doc_id: &str,
+        node_id: &str,
+    ) -> (Option<String>, Vec<(String, String, Option<String>)>) {
+        use automerge::ReadDoc;
+        let handle = hub_repo
+            .find(canvas_doc_id)
+            .await
+            .expect("doc should exist");
+        let node_id = node_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            handle.with_document(|doc| {
+                let role = match doc.get(automerge::ROOT, "acl") {
+                    Ok(Some((_, acl_obj))) => match doc.get(&acl_obj, node_id.as_str()) {
+                        Ok(Some((_, entry_obj))) => match doc.get(&entry_obj, "role") {
+                            Ok(Some((v, _))) => v.to_str().map(|s| s.to_string()),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                };
+
+                let mut decisions = Vec::new();
+                if let Ok(Some((_, pending_obj))) = doc.get(automerge::ROOT, "pendingKnocks") {
+                    if let Ok(Some((_, knock_obj))) = doc.get(&pending_obj, node_id.as_str()) {
+                        if let Ok(Some((_, decisions_obj))) = doc.get(&knock_obj, "decisions") {
+                            for i in 0..doc.length(&decisions_obj) {
+                                if let Ok(Some((_, decision_obj))) = doc.get(&decisions_obj, i) {
+                                    let by_node_id = doc
+                                        .get(&decision_obj, "byNodeId")
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|(v, _)| v.to_str().map(|s| s.to_string()))
+                                        .unwrap_or_default();
+                                    let decision = doc
+                                        .get(&decision_obj, "decision")
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|(v, _)| v.to_str().map(|s| s.to_string()))
+                                        .unwrap_or_default();
+                                    let role = doc
+                                        .get(&decision_obj, "role")
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|(v, _)| v.to_str().map(|s| s.to_string()));
+                                    decisions.push((by_node_id, decision, role));
+                                }
+                            }
+                        }
+                    }
+                }
+                (role, decisions)
+            })
+        })
+        .await
+        .expect("read_acl_role_and_decisions spawn_blocking should not panic")
+    }
+
+    #[tokio::test]
+    async fn approve_knock_grants_acl_role_and_records_decision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        seed_canvas_with_knocks(
+            &db_path,
+            "canvas-1",
+            &[("req-1", "alice", "hi", "2025-01-01T00:00:00Z")],
+        )
+        .await;
+
+        let (handler, adminz_store) = make_handler_over_seeded_db(&db_path, &tmp).await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let response = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::ApproveKnock {
+                canvas_doc_id: "canvas-1".to_string(),
+                requester_node_id: "req-1".to_string(),
+                role: "member".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            response,
+            AdminResponse::KnockDecided { canvas_doc_id, requester_node_id }
+                if canvas_doc_id == "canvas-1" && requester_node_id == "req-1"
+        ));
+
+        let (role, decisions) =
+            read_acl_role_and_decisions(&handler.inner.hub_repo, "canvas-1", "req-1").await;
+        assert_eq!(
+            role,
+            Some("member".to_string()),
+            "acl role should be granted"
+        );
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].0, "hub-node");
+        assert_eq!(decisions[0].1, "approve");
+        assert_eq!(decisions[0].2, Some("member".to_string()));
+    }
+
+    #[tokio::test]
+    async fn decline_knock_records_decision_without_granting_access() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        seed_canvas_with_knocks(
+            &db_path,
+            "canvas-1",
+            &[("req-1", "alice", "hi", "2025-01-01T00:00:00Z")],
+        )
+        .await;
+
+        let (handler, adminz_store) = make_handler_over_seeded_db(&db_path, &tmp).await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let response = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::DeclineKnock {
+                canvas_doc_id: "canvas-1".to_string(),
+                requester_node_id: "req-1".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(response, AdminResponse::KnockDecided { .. }));
+
+        let (role, decisions) =
+            read_acl_role_and_decisions(&handler.inner.hub_repo, "canvas-1", "req-1").await;
+        assert_eq!(role, None, "declining must not grant an acl role");
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].0, "hub-node");
+        assert_eq!(decisions[0].1, "decline");
+        assert_eq!(decisions[0].2, None);
+    }
+
+    #[tokio::test]
+    async fn approve_knock_rejects_invalid_role() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        seed_canvas_with_knocks(
+            &db_path,
+            "canvas-1",
+            &[("req-1", "alice", "hi", "2025-01-01T00:00:00Z")],
+        )
+        .await;
+
+        let (handler, adminz_store) = make_handler_over_seeded_db(&db_path, &tmp).await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let response = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::ApproveKnock {
+                canvas_doc_id: "canvas-1".to_string(),
+                requester_node_id: "req-1".to_string(),
+                role: "admin".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(response, AdminResponse::Error { .. }));
+
+        let (role, decisions) =
+            read_acl_role_and_decisions(&handler.inner.hub_repo, "canvas-1", "req-1").await;
+        assert_eq!(role, None, "an invalid role must not be written");
+        assert!(decisions.is_empty(), "no decision should be recorded");
+    }
+
+    #[tokio::test]
+    async fn decide_knock_for_unknown_requester_returns_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        seed_canvas_with_knocks(&db_path, "canvas-1", &[]).await;
+
+        let (handler, adminz_store) = make_handler_over_seeded_db(&db_path, &tmp).await;
+        let admin_node = "admin-node";
+        adminz_store.allow(admin_node).await.unwrap();
+
+        let response = handle_request(
+            &handler,
+            admin_node,
+            AdminRequest::ApproveKnock {
+                canvas_doc_id: "canvas-1".to_string(),
+                requester_node_id: "no-such-requester".to_string(),
+                role: "member".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(response, AdminResponse::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_approve_or_decline_knocks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub-docs.db");
+        seed_canvas_with_knocks(
+            &db_path,
+            "canvas-1",
+            &[("req-1", "alice", "hi", "2025-01-01T00:00:00Z")],
+        )
+        .await;
+
+        let (handler, _adminz_store) = make_handler_over_seeded_db(&db_path, &tmp).await;
+        let stranger = "stranger-node";
+
+        let approve = handle_request(
+            &handler,
+            stranger,
+            AdminRequest::ApproveKnock {
+                canvas_doc_id: "canvas-1".to_string(),
+                requester_node_id: "req-1".to_string(),
+                role: "member".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(approve, AdminResponse::NotAdmin));
+
+        let (role, decisions) =
+            read_acl_role_and_decisions(&handler.inner.hub_repo, "canvas-1", "req-1").await;
+        assert_eq!(role, None, "non-admin must not be able to grant access");
+        assert!(
+            decisions.is_empty(),
+            "non-admin must not be able to record a decision"
         );
     }
 

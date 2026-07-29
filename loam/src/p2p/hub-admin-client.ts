@@ -60,10 +60,9 @@ export interface HubAdminFriendSummary {
 
 /**
  * a single pending knock, aggregated across every canvas doc the hub
- * holds, as reported by `AdminResponse::PendingKnocks`. read-only — this
- * panel never approves/declines a knock (see
- * docs/hub-and-profile-plan.md section 5 and
- * docs/knock-and-hub-relay-plan.md section 8's `ListPendingKnocks` note).
+ * holds, as reported by `AdminResponse::PendingKnocks`. `knockId` doubles
+ * as the `requesterNodeId` `hubAdminApproveKnock`/`hubAdminDeclineKnock`
+ * expect for `canvasDocId`.
  */
 export interface HubAdminPendingKnockSummary {
   canvasDocId: string;
@@ -136,6 +135,8 @@ export type HubAdminRequest =
   | { kind: "promoteAdmin"; nodeId: string }
   | { kind: "demoteAdmin"; nodeId: string }
   | { kind: "listPendingKnocks" }
+  | { kind: "approveKnock"; canvasDocId: string; requesterNodeId: string; role: string }
+  | { kind: "declineKnock"; canvasDocId: string; requesterNodeId: string }
   | { kind: "diskUsage" }
   | { kind: "canvasUsage"; offset: number; limit: number }
   | { kind: "blobUsage"; offset: number; limit: number }
@@ -162,6 +163,7 @@ export type HubAdminResponse =
   | { kind: "notAdmin" }
   | { kind: "error"; message: string }
   | { kind: "pendingKnocks"; knocks: HubAdminPendingKnockSummary[] }
+  | { kind: "knockDecided"; canvasDocId: string; requesterNodeId: string }
   | { kind: "diskUsage"; usage: HubAdminDiskUsage }
   | { kind: "canvasUsage"; canvases: HubAdminCanvasUsageSummary[]; total: number }
   | { kind: "blobUsage"; blobs: HubAdminBlobUsageSummary[]; total: number }
@@ -194,6 +196,18 @@ export function toWireAdminRequest(request: HubAdminRequest): unknown {
       return { DemoteAdmin: { node_id: request.nodeId } };
     case "listPendingKnocks":
       return "ListPendingKnocks";
+    case "approveKnock":
+      return {
+        ApproveKnock: {
+          canvas_doc_id: request.canvasDocId,
+          requester_node_id: request.requesterNodeId,
+          role: request.role,
+        },
+      };
+    case "declineKnock":
+      return {
+        DeclineKnock: { canvas_doc_id: request.canvasDocId, requester_node_id: request.requesterNodeId },
+      };
     case "diskUsage":
       return "DiskUsage";
     case "canvasUsage":
@@ -302,6 +316,10 @@ export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
           knockedAt: toNum(k.knocked_at),
         })),
       };
+    }
+    if ("KnockDecided" in obj) {
+      const v = obj.KnockDecided as { canvas_doc_id: string; requester_node_id: string };
+      return { kind: "knockDecided", canvasDocId: v.canvas_doc_id, requesterNodeId: v.requester_node_id };
     }
     if ("DiskUsage" in obj) {
       const v = obj.DiskUsage as {
@@ -520,11 +538,23 @@ export interface HubAdminClient {
   hubAdminDemoteAdmin(peerNodeId: string, nodeIdToDemote: string): Promise<HubAdminResponse>;
   /**
    * list pending knocks the hub is holding across every canvas doc it
-   * holds — read-only, informational aggregation. approving/declining a
-   * knock is never done through this channel (see
-   * docs/hub-and-profile-plan.md section 5).
+   * holds — a cross-canvas convenience view.
    */
   hubAdminListPendingKnocks(peerNodeId: string): Promise<HubAdminResponse>;
+  /**
+   * approve a pending knock: grants `role` ("member" or "viewer") on the
+   * canvas doc's acl and records the decision. does not establish a friend
+   * relationship with the requester (that's specific to a peer-to-peer
+   * admin accepting someone into their own social graph, not the hub).
+   */
+  hubAdminApproveKnock(
+    peerNodeId: string,
+    canvasDocId: string,
+    requesterNodeId: string,
+    role: string
+  ): Promise<HubAdminResponse>;
+  /** decline a pending knock: records the decision, grants no access. */
+  hubAdminDeclineKnock(peerNodeId: string, canvasDocId: string, requesterNodeId: string): Promise<HubAdminResponse>;
   /** fetch disk and blob storage usage metrics for the hub. */
   hubAdminDiskUsage(peerNodeId: string): Promise<HubAdminResponse>;
   /**
@@ -615,6 +645,21 @@ export function createHubAdminClient(transport: HubAdminTransport): HubAdminClie
     },
     hubAdminListPendingKnocks(peerNodeId) {
       return sendAdminRequest(transport, peerNodeId, { kind: "listPendingKnocks" });
+    },
+    hubAdminApproveKnock(peerNodeId, canvasDocId, requesterNodeId, role) {
+      return sendAdminRequest(transport, peerNodeId, {
+        kind: "approveKnock",
+        canvasDocId,
+        requesterNodeId,
+        role,
+      });
+    },
+    hubAdminDeclineKnock(peerNodeId, canvasDocId, requesterNodeId) {
+      return sendAdminRequest(transport, peerNodeId, {
+        kind: "declineKnock",
+        canvasDocId,
+        requesterNodeId,
+      });
     },
     hubAdminDiskUsage(peerNodeId) {
       return sendAdminRequest(transport, peerNodeId, { kind: "diskUsage" });

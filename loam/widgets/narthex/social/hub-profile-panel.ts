@@ -72,6 +72,14 @@ const SECTION_GAP = 18;
 const REMOVE_BTN_W = 52;
 const BLOCK_BTN_W = 52;
 const ADMIN_BTN_W = 56;
+const ACCEPT_BTN_W = 56;
+const APPROVE_KNOCK_BTN_W = 60;
+const DECLINE_KNOCK_BTN_W = 60;
+/** role granted when a pending knock is approved from this panel — matches
+ *  the default role used elsewhere for a hub-driven grant (e.g. the invite
+ *  flow's default role). knocks don't carry a role request of their own, so
+ *  there's nothing more specific to honor here. */
+const KNOCK_APPROVE_ROLE = "member";
 const ACTION_BTN_H = 20;
 const ACTION_BTN_GAP = 6;
 const COPY_BTN_FEEDBACK_MS = 1500;
@@ -179,6 +187,18 @@ export interface HubProfilePanelHandle {
    *  toggle ("+admin"/"-admin") button, by that friend's node id, or null
    *  if not rendered. */
   getAdminButtonGlobalPos(nodeId: string): { x: number; y: number } | null;
+  /** dev/test-only: global center position of a pending friend row's
+   *  "accept" button, by that friend's node id, or null if not rendered
+   *  (only pending-status rows render this button). */
+  getAcceptFriendButtonGlobalPos(nodeId: string): { x: number; y: number } | null;
+  /** dev/test-only: global center position of a pending knock row's
+   *  "approve" button, keyed by canvas doc id + requester node id, or null
+   *  if not rendered. */
+  getApproveKnockButtonGlobalPos(canvasDocId: string, requesterNodeId: string): { x: number; y: number } | null;
+  /** dev/test-only: global center position of a pending knock row's
+   *  "decline" button, keyed by canvas doc id + requester node id, or null
+   *  if not rendered. */
+  getDeclineKnockButtonGlobalPos(canvasDocId: string, requesterNodeId: string): { x: number; y: number } | null;
   /** dev/test-only: global center position of a friend row's "copy" (node
    *  id to clipboard) button, by that friend's node id, or null if not
    *  rendered. */
@@ -217,6 +237,10 @@ export function mountHubProfilePanel(
   const removeInFlight = new Set<string>();
   const blockInFlight = new Set<string>();
   const promoteInFlight = new Set<string>();
+  const acceptFriendInFlight = new Set<string>();
+  /** keyed by `${canvasDocId}::${requesterNodeId}` — one outstanding
+   *  approve/decline at a time per pending knock. */
+  const knockDecisionInFlight = new Set<string>();
 
   // accordion collapsed state (module-lifetime, survives refresh())
   // defaults: friendz expanded; everything else collapsed.
@@ -278,6 +302,9 @@ export function mountHubProfilePanel(
   const removeButtonRefs = new Map<string, Container>();
   const blockButtonRefs = new Map<string, Container>();
   const adminButtonRefs = new Map<string, Container>();
+  const acceptFriendButtonRefs = new Map<string, Container>();
+  const approveKnockButtonRefs = new Map<string, Container>();
+  const declineKnockButtonRefs = new Map<string, Container>();
   const copyButtonRefs = new Map<string, Container>();
   let blobPrevBtnRef: Container | null = null;
   let blobNextBtnRef: Container | null = null;
@@ -629,6 +656,92 @@ export function mountHubProfilePanel(
       log.warn(TAG, "hubAdminDemoteAdmin failed:", err);
     } finally {
       promoteInFlight.delete(nodeId);
+      if (!destroyed) rebuild();
+    }
+  }
+
+  /** accept an incoming friend request: a "pending" row is an inbound
+   *  friend request awaiting operator action (see `FriendStatus::Pending`
+   *  in `friendz.rs`) \u2014 promoting it is the exact same wire request as the
+   *  manual allow/unblock flows, so this just reuses `hubAdminAllow`. */
+  async function handleAcceptFriendRequest(nodeId: string): Promise<void> {
+    if (acceptFriendInFlight.has(nodeId)) return;
+    acceptFriendInFlight.add(nodeId);
+    rebuild();
+    try {
+      const response = await client.hubAdminAllow(hubNodeId, nodeId);
+      if (destroyed) return;
+      if (response.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (response.kind === "error") {
+        log.warn(TAG, "hubAdminAllow (accept friend request) failed:", response.message);
+        return;
+      }
+      await refresh();
+    } catch (err) {
+      log.warn(TAG, "hubAdminAllow (accept friend request) failed:", err);
+    } finally {
+      acceptFriendInFlight.delete(nodeId);
+      if (!destroyed) rebuild();
+    }
+  }
+
+  async function handleApproveKnock(canvasDocId: string, requesterNodeId: string): Promise<void> {
+    const key = `${canvasDocId}::${requesterNodeId}`;
+    if (knockDecisionInFlight.has(key)) return;
+    knockDecisionInFlight.add(key);
+    rebuild();
+    try {
+      const response = await client.hubAdminApproveKnock(
+        hubNodeId,
+        canvasDocId,
+        requesterNodeId,
+        KNOCK_APPROVE_ROLE
+      );
+      if (destroyed) return;
+      if (response.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (response.kind === "error") {
+        log.warn(TAG, "hubAdminApproveKnock failed:", response.message);
+        return;
+      }
+      await refresh();
+    } catch (err) {
+      log.warn(TAG, "hubAdminApproveKnock failed:", err);
+    } finally {
+      knockDecisionInFlight.delete(key);
+      if (!destroyed) rebuild();
+    }
+  }
+
+  async function handleDeclineKnock(canvasDocId: string, requesterNodeId: string): Promise<void> {
+    const key = `${canvasDocId}::${requesterNodeId}`;
+    if (knockDecisionInFlight.has(key)) return;
+    knockDecisionInFlight.add(key);
+    rebuild();
+    try {
+      const response = await client.hubAdminDeclineKnock(hubNodeId, canvasDocId, requesterNodeId);
+      if (destroyed) return;
+      if (response.kind === "notAdmin") {
+        state = { status: "notAdmin" };
+        rebuild();
+        return;
+      }
+      if (response.kind === "error") {
+        log.warn(TAG, "hubAdminDeclineKnock failed:", response.message);
+        return;
+      }
+      await refresh();
+    } catch (err) {
+      log.warn(TAG, "hubAdminDeclineKnock failed:", err);
+    } finally {
+      knockDecisionInFlight.delete(key);
       if (!destroyed) rebuild();
     }
   }
@@ -1137,6 +1250,9 @@ export function mountHubProfilePanel(
     blockButtonRefs.clear();
     adminButtonRefs.clear();
     copyButtonRefs.clear();
+    acceptFriendButtonRefs.clear();
+    approveKnockButtonRefs.clear();
+    declineKnockButtonRefs.clear();
     unsyncButtonRefs.clear();
     blobPrevBtnRef = null;
     blobNextBtnRef = null;
@@ -1728,7 +1844,22 @@ export function mountHubProfilePanel(
           const promoting = promoteInFlight.has(friend.nodeId);
           const blocking = blockInFlight.has(friend.nodeId);
           const removing = removeInFlight.has(friend.nodeId);
+          const accepting = acceptFriendInFlight.has(friend.nodeId);
           const isBlocked = friend.status === "blocked";
+          const isPending = friend.status === "pending";
+
+          const acceptBtn = isPending
+            ? buildOutlinedButton({
+                label: accepting ? "\u2026" : "accept",
+                width: ACCEPT_BTN_W,
+                height: ACTION_BTN_H,
+                color: ONLINE_COLOR,
+                disabled: accepting,
+                onTap: () => {
+                  handleAcceptFriendRequest(friend.nodeId).catch(() => {});
+                },
+              })
+            : null;
 
           const adminBtn = buildOutlinedButton({
             label: promoting ? "\u2026" : friend.isAdmin ? "-admin" : "+admin",
@@ -1777,6 +1908,13 @@ export function mountHubProfilePanel(
           adminBtn.x = blockBtn.x - ADMIN_BTN_W - ACTION_BTN_GAP;
           adminBtn.y = actionsY;
 
+          if (acceptBtn) {
+            acceptBtn.x = adminBtn.x - ACCEPT_BTN_W - ACTION_BTN_GAP;
+            acceptBtn.y = actionsY;
+            row.addChild(acceptBtn);
+            acceptFriendButtonRefs.set(friend.nodeId, acceptBtn);
+          }
+
           row.addChild(adminBtn);
           row.addChild(blockBtn);
           row.addChild(removeBtn);
@@ -1794,7 +1932,7 @@ export function mountHubProfilePanel(
     addSectionHeader("knocks", "pending knocks", state.pendingKnocks.length);
     if (!(sectionCollapsed.get("knocks") ?? true)) {
       const knocksHint = new Text({
-        text: "read-only \u2014 approve/decline from the requester's canvas instead",
+        text: "approve grants access on the canvas; decline just records the decision",
         style: { fontFamily: FONT, fontSize: 9, fill: MUTED_TEXT },
         resolution: RESOLUTION,
       });
@@ -1819,7 +1957,7 @@ export function mountHubProfilePanel(
         for (let i = 0; i < state.pendingKnocks.length; i++) {
           const knock = state.pendingKnocks[i];
           const row = new Container();
-          row.eventMode = "none";
+          row.eventMode = "static";
           row.y = dy;
           inner.addChild(row);
 
@@ -1870,6 +2008,41 @@ export function mountHubProfilePanel(
           knockedAtText.x = ROW_PADDING_X;
           knockedAtText.y = 50;
           row.addChild(knockedAtText);
+
+          const knockKey = `${knock.canvasDocId}::${knock.requesterNodeId}`;
+          const deciding = knockDecisionInFlight.has(knockKey);
+
+          const declineKnockBtn = buildOutlinedButton({
+            label: deciding ? "\u2026" : "decline",
+            width: DECLINE_KNOCK_BTN_W,
+            height: ACTION_BTN_H,
+            color: REJECT_COLOR,
+            disabled: deciding,
+            onTap: () => {
+              handleDeclineKnock(knock.canvasDocId, knock.requesterNodeId).catch(() => {});
+            },
+          });
+          const approveKnockBtn = buildOutlinedButton({
+            label: deciding ? "\u2026" : "approve",
+            width: APPROVE_KNOCK_BTN_W,
+            height: ACTION_BTN_H,
+            color: ONLINE_COLOR,
+            disabled: deciding,
+            onTap: () => {
+              handleApproveKnock(knock.canvasDocId, knock.requesterNodeId).catch(() => {});
+            },
+          });
+
+          const knockActionsY = KNOCK_ROW_HEIGHT - ACTION_BTN_H - 6;
+          declineKnockBtn.x = contentW - DECLINE_KNOCK_BTN_W - ROW_PADDING_X;
+          declineKnockBtn.y = knockActionsY;
+          approveKnockBtn.x = declineKnockBtn.x - APPROVE_KNOCK_BTN_W - ACTION_BTN_GAP;
+          approveKnockBtn.y = knockActionsY;
+
+          row.addChild(approveKnockBtn);
+          row.addChild(declineKnockBtn);
+          approveKnockButtonRefs.set(knockKey, approveKnockBtn);
+          declineKnockButtonRefs.set(knockKey, declineKnockBtn);
 
           dy += KNOCK_ROW_HEIGHT;
         }
@@ -2579,6 +2752,30 @@ export function mountHubProfilePanel(
     return globalCenter(btn);
   }
 
+  function getAcceptFriendButtonGlobalPos(nodeId: string): { x: number; y: number } | null {
+    const btn = acceptFriendButtonRefs.get(nodeId);
+    if (!btn) return null;
+    return globalCenter(btn);
+  }
+
+  function getApproveKnockButtonGlobalPos(
+    canvasDocId: string,
+    requesterNodeId: string
+  ): { x: number; y: number } | null {
+    const btn = approveKnockButtonRefs.get(`${canvasDocId}::${requesterNodeId}`);
+    if (!btn) return null;
+    return globalCenter(btn);
+  }
+
+  function getDeclineKnockButtonGlobalPos(
+    canvasDocId: string,
+    requesterNodeId: string
+  ): { x: number; y: number } | null {
+    const btn = declineKnockButtonRefs.get(`${canvasDocId}::${requesterNodeId}`);
+    if (!btn) return null;
+    return globalCenter(btn);
+  }
+
   function getCopyButtonGlobalPos(nodeId: string): { x: number; y: number } | null {
     const btn = copyButtonRefs.get(nodeId);
     if (!btn) return null;
@@ -2663,6 +2860,9 @@ export function mountHubProfilePanel(
     getRemoveButtonGlobalPos,
     getBlockButtonGlobalPos,
     getAdminButtonGlobalPos,
+    getAcceptFriendButtonGlobalPos,
+    getApproveKnockButtonGlobalPos,
+    getDeclineKnockButtonGlobalPos,
     getCopyButtonGlobalPos,
     getSectionCollapsed(sectionId: string): boolean {
       return sectionCollapsed.get(sectionId as SectionId) ?? false;

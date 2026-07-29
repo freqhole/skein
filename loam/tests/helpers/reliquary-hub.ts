@@ -155,16 +155,20 @@ export async function startReliquaryHub(options?: {
   const dataDir = options?.dataDir ?? (await mkdtemp(join(tmpdir(), `reliquary-hub-${randomUUID()}-`)));
   const readyTimeoutMs = options?.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
 
-  const child = spawn(RELIQUARY_BIN, ["--data-dir", dataDir, "--port", "0", "serve"], {
-    // `tumulus=debug` alone leaves every reliquary-crate target (the shared
-    // `freqhole-reliquary` dependency's own `ensure`/`snatch` modules -
-    // access-gate decisions, probe/download failures) below the implicit
-    // default filter level and invisible in `getLog()`'s captured output,
-    // since an env-filter with only target-scoped directives falls back to
-    // erroring out anything unmatched, not passing it through.
-    env: { ...process.env, RUST_LOG: "tumulus=debug,reliquary=debug" },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const child = spawn(
+    RELIQUARY_BIN,
+    ["--data-dir", dataDir, "--port", "0", "--log-stdout", "serve"],
+    {
+      // `tumulus=debug` alone leaves every reliquary-crate target (the shared
+      // `freqhole-reliquary` dependency's own `ensure`/`snatch` modules -
+      // access-gate decisions, probe/download failures) below the implicit
+      // default filter level and invisible in `getLog()`'s captured output,
+      // since an env-filter with only target-scoped directives falls back to
+      // erroring out anything unmatched, not passing it through.
+      env: { ...process.env, RUST_LOG: "tumulus=debug,reliquary=debug" },
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  );
 
   let nodeId: string | null = null;
   let output = "";

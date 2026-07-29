@@ -722,6 +722,13 @@ impl HubRepo {
             incoming.changes = automerge::sync::ChunkList::empty();
         }
 
+        // heads before applying — used below to tell whether this sync
+        // message actually changed the document, or was a no-op round trip
+        // (an ack/keepalive-style exchange with no new changes to apply,
+        // which automerge-repo peers send routinely as part of normal sync
+        // state reconciliation, not just when there's real content).
+        let heads_before = doc.get_heads();
+
         // apply the message to our document
         if let Err(e) = doc.receive_sync_message(sync_state, incoming) {
             tracing::warn!(
@@ -733,19 +740,31 @@ impl HubRepo {
             return None;
         }
 
-        // notify waiters on every successful receive (doc may now have content)
-        let _ = self.doc_notify.send(doc_id.to_string());
+        // only notify + persist when the document's content actually
+        // changed. without this check, every sync round trip — including
+        // no-op ones — fired a doc-change notification and a sqlite write,
+        // regardless of whether anything new was applied. under routine
+        // sync traffic (which includes plenty of no-op exchanges) this
+        // flooded `doc_notify`'s broadcast channel fast enough to overrun
+        // its buffer, forcing `reliquary::snatch`'s change-driven loop into
+        // its "channel lagged, run a full scan" fallback over and over —
+        // the "scanned canvas for file widgets" log spam — and hammered
+        // `hub_docs` with redundant writes on every exchange, not just ones
+        // with real content.
+        let changed = doc.get_heads() != heads_before;
+        if changed {
+            let _ = self.doc_notify.send(doc_id.to_string());
+
+            let save_bytes = doc.save();
+            let storage = Arc::clone(&self.storage);
+            let doc_id_owned = doc_id.to_string();
+            tokio::spawn(async move {
+                storage.save_doc(&doc_id_owned, &save_bytes).await;
+            });
+        }
 
         // generate a response message if we have changes to send back
         let response = doc.generate_sync_message(sync_state);
-
-        // persist the document asynchronously after receiving sync
-        let save_bytes = doc.save();
-        let storage = Arc::clone(&self.storage);
-        let doc_id_owned = doc_id.to_string();
-        tokio::spawn(async move {
-            storage.save_doc(&doc_id_owned, &save_bytes).await;
-        });
 
         response.map(|msg: automerge::sync::Message| msg.encode())
     }

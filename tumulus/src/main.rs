@@ -19,9 +19,12 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     port: u16,
 
-    /// write logs to a file (<data_dir>/tumulus.log) instead of stdout/stderr
+    /// print logs to stdout/stderr instead of a log file. by default (this
+    /// flag absent), logs go to <data_dir>/tumulus.log and the terminal
+    /// instead shows a live status dashboard (node id, endpoint status,
+    /// friend/canvas/blob counts, pending requests).
     #[arg(long)]
-    log_file: bool,
+    log_stdout: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -185,20 +188,24 @@ fn truncate_log_file_if_needed(path: &std::path::Path, max_lines: usize) {
     }
 }
 
-/// set up tracing: writes to a log file in `data_dir` (`tumulus.log`) when
-/// `log_file` is true, otherwise to stdout/stderr as before. file logging
+/// set up tracing: writes to a log file in `data_dir` (`tumulus.log`) by
+/// default, or to stdout/stderr when `log_stdout` is true. file logging
 /// replaces stdout/stderr entirely rather than duplicating output to both,
-/// so a headless hub run under a process supervisor can be switched to a
-/// plain log file without doubling up output.
-fn setup_tracing(log_file: bool, data_dir: &std::path::Path) {
+/// so a headless hub run under a process supervisor can be switched to
+/// plain stdout without doubling up output.
+///
+/// returns `true` if logs actually ended up in the file (the caller uses
+/// this to decide whether the terminal is free to show the live status
+/// dashboard instead - see `serve`).
+fn setup_tracing(log_stdout: bool, data_dir: &std::path::Path) -> bool {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    if !log_file {
+    if log_stdout {
         tracing_subscriber::fmt().with_env_filter(filter).init();
-        return;
+        return false;
     }
 
     let log_path = data_dir.join(LOG_FILE_NAME);
@@ -219,6 +226,7 @@ fn setup_tracing(log_file: bool, data_dir: &std::path::Path) {
                 .with(filter)
                 .with(file_layer)
                 .init();
+            true
         }
         None => {
             // file failed to open (e.g. read-only/missing data dir) - fall
@@ -228,6 +236,7 @@ fn setup_tracing(log_file: bool, data_dir: &std::path::Path) {
                 log_path.display()
             );
             tracing_subscriber::fmt().with_env_filter(filter).init();
+            false
         }
     }
 }
@@ -238,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = cli.data_dir.unwrap_or_else(default_data_dir);
     tokio::fs::create_dir_all(&data_dir).await?;
 
-    setup_tracing(cli.log_file, &data_dir);
+    let logging_to_file = setup_tracing(cli.log_stdout, &data_dir);
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Init => {
@@ -254,14 +263,14 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("data_dir = {}", data_dir.display());
             Ok(())
         }
-        Command::Serve => serve(data_dir, cli.port).await,
+        Command::Serve => serve(data_dir, cli.port, logging_to_file).await,
         Command::Friend(cmd) => friend(data_dir, cmd).await,
         Command::Admin(cmd) => admin(data_dir, cmd).await,
         Command::Maintenance(cmd) => maintenance(data_dir, cmd).await,
     }
 }
 
-async fn serve(data_dir: PathBuf, port: u16) -> anyhow::Result<()> {
+async fn serve(data_dir: PathBuf, port: u16, show_dashboard: bool) -> anyhow::Result<()> {
     let secret = load_or_generate(&data_dir)?;
     let node_id = secret.public();
 
@@ -304,7 +313,7 @@ async fn serve(data_dir: PathBuf, port: u16) -> anyhow::Result<()> {
         }
     });
 
-    service.run(cancel).await;
+    service.run(cancel, show_dashboard).await;
     Ok(())
 }
 

@@ -11,6 +11,7 @@
 
 pub mod adminz;
 pub mod blob_acl;
+pub mod dashboard;
 pub mod db;
 pub mod documents;
 pub mod friendz;

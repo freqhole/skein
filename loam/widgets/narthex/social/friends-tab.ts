@@ -1414,31 +1414,6 @@ export function createFriendsTab(ctx: TabContext): TabController {
 
       dy += DETAIL_BTN_HEIGHT + 10;
 
-      // rendered node id — docs/hub-and-profile-plan.md section 10.3, the
-      // user specifically asked for this to be verifiable in the friend-
-      // detail view, not just present in the underlying doc.
-      if (hubNodeIdForFriend) {
-        const hubNodeIdLabel = new Text({
-          text: "hub node id",
-          style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
-          resolution: RESOLUTION,
-        });
-        hubNodeIdLabel.eventMode = "none";
-        hubNodeIdLabel.y = dy;
-        detailInner.addChild(hubNodeIdLabel);
-        dy += LABEL_SIZE + 4;
-
-        const hubNodeIdText = new Text({
-          text: truncate(hubNodeIdForFriend, 48),
-          style: { fontFamily: FONT, fontSize: DETAIL_NODEID_SIZE, fill: MUTED_TEXT },
-          resolution: RESOLUTION,
-        });
-        hubNodeIdText.eventMode = "none";
-        hubNodeIdText.y = dy;
-        detailInner.addChild(hubNodeIdText);
-        detailNodeIdTextRef = hubNodeIdText;
-        dy += hubNodeIdText.height + 8;
-      }
     }
 
     // -----------------------------------------------------------------------

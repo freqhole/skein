@@ -24,10 +24,11 @@ import type { DocumentId, NetworkAdapter } from "@automerge/automerge-repo";
 import { Repo } from "@automerge/automerge-repo";
 import { BroadcastChannelNetworkAdapter } from "@automerge/automerge-repo-network-broadcastchannel";
 import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb";
+import { DEFAULT_ENSURE_ALPN } from "@freqhole/reliquary/ensure";
 import { CanvasStore } from "../canvas/canvas-store";
 import { ensureIdentity, getMiddenNode as getDefaultMiddenNode } from "../p2p/identity";
 import { createIrohNetworkAdapter, type IrohNetworkAdapter, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
-import { handleSkeinStream } from "../p2p/skein-handler";
+import { createSkeinEnsureBlobHandler, handleSkeinStream } from "../p2p/skein-handler";
 
 export interface SkeinHarnessOptions {
   /**
@@ -187,13 +188,18 @@ export async function createSkeinHarness(
           (await getDefaultMiddenNode()) as unknown as MiddenStreamNode);
       iroh = createIrohNetworkAdapter(getMidden);
 
-      // register the skein/1 handler so this peer can serve blobs (and
-      // answer ensure_blob probes) to other peers/hubs — mirrors what
-      // boot.ts/friendz-wiring.ts do for the production app. without this,
-      // any peer built via this harness silently drops inbound skein/1
-      // streams (see iroh-network-adapter.ts's accept loop), which broke
-      // the hub's blob-snatch pipeline in e2e tests.
+      // register the skein/1 and freqhole/1 (ensure_blob) handlers so this
+      // peer can serve blobs and answer ensure_blob probes from other
+      // peers/hubs — mirrors what boot.ts/friendz-wiring.ts do for the
+      // production app. these are two separate ALPNs/protocols: skein/1
+      // carries proxy_request/compute_blake3_request, freqhole/1 carries
+      // ensure_blob_request. without both, any peer built via this harness
+      // silently drops the corresponding inbound streams (see
+      // iroh-network-adapter.ts's accept loop), which broke the hub's
+      // blob-snatch pipeline in e2e tests — a hub's ensure_blob probe would
+      // get its stream accepted then dropped with no response at all.
       iroh.registerAlpnHandler("skein/1", handleSkeinStream);
+      iroh.registerAlpnHandler(DEFAULT_ENSURE_ALPN, createSkeinEnsureBlobHandler());
       network.push(options.wrapNetworkAdapter ? options.wrapNetworkAdapter(iroh) : iroh);
     }
 

@@ -490,9 +490,9 @@ impl HubPeerService {
                     // response sync cycle, so nothing would otherwise tell
                     // an already-connected peer's `handle_connection` loop
                     // to push it — see `notify_doc_changed`'s doc comment
-                    // for the bug this closes (a real one, 2026-07-02: the
-                    // hub wrote itself into `.peers` successfully but the
-                    // inviting peer never found out).
+                    // for the bug this closes (the hub wrote itself into
+                    // `.peers` successfully but the inviting peer never
+                    // found out).
                     hub_repo.notify_doc_changed(&doc_id_str);
                     return;
                 }

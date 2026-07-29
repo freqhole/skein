@@ -572,7 +572,8 @@ impl Service {
 /// bootstrap a [`crate::hub::HubPeerService`] sharing the same data_dir +
 /// sqlite pool as the minimal `Service`.
 ///
-/// returns a ready-to-run hub. spawn `service.run(cancel)` to drive it.
+/// returns a ready-to-run hub. spawn `service.run(cancel, show_dashboard)` to
+/// drive it.
 pub async fn start_hub(
     endpoint: Endpoint,
     pool: SqlitePool,
