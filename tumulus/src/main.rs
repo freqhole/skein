@@ -11,7 +11,9 @@ use tumulus::{adminz, db, friendz, userz};
 #[derive(Parser, Debug)]
 #[command(name = "reliquary", version, about = "skein hub peer")]
 struct Cli {
-    /// data directory for keypair, sqlite db, and blob files
+    /// data directory for keypair, sqlite db, and blob files. defaults to
+    /// `./tumulus-data` (created if missing) - or `.` itself, if `.` already
+    /// has a keypair from an install that predates this default.
     #[arg(long, env = "SKEIN_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
@@ -124,38 +126,28 @@ enum MaintenanceCommand {
     },
 }
 
-fn default_data_dir() -> PathBuf {
-    dirs_data_local()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("skein-hub")
+/// detects an existing install with its keypair sitting directly in the
+/// current working directory (predates the `./tumulus-data` default) - see
+/// [`default_data_dir`]. the keypair alone is enough of a signal: everything
+/// else (db, log file, blob files) is created on demand if missing.
+fn cwd_has_existing_data(cwd: &std::path::Path) -> bool {
+    cwd.join(identity::DEFAULT_KEYPAIR_FILENAME).exists()
 }
 
-fn dirs_data_local() -> Option<PathBuf> {
-    // minimal xdg_data_home / %LOCALAPPDATA% resolver; avoids a `dirs` dep.
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg));
-        }
+/// default data directory used when `--data-dir` isn't passed: `./tumulus-data`
+/// (relative to the current working directory), created on first run.
+///
+/// for backward compatibility with installs that predate this default, this
+/// first checks `.` itself for an existing keypair and keeps using it as-is
+/// if found, rather than silently splitting an existing install's files
+/// across two directories. fresh installs always initialize straight into
+/// `./tumulus-data`.
+fn default_data_dir() -> PathBuf {
+    let cwd = PathBuf::from(".");
+    if cwd_has_existing_data(&cwd) {
+        return cwd;
     }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return Some(PathBuf::from(home).join("Library/Application Support"));
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-            return Some(PathBuf::from(appdata));
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return Some(PathBuf::from(home).join(".local/share"));
-        }
-    }
-    None
+    PathBuf::from("tumulus-data")
 }
 
 /// log file name, written alongside the hub's sqlite db and keypair in the data dir.
