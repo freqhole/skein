@@ -57,6 +57,15 @@ tempfile = "3"
 indexmap = "2"
 async-trait = "0.1"
 
+# temporary local override while actively debugging the blob-snatch pipeline
+# (see /memories/repo/skein-blob-sync-alpn-bug.md) - points the pinned
+# `reliquary` git dependency at the live tomb/lib/reliquary source instead of
+# the tagged commit, so diagnostic logging added there gets picked up by a
+# normal `cargo build` without needing a new tomb release/tag bump. remove
+# once the investigation is done and reliquary gets a real version bump.
+[patch."https://github.com/freqhole/tomb"]
+reliquary = { path = "../tomb/lib/reliquary/rust" }
+
 # release profile optimizations for smaller binaries
 [profile.release]
 lto = "thin"

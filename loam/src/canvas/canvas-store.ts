@@ -11,6 +11,7 @@ import type {
 } from "./canvas-doc";
 import { canvasRoleSchema, emptyCanvasDoc } from "./canvas-doc";
 import { resolveDocReady } from "../p2p/doc-ready";
+import { normalizeCanvasDoc } from "./automerge-values";
 
 /**
  * default bound for `CanvasStore.open()` when a caller passes no
@@ -134,9 +135,21 @@ export class CanvasStore {
     return new CanvasStore(repo, handle);
   }
 
-  /** get the current document state. */
+  /**
+   * get the current document state.
+   *
+   * normalizes `peers`/`acl`/`pendingKnocks` through `normalizeCanvasDoc()`
+   * before returning — several of those fields are written directly by
+   * tumulus's rust code, which round-trips into js as an `ImmutableString`
+   * *instance* rather than a plain string (a confirmed cross-language
+   * automerge interop gap, not a one-off bug — see
+   * `automerge-values.ts`'s doc comments for the full explanation). this
+   * makes every reader of `doc()` — not just `CanvasStore`'s own getters
+   * like `getRole()`/`peers()` — see plain strings regardless of which
+   * side wrote the field.
+   */
   doc(): CanvasDocument {
-    return this.handle.doc() ?? emptyCanvasDoc();
+    return normalizeCanvasDoc(this.handle.doc() ?? emptyCanvasDoc());
   }
 
   /** get a widget entry by ID. returns null if not found. */
@@ -156,7 +169,9 @@ export class CanvasStore {
 
   // -- peer tracking ---------------------------------------------------------
 
-  /** get all known peers for this canvas. */
+  /** get all known peers for this canvas. see `doc()`'s doc comment — a
+   *  peer entry written by the hub is already normalized to plain strings
+   *  by the time it reaches here. */
   peers(): Record<string, CanvasPeer> {
     return this.doc().peers ?? {};
   }
@@ -440,7 +455,9 @@ export class CanvasStore {
    * rather than propagating garbage as if it were a valid role. see
    * canvas-doc.ts's centralized role schemas for why this matters — this
    * is the one place in the ACL model that reads untrusted synced data as
-   * a security-relevant value.
+   * a security-relevant value. see `doc()`'s doc comment — a role written
+   * by the hub is already normalized to a plain string by the time it
+   * reaches here.
    */
   getRole(nodeId: string): CanvasRole {
     const raw = this.doc().acl?.[nodeId]?.role;

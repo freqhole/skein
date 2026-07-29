@@ -530,20 +530,6 @@ class SkeinRouter {
       }
     }) as EventListener);
 
-    // listen for the connect-via-hub event dispatched from a narthex
-    // canvas-card's "connect via hub" pill (widgets/narthex/canvas-card.ts)
-    // — an explicit, user-initiated action (never automatic) for a canvas
-    // whose share link carried hub node ids, see connectViaHub()'s doc
-    // comment for the full rationale.
-    window.addEventListener("skein:connect-via-hub", ((e: CustomEvent) => {
-      const { hubNodeId } = e.detail ?? {};
-      if (typeof hubNodeId === "string") {
-        this.connectViaHub(hubNodeId).catch((err) => {
-          log.warn(TAG, "failed to connect via hub:", err);
-        });
-      }
-    }) as EventListener);
-
     // listen for the canvas-card-trashed event dispatched from
     // trashCanvasCard() (widgets/narthex/trash-widget.ts) once a narthex
     // canvas card has been soft-deleted — clears any now-stale outbox
@@ -1251,6 +1237,14 @@ class SkeinRouter {
 
           // build peer list from canvas doc (exclude self)
           const peersRecord = this.currentCanvas!.store.peers();
+          log.debug(
+            TAG,
+            "share dialog: raw peers map from canvas doc",
+            "docId=" + docId,
+            "self=" + identity.node_id,
+            "keys=" + JSON.stringify(Object.keys(peersRecord)),
+            "hubNodeIds=" + JSON.stringify(this.currentCanvas!.store.doc().hubNodeIds ?? [])
+          );
           // known friends by nodeId, for avatar/online lookups on already-
           // joined peers below (a peer may or may not be a confirmed friend)
           const friendByNodeId = new Map<
@@ -1271,17 +1265,24 @@ class SkeinRouter {
           }
           const peerList = Object.values(peersRecord)
             .filter((p) => {
-              // guard: automerge may return non-string nodeId from Rust-written entries
+              // `store.peers()` normalizes nodeId to a plain string (see
+              // `automerge-values.ts` — this guard used to silently DROP
+              // any peer whose nodeId came back as an automerge
+              // `ImmutableString` instance instead of a plain string,
+              // which is exactly what happened to every hub-authored peer
+              // entry and was the root cause of the hub disappearing from
+              // this dialog). kept only as a defensive last-resort log in
+              // case normalization is ever bypassed — no longer drops the
+              // entry.
               if (typeof p.nodeId !== "string") {
                 log.warn(
                   TAG,
-                  "share dialog: peer entry has non-string nodeId:",
+                  "share dialog: peer entry has non-string nodeId (should not happen after normalizeCanvasDoc):",
                   typeof p.nodeId,
                   JSON.stringify(p)
                 );
-                return false;
               }
-              return p.nodeId !== identity.node_id;
+              return String(p.nodeId) !== identity.node_id;
             })
             .map((p) => ({
               nodeId: String(p.nodeId),
@@ -1290,6 +1291,12 @@ class SkeinRouter {
               avatarDataUrl: friendByNodeId.get(String(p.nodeId))?.avatarDataUrl,
               isOnline: this.friendzProtocol?.isOnline(String(p.nodeId)) ?? false,
             }));
+          log.debug(
+            TAG,
+            "share dialog: final peerList after filtering self/non-string nodeIds",
+            "count=" + peerList.length,
+            "nodeIds=" + JSON.stringify(peerList.map((p) => p.nodeId))
+          );
 
           // build friends list for invite picker — exclude already shared
           const peerNodeIds = new Set(peerList.map((p) => p.nodeId));
@@ -1608,6 +1615,15 @@ class SkeinRouter {
                 // lands, actual sync enforcement) as soon as this peer
                 // connects, independent of whether they've "accepted" yet.
                 this.currentCanvas.store.setRole(friend.nodeId, role);
+                // a friend invited from the "hub nodes" section is a known
+                // reliquary hub — record it in the canvas's `hubNodeIds` too
+                // so the share-link "include hub(s) in link" toggle actually
+                // has something to include (previously nothing in the app
+                // ever called `addHubNodeId()`, so this list stayed
+                // permanently empty no matter how many hubs were invited).
+                if (friend.isHub) {
+                  this.currentCanvas.store.addHubNodeId(friend.nodeId);
+                }
               }
 
               // attempt direct send — best effort, gossip relay handles offline peers
@@ -1709,11 +1725,18 @@ class SkeinRouter {
               shareOptions = buildShareOptions();
               shareOptions.onClose = teardownSubscriptions;
               shareHandle = showShareDialog(shareOptions);
+              log.debug(TAG, "share dialog: rebuilt", "docId=" + docId);
             });
           };
 
-          const unsubStore = this.currentCanvas.store.onChange(() => rebuild());
-          const messagezListener = () => rebuild();
+          const unsubStore = this.currentCanvas.store.onChange(() => {
+            log.debug(TAG, "share dialog: canvas store onChange fired, queueing rebuild");
+            rebuild();
+          });
+          const messagezListener = () => {
+            log.debug(TAG, "share dialog: messagez doc change fired, queueing rebuild");
+            rebuild();
+          };
           this.messagezDocHandle?.on("change", messagezListener);
 
           const teardownSubscriptions = (): void => {
@@ -2144,53 +2167,6 @@ class SkeinRouter {
   }
 
   /**
-   * send a friend request to a hub whose node id was discovered from a
-   * canvas share link (see share-string.ts's `hubNodeIds`), and attempt to
-   * connect to it. used by the narthex card's "connect via hub" pill
-   * (`canvas-card.ts`) — always an explicit click, never dispatched
-   * automatically on decoding a share link, since silently friending an
-   * arbitrary node id embedded in a pasted link would be a real trust
-   * surprise.
-   *
-   * the hub auto-accepts the friend request if (and only if) this peer's
-   * own node id already appears in the shared canvas's `acl` or
-   * `pendingInvites` — i.e. the canvas owner already explicitly invited
-   * this peer, the hub just happens to be who's reachable right now (see
-   * tumulus's `HubPeerService::is_vouched_by_any_canvas`). once accepted,
-   * the hub's regular gossip digest delivers the pending canvas invite (and
-   * the canvas doc itself) the same way it would from any other friend —
-   * no separate machinery needed here beyond the friend request itself.
-   */
-  private async connectViaHub(hubNodeId: string): Promise<void> {
-    if (!this.friendzProtocol) {
-      log.warn(TAG, "cannot connect via hub — friendz protocol not ready");
-      return;
-    }
-    const identity = await getStoredIdentity();
-    if (!identity) {
-      log.debug(TAG, "no identity — generate one first (profile widget)");
-      return;
-    }
-
-    if (!isFriend(hubNodeId)) {
-      try {
-        await sendFriendRequest(hubNodeId);
-        log.debug(TAG, "sent friend request to hub:", hubNodeId.slice(0, 16) + "...");
-      } catch (err) {
-        log.warn(TAG, "failed to send friend request to hub:", err);
-      }
-    }
-
-    try {
-      await this.irohAdapter.addPeer(hubNodeId);
-      log.debug(TAG, "connected to hub:", hubNodeId.slice(0, 16) + "...");
-    } catch (err) {
-      log.warn(TAG, "failed to connect to hub:", hubNodeId.slice(0, 16) + "...", err);
-    }
-  }
-
-
-  /**
    * join a remote canvas via share string.
    * connects to the peer, creates a canvas-card in the narthex, and navigates.
    */
@@ -2257,10 +2233,41 @@ class SkeinRouter {
     // emits peer-disconnected (even with no live stream), guaranteeing the
     // repo's synchronizer clears its stale per-peer bookkeeping for this
     // doc and re-requests it from scratch on the reconnect.
+    // bound each dial attempt well below the messagez widget's own 15s
+    // accept timeout: `IrohNetworkAdapter.addPeer()` -> `openBiWithRetry()`
+    // retries a failed dial up to 4x with a 750ms gap, and each individual
+    // attempt gets its own ~10s `DEFAULT_CONNECT_TIMEOUT` (midden/src/lib.rs)
+    // before failing over to the next attempt - worst case ~40s just for
+    // the direct dial to `fromNodeId` alone. when `fromNodeId` (the
+    // original inviter) is genuinely offline - exactly the case a
+    // hub-relayed invite exists to handle - that whole retry loop has to
+    // run to completion and reject before this function's `catch` below
+    // ever gets a chance to try `relayedBy`, guaranteeing the widget's own
+    // 15s timeout fires first and the hub fallback never even starts. race
+    // each dial against a short local timeout instead: if the direct dial
+    // hasn't succeeded quickly, move on to the hub without waiting for
+    // iroh's own much longer internal retry/timeout budget to expire (the
+    // abandoned dial keeps running in the background and is still handled
+    // via `.then` below, so it can't produce an unhandled rejection).
+    const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T> =>
+      new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`dial timed out after ${ms}ms`)), ms);
+        promise.then(
+          (value) => {
+            clearTimeout(timer);
+            resolve(value);
+          },
+          (err) => {
+            clearTimeout(timer);
+            reject(err);
+          }
+        );
+      });
+
     let connected = false;
     try {
       this.irohAdapter.forgetPeer(detail.fromNodeId);
-      await this.irohAdapter.addPeer(detail.fromNodeId);
+      await withTimeout(this.irohAdapter.addPeer(detail.fromNodeId), 4000);
       connected = true;
     } catch (err) {
       log.error(TAG, "failed to connect to invite peer:", err);
@@ -2269,7 +2276,7 @@ class SkeinRouter {
     if (!connected && detail.relayedBy && detail.relayedBy !== detail.fromNodeId) {
       try {
         this.irohAdapter.forgetPeer(detail.relayedBy);
-        await this.irohAdapter.addPeer(detail.relayedBy);
+        await withTimeout(this.irohAdapter.addPeer(detail.relayedBy), 5000);
         connected = true;
       } catch (err) {
         log.error(TAG, "failed to connect to relaying hub:", err);
@@ -2327,6 +2334,15 @@ class SkeinRouter {
       }
     }
 
+    // the relaying hub's node id (if any), carried onto the canvas-card as
+    // informational card data (see canvasCardSchema's `hubNodeIds` doc
+    // comment) — no client-initiated friend request is sent for it. the
+    // hub itself proactively sends this peer a friend request once it
+    // notices them online and finds them vouched for by this canvas's acl
+    // (see tumulus's `HubPeerService::maybe_send_proactive_friend_request`),
+    // so there's nothing for the client to initiate here.
+    const hubNodeIds = detail.relayedBy ? [detail.relayedBy] : [];
+
     if (narthexStore) {
       const existing = narthexStore.allWidgets();
       const alreadyExists = existing.some((w) => {
@@ -2361,6 +2377,8 @@ class SkeinRouter {
             role: detail.role ?? "member",
             accessRevoked: false,
             accessPending: false,
+            // see `hubNodeIds` const above.
+            hubNodeIds,
           });
         }
       } else {
@@ -2397,6 +2415,8 @@ class SkeinRouter {
             ownerNodeId: detail.fromNodeId,
             ownerUsername: detail.fromUsername || "",
             ownerAvatarDataUrl: detail.fromAvatarDataUrl || "",
+            // see `hubNodeIds` const above.
+            hubNodeIds,
             // NOTE: this is a cosmetic display field on the *local* narthex
             // canvas-card only — it is NOT the actual access control. the
             // real ACL lives in the shared canvas doc's `.acl` map (see
@@ -2489,6 +2509,29 @@ class SkeinRouter {
         "share link owner isn't a friend yet — staying on narthex:",
         decoded.nodeId.slice(0, 16) + "..."
       );
+
+      // best-effort fallback: dial any hub(s) the share link named (see
+      // share-string.ts's `hubNodeIds`), even though we're not opening the
+      // canvas yet. this is what lets a hub ever notice this peer is
+      // online and reachable in the first place — the hub's own
+      // `FriendzEvent::PeerOnline` handler only fires once it *receives*
+      // something from us (see tumulus's `mark_online_if_new`), so simply
+      // knowing the hub's node id is useless until we actually connect to
+      // it at least once. no friend request is sent from here: if the
+      // canvas owner already invited this exact node id (named in the
+      // canvas's acl/pendingInvites, which is how a real invite — as
+      // opposed to a generic share link nobody in particular was granted
+      // — gets recorded), the hub proactively sends a friend request of
+      // its own the moment it notices us (see tumulus's
+      // `HubPeerService::maybe_send_proactive_friend_request`); if we were
+      // never actually invited, this dial harmlessly does nothing further.
+      for (const hubNodeId of decoded.hubNodeIds ?? []) {
+        try {
+          await this.irohAdapter.addPeer(hubNodeId);
+        } catch (err) {
+          log.debug(TAG, "failed to connect to share-link hub:", hubNodeId.slice(0, 16) + "...", err);
+        }
+      }
     }
 
     // remove the join wizard widget if it was used

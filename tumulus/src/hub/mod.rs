@@ -465,9 +465,11 @@ impl HubPeerService {
                 endpoint: self.endpoint.clone(),
                 hub_repo: self.hub_repo.clone(),
                 friendz_store: self.friendz_store.clone(),
+                userz: self.userz.clone(),
                 blobz: self.blobz.clone(),
                 canvas_doc_ids: Arc::clone(&self.canvas_doc_ids),
                 data_dir: self.data_dir.clone(),
+                engine: self.engine.clone(),
             };
             let dashboard_cancel = cancel.clone();
             tokio::spawn(crate::dashboard::run(dashboard_ctx, dashboard_cancel))

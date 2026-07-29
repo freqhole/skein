@@ -1,5 +1,6 @@
 import type { DocHandle } from "@automerge/automerge-repo";
 import { z } from "zod";
+import { deepUnwrapAmStrings } from "../canvas/automerge-values";
 import type { WidgetDoc } from "./widget-types";
 
 /**
@@ -29,14 +30,22 @@ export function createWidgetDoc<S extends z.ZodType>(
   let cachedState: State | null = null;
 
   function parseDoc(): State {
-    const raw = handle.doc();
+    const rawDoc = handle.doc();
+    // a widget doc a rust peer (tumulus's hub) has ever written into
+    // directly comes back with any string-typed field as an
+    // `ImmutableString` instance rather than a plain js string (see
+    // automerge-values.ts's `deepUnwrapAmStrings` doc comment) — coerce the
+    // whole doc up front so zod's `z.string()`/`z.array(z.string())`
+    // checks see plain strings regardless of who wrote them.
+    const raw = rawDoc ? deepUnwrapAmStrings(rawDoc) : rawDoc;
     try {
       return schema.parse(raw ?? {});
     } catch (err) {
       if (migrate) {
         try {
           handle.change(migrate);
-          return schema.parse(handle.doc() ?? {});
+          const migrated = handle.doc();
+          return schema.parse(migrated ? deepUnwrapAmStrings(migrated) : {});
         } catch {
           // migration didn't fix it — fall through to the default fallback below.
         }
@@ -49,6 +58,7 @@ export function createWidgetDoc<S extends z.ZodType>(
         "raw keys:",
         raw ? Object.keys(raw) : "null"
       );
+
       return schema.parse({});
     }
   }

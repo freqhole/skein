@@ -46,6 +46,24 @@ impl HubPeerService {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
                     self.compute_and_send_gossip_digest(&node_id).await;
+                } else {
+                    // not a friend yet - if this peer is already named in
+                    // the acl/pendingInvites of a canvas the hub holds (the
+                    // same "canvas-vouched" condition an inbound
+                    // FriendRequest auto-accepts against, see
+                    // `is_vouched_by_any_canvas`'s doc comment), proactively
+                    // send them a friend request ourselves instead of
+                    // waiting for them to discover and friend the hub
+                    // first. this is what lets a peer whose canvas owner is
+                    // offline still get their canvas + blobs relayed by the
+                    // hub the moment they come online, without any manual
+                    // "connect via hub" step on their side. canvas + blob
+                    // access itself is authorized by canvas-acl membership
+                    // alone (see `blob_acl.rs`'s `for_hub` gate) - this
+                    // friend request is a separate, weaker relationship
+                    // the peer still has to accept before the hub will
+                    // accept new blobs *from* them or sync more broadly.
+                    self.maybe_send_proactive_friend_request(&node_id).await;
                 }
             }
             FriendzEvent::PeerOffline { node_id } => {
@@ -117,6 +135,16 @@ impl HubPeerService {
                     peer = %from_node_id,
                     username = %username,
                     "received profile response"
+                );
+                // TEMP DEBUG — remove once the "weird username" report is
+                // root-caused. bumped to info (debug! is often filtered out
+                // in normal runs) and uses {:?} to reveal any
+                // whitespace/invisible-character surprises the %-display
+                // form would hide.
+                tracing::info!(
+                    peer = %from_node_id,
+                    username = ?username,
+                    "TEMP received profile-response username"
                 );
 
                 let avatar_blake3 = self
@@ -193,6 +221,13 @@ impl HubPeerService {
                 );
                 let vouched = !pre_approved && self.is_vouched_by_any_canvas(from_node_id).await;
                 let auto_accept = pre_approved || vouched;
+                tracing::debug!(
+                    peer = %from_node_id,
+                    pre_approved,
+                    vouched,
+                    auto_accept,
+                    "friend request auto-accept decision"
+                );
                 if vouched {
                     tracing::info!(
                         peer = %from_node_id,
@@ -389,6 +424,25 @@ impl HubPeerService {
 
                 // NOTE: no outbound sync dial — see PeerOnline handler comment.
                 // the JS side will establish sync when it needs to.
+
+                // send the gossip digest right away rather than waiting for
+                // this peer's next `PeerOnline` transition (which won't
+                // fire again for an already-online connection — presence
+                // is edge-triggered, see `mark_online_if_new` in haruspex).
+                // this matters most for exactly the proactive-friend-request
+                // case (see `maybe_send_proactive_friend_request`): a peer
+                // who just came online, got auto-friended by us, and
+                // accepted right back shouldn't have to wait for a whole
+                // separate reconnect cycle to actually receive the pending
+                // canvas invite (and the canvas doc/blobs themselves) this
+                // friendship exists to deliver. same delay as the
+                // `PeerOnline` friend branch and same tradeoff (blocks this
+                // service's event loop for the duration — see that
+                // branch's comment), for the same reason (let the peer's
+                // JS side finish establishing automerge sync via the
+                // acceptor path first).
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                self.compute_and_send_gossip_digest(from_node_id).await;
             }
             CoreMessage::FriendAcceptAck { .. } => {
                 tracing::debug!(
@@ -643,6 +697,102 @@ impl HubPeerService {
                     code = %code,
                     message = %message,
                     "received protocol error message"
+                );
+            }
+        }
+    }
+
+    /// proactively send a friend request to `node_id`, if (and only if)
+    /// there's no existing friendz row for them at all — an `Allowed`/
+    /// `Accepted`/`Pending` row (either direction) or a `Blocked` row all
+    /// mean either a request already went out (or came in), or the
+    /// operator explicitly doesn't want one sent, so this only ever fires
+    /// once per peer until something else changes their status. called
+    /// from the `PeerOnline` handler above once `is_vouched_by_any_canvas`
+    /// has already confirmed the peer is a legitimate invitee of a canvas
+    /// the hub holds — see that call site's doc comment for the full
+    /// rationale (canvas + blob access itself doesn't wait on this;
+    /// see `blob_acl.rs`'s `for_hub` gate).
+    pub(crate) async fn maybe_send_proactive_friend_request(&self, node_id: &str) {
+        use crate::friendz::{Direction, FriendStatus};
+
+        match self.friendz_store.get(node_id).await {
+            Ok(Some(existing)) => {
+                tracing::debug!(
+                    peer = %node_id,
+                    status = ?existing.status,
+                    "not sending proactive friend request — friendz row already exists"
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    peer = %node_id,
+                    error = %e,
+                    "friendz lookup failed, skipping proactive friend request"
+                );
+                return;
+            }
+        }
+
+        let (hub_username, hub_bio, hub_avatar_data_url, hub_accent_color) = {
+            let p = self.hub_profile.read().await;
+            (
+                p.username.clone(),
+                p.bio.clone(),
+                p.avatar_data_url.clone(),
+                p.accent_color,
+            )
+        };
+
+        tracing::info!(
+            peer = %node_id,
+            "proactively sending friend request to canvas-vouched peer that just came online"
+        );
+
+        let request = FriendzMessage::Core(CoreMessage::FriendRequest {
+            v: 1,
+            from_node_id: self.node_id_str.clone(),
+            from_username: hub_username,
+            bio: Some(hub_bio),
+            avatar_data_url: Some(hub_avatar_data_url),
+            accent_color: Some(hub_accent_color),
+            // self-declare as a hub, same as the reactive FriendAccept path
+            // (see `handle_core_message`'s `CoreMessage::FriendRequest` arm).
+            is_hub: Some(true),
+        });
+
+        match self.send_friendz_message(node_id, &request).await {
+            Ok(()) => {
+                // record it as an outbound-initiated pending request so this
+                // never resends on a later PeerOnline for the same peer, and
+                // so an incoming FriendAccept later has a row to "honor"
+                // against (see `CoreMessage::FriendAccept`'s handler).
+                if let Err(e) = self
+                    .friendz_store
+                    .upsert_full(
+                        node_id,
+                        FriendStatus::Pending,
+                        Some(Direction::Outbound),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        peer = %node_id,
+                        error = %e,
+                        "failed to record proactive friend request as pending"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    peer = %node_id,
+                    error = %e,
+                    "failed to send proactive friend request (peer may not be reachable yet)"
                 );
             }
         }

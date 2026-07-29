@@ -3,7 +3,8 @@
 //! engine that scans for blob references and fetches any missing blobs
 //! from peers.
 //!
-//! [`HubBlobRefSource`] scans automerge canvas docs for file widgets and
+//! [`HubBlobRefSource`] scans automerge canvas docs for blob-bearing widgets
+//! (file, audio-recording, voice-recording - see `BLOB_WIDGET_TYPES`) and
 //! their widget-state docs for blake3/snatchedBy fields - the engine calls
 //! it both for a full boot-time sweep and for single-doc rescans driven by
 //! `hub_repo`'s doc-change notifications. [`HubPeerProbeTransport`] asks a
@@ -95,6 +96,11 @@ impl HubBlobRefSource {
         let mut descriptors = Vec::new();
         for placeholder in &placeholder_refs {
             let Some(whandle) = self.repo.find(&placeholder.widget_doc_id).await else {
+                tracing::info!(
+                    canvas = canvas_doc_id,
+                    widget_doc_id = %placeholder.widget_doc_id,
+                    "widget-state doc not yet synced to hub - skipping this widget for now"
+                );
                 continue;
             };
             let canvas_id = canvas_doc_id.to_string();
@@ -106,9 +112,33 @@ impl HubBlobRefSource {
             .ok()
             .flatten();
 
-            if let Some(blob_ref) = blob_ref {
-                if !blob_ref.blake3.is_empty() {
-                    descriptors.push(to_descriptor(blob_ref, &peers, &self.local_node_id));
+            match blob_ref {
+                None => {
+                    tracing::info!(
+                        canvas = canvas_doc_id,
+                        widget_doc_id = %placeholder.widget_doc_id,
+                        "widget-state doc has no blobId/blake3 field at all yet"
+                    );
+                }
+                Some(blob_ref) if blob_ref.blake3.is_empty() => {
+                    tracing::info!(
+                        canvas = canvas_doc_id,
+                        widget_doc_id = %placeholder.widget_doc_id,
+                        blob_id = %blob_ref.blob_id,
+                        "widget-state doc has a blobId but no blake3 yet - can't snatch without it"
+                    );
+                }
+                Some(blob_ref) => {
+                    let descriptor = to_descriptor(blob_ref, &peers, &self.local_node_id);
+                    tracing::info!(
+                        canvas = canvas_doc_id,
+                        widget_doc_id = %placeholder.widget_doc_id,
+                        blake3 = trunc(&descriptor.blake3),
+                        canvas_peers = ?peers,
+                        candidate_peers = ?descriptor.candidate_peers,
+                        "resolved blob descriptor from canvas file widget"
+                    );
+                    descriptors.push(descriptor);
                 }
             }
         }
@@ -120,6 +150,10 @@ impl HubBlobRefSource {
     /// change carries no canvas context of its own).
     async fn extract_from_widget_state(&self, widget_doc_id: &str) -> Vec<BlobDescriptor> {
         let Some(handle) = self.repo.find(widget_doc_id).await else {
+            tracing::info!(
+                widget_doc_id,
+                "extract_from_widget_state: doc not found in hub repo"
+            );
             return Vec::new();
         };
         let placeholder_canvas_id = String::new();
@@ -130,11 +164,32 @@ impl HubBlobRefSource {
         .await
         {
             Ok(Some(b)) if !b.blake3.is_empty() => b,
-            _ => return Vec::new(),
+            Ok(Some(_)) => {
+                tracing::info!(
+                    widget_doc_id,
+                    "extract_from_widget_state: doc found but blake3 is empty"
+                );
+                return Vec::new();
+            }
+            _ => {
+                tracing::info!(
+                    widget_doc_id,
+                    "extract_from_widget_state: doc has no blobId/blake3 field at all"
+                );
+                return Vec::new();
+            }
         };
 
         let peers = self.peers_referencing_widget(widget_doc_id).await;
-        vec![to_descriptor(blob_ref, &peers, &self.local_node_id)]
+        let descriptor = to_descriptor(blob_ref, &peers, &self.local_node_id);
+        tracing::info!(
+            widget_doc_id,
+            blake3 = trunc(&descriptor.blake3),
+            canvas_peers = ?peers,
+            candidate_peers = ?descriptor.candidate_peers,
+            "resolved blob descriptor from widget-state doc change"
+        );
+        vec![descriptor]
     }
 
     /// walk every doc the hub holds to find canvases that reference
@@ -499,7 +554,18 @@ pub(crate) fn classify_doc(handle: &crate::hub_repo::DocHandle) -> DocKind {
     kind
 }
 
-/// read a canvas automerge doc to find file widget docIds and peer node IDs.
+/// widget types whose state doc may carry a blob reference (`blobId`/
+/// `blake3`) that the hub should discover, snatch/replicate, and gate via
+/// `blob_acl`. keep this in sync with the client-side widget schemas (loam's
+/// `widgets/file.ts`, `widgets/audio-recording.ts`, `widgets/voice-recording.ts`)
+/// — a future blob-backed widget type needs to be added here too, or its
+/// widget-state docs are silently skipped by the scan below and the hub
+/// never proxies/mirrors its blobs.
+const BLOB_WIDGET_TYPES: &[&str] = &["file", "audio-recording", "voice-recording"];
+
+/// read a canvas automerge doc to find blob-bearing widget docIds (file,
+/// audio-recording, voice-recording — see `BLOB_WIDGET_TYPES`) and peer node
+/// IDs.
 ///
 /// returns placeholder BlobRefs (only canvas_doc_id + widget_doc_id populated)
 /// plus the list of peer node IDs from the canvas peers map.
@@ -536,18 +602,18 @@ pub(crate) fn read_canvas_for_file_widgets(
             }
         }
 
-        // find file widgets in the "widgets" map
+        // find blob-bearing widgets in the "widgets" map
         if let Ok(Some((_, widgets_obj))) = doc.get(automerge::ROOT, "widgets") {
             for key in doc.keys(&widgets_obj) {
                 let key_str: &str = &key;
                 if let Ok(Some((_, widget_obj))) = doc.get(&widgets_obj, key_str) {
                     // check widget type
                     let widget_type = read_str(doc, &widget_obj, "type");
-                    if widget_type != "file" {
+                    if !BLOB_WIDGET_TYPES.contains(&widget_type.as_str()) {
                         continue;
                     }
 
-                    // get the docId pointing to the file widget state doc
+                    // get the docId pointing to the widget state doc
                     let doc_id = read_str(doc, &widget_obj, "docId");
                     if !doc_id.is_empty() {
                         widget_doc_ids.push(doc_id);
@@ -560,16 +626,16 @@ pub(crate) fn read_canvas_for_file_widgets(
     if widget_doc_ids.is_empty() {
         tracing::trace!(
             canvas = canvas_doc_id,
-            file_widgets = 0,
+            blob_widgets = 0,
             peers = peers.len(),
-            "scanned canvas for file widgets"
+            "scanned canvas for blob widgets"
         );
     } else {
         tracing::info!(
             canvas = canvas_doc_id,
-            file_widgets = widget_doc_ids.len(),
+            blob_widgets = widget_doc_ids.len(),
             peers = peers.len(),
-            "scanned canvas for file widgets"
+            "scanned canvas for blob widgets"
         );
     }
 
@@ -592,7 +658,7 @@ pub(crate) fn read_canvas_for_file_widgets(
     (placeholder_refs, peers)
 }
 
-/// read a file widget state doc to extract blob reference fields.
+/// read a blob-bearing widget state doc to extract blob reference fields.
 ///
 /// `pub(crate)`: also used by `blob_acl`'s canvas-membership resolver to
 /// read a widget doc's `blake3` field when checking whether a given blob is
@@ -743,5 +809,74 @@ mod tests {
         };
         assert_eq!(trunc(&br.blake3), "");
         assert_eq!(trunc(&br.blob_id), "");
+    }
+
+    /// a canvas with file/audio-recording/voice-recording widgets should have
+    /// all three discovered for blob replication; a non-blob widget type
+    /// (canvas-card) should be skipped. regression test for the hub silently
+    /// never proxying/snatching audio and voice recording blobs because the
+    /// scan used to hardcode `widget_type != "file"`.
+    #[tokio::test]
+    async fn read_canvas_for_file_widgets_includes_audio_and_voice_widgets() {
+        use automerge::transaction::Transactable;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub.db");
+
+        let storage = crate::hub_repo::HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+
+        let mut canvas_doc = automerge::Automerge::new();
+        canvas_doc
+            .transact::<_, _, automerge::AutomergeError>(|tx| {
+                let widgets = tx.put_object(automerge::ROOT, "widgets", automerge::ObjType::Map)?;
+
+                let file_widget = tx.put_object(&widgets, "w1", automerge::ObjType::Map)?;
+                tx.put(&file_widget, "type", "file")?;
+                tx.put(&file_widget, "docId", "file-widget-doc")?;
+
+                let audio_widget = tx.put_object(&widgets, "w2", automerge::ObjType::Map)?;
+                tx.put(&audio_widget, "type", "audio-recording")?;
+                tx.put(&audio_widget, "docId", "audio-widget-doc")?;
+
+                let voice_widget = tx.put_object(&widgets, "w3", automerge::ObjType::Map)?;
+                tx.put(&voice_widget, "type", "voice-recording")?;
+                tx.put(&voice_widget, "docId", "voice-widget-doc")?;
+
+                // non-blob widget type — should be skipped by the scan.
+                let card_widget = tx.put_object(&widgets, "w4", automerge::ObjType::Map)?;
+                tx.put(&card_widget, "type", "canvas-card")?;
+                tx.put(&card_widget, "docId", "card-widget-doc")?;
+
+                Ok(())
+            })
+            .expect("canvas doc transact should succeed");
+        storage.save_doc("canvas-1", &canvas_doc.save()).await;
+
+        let repo = HubRepo::new("local-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new should succeed");
+        let handle = repo
+            .find("canvas-1")
+            .await
+            .expect("canvas doc should be findable");
+
+        // `read_canvas_for_file_widgets` uses `DocHandle::with_document`'s
+        // `blocking_read()` internally, which panics if called directly on
+        // a tokio runtime thread — run it via `spawn_blocking`, same as the
+        // real callers (`extract_from_canvas`, `blob_acl`'s resolver) do.
+        let (refs, _peers) = tokio::task::spawn_blocking(move || {
+            read_canvas_for_file_widgets(&handle, "canvas-1", "local-node")
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+        let widget_doc_ids: Vec<&str> = refs.iter().map(|r| r.widget_doc_id.as_str()).collect();
+
+        assert!(widget_doc_ids.contains(&"file-widget-doc"));
+        assert!(widget_doc_ids.contains(&"audio-widget-doc"));
+        assert!(widget_doc_ids.contains(&"voice-widget-doc"));
+        assert!(!widget_doc_ids.contains(&"card-widget-doc"));
+        assert_eq!(widget_doc_ids.len(), 3);
     }
 }

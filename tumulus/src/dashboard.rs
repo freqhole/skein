@@ -26,6 +26,8 @@ use tokio_util::sync::CancellationToken;
 use crate::friendz::{self, Direction};
 use crate::hub_repo::HubRepo;
 use crate::protocol::hub_admin::{disk_space, list_pending_knocks};
+use crate::snatch::HubSnatchEngine;
+use crate::userz;
 use freqhole_reliquary::blobz::BlobStore;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
@@ -49,9 +51,11 @@ pub struct DashboardContext {
     pub endpoint: iroh::Endpoint,
     pub hub_repo: HubRepo,
     pub friendz_store: friendz::Store,
+    pub userz: userz::Directory,
     pub blobz: Arc<dyn BlobStore>,
     pub canvas_doc_ids: Arc<Mutex<HashSet<String>>>,
     pub data_dir: PathBuf,
+    pub(crate) engine: Arc<HubSnatchEngine>,
 }
 
 /// drive the dashboard until `cancel` fires.
@@ -130,6 +134,45 @@ async fn render_frame(
     }
     out.push('\n');
 
+    // online friends - `connected_peer_ids` includes any live connection
+    // (a peer mid-knock/invite flow may connect before being a friend), so
+    // filter down to actual friendz relationships before labeling this
+    // "friends".
+    let mut online_friends = Vec::new();
+    for peer_id in ctx.hub_repo.connected_peer_ids().await {
+        if ctx.friendz_store.is_friend(&peer_id).await {
+            online_friends.push(display_name_for(&ctx.userz, &peer_id).await);
+        }
+    }
+    if online_friends.is_empty() {
+        out.push_str("online friends: none\n\n");
+    } else {
+        out.push_str(&format!(
+            "online friends ({}): {}\n\n",
+            online_friends.len(),
+            online_friends.join(", ")
+        ));
+    }
+
+    let active_downloads = ctx.engine.active_downloads();
+    if active_downloads.is_empty() {
+        out.push_str("downloads: none in progress\n\n");
+    } else {
+        out.push_str(&format!(
+            "downloads: {} in progress\n",
+            active_downloads.len()
+        ));
+        for download in &active_downloads {
+            let from = display_name_for(&ctx.userz, &download.peer).await;
+            let elapsed = download.started_at.elapsed().as_secs();
+            out.push_str(&format!(
+                "  - {} from {from} ({elapsed}s)\n",
+                download.filename
+            ));
+        }
+        out.push('\n');
+    }
+
     let pending_friend_requests = ctx
         .friendz_store
         .list_pending(Some(Direction::Inbound))
@@ -145,7 +188,7 @@ async fn render_frame(
         for req in &pending_friend_requests {
             out.push_str(&format!(
                 "  - friend request from {}\n",
-                short_node_id(&req.friend_node_id)
+                display_name_for(&ctx.userz, &req.friend_node_id).await
             ));
         }
         for knock in &pending_knocks {
@@ -154,14 +197,40 @@ async fn render_frame(
             } else {
                 knock.requester_username.clone()
             };
+            let canvas_label = ctx
+                .hub_repo
+                .canvas_title(&knock.canvas_doc_id)
+                .await
+                .unwrap_or_else(|| short_node_id(&knock.canvas_doc_id));
             out.push_str(&format!(
-                "  - canvas request from {who} (canvas {})\n",
-                short_node_id(&knock.canvas_doc_id)
+                "  - canvas request from {who} (canvas {canvas_label})\n"
             ));
         }
     }
 
     out
+}
+
+/// resolve a peer's display name via `userz`, falling back to a shortened
+/// node id when no username is on record.
+async fn display_name_for(userz: &userz::Directory, node_id: &str) -> String {
+    let record = userz.get(node_id).await;
+    // TEMP DEBUG — remove once the "weird username" report is root-caused.
+    // {:?} on the whole record shows display_name *and* alias together, so
+    // we can tell whether a stale/wrong alias (not display_name) is what's
+    // actually surfacing.
+    tracing::info!(
+        peer = %node_id,
+        record = ?record,
+        "TEMP display_name_for resolved record"
+    );
+    match record {
+        Ok(Some(record)) => match record.display_name {
+            Some(name) if !name.is_empty() => name,
+            _ => short_node_id(node_id),
+        },
+        _ => short_node_id(node_id),
+    }
 }
 
 /// shorten a node/doc id for compact display: first 8 + last 4 hex chars.
