@@ -183,10 +183,11 @@ impl HubDocStorage {
     pub async fn new(db_path: &Path) -> Result<Self, sqlx::Error> {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(db_path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
 
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(4)
+            .max_connections(8)
             .connect_with(options)
             .await?;
 

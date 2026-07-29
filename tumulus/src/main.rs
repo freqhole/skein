@@ -19,6 +19,10 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     port: u16,
 
+    /// write logs to a file (<data_dir>/tumulus.log) instead of stdout/stderr
+    #[arg(long)]
+    log_file: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -151,18 +155,90 @@ fn dirs_data_local() -> Option<PathBuf> {
     None
 }
 
+/// log file name, written alongside the hub's sqlite db and keypair in the data dir.
+const LOG_FILE_NAME: &str = "tumulus.log";
+/// log file is truncated (keeping the newest lines) once it exceeds this many lines.
+const MAX_LOG_LINES: usize = 10_000;
+
+/// truncate a log file to its newest `max_lines` lines, if it's grown past
+/// that - keeps a long-running hub's log from growing unbounded.
+fn truncate_log_file_if_needed(path: &std::path::Path, max_lines: usize) {
+    use std::io::{BufRead, BufReader, Write};
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let reader = BufReader::new(file);
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+
+    if lines.len() <= max_lines {
+        return;
+    }
+
+    let keep_from = lines.len() - max_lines;
+    if let Ok(mut file) = std::fs::File::create(path) {
+        for line in &lines[keep_from..] {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+/// set up tracing: writes to a log file in `data_dir` (`tumulus.log`) when
+/// `log_file` is true, otherwise to stdout/stderr as before. file logging
+/// replaces stdout/stderr entirely rather than duplicating output to both,
+/// so a headless hub run under a process supervisor can be switched to a
+/// plain log file without doubling up output.
+fn setup_tracing(log_file: bool, data_dir: &std::path::Path) {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    if !log_file {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        return;
+    }
+
+    let log_path = data_dir.join(LOG_FILE_NAME);
+    truncate_log_file_if_needed(&log_path, MAX_LOG_LINES);
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok();
+
+    match file {
+        Some(file) => {
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false);
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(file_layer)
+                .init();
+        }
+        None => {
+            // file failed to open (e.g. read-only/missing data dir) - fall
+            // back to stdout/stderr rather than failing to start.
+            eprintln!(
+                "warning: could not open log file {}, falling back to stdout",
+                log_path.display()
+            );
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
     let data_dir = cli.data_dir.unwrap_or_else(default_data_dir);
     tokio::fs::create_dir_all(&data_dir).await?;
+
+    setup_tracing(cli.log_file, &data_dir);
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Init => {
