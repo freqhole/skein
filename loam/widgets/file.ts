@@ -1115,6 +1115,15 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           ctx.doc.current.blobId === blobId &&
           ctx.doc.current.thumbnailDataUrl !== dataUrl
         ) {
+          // update prevThumbDataUrl *before* writing, so the doc-change
+          // subscription (which fires synchronously from ctx.doc.change)
+          // doesn't see it as "new" and re-enter with a nested
+          // loadEmbeddedThumbnail() call while we're still mid-flight here —
+          // that reentrancy corrupts the sprite/texture/loadState this call
+          // is about to finish setting up, leaving the widget stuck on
+          // "loading..." forever. same suppression pattern handleUpload
+          // already uses for prevBlobId.
+          prevThumbDataUrl = dataUrl;
           ctx.doc.change((draft) => {
             draft.thumbnailDataUrl = dataUrl;
           });
@@ -1402,6 +1411,24 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
                 }
               }
             });
+
+            // video/audio/pdf thumbnails need ffmpeg/magick, so they're never
+            // ready synchronously at upload time. a bin never mounts its
+            // children's full widget lifecycle (it only reads the persisted
+            // doc via getCompactInfo), so nothing else will ever generate and
+            // persist one later - fetch and write it now, best-effort.
+            if (!result.thumbnailDataUrl) {
+              try {
+                const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200 });
+                if (thumbDataUrl) {
+                  childDocHandle.change((draft: any) => {
+                    draft.thumbnailDataUrl = thumbDataUrl;
+                  });
+                }
+              } catch {
+                log.debug("file-widget", "auto-bin thumbnail generation failed for", result.blobId);
+              }
+            }
           })
           .catch((err) => {
             log.warn("file-widget", `auto-bin upload failed for ${file.filename}:`, err);

@@ -2,7 +2,7 @@ import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics, Sprite, Text, Texture, Assets } from "pixi.js";
 
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
-import { pickFiles, uploadFile } from "../../src/widgets/file-utils";
+import { getThumbnailDataUrl, pickFiles, uploadFile } from "../../src/widgets/file-utils";
 import { fileSchema } from "../file";
 import { snatchAllInBin } from "./bin-actions";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
@@ -470,6 +470,25 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
             draft.blake3 = result.blake3 ?? "";
             draft.thumbnailDataUrl = result.thumbnailDataUrl ?? "";
           });
+
+          // video/audio/pdf thumbnails need ffmpeg/magick, so they're never
+          // ready synchronously at upload time. a bin never mounts its
+          // children's full widget lifecycle (it only reads the persisted
+          // doc via getCompactInfo), so nothing else will ever generate and
+          // persist one later - fetch and write it now, best-effort.
+          if (!result.thumbnailDataUrl) {
+            try {
+              const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200 });
+              if (thumbDataUrl) {
+                docHandle.change((draft: any) => {
+                  draft.thumbnailDataUrl = thumbDataUrl;
+                });
+              }
+            } catch {
+              // thumbnail generation is best-effort — don't fail the upload
+              log.debug("bin", "thumbnail generation failed for", result.blobId);
+            }
+          }
 
           // add the item to the bin's items list only on success
           currentItems.push({ widgetId: childId, slot });
