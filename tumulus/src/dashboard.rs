@@ -39,7 +39,6 @@ const BANNER: &str = "\
   █   █   █ █ █ █ █   █ █     █   █ █████
   █   █   █ █   █ █   █ █     █   █     █
   █   █████ █   █ █████ █████ █████ █████";
-
 /// ANSI magenta foreground, reset at the end - wraps the banner only.
 const MAGENTA: &str = "\x1b[35m";
 const RESET: &str = "\x1b[0m";
@@ -81,6 +80,7 @@ async fn render_frame(
     relay_watcher: &mut impl Watcher<Value = Vec<RelayStatus>>,
 ) -> String {
     let mut out = String::new();
+    out.push('\n');
     out.push_str(MAGENTA);
     out.push_str(BANNER);
     out.push_str(RESET);

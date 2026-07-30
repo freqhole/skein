@@ -42,13 +42,13 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 
 tumulus = { path = "../tumulus" }
-freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.5" }
+freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.6" }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 # test-utils pulls in reliquary::testing (make_local_storage_node etc.) — only
 # activated for test builds, resolver v2 keeps it out of the release binary.
-freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.5", features = [
+freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.6", features = [
     "test-utils",
 ] }
 tempfile = "3"

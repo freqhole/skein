@@ -2376,8 +2376,8 @@ dependencies = [
 
 [[package]]
 name = "haruspex"
-version = "0.2.5"
-source = "git+https://github.com/freqhole/tomb?tag=v0.2.5#66313d1d9d09e0b0179a58f51be633716d5bba40"
+version = "0.2.6"
+source = "git+https://github.com/freqhole/tomb?tag=v0.2.6#af5cab8b7b24a122ecf568bafd9f9a9abbb97ec5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5292,8 +5292,8 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reliquary"
-version = "0.2.5"
-source = "git+https://github.com/freqhole/tomb?tag=v0.2.5#66313d1d9d09e0b0179a58f51be633716d5bba40"
+version = "0.2.6"
+source = "git+https://github.com/freqhole/tomb?tag=v0.2.6#af5cab8b7b24a122ecf568bafd9f9a9abbb97ec5"
 dependencies = [
  "anyhow",
  "async-trait",

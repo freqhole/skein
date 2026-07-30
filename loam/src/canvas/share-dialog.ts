@@ -52,6 +52,9 @@ export interface ShareDialogOptions {
     role?: CanvasRole;
     avatarDataUrl?: string;
     isOnline?: boolean;
+    /** truncated and shown under the peer's name, when known — same
+     *  treatment as FriendInfo.bio. */
+    bio?: string;
   }>;
   /** called when user clicks "remove" on a peer */
   onRemovePeer?: (nodeId: string) => void;
@@ -169,7 +172,7 @@ export function splitFriendsForInvite(friends: FriendInfo[]): {
 // constants
 // ---------------------------------------------------------------------------
 
-const DIALOG_WIDTH = 420;
+const DIALOG_WIDTH = 480;
 const DIALOG_PADDING = 20;
 const SECTION_GAP = 16;
 const LABEL_GAP = 6;
@@ -182,6 +185,14 @@ const DOM_Z = "10003";
 // extra row height given to a friend-invite row when it also shows a
 // truncated bio line underneath the name (see buildFriendInviteRow).
 const FRIEND_ROW_BIO_EXTRA = 14;
+// action buttons/toggles in a row (buildPeerRow, buildFriendInviteRow) are
+// laid out right-to-left with a single running cursor, starting this many
+// px in from the row's right edge, with exactly ROW_GAP between every
+// adjacent pair — using each element's *actual* measured width (rather
+// than a flat per-slot increment) is what keeps the gaps uniform no
+// matter which combination of buttons/labels a given row shows.
+const ROW_RIGHT_MARGIN = 8;
+const ROW_GAP = 10;
 
 // ---------------------------------------------------------------------------
 // helpers — pixi
@@ -199,6 +210,22 @@ function makeLabel(text: string, theme: SkeinTheme): Text {
   });
   t.eventMode = "none";
   return t;
+}
+
+/** measure how wide a one-off Text with the row's small font would render,
+ *  without adding it to the display list — used to size the "remove" and
+ *  "invite" buttons (in buildPeerRow / buildFriendInviteRow respectively)
+ *  to the same fixed width, so they line up across sections instead of
+ *  each hugging its own (slightly different) label width. */
+function measureTextWidth(text: string, theme: SkeinTheme): number {
+  const probe = new Text({
+    text,
+    style: { fontFamily: theme.fontFamily, fontSize: theme.fontSizeSmall },
+    resolution: theme.textResolution,
+  });
+  const width = probe.width;
+  probe.destroy();
+  return width;
 }
 
 function makeCopyButton(theme: SkeinTheme): {
@@ -343,6 +370,8 @@ function buildPeerRow(
   theme: SkeinTheme,
   scrollBoxWidth: number,
   copyBtnH: number,
+  rowHeight: number,
+  actionBtnWidth: number,
   isRemoved: () => boolean,
   onRemovePeer?: (nodeId: string) => void,
   onAddFriend?: (nodeId: string) => void | Promise<void>,
@@ -351,7 +380,8 @@ function buildPeerRow(
   onChangeRole?: (nodeId: string, role: InvitableRole) => void,
   isAlreadyFriend?: boolean,
   avatarDataUrl?: string,
-  isOnline?: boolean
+  isOnline?: boolean,
+  bio?: string
 ): Container {
   const row = new Container();
 
@@ -369,7 +399,7 @@ function buildPeerRow(
     parent: row,
     cacheKey: `share-peer-avatar-${safeNodeId}`,
     centerX: avatarSize / 2,
-    centerY: copyBtnH / 2,
+    centerY: rowHeight / 2,
     size: avatarSize,
     displayName: displayName || truncated,
     colorSeed: 0,
@@ -377,7 +407,10 @@ function buildPeerRow(
     online: isOnline,
   });
 
-  // peer display: show name if known, otherwise truncated node ID
+  // peer display: show name if known, otherwise fall back to a truncated
+  // node ID (only when nothing else identifies this peer) — node ids are
+  // otherwise not shown at all here anymore (still copyable via the copy
+  // button below).
   const label = displayName ? displayName : truncated;
   const idText = new Text({
     text: label,
@@ -391,13 +424,15 @@ function buildPeerRow(
   });
   idText.eventMode = "none";
   idText.x = avatarSize + 8;
-  idText.y = (copyBtnH - idText.height) / 2;
+  idText.y = bio ? avatarSize / 2 - idText.height - 1 : (rowHeight - idText.height) / 2;
   row.addChild(idText);
 
-  // show truncated nodeId below the name if we have a display name
-  if (displayName) {
-    const subIdText = new Text({
-      text: truncated,
+  // bio, truncated — shown under the name when there's room (the row
+  // grows a little taller for this, see the caller's per-row height calc),
+  // same treatment as buildFriendInviteRow's bio line.
+  if (bio) {
+    const bioText = new Text({
+      text: truncate(bio, 40),
       style: {
         fontFamily: theme.fontFamily,
         fontSize: theme.fontSizeSmall - 1,
@@ -405,58 +440,25 @@ function buildPeerRow(
       },
       resolution: theme.textResolution,
     });
-    subIdText.eventMode = "none";
-    subIdText.x = idText.x + idText.width + 6;
-    subIdText.y = (copyBtnH - subIdText.height) / 2;
-    row.addChild(subIdText);
+    bioText.eventMode = "none";
+    bioText.x = idText.x;
+    bioText.y = idText.y + idText.height + 2;
+    row.addChild(bioText);
   }
-  // role toggle — shown for non-admin peers when a change handler is
-  // provided. sits between the "friend" button and the copy button.
-  // the "friend" button/offset only applies when the peer genuinely isn't
-  // already a friend (see isAlreadyFriend param / knownFriendNodeIds).
+
+  // action buttons/toggle are laid out right-to-left with a single running
+  // cursor and a uniform ROW_GAP between every adjacent pair, using each
+  // element's *actual* measured width — order (right to left): remove ->
+  // friend -> role toggle/admin label -> copy. the "friend" button only
+  // applies when the peer genuinely isn't already a friend (see
+  // isAlreadyFriend param / knownFriendNodeIds).
   const showFriendBtn = !!onAddFriend && !isAlreadyFriend;
   const showRoleToggle = !!onChangeRole && role !== "admin";
-  if (showRoleToggle) {
-    const toggle = buildRoleToggle(theme, role === "viewer" ? "viewer" : "member", (newRole) => {
-      onChangeRole!(safeNodeId, newRole);
-    });
-    let roleRightOffset = 8;
-    if (onRemovePeer) roleRightOffset += 70;
-    if (showFriendBtn) roleRightOffset += 70;
-    toggle.container.x = scrollBoxWidth - toggle.width - roleRightOffset;
-    toggle.container.y = (copyBtnH - toggle.height) / 2;
-    row.addChild(toggle.container);
-  } else if (role === "admin") {
-    const adminText = new Text({
-      text: "admin",
-      style: {
-        fontFamily: theme.fontFamily,
-        fontSize: theme.fontSizeSmall,
-        fill: 0x6b7280,
-      },
-      resolution: theme.textResolution,
-    });
-    adminText.eventMode = "none";
-    let roleRightOffset = 8;
-    if (onRemovePeer) roleRightOffset += 70;
-    if (showFriendBtn) roleRightOffset += 70;
-    adminText.x = scrollBoxWidth - adminText.width - roleRightOffset;
-    adminText.y = (copyBtnH - adminText.height) / 2;
-    row.addChild(adminText);
-  }
+  const showAdminLabel = !showRoleToggle && role === "admin";
 
-  // copy button — copies full node ID
-  const copyBtn = makeCopyButton(theme);
-  let rightOffset = 8;
-  if (onRemovePeer) rightOffset += 70;
-  if (showFriendBtn) rightOffset += 70;
-  if (showRoleToggle || role === "admin") rightOffset += 70;
-  copyBtn.btn.x = scrollBoxWidth - copyBtn.width - rightOffset;
-  copyBtn.btn.y = 0;
-  row.addChild(copyBtn.btn);
-  wireCopy(copyBtn.btn, copyBtn.bg, copyBtn.text, copyBtnH, safeNodeId, theme, isRemoved);
+  let cursor = scrollBoxWidth - ROW_RIGHT_MARGIN;
 
-  // remove button (if handler provided)
+  // remove button (if handler provided) — flush right
   if (onRemovePeer) {
     const removeBtnText = new Text({
       text: "remove",
@@ -470,7 +472,10 @@ function buildPeerRow(
     removeBtnText.eventMode = "none";
 
     const removeBtnBg = new Graphics();
-    const removeW = removeBtnText.width + 14 * 2;
+    // fixed width (matches buildFriendInviteRow's "invite" button) so
+    // remove/invite buttons line up across the dialog's sections instead
+    // of each hugging its own label's width.
+    const removeW = actionBtnWidth;
     const removeH = removeBtnText.height + 6 * 2;
     removeBtnBg.roundRect(0, 0, removeW, removeH, 4);
     removeBtnBg.fill({ color: 0x7f1d1d });
@@ -483,9 +488,10 @@ function buildPeerRow(
 
     const removeBtn = new ButtonContainer(removeView);
     removeBtn.cursor = "pointer";
-    removeBtn.x = scrollBoxWidth - removeW;
-    removeBtn.y = 0;
+    removeBtn.x = cursor - removeW;
+    removeBtn.y = (rowHeight - removeH) / 2;
     row.addChild(removeBtn);
+    cursor -= removeW + ROW_GAP;
 
     removeBtn.onPress.connect(() => {
       onRemovePeer(safeNodeId);
@@ -520,11 +526,10 @@ function buildPeerRow(
     const friendBtn = new ButtonContainer(friendView);
     friendBtn.cursor = "pointer";
 
-    let friendRightOffset = 8;
-    if (onRemovePeer) friendRightOffset += 70;
-    friendBtn.x = scrollBoxWidth - friendW - friendRightOffset;
-    friendBtn.y = 0;
+    friendBtn.x = cursor - friendW;
+    friendBtn.y = (rowHeight - friendH) / 2;
     row.addChild(friendBtn);
+    cursor -= friendW + ROW_GAP;
 
     friendBtn.onPress.connect(async () => {
       // show immediate feedback
@@ -558,6 +563,41 @@ function buildPeerRow(
     });
   }
 
+  // role toggle — shown for non-admin peers when a change handler is
+  // provided, otherwise an "admin" label for admins. sits between the
+  // friend/remove buttons and the copy button.
+  if (showRoleToggle) {
+    const toggle = buildRoleToggle(theme, role === "viewer" ? "viewer" : "member", (newRole) => {
+      onChangeRole!(safeNodeId, newRole);
+    });
+    toggle.container.x = cursor - toggle.width;
+    toggle.container.y = (rowHeight - toggle.height) / 2;
+    row.addChild(toggle.container);
+    cursor -= toggle.width + ROW_GAP;
+  } else if (showAdminLabel) {
+    const adminText = new Text({
+      text: "admin",
+      style: {
+        fontFamily: theme.fontFamily,
+        fontSize: theme.fontSizeSmall,
+        fill: 0x6b7280,
+      },
+      resolution: theme.textResolution,
+    });
+    adminText.eventMode = "none";
+    adminText.x = cursor - adminText.width;
+    adminText.y = (rowHeight - adminText.height) / 2;
+    row.addChild(adminText);
+    cursor -= adminText.width + ROW_GAP;
+  }
+
+  // copy button — copies full node ID; always the leftmost action element
+  const copyBtn = makeCopyButton(theme);
+  copyBtn.btn.x = cursor - copyBtn.width;
+  copyBtn.btn.y = (rowHeight - copyBtn.height) / 2;
+  row.addChild(copyBtn.btn);
+  wireCopy(copyBtn.btn, copyBtn.bg, copyBtn.text, copyBtnH, safeNodeId, theme, isRemoved);
+
   return row;
 }
 
@@ -570,6 +610,7 @@ function buildFriendInviteRow(
   theme: SkeinTheme,
   scrollBoxWidth: number,
   rowHeight: number,
+  actionBtnWidth: number,
   isRemoved: () => boolean,
   onInvite?: (friend: FriendInfo, role: InvitableRole) => void | Promise<void>
 ): { container: Container; nameText: Text } {
@@ -649,7 +690,10 @@ function buildFriendInviteRow(
   inviteBtnText.eventMode = "none";
 
   const inviteBtnBg = new Graphics();
-  const inviteW = inviteBtnText.width + 14 * 2;
+  // fixed width (matches buildPeerRow's "remove" button) so remove/invite
+  // buttons line up across the dialog's sections instead of each hugging
+  // its own label's width.
+  const inviteW = actionBtnWidth;
   const inviteH = inviteBtnText.height + 6 * 2;
   inviteBtnBg.roundRect(0, 0, inviteW, inviteH, 4);
   inviteBtnBg.fill({ color: 0x1e3a5f });
@@ -662,11 +706,11 @@ function buildFriendInviteRow(
 
   const inviteBtn = new ButtonContainer(inviteView);
   inviteBtn.cursor = "pointer";
-  inviteBtn.x = scrollBoxWidth - inviteW - 8;
+  inviteBtn.x = scrollBoxWidth - inviteW - ROW_RIGHT_MARGIN;
   inviteBtn.y = (rowHeight - inviteH) / 2;
   row.addChild(inviteBtn);
 
-  roleToggle.container.x = inviteBtn.x - roleToggle.width - 8;
+  roleToggle.container.x = inviteBtn.x - roleToggle.width - ROW_GAP;
   roleToggle.container.y = (rowHeight - roleToggle.height) / 2;
   row.addChild(roleToggle.container);
 
@@ -952,6 +996,14 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   const copyBtnW = copyBtnProbe.width;
   const copyBtnH = copyBtnProbe.height;
 
+  // shared fixed width for the "remove" (buildPeerRow) and "invite"
+  // (buildFriendInviteRow) buttons — using the wider of the two labels'
+  // natural widths means both buttons line up across sections instead of
+  // each hugging its own (slightly different) label width.
+  const actionBtnWidth =
+    Math.max(measureTextWidth("remove", theme), measureTextWidth("invite", theme)) +
+    BUTTON_PAD_H * 2;
+
   // scrollBox width = dialogWidth - 2 * padding (Dialog does this internally)
   const scrollBoxWidth = DIALOG_WIDTH - DIALOG_PADDING * 2;
   const valueWidth = scrollBoxWidth - copyBtnW - 8;
@@ -1039,7 +1091,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
       toggleText.y = BUTTON_PAD_V;
       return { w, h };
     };
-    const { w: toggleW } = drawToggle(includeHubs);
+    const { w: toggleW, h: toggleH } = drawToggle(includeHubs);
 
     const toggleView = new Container();
     toggleView.addChild(toggleBg);
@@ -1048,7 +1100,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
     const toggleBtn = new ButtonContainer(toggleView);
     toggleBtn.cursor = "pointer";
     toggleBtn.x = scrollBoxWidth - toggleW;
-    toggleBtn.y = toggleLabel.height / 2 - (toggleText.height + BUTTON_PAD_V * 2) / 2;
+    toggleBtn.y = toggleLabel.height / 2 - toggleH / 2;
     toggleBtn.onPress.connect(() => {
       options.onToggleIncludeHubs?.(!includeHubs);
     });
@@ -1068,19 +1120,38 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
       },
       resolution: theme.textResolution,
     });
-    description.y = toggleLabel.height + LABEL_GAP;
+    // the toggle button's row (label + button, whichever is taller) needs
+    // to fully clear before the description starts, not just the label's
+    // own height — the button is often taller than the label text, so
+    // using only toggleLabel.height here left the description crowding /
+    // overlapping the button.
+    description.y = Math.max(toggleLabel.height, toggleBtn.y + toggleH) + LABEL_GAP;
     includeHubsSection.addChild(description);
   }
 
   // -------------------------------------------------------------------------
   // peer list section
+  //
+  // peers whose node id is a known hub (hubNodeIds, from the canvas doc) are
+  // rendered in the "hub nodes" section below instead of here — grouped
+  // together with not-yet-invited hub friends rather than mixed in among
+  // regular peers, per a real reported preference.
   // -------------------------------------------------------------------------
+
+  const hubNodeIdSet = new Set(hubNodeIds);
+  const hubPeers = peerList.filter((p) => hubNodeIdSet.has(p.nodeId));
+  const nonHubPeers = peerList.filter((p) => !hubNodeIdSet.has(p.nodeId));
+  const peerNameMap = options.peerDisplayNames;
+  const knownFriends =
+    options.knownFriendNodeIds instanceof Set
+      ? options.knownFriendNodeIds
+      : new Set(options.knownFriendNodeIds ?? []);
 
   const peerSection = new Container();
   const peerLabel = makeLabel("shared with", theme);
   peerSection.addChild(peerLabel);
 
-  if (peerList.length === 0) {
+  if (nonHubPeers.length === 0) {
     const emptyText = new Text({
       text: "no peers yet",
       style: {
@@ -1094,31 +1165,30 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
     peerSection.addChild(emptyText);
   } else {
     let peerY = peerLabel.height + LABEL_GAP;
-    const nameMap = options.peerDisplayNames;
-    const knownFriends =
-      options.knownFriendNodeIds instanceof Set
-        ? options.knownFriendNodeIds
-        : new Set(options.knownFriendNodeIds ?? []);
-    for (const peer of peerList) {
+    for (const peer of nonHubPeers) {
+      const rowHeight = peer.bio ? copyBtnH + FRIEND_ROW_BIO_EXTRA : copyBtnH;
       const peerRow = buildPeerRow(
         peer.nodeId,
         peer.joinedAt,
         theme,
         scrollBoxWidth,
         copyBtnH,
+        rowHeight,
+        actionBtnWidth,
         isRemoved,
         options.onRemovePeer,
         options.onAddFriend,
-        nameMap?.get(peer.nodeId),
+        peerNameMap?.get(peer.nodeId),
         peer.role,
         options.onChangeRole,
         knownFriends.has(peer.nodeId),
         peer.avatarDataUrl,
-        peer.isOnline
+        peer.isOnline,
+        peer.bio
       );
       peerRow.y = peerY;
       peerSection.addChild(peerRow);
-      peerY += copyBtnH + 4;
+      peerY += rowHeight + 4;
     }
   }
 
@@ -1165,6 +1235,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
           theme,
           scrollBoxWidth,
           rowHeight,
+          actionBtnWidth,
           isRemoved,
           options.onInviteFriend
         );
@@ -1177,16 +1248,45 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   }
 
   // -------------------------------------------------------------------------
-  // hub friends section — always last, only shown when non-empty (and
-  // never in read-only mode — see ShareDialogOptions.readOnly)
+  // hub nodes section — always last. groups BOTH hub peers already shared
+  // with this canvas (moved out of "shared with" above, at the top of this
+  // list) and hub friends not yet invited (below them). the invite-friend
+  // sub-list is admin-only (see ShareDialogOptions.readOnly), but already-
+  // shared hub peers are shown to anyone (same visibility as "shared with").
   // -------------------------------------------------------------------------
 
   const hubFriendSection = new Container();
-  if (!readOnly && hubFriendList.length > 0) {
+  const showHubSection = hubPeers.length > 0 || (!readOnly && hubFriendList.length > 0);
+  if (showHubSection) {
     const hubFriendLabel = makeLabel("hub nodes", theme);
     hubFriendSection.addChild(hubFriendLabel);
 
     let hubFriendY = hubFriendLabel.height + LABEL_GAP;
+    for (const peer of hubPeers) {
+      const rowHeight = peer.bio ? copyBtnH + FRIEND_ROW_BIO_EXTRA : copyBtnH;
+      const peerRow = buildPeerRow(
+        peer.nodeId,
+        peer.joinedAt,
+        theme,
+        scrollBoxWidth,
+        copyBtnH,
+        rowHeight,
+        actionBtnWidth,
+        isRemoved,
+        options.onRemovePeer,
+        options.onAddFriend,
+        peerNameMap?.get(peer.nodeId),
+        peer.role,
+        options.onChangeRole,
+        knownFriends.has(peer.nodeId),
+        peer.avatarDataUrl,
+        peer.isOnline,
+        peer.bio
+      );
+      peerRow.y = hubFriendY;
+      hubFriendSection.addChild(peerRow);
+      hubFriendY += rowHeight + 4;
+    }
     for (const friend of hubFriendList) {
       const rowHeight = friend.bio ? copyBtnH + FRIEND_ROW_BIO_EXTRA : copyBtnH;
       const { container: friendRow, nameText } = buildFriendInviteRow(
@@ -1194,6 +1294,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
         theme,
         scrollBoxWidth,
         rowHeight,
+        actionBtnWidth,
         isRemoved,
         options.onInviteFriend
       );
@@ -1350,27 +1451,32 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
     ...(hubNodeIds.length > 0 ? [includeHubsSection] : []),
     peerSection,
     ...(readOnly ? [] : [friendSection]),
-    ...(!readOnly && hubFriendList.length > 0 ? [hubFriendSection] : []),
+    ...(showHubSection ? [hubFriendSection] : []),
     pendingSection,
     ...(readOnly ? [] : [declinedSection]),
   ];
 
   const rowHeight = titleText.height + LABEL_GAP + INPUT_HEIGHT; // approximate single row
-  const peerSectionHeight =
-    peerLabel.height + LABEL_GAP + Math.max(1, peerList.length) * (copyBtnH + 4);
-  // sum actual per-row heights (not a flat multiply) since a friend row
-  // with a bio grows taller than the base copyBtnH — see FRIEND_ROW_BIO_EXTRA.
-  const friendRowsHeight = (list: FriendInfo[]) =>
+  // sum actual per-row heights (not a flat multiply) since a row with a
+  // bio grows taller than the base copyBtnH — see FRIEND_ROW_BIO_EXTRA.
+  // works for both FriendInfo rows and peer rows (both have an optional
+  // `bio` field).
+  const friendRowsHeight = (list: Array<{ bio?: string }>) =>
     list.length === 0
       ? copyBtnH + 4
       : list.reduce((sum, f) => sum + (f.bio ? copyBtnH + FRIEND_ROW_BIO_EXTRA : copyBtnH) + 4, 0);
+  const sumRowHeights = (list: Array<{ bio?: string }>) =>
+    list.reduce((sum, item) => sum + (item.bio ? copyBtnH + FRIEND_ROW_BIO_EXTRA : copyBtnH) + 4, 0);
+  const peerSectionHeight = peerLabel.height + LABEL_GAP + friendRowsHeight(nonHubPeers);
   const friendSectionHeight = readOnly
     ? 0
     : friendLabel.height + LABEL_GAP + friendRowsHeight(friendList);
-  const hubFriendSectionHeight =
-    !readOnly && hubFriendList.length > 0
-      ? hubFriendSection.getChildAt(0).height + LABEL_GAP + friendRowsHeight(hubFriendList)
-      : 0;
+  const hubFriendSectionHeight = showHubSection
+    ? hubFriendSection.getChildAt(0).height +
+      LABEL_GAP +
+      sumRowHeights(hubPeers) +
+      sumRowHeights(hubFriendList)
+    : 0;
   // measured after the section is fully built above (label + toggle row +
   // wrapped description) — getBounds()/getLocalBounds() reflects the real
   // wrapped text height, unlike a fixed estimate.
