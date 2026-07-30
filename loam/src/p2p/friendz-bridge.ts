@@ -247,7 +247,17 @@ export async function sendFriendRequest(peerNodeId: string, hintUsername?: strin
   // if the pending-state hook only fired on success, an offline target
   // would never get marked pending and would have nothing for gossip
   // relay to carry, defeating the entire point of that feature.
-  outboundRequestHook?.(peerNodeId, hintUsername);
+  //
+  // only pass hintUsername through when the caller actually supplied one —
+  // `hook?.(peerNodeId, undefined)` is a call with 2 arguments (the 2nd
+  // being undefined), which is NOT the same thing to a spy/mock as a call
+  // with 1 argument (`toHaveBeenCalledWith("x")` fails against it) — a
+  // real CI failure caused by always passing the second arg positionally.
+  if (hintUsername !== undefined) {
+    outboundRequestHook?.(peerNodeId, hintUsername);
+  } else {
+    outboundRequestHook?.(peerNodeId);
+  }
   if (!isOnline(peerNodeId)) {
     gossipFriendRequestsNow();
   }
