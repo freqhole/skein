@@ -490,9 +490,9 @@ impl HubPeerService {
                     // response sync cycle, so nothing would otherwise tell
                     // an already-connected peer's `handle_connection` loop
                     // to push it — see `notify_doc_changed`'s doc comment
-                    // for the bug this closes (a real one, 2026-07-02: the
-                    // hub wrote itself into `.peers` successfully but the
-                    // inviting peer never found out).
+                    // for the bug this closes (the hub wrote itself into
+                    // `.peers` successfully but the inviting peer never
+                    // found out).
                     hub_repo.notify_doc_changed(&doc_id_str);
                     return;
                 }
@@ -1025,21 +1025,42 @@ impl HubPeerService {
             let ids = self.canvas_doc_ids.lock().await;
             ids.iter().cloned().collect()
         };
+        tracing::debug!(
+            peer = %node_id,
+            canvas_count = doc_ids.len(),
+            "is_vouched_by_any_canvas: checking tracked canvases for acl/pendingInvites match"
+        );
 
-        for doc_id in doc_ids {
-            let Some(handle) = self.hub_repo.find(&doc_id).await else {
+        for doc_id in &doc_ids {
+            let Some(handle) = self.hub_repo.find(doc_id).await else {
+                tracing::debug!(
+                    peer = %node_id,
+                    canvas_doc_id = %doc_id,
+                    "is_vouched_by_any_canvas: hub_repo has no doc handle for this tracked canvas id, skipping"
+                );
                 continue;
             };
             let node_id_owned = node_id.to_string();
+            let doc_id_for_blocking = doc_id.clone();
             let vouched = tokio::task::spawn_blocking(move || {
                 canvas_acl_or_invite_contains(&handle, &node_id_owned)
             })
             .await
             .unwrap_or(false);
             if vouched {
+                tracing::info!(
+                    peer = %node_id,
+                    canvas_doc_id = %doc_id_for_blocking,
+                    "is_vouched_by_any_canvas: peer found in this canvas's acl or pendingInvites - vouched"
+                );
                 return true;
             }
         }
+        tracing::debug!(
+            peer = %node_id,
+            canvas_count = doc_ids.len(),
+            "is_vouched_by_any_canvas: peer not found in acl/pendingInvites of any tracked canvas - not vouched"
+        );
         false
     }
 
@@ -1435,14 +1456,38 @@ fn canvas_acl_or_invite_contains(handle: &crate::hub_repo::DocHandle, node_id: &
     use automerge::ReadDoc;
 
     handle.with_document(|doc| {
-        if let Ok(Some((_, acl_obj))) = doc.get(automerge::ROOT, "acl") {
-            if doc.get(&acl_obj, node_id).ok().flatten().is_some() {
-                return true;
+        match doc.get(automerge::ROOT, "acl") {
+            Ok(Some((_, acl_obj))) => {
+                if doc.get(&acl_obj, node_id).ok().flatten().is_some() {
+                    tracing::debug!(
+                        peer = %node_id,
+                        "canvas_acl_or_invite_contains: peer found in doc's acl map"
+                    );
+                    return true;
+                }
+            }
+            Ok(None) => {
+                tracing::debug!("canvas_acl_or_invite_contains: doc has no acl map");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "canvas_acl_or_invite_contains: failed to read acl map");
             }
         }
-        if let Ok(Some((_, pending_obj))) = doc.get(automerge::ROOT, "pendingInvites") {
-            if doc.get(&pending_obj, node_id).ok().flatten().is_some() {
-                return true;
+        match doc.get(automerge::ROOT, "pendingInvites") {
+            Ok(Some((_, pending_obj))) => {
+                if doc.get(&pending_obj, node_id).ok().flatten().is_some() {
+                    tracing::debug!(
+                        peer = %node_id,
+                        "canvas_acl_or_invite_contains: peer found in doc's pendingInvites map"
+                    );
+                    return true;
+                }
+            }
+            Ok(None) => {
+                tracing::debug!("canvas_acl_or_invite_contains: doc has no pendingInvites map");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "canvas_acl_or_invite_contains: failed to read pendingInvites map");
             }
         }
         false

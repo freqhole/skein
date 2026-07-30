@@ -11,3 +11,4 @@
 # at the same time without sharing an iroh identity/sqlite files.
 /tumulus/hub-dev-data/
 node_modules
+tumulus.log

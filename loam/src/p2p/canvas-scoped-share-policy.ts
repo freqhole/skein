@@ -95,6 +95,9 @@
 // ---------------------------------------------------------------------------
 
 import type { DocumentId, PeerId, Repo } from "@automerge/automerge-repo";
+import { log } from "@freqhole/reliquary/utils";
+
+const TAG = "p2p.canvas-share-policy";
 
 /** minimal shape this policy actually reads off a doc — deliberately loose
  *  (`unknown`-ish), since it must tolerate every doc shape in the app
@@ -157,6 +160,24 @@ export function createCanvasScopedSharePolicy(
   return async (peerId, documentId) => evaluate(repo, peerId, documentId, isFriend);
 }
 
+// diagnostic-only: logs a given (doc, peer, outcome-tag) combination at most
+// once per page session, so a peer stuck retrying a not-ready doc doesn't
+// flood the console - see friendz-wiring.ts's matching approveKnock log for
+// the other half of this diagnostic pair. safe to delete both once the
+// underlying "requester's doc handle never reaches ready" bug is found.
+const loggedOnce = new Set<string>();
+function logOnce(key: string, msg: string, ...args: unknown[]): void {
+  if (loggedOnce.has(key)) return;
+  loggedOnce.add(key);
+  // trace (not debug): this fires once per unique doc+peer+outcome combo,
+  // which still adds up to a lot of console noise across ~20 locally
+  // known docs every time a peer connects. the acute bug this was added
+  // to diagnose (2026-07-29's "unavailable"-state deadlock) is now fixed
+  // - kept at trace (off by default) rather than removed outright in case
+  // it's needed again.
+  log.trace(TAG, msg, ...args);
+}
+
 function evaluate(
   repo: Repo,
   peerId: PeerId,
@@ -166,7 +187,16 @@ function evaluate(
   if (!documentId) return false;
 
   const handle = repo.handles[documentId];
-  if (!handle) return false;
+  if (!handle) {
+    logOnce(
+      "no-handle:" + documentId + ":" + peerId,
+      "deny: no local handle at all for doc:",
+      documentId.slice(0, 16) + "...",
+      "peer:",
+      peerId.slice(0, 16) + "..."
+    );
+    return false;
+  }
 
   // rule 4 — not ready yet: friend-gate floor, no waiting. see this
   // module's doc comment for why this is both necessary (the alternative
@@ -175,7 +205,19 @@ function evaluate(
   // real data — the data-holding device's handle is always ready, so it
   // always gets the real, content-based answer below instead).
   if (!handle.isReady()) {
-    return isFriend(peerId);
+    const allowed = isFriend(peerId);
+    logOnce(
+      "rule4:" + documentId + ":" + peerId + ":" + allowed + ":" + handle.state,
+      "rule 4 (not ready yet, friend-gate floor):",
+      allowed ? "allow" : "deny",
+      "doc:",
+      documentId.slice(0, 16) + "...",
+      "peer:",
+      peerId.slice(0, 16) + "...",
+      "handle.state:",
+      handle.state
+    );
+    return allowed;
   }
 
   const doc = handle.doc();
@@ -183,7 +225,20 @@ function evaluate(
 
   // rule 1 — a real canvas doc, own ACL is authoritative, no fallback.
   if (hasAclField(doc)) {
-    return peerIsInAcl(doc, peerId);
+    const allowed = peerIsInAcl(doc, peerId);
+    if (!allowed) {
+      logOnce(
+        "rule1-deny:" + documentId + ":" + peerId,
+        "rule 1 deny: peer not in doc.acl",
+        "doc:",
+        documentId.slice(0, 16) + "...",
+        "peer:",
+        peerId.slice(0, 16) + "...",
+        "acl keys:",
+        JSON.stringify(Object.keys(doc.acl ?? {}).map((k) => k.slice(0, 16) + "..."))
+      );
+    }
+    return allowed;
   }
 
   // rule 2 — a per-widget state doc, stamped with its owning canvas's id.

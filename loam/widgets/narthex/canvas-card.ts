@@ -9,6 +9,7 @@ import {
   onFriendsChange,
   onKnockAcked,
 } from "../../src/p2p/friendz-bridge";
+import { getStoredIdentity, onIdentityChange } from "../../src/p2p/identity";
 import { formatRelativeTime, formatShortDate } from "../../src/widgets/format";
 import {
   isTransparent,
@@ -57,15 +58,18 @@ export const canvasCardSchema = z.object({
   accessDeclined: z.boolean().default(false),
   /** node ids of hubs the sharer's canvas has been explicitly shared
    *  with, carried over from the share link (see share-string.ts's
-   *  `hubNodeIds`) — when non-empty on a not-yet-accessible remote card,
-   *  offers a "connect via hub" pill alongside "request access" so the
-   *  invitee can befriend a reachable hub instead of waiting for the
-   *  owner to come back online. */
+   *  `hubNodeIds`) or from an accepted invite's `relayedBy` (see
+   *  `boot.ts`'s `acceptCanvasInvite()`) - kept as informational card data
+   *  only. there's no client-side "connect via hub" affordance anymore:
+   *  the hub itself proactively sends a friend request to a canvas-vouched
+   *  peer once it notices them online (see tumulus's
+   *  `HubPeerService::maybe_send_proactive_friend_request`), so the client
+   *  never needs to initiate that connection/request itself. */
   hubNodeIds: z.array(z.string()).default([]),
-  /** ISO timestamp set the moment the "connect via hub" pill is clicked —
-   *  mirrors `accessRequestedAt`'s debounce role for the hub-connect
-   *  action; cleared if the card is ever reset back to a fresh
-   *  access-pending state. */
+  /** unused now that the "connect via hub" pill has been removed — kept
+   *  only so older persisted docs still parse (schema fields can't be
+   *  removed outright without breaking automerge docs written before this
+   *  change). always "" on newly-created cards. */
   hubConnectRequestedAt: z.string().default(""),
   lastVisitedAt: z.string().default(""),
   hasUpdates: z.boolean().default(false),
@@ -268,6 +272,13 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
     let currentWidth = ctx.width;
     let currentHeight = ctx.height;
     let hovered = false;
+
+    // the request-access pill is disabled until an identity exists (see
+    // drawRequestAccessPill below) — declared here, before the initial
+    // layout() call further down, since layout() runs synchronously during
+    // widget creation and would otherwise throw a temporal-dead-zone
+    // ReferenceError referencing this before its declaration ran.
+    let hasIdentity = false;
 
     // --- graphics layers ---
 
@@ -523,29 +534,6 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       resolution: 3,
     });
     requestAccessContainer.addChild(requestAccessText);
-
-    // --- connect-via-hub pill (remote cards with a share-link hub id) ---
-    const connectHubContainer = new Container();
-    connectHubContainer.visible = false;
-    connectHubContainer.zIndex = 50;
-    connectHubContainer.eventMode = "static";
-    connectHubContainer.cursor = "pointer";
-    container.addChild(connectHubContainer);
-
-    const connectHubBg = new Graphics();
-    connectHubContainer.addChild(connectHubBg);
-
-    const connectHubText = new Text({
-      text: "connect via hub",
-      style: {
-        fontFamily: "system-ui, sans-serif",
-        fontSize: DATE_FONT_SIZE,
-        fontWeight: "600",
-        fill: 0x38bdf8,
-      },
-      resolution: 3,
-    });
-    connectHubContainer.addChild(connectHubText);
 
     // --- syncing indicator for newly accepted remote cards ---
     const syncingContainer = new Container();
@@ -966,17 +954,29 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       const requested = !!state.accessRequestedAt;
       const declined = !requested && state.accessDeclined;
       const delivered = requested && hasKnockAckForCanvas(state.canvasDocId);
-      requestAccessContainer.eventMode = requested ? "none" : "static";
-      requestAccessContainer.cursor = requested ? "default" : "pointer";
+      // no identity yet means there's no p2p endpoint to send a knock
+      // from at all (see boot.ts's requestCanvasAccess()) — clicking would
+      // just silently no-op, so disable the pill entirely rather than
+      // let the user tap something that does nothing.
+      requestAccessContainer.eventMode = requested || !hasIdentity ? "none" : "static";
+      requestAccessContainer.cursor = requested || !hasIdentity ? "default" : "pointer";
 
-      const color = declined ? REQUEST_DECLINED_COLOR : requested ? REQUEST_SENT_COLOR : 0xf59e0b;
-      requestAccessText.text = declined
-        ? "access declined \u2022 tap to retry"
-        : delivered
-          ? "request sent \u2022 waiting for admin"
+      const color = !hasIdentity
+        ? REQUEST_SENT_COLOR
+        : declined
+          ? REQUEST_DECLINED_COLOR
           : requested
-            ? "request sent"
-            : "request access";
+            ? REQUEST_SENT_COLOR
+            : 0xf59e0b;
+      requestAccessText.text = !hasIdentity
+        ? "request access \u2014 set up identity first"
+        : declined
+          ? "access declined \u2022 tap to retry"
+          : delivered
+            ? "request sent \u2022 waiting for admin"
+            : requested
+              ? "request sent"
+              : "request access";
       requestAccessText.style.fill = color;
 
       const tw = requestAccessText.width;
@@ -995,49 +995,6 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
 
       requestAccessText.x = pillX + padX;
       requestAccessText.y = pillY + padY;
-    };
-
-    const HUB_SENT_COLOR = 0x888898;
-
-    const drawConnectHubPill = (w: number, _h: number, state: CanvasCardState) => {
-      const show =
-        state.isRemote &&
-        state.accessPending &&
-        !state.accessRevoked &&
-        !state.isDeleted &&
-        state.hubNodeIds.length > 0;
-      connectHubContainer.visible = show;
-      if (!show) return;
-
-      // once clicked, stops being clickable — the friend request +
-      // connect attempt is already in flight, and a second click would
-      // only risk sending a duplicate friend request.
-      const requested = !!state.hubConnectRequestedAt;
-      connectHubContainer.eventMode = requested ? "none" : "static";
-      connectHubContainer.cursor = requested ? "default" : "pointer";
-
-      const color = requested ? HUB_SENT_COLOR : 0x38bdf8;
-      connectHubText.text = requested ? "connecting via hub..." : "connect via hub";
-      connectHubText.style.fill = color;
-
-      const tw = connectHubText.width;
-      const th = connectHubText.height;
-      const padX = 6;
-      const padY = 2;
-      const pillW = tw + padX * 2;
-      const pillH = th + padY * 2;
-      const pillX = w - pillW - PADDING_X;
-      // stacked just below the request-access pill, same right edge —
-      // both can be visible at once (a stranger may want either path).
-      const pillY = ACCENT_HEIGHT + 6 + pillH + 4;
-
-      connectHubBg.clear();
-      connectHubBg.roundRect(pillX, pillY, pillW, pillH, pillH / 2);
-      connectHubBg.fill({ color, alpha: 0.15 });
-      connectHubBg.stroke({ color, width: 1, alpha: 0.4 });
-
-      connectHubText.x = pillX + padX;
-      connectHubText.y = pillY + padY;
     };
 
     // --- full layout ---
@@ -1081,8 +1038,25 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       const descMaxCharsPerLine = estimateMaxChars(descMaxWidth, DESC_FONT_SIZE);
       const descMaxChars = descMaxCharsPerLine * Math.min(maxDescLines, 2);
 
-      if (state.description) {
-        descText.text = truncate(state.description, descMaxChars);
+      // the "not a friend yet — use ..." hint is baked into
+      // `state.description` once, at card-creation time (boot.ts, when a
+      // share link is first joined) — it never gets refreshed after that,
+      // so it goes stale and stays factually wrong forever once the
+      // friend request is later accepted (a real reported bug: "it's
+      // showing after the request has been sent, so it's incorrect (we
+      // are friends)"). same fix as `drawAuthorBadge` above: check the
+      // live social doc instead of trusting the frozen stored copy.
+      let effectiveDescription = state.description;
+      if (
+        state.isRemote &&
+        effectiveDescription.startsWith("not a friend yet") &&
+        getFriendInfo(state.ownerNodeId)
+      ) {
+        effectiveDescription = "connecting to peer";
+      }
+
+      if (effectiveDescription) {
+        descText.text = truncate(effectiveDescription, descMaxChars);
         descText.visible = true;
       } else {
         descText.text = "";
@@ -1126,9 +1100,6 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
 
       // request-access pill for remote cards that never successfully synced
       drawRequestAccessPill(w, h, state);
-
-      // connect-via-hub pill for remote cards whose share link carried hub node ids
-      drawConnectHubPill(w, h, state);
 
       // deleted overlay — renders above the update pill
       drawDeletedOverlay(w, h, state);
@@ -1193,6 +1164,10 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       event.stopPropagation();
       const state = ctx.doc.current;
       if (!state.canvasDocId || !state.ownerNodeId) return;
+      // no identity yet — drawRequestAccessPill() already disables the hit
+      // target for this case, but guard here too in case a tap was
+      // already in flight when identity state changed.
+      if (!hasIdentity) return;
       // already requested — drawRequestAccessPill() disables the hit
       // target for this case too, but guard here as well in case a tap
       // event was already in flight when that ran.
@@ -1206,30 +1181,8 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
           detail: {
             canvasDocId: state.canvasDocId,
             ownerNodeId: state.ownerNodeId,
+            hubNodeIds: state.hubNodeIds,
           },
-        })
-      );
-    });
-
-    // --- connect-via-hub pill click ---
-    // a separate hit target, same rationale as the request-access pill
-    // above: stops propagation so tapping the pill connects to the hub
-    // instead of also navigating to a canvas known not to be reachable
-    // directly yet. this is the explicit, user-initiated action required
-    // before any friend request or connection attempt is made against a
-    // hub node id discovered from a share link — never automatic.
-    connectHubContainer.on("pointertap", (event) => {
-      event.stopPropagation();
-      const state = ctx.doc.current;
-      const hubNodeId = state.hubNodeIds[0];
-      if (!hubNodeId) return;
-      if (state.hubConnectRequestedAt) return;
-      ctx.doc.change((d: CanvasCardState) => {
-        d.hubConnectRequestedAt = new Date().toISOString();
-      });
-      window.dispatchEvent(
-        new CustomEvent("skein:connect-via-hub", {
-          detail: { hubNodeId },
         })
       );
     });
@@ -1305,6 +1258,21 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       layout(currentWidth, currentHeight);
     });
 
+    // identity lookup is async (IndexedDB-backed) — check once at mount
+    // time and keep it live afterward via onIdentityChange, so a card
+    // already on screen when the user finishes generating one flips the
+    // pill from disabled to clickable without needing a reload.
+    void getStoredIdentity().then((identity) => {
+      if (identity) {
+        hasIdentity = true;
+        layout(currentWidth, currentHeight);
+      }
+    });
+    const unsubIdentity = onIdentityChange(() => {
+      hasIdentity = true;
+      layout(currentWidth, currentHeight);
+    });
+
     return {
       container,
       destroy() {
@@ -1314,6 +1282,7 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
         unsubStoreTitle?.();
         unsubFriends();
         unsubKnockAcked();
+        unsubIdentity();
         if (previewSprite) {
           container.removeChild(previewSprite);
           previewSprite.mask = null;

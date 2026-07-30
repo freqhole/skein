@@ -571,6 +571,28 @@ impl HubRepo {
         })
     }
 
+    /// best-effort canvas title for display purposes (dashboard status
+    /// text, log lines) - `None` if the doc isn't loaded locally (not a
+    /// canvas this hub tracks) or has no `title` set. never fails loudly:
+    /// callers should fall back to the doc id itself when this is `None`.
+    pub async fn canvas_title(&self, doc_id: &str) -> Option<String> {
+        let handle = self.find(doc_id).await?;
+        tokio::task::spawn_blocking(move || {
+            use automerge::ReadDoc;
+            handle.with_document(|doc| match doc.get(automerge::ROOT, "title") {
+                Ok(Some((automerge::Value::Object(automerge::ObjType::Text), text_id))) => {
+                    let title = doc.text(&text_id).unwrap_or_default();
+                    (!title.is_empty()).then_some(title)
+                }
+                Ok(Some((v, _))) => v.to_str().map(str::to_string).filter(|s| !s.is_empty()),
+                _ => None,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// wait for a document to appear (either already exists or arrives via
     /// sync). returns `None` on timeout.
     pub async fn wait_for_doc(
@@ -722,6 +744,13 @@ impl HubRepo {
             incoming.changes = automerge::sync::ChunkList::empty();
         }
 
+        // heads before applying — used below to tell whether this sync
+        // message actually changed the document, or was a no-op round trip
+        // (an ack/keepalive-style exchange with no new changes to apply,
+        // which automerge-repo peers send routinely as part of normal sync
+        // state reconciliation, not just when there's real content).
+        let heads_before = doc.get_heads();
+
         // apply the message to our document
         if let Err(e) = doc.receive_sync_message(sync_state, incoming) {
             tracing::warn!(
@@ -733,19 +762,31 @@ impl HubRepo {
             return None;
         }
 
-        // notify waiters on every successful receive (doc may now have content)
-        let _ = self.doc_notify.send(doc_id.to_string());
+        // only notify + persist when the document's content actually
+        // changed. without this check, every sync round trip — including
+        // no-op ones — fired a doc-change notification and a sqlite write,
+        // regardless of whether anything new was applied. under routine
+        // sync traffic (which includes plenty of no-op exchanges) this
+        // flooded `doc_notify`'s broadcast channel fast enough to overrun
+        // its buffer, forcing `reliquary::snatch`'s change-driven loop into
+        // its "channel lagged, run a full scan" fallback over and over —
+        // the "scanned canvas for file widgets" log spam — and hammered
+        // `hub_docs` with redundant writes on every exchange, not just ones
+        // with real content.
+        let changed = doc.get_heads() != heads_before;
+        if changed {
+            let _ = self.doc_notify.send(doc_id.to_string());
+
+            let save_bytes = doc.save();
+            let storage = Arc::clone(&self.storage);
+            let doc_id_owned = doc_id.to_string();
+            tokio::spawn(async move {
+                storage.save_doc(&doc_id_owned, &save_bytes).await;
+            });
+        }
 
         // generate a response message if we have changes to send back
         let response = doc.generate_sync_message(sync_state);
-
-        // persist the document asynchronously after receiving sync
-        let save_bytes = doc.save();
-        let storage = Arc::clone(&self.storage);
-        let doc_id_owned = doc_id.to_string();
-        tokio::spawn(async move {
-            storage.save_doc(&doc_id_owned, &save_bytes).await;
-        });
 
         response.map(|msg: automerge::sync::Message| msg.encode())
     }
@@ -837,6 +878,11 @@ impl HubRepo {
 
             let frame = match event {
                 LoopEvent::DocChanged(doc_id) => {
+                    tracing::debug!(
+                        peer = %peer_id_str,
+                        doc_id = %doc_id,
+                        "hub_repo: doc-change notify received, checking whether to push to this peer"
+                    );
                     if let Some(data) = self
                         .generate_outbound_sync_message(&peer_id_str, &doc_id)
                         .await
@@ -865,7 +911,7 @@ impl HubRepo {
                             );
                             break;
                         }
-                        tracing::debug!(
+                        tracing::info!(
                             peer = %peer_id_str,
                             doc_id = %doc_id,
                             "hub_repo: pushed proactive sync message (doc changed outside request/response cycle)"
@@ -913,6 +959,7 @@ impl HubRepo {
                         .handle_sync_message(&peer_id_str, &msg.document_id, &msg.data)
                         .await
                     {
+                        let response_bytes_len = response_bytes.len();
                         let response = SyncResponse {
                             msg_type: "sync".to_string(),
                             sender_id: hub_peer_id.clone(),
@@ -943,7 +990,14 @@ impl HubRepo {
                         tracing::debug!(
                             peer = %peer_id_str,
                             doc_id = %msg.document_id,
+                            response_bytes = response_bytes_len,
                             "hub_repo: sent sync response"
+                        );
+                    } else {
+                        tracing::debug!(
+                            peer = %peer_id_str,
+                            doc_id = %msg.document_id,
+                            "hub_repo: no response generated for inbound sync message (already in sync, or peer is viewer-role with no changes applied)"
                         );
                     }
                 }
@@ -1162,16 +1216,47 @@ impl HubRepo {
     ) -> Option<Vec<u8>> {
         let doc_arc = {
             let docs = self.documents.read().await;
-            docs.get(doc_id)?.clone()
+            match docs.get(doc_id) {
+                Some(d) => d.clone(),
+                None => {
+                    tracing::debug!(
+                        peer_id,
+                        doc_id,
+                        "hub_repo: generate_outbound_sync_message - doc not tracked, nothing to push"
+                    );
+                    return None;
+                }
+            }
         };
         let doc = doc_arc.read().await;
 
         let key = (peer_id.to_string(), doc_id.to_string());
         let mut sync_states = self.sync_states.write().await;
-        let sync_state = sync_states.get_mut(&key)?;
+        let sync_state = match sync_states.get_mut(&key) {
+            Some(s) => s,
+            None => {
+                tracing::info!(
+                    peer_id,
+                    doc_id,
+                    "hub_repo: generate_outbound_sync_message - no existing sync state for this \
+                     (peer, doc) pair, skipping proactive push (peer has never synced this doc \
+                     with us yet - they'll only get it once they initiate a sync themselves)"
+                );
+                return None;
+            }
+        };
 
-        doc.generate_sync_message(sync_state)
-            .map(|msg: automerge::sync::Message| msg.encode())
+        let encoded = doc
+            .generate_sync_message(sync_state)
+            .map(|msg: automerge::sync::Message| msg.encode());
+        if encoded.is_none() {
+            tracing::debug!(
+                peer_id,
+                doc_id,
+                "hub_repo: generate_outbound_sync_message - automerge says peer is already caught up, nothing to push"
+            );
+        }
+        encoded
     }
 }
 

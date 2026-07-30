@@ -6,6 +6,11 @@
 // - d: the automerge document ID of the canvas
 // - t: the canvas's display title, truncated to MAX_TITLE_CHARS (optional —
 //   omitted entirely when the canvas has no title yet, to keep the link short)
+// - o: the owner's username at share time (optional — omitted when the
+//   owner has no username set yet). lets a brand-new invitee's narthex
+//   card and pending friend-request row show a real name right away,
+//   instead of a bare node id, before any profile info has actually been
+//   exchanged with the owner.
 // - h: node ids of hubs this canvas has been shared with (optional — omitted
 //   when there are none, or when the sharer chose to exclude them)
 //
@@ -78,6 +83,9 @@ export interface SharePayload {
   /** the canvas's display title at share time, truncated — undefined if
    *  the canvas had no title, or the share string predates this field. */
   canvasTitle?: string;
+  /** the owner's username at share time — undefined if the owner had no
+   *  username set yet, or the share string predates this field. */
+  ownerUsername?: string;
   /** node ids of hubs this canvas has been shared with, at share time —
    *  undefined if there were none, or the sharer chose to exclude them
    *  (see share-dialog.ts's "include hub(s)" toggle). lets a brand-new
@@ -96,12 +104,18 @@ export interface SharePayload {
  *
  * `hubNodeIds`, when given and non-empty, is embedded as `h` — see this
  * module's top doc comment for why.
+ *
+ * `ownerUsername`, when given and non-empty, is embedded as `o` — see the
+ * `SharePayload.ownerUsername` doc comment for why. trailing param (rather
+ * than inserted before `hubNodeIds`) so existing positional call sites
+ * don't need to change.
  */
 export function encodeShareString(
   nodeId: string,
   docId: string,
   canvasTitle?: string,
-  hubNodeIds?: string[]
+  hubNodeIds?: string[],
+  ownerUsername?: string
 ): string {
   const t = canvasTitle ? truncateTitle(canvasTitle) : "";
   const payload = {
@@ -109,6 +123,7 @@ export function encodeShareString(
     d: docId,
     ...(t ? { t } : {}),
     ...(hubNodeIds && hubNodeIds.length > 0 ? { h: hubNodeIds } : {}),
+    ...(ownerUsername ? { o: ownerUsername } : {}),
   };
   return toBase64(JSON.stringify(payload));
 }
@@ -160,6 +175,7 @@ export function decodeShareString(input: string): SharePayload | null {
     }
 
     const canvasTitle = typeof parsed.t === "string" && parsed.t ? parsed.t : undefined;
+    const ownerUsername = typeof parsed.o === "string" && parsed.o ? parsed.o : undefined;
     const hubNodeIds =
       Array.isArray(parsed.h) && parsed.h.every((id: unknown) => typeof id === "string")
         ? (parsed.h as string[]).filter((id) => id.length > 0)
@@ -168,6 +184,7 @@ export function decodeShareString(input: string): SharePayload | null {
       nodeId: parsed.n,
       docId: parsed.d,
       canvasTitle,
+      ownerUsername,
       ...(hubNodeIds && hubNodeIds.length > 0 ? { hubNodeIds } : {}),
     };
   } catch {
@@ -184,9 +201,10 @@ export function shareFragment(
   nodeId: string,
   docId: string,
   canvasTitle?: string,
-  hubNodeIds?: string[]
+  hubNodeIds?: string[],
+  ownerUsername?: string
 ): string {
-  return `#share/${encodeShareString(nodeId, docId, canvasTitle, hubNodeIds)}`;
+  return `#share/${encodeShareString(nodeId, docId, canvasTitle, hubNodeIds, ownerUsername)}`;
 }
 
 /**
@@ -202,9 +220,10 @@ export function buildShareUrl(
   nodeId: string,
   docId: string,
   canvasTitle?: string,
-  hubNodeIds?: string[]
+  hubNodeIds?: string[],
+  ownerUsername?: string
 ): string {
-  const fragment = shareFragment(nodeId, docId, canvasTitle, hubNodeIds);
+  const fragment = shareFragment(nodeId, docId, canvasTitle, hubNodeIds, ownerUsername);
   if (isTauriMode()) {
     return PRODUCTION_ORIGIN + "/" + fragment;
   }

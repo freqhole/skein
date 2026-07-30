@@ -233,6 +233,53 @@ describe("hub-admin-client", () => {
     });
   });
 
+  describe("hubAdminApproveKnock / hubAdminDeclineKnock", () => {
+    it("sends the correct wire request and parses a KnockDecided response for an approval", async () => {
+      const fake = createFakeNode({
+        KnockDecided: { canvas_doc_id: "canvas-1", requester_node_id: "requester-node" },
+      });
+      const client = createHubAdminClient(transportFor(fake.node));
+
+      const response = await client.hubAdminApproveKnock(
+        PEER_NODE_ID,
+        "canvas-1",
+        "requester-node",
+        "member"
+      );
+
+      expect(fake.getWrittenRequest()).toEqual({
+        ApproveKnock: {
+          canvas_doc_id: "canvas-1",
+          requester_node_id: "requester-node",
+          role: "member",
+        },
+      });
+      expect(response).toEqual({
+        kind: "knockDecided",
+        canvasDocId: "canvas-1",
+        requesterNodeId: "requester-node",
+      });
+    });
+
+    it("sends the correct wire request and parses a KnockDecided response for a decline", async () => {
+      const fake = createFakeNode({
+        KnockDecided: { canvas_doc_id: "canvas-1", requester_node_id: "requester-node" },
+      });
+      const client = createHubAdminClient(transportFor(fake.node));
+
+      const response = await client.hubAdminDeclineKnock(PEER_NODE_ID, "canvas-1", "requester-node");
+
+      expect(fake.getWrittenRequest()).toEqual({
+        DeclineKnock: { canvas_doc_id: "canvas-1", requester_node_id: "requester-node" },
+      });
+      expect(response).toEqual({
+        kind: "knockDecided",
+        canvasDocId: "canvas-1",
+        requesterNodeId: "requester-node",
+      });
+    });
+  });
+
   describe("NotAdmin / Error responses", () => {
     it("parses a bare NotAdmin response for any request kind", async () => {
       const fake = createFakeNode("NotAdmin");

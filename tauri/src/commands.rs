@@ -308,6 +308,7 @@ pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkStat
         endpoint.clone(),
         state.storage.fs_store,
         state.friendz_store.clone(),
+        state.userz.clone(),
     )
     .await?;
 

@@ -10,6 +10,7 @@ import { ProfileStore } from "../../../src/canvas/profile-doc";
 import {
   getHubAdminTransport,
   gossipFriendRequestsNow,
+  isKnownHubNodeId,
   isOnline as bridgeIsOnline,
   isProtocolReady as bridgeIsProtocolReady,
   onOnlineChange,
@@ -866,9 +867,16 @@ export function createFriendsTab(ctx: TabContext): TabController {
         // pushes a friend entry immediately rather than waiting for
         // acceptance), so surface the outstanding status here too rather
         // than only in the requests tab's separate "sent requests" section.
+        // labeled "pending · hub" instead of plain "pending" when the
+        // target is a known canvas-sharing hub (see
+        // `recordKnownHubNodeIds()`, friendz-bridge.ts) — a friend request
+        // to a hub is expected to resolve quickly via its vouched-based
+        // auto-accept, so distinguishing it from an ordinary pending
+        // request to a person is useful context here.
         if (hasPendingOutbound) {
+          const isHubTarget = friend.nodeIds.some((n) => isKnownHubNodeId(n.nodeId));
           const badgeText = new Text({
-            text: "pending",
+            text: isHubTarget ? "pending \u00b7 hub" : "pending",
             style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE - 1, fill: MUTED_TEXT },
             resolution: RESOLUTION,
           });
@@ -1414,31 +1422,6 @@ export function createFriendsTab(ctx: TabContext): TabController {
 
       dy += DETAIL_BTN_HEIGHT + 10;
 
-      // rendered node id — docs/hub-and-profile-plan.md section 10.3, the
-      // user specifically asked for this to be verifiable in the friend-
-      // detail view, not just present in the underlying doc.
-      if (hubNodeIdForFriend) {
-        const hubNodeIdLabel = new Text({
-          text: "hub node id",
-          style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
-          resolution: RESOLUTION,
-        });
-        hubNodeIdLabel.eventMode = "none";
-        hubNodeIdLabel.y = dy;
-        detailInner.addChild(hubNodeIdLabel);
-        dy += LABEL_SIZE + 4;
-
-        const hubNodeIdText = new Text({
-          text: truncate(hubNodeIdForFriend, 48),
-          style: { fontFamily: FONT, fontSize: DETAIL_NODEID_SIZE, fill: MUTED_TEXT },
-          resolution: RESOLUTION,
-        });
-        hubNodeIdText.eventMode = "none";
-        hubNodeIdText.y = dy;
-        detailInner.addChild(hubNodeIdText);
-        detailNodeIdTextRef = hubNodeIdText;
-        dy += hubNodeIdText.height + 8;
-      }
     }
 
     // -----------------------------------------------------------------------

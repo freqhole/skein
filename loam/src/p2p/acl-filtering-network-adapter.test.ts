@@ -138,6 +138,25 @@ describe("createRepoRoleResolver", () => {
     expect(resolver(DOC_ID, MEMBER_ID)).toBe("member");
   });
 
+  it("treats a peer as \"member\" (not read-only) when the handle raced into \"unavailable\" before real sync content arrived", () => {
+    // regression coverage for a real, confirmed production deadlock: a
+    // brand-new invite's handle can reach "unavailable" (automerge-repo's
+    // own internal timeout, or an unrelated connected peer replying
+    // DOC_UNAVAILABLE) before the actual owner's sync payload arrives.
+    // automerge-repo's own state chart only reaches "unavailable" FROM
+    // "loading"/"requesting" (local storage already checked and empty,
+    // same guarantee as "requesting") and still accepts a DOC_READY
+    // transition out of it - so this state must get the same bypass, or
+    // the real content that would flip it to "ready" gets stripped
+    // forever. see this module's doc comment for the full story.
+    const repo = makeFakeRepo({
+      [DOC_ID]: { isReady: () => false, doc: () => undefined, state: "unavailable" } as any,
+    });
+    const resolver = createRepoRoleResolver(repo);
+
+    expect(resolver(DOC_ID, MEMBER_ID)).toBe("member");
+  });
+
   // -- per-widget documents (no `.acl` of their own, only `ownerCanvasId`) ---
   //
   // regression coverage for a real bug: an already-synced widget document

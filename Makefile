@@ -63,7 +63,7 @@ tauri-build: dev-data ## build the tauri desktop app
 # level loam/tests/helpers/reliquary-hub.ts already uses for a real hub
 # process.
 hub-dev: dev-data ## run a real tumulus hub (own data dir, safe alongside tauri-dev)
-	RUST_LOG=tumulus=debug cargo run -p tumulus -- --data-dir tumulus/hub-dev-data serve
+	RUST_LOG=tumulus=debug,reliquary=debug,iroh=debug,iroh_blobs=debug cargo run -p tumulus -- --data-dir tumulus/hub-dev-data serve
 
 # both target the dev hub's own data dir (tumulus/hub-dev-data, see
 # hub-dev above) so they affect a hub already running via `make hub-dev`.

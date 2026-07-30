@@ -154,6 +154,12 @@ pub struct HubPeerService {
     /// already holds its own clone, constructed in `start` below.
     #[allow(dead_code)]
     pub(crate) adminz_store: crate::adminz::Store,
+    /// absolute path to the data directory - reused by the terminal
+    /// dashboard to display where the hub's files live, and as the disk-
+    /// stats target instead of `blob_dir` (whose `blob-files` subdirectory
+    /// isn't created until the first blob is inserted, so statting it
+    /// reports "unavailable" on a fresh hub with no blobs yet).
+    pub(crate) data_dir: std::path::PathBuf,
 }
 
 impl HubPeerService {
@@ -179,23 +185,68 @@ impl HubPeerService {
 
         let fs_store = storage.fs_store;
         let blobz = storage.blobz.clone();
+        let data_dir = config.data_dir.clone();
 
         // process avatar (if configured) and persist into blobz + userz.
-        let (profile_avatar_data_url, avatar_blake3) =
+        let (config_avatar_data_url, config_avatar_blake3) =
             process_hub_avatar(config.avatar_path.as_deref(), &config.data_dir, &blobz).await?;
 
-        // persist hub's own profile so it survives restarts and is queryable
-        // alongside remote-peer rows.
+        // a previous run's admin-set profile (username/bio/accent
+        // color/avatar, set remotely via `AdminRequest::SetHubProfile`/
+        // `SetHubAvatar`) already lives in `userz` — load it *before*
+        // deciding what to persist/serve, so a fresh run doesn't clobber it
+        // back to the static config file's values. without this, every
+        // restart silently discarded anything set through "manage hub"
+        // (the write path persisted correctly; nothing on startup ever read
+        // it back — `upsert_self` below always re-wrote `config.username`/
+        // `config.bio` unconditionally, and `hub_profile`/the friendz
+        // service were always seeded straight from `config`, never from
+        // `userz`).
+        let existing_self = userz.get_self().await?;
+
+        let effective_username = existing_self
+            .as_ref()
+            .and_then(|s| s.display_name.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| config.username.clone());
+        let effective_bio = existing_self
+            .as_ref()
+            .and_then(|s| s.bio.clone())
+            .unwrap_or_else(|| config.bio.clone());
+        let effective_accent_color = existing_self.as_ref().map(|s| s.accent_color).unwrap_or(0);
+
+        // avatar: an explicit `config.avatar_path` always wins (the operator
+        // deliberately pointed at a file), otherwise fall back to whatever
+        // avatar blob a previous admin-set session already persisted.
+        let (profile_avatar_data_url, avatar_blake3) = if config_avatar_blake3.is_some() {
+            (config_avatar_data_url, config_avatar_blake3)
+        } else if let Some(existing_blake3) =
+            existing_self.as_ref().and_then(|s| s.avatar_blake3.clone())
+        {
+            match crate::protocol::hub_admin::build_avatar_data_url(&blobz, &existing_blake3).await
+            {
+                Some(data_url) => (data_url, Some(existing_blake3)),
+                None => (String::new(), None),
+            }
+        } else {
+            (String::new(), None)
+        };
+
+        // persist the effective (existing-preferred) profile so it survives
+        // restarts and is queryable alongside remote-peer rows — idempotent
+        // going forward, since these are the same values that will be served.
         userz
-            .upsert_self(
+            .upsert_self_full(
                 &node_id_str,
-                Some(&config.username),
-                Some(&config.bio),
+                Some(&effective_username),
+                None,
+                Some(&effective_bio),
                 avatar_blake3.as_deref(),
+                Some(effective_accent_color),
             )
             .await?;
         tracing::info!(
-            username = %config.username,
+            username = %effective_username,
             avatar = ?avatar_blake3,
             "hub peer profile persisted"
         );
@@ -203,9 +254,9 @@ impl HubPeerService {
         // shared live profile state — admin writes update this directly
         // so outgoing profile responses always use the current values.
         let hub_profile = Arc::new(RwLock::new(HubProfile {
-            username: config.username.clone(),
-            bio: config.bio.clone(),
-            accent_color: 0,
+            username: effective_username.clone(),
+            bio: effective_bio.clone(),
+            accent_color: effective_accent_color,
             avatar_data_url: profile_avatar_data_url.clone(),
         }));
 
@@ -222,13 +273,13 @@ impl HubPeerService {
         // other message surfaces as `FriendzEvent::MessageReceived` for
         // `handle_friendz_event`/`handle_message` (hub/messages.rs) to act on.
         let (friendz_service, friendz_events) =
-            FriendzService::new(node_id_str.clone(), config.username.clone());
+            FriendzService::new(node_id_str.clone(), effective_username.clone());
         friendz_service
             .set_local_profile(LocalProfile {
-                username: config.username.clone(),
-                bio: config.bio.clone(),
+                username: effective_username.clone(),
+                bio: effective_bio.clone(),
                 avatar_data_url: profile_avatar_data_url.clone(),
-                accent_color: Some(0),
+                accent_color: Some(effective_accent_color),
                 profile_doc_id: None,
                 profile_updated_at: None,
                 // this router is a hub's friendz handler — always flag
@@ -280,6 +331,7 @@ impl HubPeerService {
         // also hands over a `hub_repo` clone so a `Remove` request can
         // cancel an already-accepted connection for the revoked peer, not
         // just delete their `friendz` row.
+        let blob_dir = config.data_dir.join("blob-files");
         let hub_admin = crate::protocol::hub_admin::HubAdminHandler::new(
             adminz_store.clone(),
             friendz_store.clone(),
@@ -288,7 +340,7 @@ impl HubPeerService {
             // absolute path to the blob-files directory, used only for
             // filesystem disk-usage stats (not part of the BlobStore trait
             // — see freqhole_reliquary::blobz's module doc comment).
-            config.data_dir.join("blob-files"),
+            blob_dir.clone(),
             hub_repo.clone(),
             node_id_str.clone(),
             Arc::clone(&canvas_doc_ids),
@@ -346,11 +398,19 @@ impl HubPeerService {
             friendz_store,
             blobz,
             adminz_store,
+            data_dir,
         })
     }
 
     /// run the hub peer service until `cancel` is cancelled.
-    pub async fn run(mut self, cancel: CancellationToken) {
+    ///
+    /// when `show_dashboard` is true, also spawns a live terminal status
+    /// screen (`crate::dashboard`) - meant for the common case where logs
+    /// are going to a file rather than stdout, so the terminal has
+    /// something more useful to show than nothing at all. leave this false
+    /// when logs are going to stdout instead (the two would otherwise
+    /// interleave into an unreadable mess).
+    pub async fn run(mut self, cancel: CancellationToken, show_dashboard: bool) {
         tracing::info!(
             node_id = %self.endpoint.id(),
             "hub peer service running"
@@ -394,6 +454,25 @@ impl HubPeerService {
         let snatcher_cancel = cancel.clone();
         let snatcher_handle = tokio::spawn(async move {
             engine.run(snatcher_cancel).await;
+        });
+
+        // live terminal dashboard - only when the terminal isn't already
+        // being used for stdout log lines (see `HubPeerService::run`'s doc
+        // comment).
+        let dashboard_handle = show_dashboard.then(|| {
+            let dashboard_ctx = crate::dashboard::DashboardContext {
+                node_id: self.node_id_str.clone(),
+                endpoint: self.endpoint.clone(),
+                hub_repo: self.hub_repo.clone(),
+                friendz_store: self.friendz_store.clone(),
+                userz: self.userz.clone(),
+                blobz: self.blobz.clone(),
+                canvas_doc_ids: Arc::clone(&self.canvas_doc_ids),
+                data_dir: self.data_dir.clone(),
+                engine: self.engine.clone(),
+            };
+            let dashboard_cancel = cancel.clone();
+            tokio::spawn(crate::dashboard::run(dashboard_ctx, dashboard_cancel))
         });
 
         // heartbeat loop — pulls friend node IDs from friendz store on each tick
@@ -563,6 +642,9 @@ impl HubPeerService {
 
         heartbeat_handle.abort();
         snatcher_handle.abort();
+        if let Some(handle) = dashboard_handle {
+            handle.abort();
+        }
         self.shutdown().await;
     }
 

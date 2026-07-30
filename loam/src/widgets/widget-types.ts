@@ -1,5 +1,6 @@
 import type { Container } from "pixi.js";
 import { z } from "zod";
+import type { PendingCanvasKnock } from "../canvas/canvas-doc";
 import type { CanvasStore } from "../canvas/canvas-store";
 import type { ConnectionStateSource } from "../canvas/connection-status";
 import type { ProfileStore } from "../canvas/profile-doc";
@@ -165,6 +166,48 @@ export interface WidgetDoc<S extends z.ZodType> {
 }
 
 /**
+ * a pending knock (canvas access request) on some canvas OTHER than the
+ * one a widget is currently mounted on, plus enough context to render and
+ * label it — see `OtherCanvasKnocksSource`'s doc comment for why this
+ * exists.
+ */
+export interface OtherCanvasKnockEntry {
+  canvasDocId: string;
+  /** the owning canvas's title, for labeling a merged cross-canvas row
+   *  (e.g. messagez-widget.ts's knock rows) so it's clear which canvas the
+   *  request is for. */
+  canvasTitle: string;
+  knock: PendingCanvasKnock;
+}
+
+/**
+ * lets a widget mounted on ONE canvas (or narthex, which has no canvas of
+ * its own) see and act on pending knocks recorded on every OTHER canvas
+ * the local peer admins — without this, a knock notification could only
+ * ever be seen/dismissed/approved while that exact canvas happened to be
+ * open (a real reported bug/request: "i want to see these knock access
+ * requests on the narthex or any canvas, not just when i have that canvas
+ * open"). only wired in for the messagez widget's overlay mount
+ * (boot.ts); undefined for other widgets and for headless/test contexts.
+ */
+export interface OtherCanvasKnocksSource {
+  /** current snapshot of pending, non-dismissed knocks across every admin
+   *  canvas other than the one this widget is mounted on. pull-based —
+   *  call again after `onChange()` fires, don't cache the array. */
+  list(): OtherCanvasKnockEntry[];
+  /** subscribe to "something in the snapshot may have changed, call
+   *  list() again and re-render" — fires on narthex card-list changes and
+   *  on any admin canvas doc's own changes. returns an unsubscribe
+   *  function. */
+  onChange(handler: () => void): () => void;
+  /** get a `CanvasStore` for `canvasDocId` (one of the ids returned by
+   *  `list()`) so the caller can actually approve/decline the knock —
+   *  undefined if that canvas's handle isn't ready/known anymore (e.g. it
+   *  was removed from narthex between `list()` and this call). */
+  getStore(canvasDocId: string): CanvasStore | undefined;
+}
+
+/**
  * context passed to a widget factory's create() function.
  * contains everything a widget needs to render and interact with its state.
  */
@@ -220,6 +263,11 @@ export interface WidgetMountContext<S extends z.ZodType = z.ZodType> {
    *  call this whenever the action labels or set of actions changes (e.g. item
    *  count updated, snatch progress). provided by the widget manager at mount time. */
   setHeaderActions?: (actions: HeaderAction[]) => void;
+  /** pending knocks on every OTHER admin canvas — see
+   *  `OtherCanvasKnocksSource`'s doc comment. only wired in for the
+   *  messagez widget's overlay mount (boot.ts); undefined for other
+   *  widgets and for headless/test contexts. */
+  otherCanvasKnocks?: OtherCanvasKnocksSource;
 }
 
 /**

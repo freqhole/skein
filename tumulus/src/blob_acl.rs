@@ -14,7 +14,7 @@
 //! canvas `.acl` membership, resolved live by walking the same doc shapes
 //! `snatch`'s doc-scanning logic already reads.
 //!
-//! two gating modes:
+//! three gating modes:
 //! - [`BlobAclGate::for_hub`]: full canvas-ACL gating, used by
 //!   `hub::HubPeerService` (the real, embedded-in-tauri hub path — see
 //!   `docs/PLAN.md` §3.4). a peer must (a) be a hub friend and (b) have a
@@ -27,6 +27,21 @@
 //!   falls back to hub-friend status alone. strictly weaker than the hub
 //!   gate, but still closes the "any stranger can fetch anything" hole for
 //!   that path too, for the same low cost.
+//! - [`BlobAclGate::friend_or_known_hub`]: same as `friend_only`, plus a
+//!   fallback: a peer isn't (yet) a mutual `friendz` entry but this node's
+//!   own `userz` table already has them flagged `is_hub` (set as soon as
+//!   a `ProfileResponse`/`FriendRequest` with `isHub: true` is seen — this
+//!   can and does arrive before the separate friend-request/accept
+//!   handshake completes, since a hub auto-accepts a canvas-vouched friend
+//!   request asynchronously and profile exchange isn't gated on friend
+//!   status at all). used by the tauri frontend's own iroh-blobs server
+//!   (`skein/tauri/src/streams.rs`'s `start_with_blobs`): a hub that's
+//!   actively relaying blobs for a canvas this peer just shared is exactly
+//!   the case `friend_only` alone would otherwise wrongly stall on until
+//!   the friend handshake catches up. this doesn't weaken real per-peer
+//!   access control — a hub re-checks its own `for_hub` canvas-ACL gate
+//!   before re-serving to whoever it relays for, so trusting a known hub
+//!   here just avoids a redundant, laggy local precondition.
 //!
 //! reliquary has no persisted blake3->canvas mapping anywhere (the blob
 //! store is flat/content-addressed — see `SqliteBlobStore`'s module doc
@@ -43,6 +58,7 @@ use iroh_blobs::provider::events::EventSender;
 use crate::friendz;
 use crate::hub_repo::HubRepo;
 use crate::snatch::{classify_doc, read_canvas_for_file_widgets, read_widget_state, DocKind};
+use crate::userz;
 use freqhole_reliquary::gate::AccessGate;
 
 // ---------------------------------------------------------------------------
@@ -147,13 +163,16 @@ impl CanvasResolver {
 // gate
 // ---------------------------------------------------------------------------
 
-/// per-peer blob-fetch gate. construct via [`BlobAclGate::for_hub`] or
-/// [`BlobAclGate::friend_only`], then pass to
-/// [`freqhole_reliquary::gate::build_gated_blobs_events`].
+/// per-peer blob-fetch gate. construct via [`BlobAclGate::for_hub`],
+/// [`BlobAclGate::friend_only`], or [`BlobAclGate::friend_or_known_hub`],
+/// then pass to [`freqhole_reliquary::gate::build_gated_blobs_events`].
 #[derive(Clone)]
 pub struct BlobAclGate {
     friendz: friendz::Store,
     canvas: Option<CanvasResolver>,
+    /// known-hub fallback trust (see this module's doc comment) — only
+    /// ever set by [`BlobAclGate::friend_or_known_hub`].
+    userz: Option<userz::Directory>,
 }
 
 impl BlobAclGate {
@@ -163,6 +182,7 @@ impl BlobAclGate {
         Self {
             friendz,
             canvas: Some(CanvasResolver { repo }),
+            userz: None,
         }
     }
 
@@ -172,6 +192,20 @@ impl BlobAclGate {
         Self {
             friendz,
             canvas: None,
+            userz: None,
+        }
+    }
+
+    /// like [`BlobAclGate::friend_only`], plus a known-hub fallback: a peer
+    /// who isn't (yet) a mutual friendz entry but who `userz` already has
+    /// flagged `is_hub` is still allowed. used by the tauri frontend's own
+    /// iroh-blobs server (`streams.rs`'s `start_with_blobs`) — see this
+    /// module's doc comment for the rationale.
+    pub fn friend_or_known_hub(friendz: friendz::Store, userz: userz::Directory) -> Self {
+        Self {
+            friendz,
+            canvas: None,
+            userz: Some(userz),
         }
     }
 }
@@ -181,43 +215,101 @@ impl AccessGate for BlobAclGate {
     /// true if `peer_node_id` may fetch the blob identified by
     /// `blake3_hash`.
     ///
-    /// friendz status is a necessary but not sufficient condition: a hub
-    /// friend who hasn't been invited to (or removed from) the specific
-    /// canvas that references this blob is still denied. see this module's
-    /// doc comment for the full design rationale.
+    /// `for_hub` mode: canvas-ACL membership on a canvas referencing this
+    /// blob is sufficient on its own — the canvas owner already decided to
+    /// share this specific file with this specific peer, which is a
+    /// stronger, more specific authorization than generic hub-friendship
+    /// (see this module's doc comment). this deliberately does NOT also
+    /// require `is_friend`: a newly-invited peer can be served their
+    /// canvas's blobs even before they've accepted a friend request the
+    /// hub sent them (see `hub::HubPeerService::maybe_send_proactive_friend_request`)
+    /// — friendship is a separate, stronger relationship the hub still
+    /// requires before it will accept new blobs *from* that peer or sync
+    /// more broadly. an operator-`Blocked` peer is still denied outright
+    /// even so, in case a stale canvas ACL entry still lists them.
+    ///
+    /// `friend_only`/`friend_or_known_hub` modes have no canvas concept at
+    /// all, so friendz status is the only signal available there and
+    /// remains a necessary condition.
     async fn allow_blob(&self, peer_node_id: &str, blake3_hash: &str) -> bool {
-        if !self.friendz.is_friend(peer_node_id).await {
-            tracing::info!(peer = peer_node_id, "blob-acl: denied, not a hub friend");
-            return false;
-        }
+        tracing::info!(
+            peer = peer_node_id,
+            blake3 = %blake3_hash,
+            mode = if self.canvas.is_some() {
+                "for_hub"
+            } else if self.userz.is_some() {
+                "friend_or_known_hub"
+            } else {
+                "friend_only"
+            },
+            "blob-acl: allow_blob called"
+        );
 
-        let Some(canvas) = &self.canvas else {
-            // friend-only mode: no canvas concept to check further against.
-            return true;
-        };
+        if let Some(canvas) = &self.canvas {
+            if matches!(
+                self.friendz.get(peer_node_id).await,
+                Ok(Some(f)) if f.status == friendz::FriendStatus::Blocked
+            ) {
+                tracing::info!(peer = peer_node_id, "blob-acl: denied, peer is blocked");
+                return false;
+            }
 
-        let canvases = canvas.canvas_ids_referencing(blake3_hash).await;
-        if canvases.is_empty() {
+            let canvases = canvas.canvas_ids_referencing(blake3_hash).await;
+            if canvases.is_empty() {
+                tracing::info!(
+                    blake3 = %blake3_hash,
+                    "blob-acl: denied, blob not referenced by any known canvas"
+                );
+                return false;
+            }
+
+            for canvas_doc_id in &canvases {
+                if canvas.peer_in_acl(canvas_doc_id, peer_node_id).await {
+                    tracing::info!(
+                        peer = peer_node_id,
+                        canvas_doc_id = %canvas_doc_id,
+                        "blob-acl: allowed, peer is in this canvas's acl"
+                    );
+                    return true;
+                }
+            }
+
             tracing::info!(
+                peer = peer_node_id,
                 blake3 = %blake3_hash,
-                "blob-acl: denied, blob not referenced by any known canvas"
+                canvases = ?canvases,
+                "blob-acl: denied, not a member of any canvas referencing this blob"
             );
             return false;
         }
 
-        for canvas_doc_id in &canvases {
-            if canvas.peer_in_acl(canvas_doc_id, peer_node_id).await {
-                return true;
+        // friend_only / friend_or_known_hub mode: no canvas concept, fall
+        // back to friendz status (+ known-hub fallback) as the sole gate.
+        if !self.friendz.is_friend(peer_node_id).await {
+            let known_hub = match &self.userz {
+                Some(userz) => {
+                    matches!(userz.get(peer_node_id).await, Ok(Some(rec)) if rec.is_hub)
+                }
+                None => false,
+            };
+            if known_hub {
+                tracing::info!(
+                    peer = peer_node_id,
+                    "blob-acl: allowed via known-hub fallback (userz says is_hub, not yet a mutual friendz entry)"
+                );
+            } else {
+                tracing::info!(peer = peer_node_id, "blob-acl: denied, not a hub friend");
+                return false;
             }
+        } else {
+            tracing::info!(peer = peer_node_id, "blob-acl: peer is a hub friend");
         }
 
         tracing::info!(
             peer = peer_node_id,
-            blake3 = %blake3_hash,
-            canvases = ?canvases,
-            "blob-acl: denied, friend but not a member of any canvas referencing this blob"
+            "blob-acl: allowed, no canvas check in this mode"
         );
-        false
+        true
     }
 }
 
@@ -470,6 +562,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hub_gate_allows_a_canvas_member_who_is_not_yet_a_hub_friend() {
+        // this is the key case motivating the for_hub gate's canvas-ACL-
+        // alone check: a peer invited to a canvas by its owner can fetch
+        // that canvas's blobs from the hub even before accepting a friend
+        // request the hub may have sent them (see
+        // `hub::HubPeerService::maybe_send_proactive_friend_request`) —
+        // the owner's ACL decision is itself sufficient authorization.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hub_db = tmp.path().join("hub-docs.db");
+        let hub_repo = seed_canvas_and_widget(
+            &hub_db,
+            "hub-node",
+            "canvas-1",
+            "widget-1",
+            &["alice"],
+            "abc123",
+        )
+        .await;
+
+        let pool = crate::db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
+        // alice has no friendz row at all — not a friend yet.
+
+        let gate = BlobAclGate::for_hub(friendz_store, hub_repo);
+        assert!(gate.allow_blob("alice", "abc123").await);
+    }
+
+    #[tokio::test]
+    async fn hub_gate_denies_a_blocked_peer_even_if_still_in_a_canvas_acl() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hub_db = tmp.path().join("hub-docs.db");
+        let hub_repo = seed_canvas_and_widget(
+            &hub_db,
+            "hub-node",
+            "canvas-1",
+            "widget-1",
+            &["alice"],
+            "abc123",
+        )
+        .await;
+
+        let pool = crate::db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        crate::userz::Directory::new(haruspex_pool.clone())
+            .touch("alice")
+            .await
+            .expect("touch userz row");
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
+        friendz_store
+            .upsert("alice", friendz::FriendStatus::Blocked, None)
+            .await
+            .expect("upsert blocked");
+
+        let gate = BlobAclGate::for_hub(friendz_store, hub_repo);
+        // even though alice is still listed in canvas-1's acl (a stale
+        // entry the operator hasn't cleaned up), an explicit block wins.
+        assert!(!gate.allow_blob("alice", "abc123").await);
+    }
+
+    #[tokio::test]
     async fn friend_only_gate_allows_any_hub_friend_regardless_of_hash() {
         let pool = crate::db::open_in_memory().await;
         let haruspex_pool = haruspex::testing::open_in_memory().await;
@@ -495,5 +648,46 @@ mod tests {
 
         let gate = BlobAclGate::friend_only(friendz_store);
         assert!(!gate.allow_blob("mallory", "anything-at-all").await);
+    }
+
+    #[tokio::test]
+    async fn friend_or_known_hub_gate_allows_a_known_hub_that_is_not_yet_a_friend() {
+        let pool = crate::db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let userz_dir = crate::userz::Directory::new(haruspex_pool.clone());
+        // hub-1 has a userz row (e.g. from an earlier ProfileResponse) with
+        // is_hub set, but no friendz entry at all yet.
+        userz_dir.mark_as_hub("hub-1").await.expect("mark_as_hub");
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
+
+        let gate = BlobAclGate::friend_or_known_hub(friendz_store, userz_dir);
+        assert!(gate.allow_blob("hub-1", "anything-at-all").await);
+    }
+
+    #[tokio::test]
+    async fn friend_or_known_hub_gate_denies_a_stranger_that_is_neither() {
+        let pool = crate::db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let userz_dir = crate::userz::Directory::new(haruspex_pool.clone());
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
+
+        let gate = BlobAclGate::friend_or_known_hub(friendz_store, userz_dir);
+        assert!(!gate.allow_blob("mallory", "anything-at-all").await);
+    }
+
+    #[tokio::test]
+    async fn friend_or_known_hub_gate_still_allows_a_regular_friend() {
+        let pool = crate::db::open_in_memory().await;
+        let haruspex_pool = haruspex::testing::open_in_memory().await;
+        let userz_dir = crate::userz::Directory::new(haruspex_pool.clone());
+        userz_dir.touch("alice").await.expect("touch userz row");
+        let friendz_store = friendz::Store::new(haruspex_pool, pool);
+        friendz_store
+            .upsert("alice", friendz::FriendStatus::Accepted, None)
+            .await
+            .expect("upsert friend");
+
+        let gate = BlobAclGate::friend_or_known_hub(friendz_store, userz_dir);
+        assert!(gate.allow_blob("alice", "anything-at-all").await);
     }
 }
