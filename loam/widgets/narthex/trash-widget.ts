@@ -518,6 +518,25 @@ export async function softDeleteCanvasForWidget(
     const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
     if (!cardDoc?.canvasDocId || typeof cardDoc.canvasDocId !== "string") return;
 
+    // a still-pending remote card (share-link joined, access never
+    // actually granted) has no canvas doc content we're even authorized
+    // to open — the owner's side never syncs an unrecognized/not-yet-
+    // approved peer (see canvas-scoped-share-policy.ts), so
+    // `CanvasStore.open()` below would just hang out its full ~60s
+    // timeout waiting for a sync that will never arrive, then throw -
+    // this was the "can't delete, pending canvas is stuck" bug. skip
+    // straight past it: there's nothing here to soft-delete, only an
+    // outbox entry to cancel (see clearOutboxForCanvas in boot.ts,
+    // triggered by the `skein:canvas-card-trashed` event below).
+    if (cardDoc.isRemote === true && cardDoc.accessPending === true) {
+      log.debug(
+        "trash-widget",
+        "skipping remote soft-delete for still-pending canvas:",
+        (cardDoc.canvasDocId as string).slice(0, 16) + "..."
+      );
+      return;
+    }
+
     const canvasStore = await CanvasStore.open(repo, cardDoc.canvasDocId as DocumentId);
     canvasStore.setLocalNodeId(narthexStore.localNodeId);
 
@@ -553,6 +572,19 @@ async function restoreCanvasForWidget(
     const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
     if (!cardDoc?.canvasDocId || typeof cardDoc.canvasDocId !== "string") return;
 
+    // see the matching guard in softDeleteCanvasForWidget() above — a
+    // still-pending remote card was never soft-deleted in the first place
+    // (we skip that step), so there's nothing to restore, and opening the
+    // canvas doc would just hang the same way.
+    if (cardDoc.isRemote === true && cardDoc.accessPending === true) {
+      log.debug(
+        "trash-widget",
+        "skipping remote restore for still-pending canvas:",
+        (cardDoc.canvasDocId as string).slice(0, 16) + "..."
+      );
+      return;
+    }
+
     const canvasStore = await CanvasStore.open(repo, cardDoc.canvasDocId as DocumentId);
     canvasStore.setLocalNodeId(narthexStore.localNodeId);
 
@@ -586,6 +618,18 @@ async function purgeCanvasForWidget(
     await cardHandle.whenReady();
     const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
     if (!cardDoc?.canvasDocId || typeof cardDoc.canvasDocId !== "string") return;
+
+    // see the matching guard in softDeleteCanvasForWidget() above — a
+    // still-pending remote card has no canvas doc content we're
+    // authorized to open at all, so there's nothing to purge.
+    if (cardDoc.isRemote === true && cardDoc.accessPending === true) {
+      log.debug(
+        "trash-widget",
+        "skipping remote purge for still-pending canvas:",
+        (cardDoc.canvasDocId as string).slice(0, 16) + "..."
+      );
+      return;
+    }
 
     const canvasStore = await CanvasStore.open(repo, cardDoc.canvasDocId as DocumentId);
     canvasStore.setLocalNodeId(narthexStore.localNodeId);
@@ -689,32 +733,47 @@ export async function trashCanvasCard(
   cardWidgetId: string
 ): Promise<void> {
   await softDeleteCanvasForWidget(repo, narthexStore, cardWidgetId);
-  await moveCardToTrash(repo, narthexStore, cardWidgetId);
 
-  // let boot.ts clear any outbox entries (sent canvas invites, sent access
-  // requests) that referenced this canvas — they're no longer actionable
-  // once the canvas itself is gone. friend requests are deliberately left
-  // alone here: those are a real relationship, not tied to this one
-  // canvas, and already have their own manual "cancel" control in the
-  // social widget's requests tab.
+  // resolve the linked canvasDocId BEFORE any removal below, whichever path
+  // that removal takes — the `skein:canvas-card-trashed` event dispatched
+  // at the end needs it regardless of whether the card ends up moved into
+  // the trash bin or (see the no-trash-widget fallback below) removed
+  // outright.
+  let canvasDocId: string | undefined;
   try {
     const widget = narthexStore.getWidget(cardWidgetId);
-    if (!widget?.docId) return;
-
-    const cardHandle = await repo.find(widget.docId as DocumentId);
-    await cardHandle.whenReady();
-    const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
-    if (!cardDoc?.canvasDocId || typeof cardDoc.canvasDocId !== "string") return;
-
-    window.dispatchEvent(
-      new CustomEvent("skein:canvas-card-trashed", {
-        detail: { canvasDocId: cardDoc.canvasDocId },
-      })
-    );
+    if (widget?.docId) {
+      const cardHandle = await repo.find(widget.docId as DocumentId);
+      await cardHandle.whenReady();
+      const cardDoc = cardHandle.doc() as Record<string, unknown> | undefined;
+      if (cardDoc?.canvasDocId && typeof cardDoc.canvasDocId === "string") {
+        canvasDocId = cardDoc.canvasDocId;
+      }
+    }
   } catch (err) {
-    log.warn("trash-widget", "failed to dispatch canvas-card-trashed event:", cardWidgetId, err);
+    log.warn("trash-widget", "failed to resolve canvasDocId before trashing:", cardWidgetId, err);
   }
+
+  const movedToTrash = await moveCardToTrash(repo, narthexStore, cardWidgetId);
+
+  // `moveCardToTrash()` is a documented no-op when this narthex has no
+  // trash-widget instance at all (a user-added widget, not auto-created) —
+  // which used to mean the property tray's "delete widget" button (routed
+  // here via canvas-card.ts's `onBeforeClose`) silently did nothing: the
+  // card just sat exactly where it was, with no visible feedback that
+  // anything happened. fall back to an outright removal in that case,
+  // matching what the top-nav toolbar's generic delete action already
+  // does for any other widget.
+  if (!movedToTrash) {
+    narthexStore.removeWidget(cardWidgetId);
+  }
+
+  if (!canvasDocId) return;
+  window.dispatchEvent(
+    new CustomEvent("skein:canvas-card-trashed", { detail: { canvasDocId } })
+  );
 }
+
 
 // -----------------------------------------------------------------------
 // registration (must be called with the narthex registry)

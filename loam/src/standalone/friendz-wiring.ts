@@ -700,7 +700,7 @@ export async function initFriendzWiring(
   initBridge(protocol);
 
   // hook outbound request side-effects: track sent friend requests in social doc
-  setOutboundRequestHook((targetNodeId: string) => {
+  setOutboundRequestHook((targetNodeId: string, hintUsername?: string) => {
     sDoc.change((draft: any) => {
       if (!draft.outboundRequests) draft.outboundRequests = [];
       const exists = draft.outboundRequests.some((r: any) => r.toNodeId === targetNodeId);
@@ -708,7 +708,14 @@ export async function initFriendzWiring(
         const sentAt = new Date().toISOString();
         draft.outboundRequests.push({
           toNodeId: targetNodeId,
-          toUsername: "unknown",
+          // "" (not a literal "unknown") so the requests-tab UI's own
+          // `outReq.toUsername || outReq.toNodeId.slice(0, 8)` fallback
+          // actually kicks in — a truthy placeholder string defeated that
+          // fallback entirely, showing the literal word "unknown" for
+          // every outbound request until a real profile response arrived.
+          // `hintUsername`, when the caller has one (e.g. a share link's
+          // embedded owner username), seeds a real-looking name instead.
+          toUsername: hintUsername ?? "",
           sentAt,
           expiresAt: addDays(sentAt, FRIEND_REQUEST_TTL_DAYS),
           status: "pending",
@@ -1404,6 +1411,7 @@ export async function initFriendzWiring(
     const accessRequests = (messagezHandle?.doc()?.accessRequests ?? []) as any[];
     for (const req of accessRequests) {
       if (req.delivered) continue;
+      if (req.status === "cancelled") continue;
       if (req.ownerNodeId !== peerNodeId) continue;
       log.debug(
         TAG,
@@ -2110,6 +2118,17 @@ export interface FriendHandlersDeps {
    * that don't care about profile-doc sync can omit it.
    */
   profileStore?: ProfileStore;
+  /**
+   * fired at the end of `onFriendAccept` with the accepting peer's node id.
+   * optional — used by boot.ts to detect a "hub ack" for a pending
+   * canvas access-request (a friend-accept from a nodeId listed in that
+   * request's `hubNodeIds` — see `requestCanvasAccess()`'s doc comment).
+   * `wireFriendHandlers()` is safe to re-invoke with this set after
+   * `initFriendzWiring()` already wired it once without it, mirroring
+   * `wireKnockHandlers()`'s "re-register with live-attribution callbacks"
+   * pattern below.
+   */
+  onFriendAccepted?: (fromNodeId: string) => void;
 }
 
 /**
@@ -2338,7 +2357,6 @@ export function applyRelayedOutboundRequestUpdate(
  */
 export function wireFriendHandlers(deps: FriendHandlersDeps): void {
   const { protocol, sDoc, profileStore } = deps;
-
   // incoming friend request -> write to social doc.
   // edge cases handled here:
   //   1. duplicate request from same peer: skip the push
@@ -2428,6 +2446,8 @@ export function wireFriendHandlers(deps: FriendHandlersDeps): void {
     // matters at all: without it, no peer's profile doc `.acl` ever gains
     // an entry, so it can never sync to anyone.
     profileStore?.grantViewerRole(fromNodeId);
+
+    deps.onFriendAccepted?.(fromNodeId);
   };
 }
 
@@ -2891,6 +2911,28 @@ export async function approveKnock(
 
   store.setRole(requesterNodeId, role);
   store.addKnockDecision(requesterNodeId, localNodeId, "approve", role);
+
+  // diagnostic: confirm the acl write actually landed on THIS canvas's
+  // doc, keyed by the exact requesterNodeId - added while chasing a bug
+  // report where a knock approval appeared to succeed (no errors, a
+  // "knock approve" notification reached the requester) but the
+  // requester's own copy of the canvas never became accessible. if the
+  // logged role here doesn't match `role`, or the canvas doc id looks
+  // wrong, that's the smoking gun; if it DOES match, the problem is
+  // downstream of this write (sync/network layer - see
+  // canvas-scoped-share-policy.ts's matching diagnostic log).
+  log.debug(
+    TAG,
+    "approveKnock: wrote acl role",
+    "canvas:",
+    store.handle.documentId.slice(0, 16) + "...",
+    "requester:",
+    requesterNodeId.slice(0, 16) + "...",
+    "role:",
+    role,
+    "readback:",
+    store.getRole(requesterNodeId)
+  );
 
   const alreadyFriend = (socialDoc.current.friends ?? []).some((f) =>
     f.nodeIds?.some((n) => n.nodeId === requesterNodeId)

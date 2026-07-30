@@ -10,6 +10,7 @@ import { ProfileStore } from "../../../src/canvas/profile-doc";
 import {
   getHubAdminTransport,
   gossipFriendRequestsNow,
+  isKnownHubNodeId,
   isOnline as bridgeIsOnline,
   isProtocolReady as bridgeIsProtocolReady,
   onOnlineChange,
@@ -866,9 +867,16 @@ export function createFriendsTab(ctx: TabContext): TabController {
         // pushes a friend entry immediately rather than waiting for
         // acceptance), so surface the outstanding status here too rather
         // than only in the requests tab's separate "sent requests" section.
+        // labeled "pending · hub" instead of plain "pending" when the
+        // target is a known canvas-sharing hub (see
+        // `recordKnownHubNodeIds()`, friendz-bridge.ts) — a friend request
+        // to a hub is expected to resolve quickly via its vouched-based
+        // auto-accept, so distinguishing it from an ordinary pending
+        // request to a person is useful context here.
         if (hasPendingOutbound) {
+          const isHubTarget = friend.nodeIds.some((n) => isKnownHubNodeId(n.nodeId));
           const badgeText = new Text({
-            text: "pending",
+            text: isHubTarget ? "pending \u00b7 hub" : "pending",
             style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE - 1, fill: MUTED_TEXT },
             resolution: RESOLUTION,
           });

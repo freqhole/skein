@@ -26,7 +26,7 @@ import type { MiddenStreamNode } from "./iroh-network-adapter";
 
 let protocol: FriendzProtocol | null = null;
 let bridgeReadyListeners: Array<() => void> = [];
-let outboundRequestHook: ((toNodeId: string) => void) | null = null;
+let outboundRequestHook: ((toNodeId: string, hintUsername?: string) => void) | null = null;
 let gossipNowHook: (() => void) | null = null;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +67,40 @@ let knockRelayListeners: Array<(info: KnockRelayAttribution) => void> = [];
 const knockAckedCanvasIds = new Set<string>();
 let knockAckListeners: Array<(info: KnockAckInfo) => void> = [];
 
+export interface HubAckInfo {
+  canvasDocId: string;
+  hubNodeId: string;
+}
+
+/** canvas doc ids for which a hub-side ack has been observed — a
+ *  `friend-accept` arriving from a nodeId listed in that canvas's pending
+ *  access-request `hubNodeIds` (see `requestCanvasAccess()`'s doc comment,
+ *  boot.ts, for why a hub friend-accept is treated as an ack at all: the
+ *  hub's vouched-based auto-accept means this only fires once the hub has
+ *  actually put the requester on its friends-only gossip network, which is
+ *  the thing that makes onward relay to the canvas owner possible). backed
+ *  by the persisted `accessRequests[].hubAcked` field (messagez doc) —
+ *  boot.ts backfills this set from that field at startup, so it also
+ *  reflects acks observed in a previous session, unlike `knockAckedCanvasIds`
+ *  above. */
+const hubAckedCanvasIds = new Set<string>();
+let hubAckListeners: Array<(info: HubAckInfo) => void> = [];
+
+/** canvas doc ids whose access-request "resend" action has already been
+ *  used once this session — a deliberately lightweight, session-only spam
+ *  guard (see `markManuallyRetried()`/`wasManuallyRetried()`): disabled
+ *  until the next full page reload, at which point the user can try again.
+ *  automatic retry-on-peer-online (`onPeerBecameOnline`, friendz-wiring.ts)
+ *  is unrelated to this and keeps working regardless. */
+const manuallyRetriedCanvasIds = new Set<string>();
+
+/** node ids known to be canvas-sharing hubs — populated whenever a share
+ *  link or canvas-card carries `hubNodeIds` (see `canvas-card.ts`,
+ *  `boot.ts`'s `joinCanvasFromNarthex()`/`requestCanvasAccess()`). used
+ *  purely for a "(hub)" label on an outgoing friend request in the friends
+ *  tab (`friends-tab.ts`) — session-only, not persisted. */
+const knownHubNodeIds = new Set<string>();
+
 function knockRelayKey(canvasDocId: string, requesterNodeId: string): string {
   return `${canvasDocId}:${requesterNodeId}`;
 }
@@ -105,6 +139,10 @@ export function destroyBridge(): void {
   knockRelayListeners = [];
   knockAckedCanvasIds.clear();
   knockAckListeners = [];
+  hubAckedCanvasIds.clear();
+  hubAckListeners = [];
+  manuallyRetriedCanvasIds.clear();
+  knownHubNodeIds.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -186,8 +224,16 @@ export function onBridgeReady(handler: () => void): () => void {
 /**
  * send a friend request to a peer.
  * throws if the bridge isn't ready.
+ *
+ * `hintUsername`, when given, seeds the outbound-request placeholder's
+ * display name (see the hook body in friendz-wiring.ts) so a fresh request
+ * doesn't show as a bare/"unknown" name until the recipient's own profile
+ * info comes back - e.g. requestCanvasAccess() in boot.ts passes the
+ * canvas owner's username straight from the narthex card (itself
+ * populated from the share link's embedded `ownerUsername`, see
+ * share-string.ts) when asking to friend a canvas owner it just knocked.
  */
-export async function sendFriendRequest(peerNodeId: string): Promise<void> {
+export async function sendFriendRequest(peerNodeId: string, hintUsername?: string): Promise<void> {
   if (!protocol) throw new Error("friendz bridge not initialized");
 
   // mark the outbound request as pending, and kick off a gossip-relay
@@ -201,7 +247,7 @@ export async function sendFriendRequest(peerNodeId: string): Promise<void> {
   // if the pending-state hook only fired on success, an offline target
   // would never get marked pending and would have nothing for gossip
   // relay to carry, defeating the entire point of that feature.
-  outboundRequestHook?.(peerNodeId);
+  outboundRequestHook?.(peerNodeId, hintUsername);
   if (!isOnline(peerNodeId)) {
     gossipFriendRequestsNow();
   }
@@ -214,7 +260,9 @@ export async function sendFriendRequest(peerNodeId: string): Promise<void> {
  * boot.ts uses this to track outbound requests in the friends doc.
  * call with null to unregister.
  */
-export function setOutboundRequestHook(hook: ((toNodeId: string) => void) | null): void {
+export function setOutboundRequestHook(
+  hook: ((toNodeId: string, hintUsername?: string) => void) | null
+): void {
   outboundRequestHook = hook;
 }
 
@@ -637,6 +685,52 @@ export function onKnockAcked(handler: (info: KnockAckInfo) => void): () => void 
  *  for this pass. */
 export function hasKnockAckForCanvas(canvasDocId: string): boolean {
   return knockAckedCanvasIds.has(canvasDocId);
+}
+
+/** record a hub-side ack (see `HubAckInfo`'s doc comment) and notify
+ *  subscribers — see `onHubAcked()`. */
+export function recordHubAck(info: HubAckInfo): void {
+  hubAckedCanvasIds.add(info.canvasDocId);
+  for (const listener of hubAckListeners) listener(info);
+}
+
+/** subscribe to hub-ack events. returns an unsubscribe function. */
+export function onHubAcked(handler: (info: HubAckInfo) => void): () => void {
+  hubAckListeners.push(handler);
+  return () => {
+    hubAckListeners = hubAckListeners.filter((h) => h !== handler);
+  };
+}
+
+/** true if a hub ack for `canvasDocId` has been observed (this session, or
+ *  backfilled from the persisted `accessRequests[].hubAcked` field at
+ *  startup — see `hubAckedCanvasIds`'s doc comment). */
+export function hasHubAckForCanvas(canvasDocId: string): boolean {
+  return hubAckedCanvasIds.has(canvasDocId);
+}
+
+/** mark a canvas's access-request "resend" action as used for the rest of
+ *  this session — see `manuallyRetriedCanvasIds`'s doc comment. */
+export function markManuallyRetried(canvasDocId: string): void {
+  manuallyRetriedCanvasIds.add(canvasDocId);
+}
+
+/** true if the "resend" action for `canvasDocId` has already been used
+ *  this session (see `markManuallyRetried()`). */
+export function wasManuallyRetried(canvasDocId: string): boolean {
+  return manuallyRetriedCanvasIds.has(canvasDocId);
+}
+
+/** record one or more node ids as known canvas-sharing hubs — see
+ *  `knownHubNodeIds`'s doc comment. safe to call repeatedly with the same
+ *  ids. */
+export function recordKnownHubNodeIds(nodeIds: string[]): void {
+  for (const id of nodeIds) knownHubNodeIds.add(id);
+}
+
+/** true if `nodeId` is a known canvas-sharing hub (see `recordKnownHubNodeIds()`). */
+export function isKnownHubNodeId(nodeId: string): boolean {
+  return knownHubNodeIds.has(nodeId);
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ import {
   onFriendsChange,
   onKnockAcked,
 } from "../../src/p2p/friendz-bridge";
+import { getStoredIdentity, onIdentityChange } from "../../src/p2p/identity";
 import { formatRelativeTime, formatShortDate } from "../../src/widgets/format";
 import {
   isTransparent,
@@ -271,6 +272,13 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
     let currentWidth = ctx.width;
     let currentHeight = ctx.height;
     let hovered = false;
+
+    // the request-access pill is disabled until an identity exists (see
+    // drawRequestAccessPill below) — declared here, before the initial
+    // layout() call further down, since layout() runs synchronously during
+    // widget creation and would otherwise throw a temporal-dead-zone
+    // ReferenceError referencing this before its declaration ran.
+    let hasIdentity = false;
 
     // --- graphics layers ---
 
@@ -946,17 +954,29 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       const requested = !!state.accessRequestedAt;
       const declined = !requested && state.accessDeclined;
       const delivered = requested && hasKnockAckForCanvas(state.canvasDocId);
-      requestAccessContainer.eventMode = requested ? "none" : "static";
-      requestAccessContainer.cursor = requested ? "default" : "pointer";
+      // no identity yet means there's no p2p endpoint to send a knock
+      // from at all (see boot.ts's requestCanvasAccess()) — clicking would
+      // just silently no-op, so disable the pill entirely rather than
+      // let the user tap something that does nothing.
+      requestAccessContainer.eventMode = requested || !hasIdentity ? "none" : "static";
+      requestAccessContainer.cursor = requested || !hasIdentity ? "default" : "pointer";
 
-      const color = declined ? REQUEST_DECLINED_COLOR : requested ? REQUEST_SENT_COLOR : 0xf59e0b;
-      requestAccessText.text = declined
-        ? "access declined \u2022 tap to retry"
-        : delivered
-          ? "request sent \u2022 waiting for admin"
+      const color = !hasIdentity
+        ? REQUEST_SENT_COLOR
+        : declined
+          ? REQUEST_DECLINED_COLOR
           : requested
-            ? "request sent"
-            : "request access";
+            ? REQUEST_SENT_COLOR
+            : 0xf59e0b;
+      requestAccessText.text = !hasIdentity
+        ? "request access \u2014 set up identity first"
+        : declined
+          ? "access declined \u2022 tap to retry"
+          : delivered
+            ? "request sent \u2022 waiting for admin"
+            : requested
+              ? "request sent"
+              : "request access";
       requestAccessText.style.fill = color;
 
       const tw = requestAccessText.width;
@@ -1018,8 +1038,25 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       const descMaxCharsPerLine = estimateMaxChars(descMaxWidth, DESC_FONT_SIZE);
       const descMaxChars = descMaxCharsPerLine * Math.min(maxDescLines, 2);
 
-      if (state.description) {
-        descText.text = truncate(state.description, descMaxChars);
+      // the "not a friend yet — use ..." hint is baked into
+      // `state.description` once, at card-creation time (boot.ts, when a
+      // share link is first joined) — it never gets refreshed after that,
+      // so it goes stale and stays factually wrong forever once the
+      // friend request is later accepted (a real reported bug: "it's
+      // showing after the request has been sent, so it's incorrect (we
+      // are friends)"). same fix as `drawAuthorBadge` above: check the
+      // live social doc instead of trusting the frozen stored copy.
+      let effectiveDescription = state.description;
+      if (
+        state.isRemote &&
+        effectiveDescription.startsWith("not a friend yet") &&
+        getFriendInfo(state.ownerNodeId)
+      ) {
+        effectiveDescription = "connecting to peer";
+      }
+
+      if (effectiveDescription) {
+        descText.text = truncate(effectiveDescription, descMaxChars);
         descText.visible = true;
       } else {
         descText.text = "";
@@ -1127,6 +1164,10 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       event.stopPropagation();
       const state = ctx.doc.current;
       if (!state.canvasDocId || !state.ownerNodeId) return;
+      // no identity yet — drawRequestAccessPill() already disables the hit
+      // target for this case, but guard here too in case a tap was
+      // already in flight when identity state changed.
+      if (!hasIdentity) return;
       // already requested — drawRequestAccessPill() disables the hit
       // target for this case too, but guard here as well in case a tap
       // event was already in flight when that ran.
@@ -1140,6 +1181,7 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
           detail: {
             canvasDocId: state.canvasDocId,
             ownerNodeId: state.ownerNodeId,
+            hubNodeIds: state.hubNodeIds,
           },
         })
       );
@@ -1216,6 +1258,21 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       layout(currentWidth, currentHeight);
     });
 
+    // identity lookup is async (IndexedDB-backed) — check once at mount
+    // time and keep it live afterward via onIdentityChange, so a card
+    // already on screen when the user finishes generating one flips the
+    // pill from disabled to clickable without needing a reload.
+    void getStoredIdentity().then((identity) => {
+      if (identity) {
+        hasIdentity = true;
+        layout(currentWidth, currentHeight);
+      }
+    });
+    const unsubIdentity = onIdentityChange(() => {
+      hasIdentity = true;
+      layout(currentWidth, currentHeight);
+    });
+
     return {
       container,
       destroy() {
@@ -1225,6 +1282,7 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
         unsubStoreTitle?.();
         unsubFriends();
         unsubKnockAcked();
+        unsubIdentity();
         if (previewSprite) {
           container.removeChild(previewSprite);
           previewSprite.mask = null;

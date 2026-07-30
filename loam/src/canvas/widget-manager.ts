@@ -3,7 +3,7 @@ import { Container, Graphics } from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { KeyboardDriver } from "../widgets/keyboard-driver";
 import { createWidgetDoc } from "../widgets/widget-doc";
-import { resolveDocReadyCached } from "../p2p/doc-ready";
+import { resolveDocReadyCached, watchDocReady } from "../p2p/doc-ready";
 import type { WidgetRegistry } from "../widgets/widget-registry";
 import type { WidgetController, WidgetDoc, WidgetMountContext } from "../widgets/widget-types";
 import type { CanvasDocument, WidgetEntry } from "./canvas-doc";
@@ -81,6 +81,24 @@ export class WidgetManager {
   private readonly liveWidgets = new Map<string, LiveWidget>();
   private readonly mountingIds = new Set<string>();
   private unsubs: (() => void)[] = [];
+
+  /** background `watchDocReady()` cancel functions, one per widget ID
+   *  currently showing a crashed placeholder because its per-widget doc
+   *  failed to resolve in time (see `mountWidget()`'s `entry.docId` catch
+   *  branch). lets the widget self-heal — remount for real — the moment
+   *  the doc actually becomes ready, rather than staying permanently
+   *  crashed until the whole canvas is torn down and remounted (a real
+   *  reported bug: right after a knock/access-request was approved, the
+   *  very first navigation into that canvas crashed every widget with
+   *  "document unavailable" — the underlying ACL update hadn't finished
+   *  propagating to whichever peer was serving the widget docs yet, but
+   *  `resolveDocReadyCached()`'s bounded ~15s wait gave up long before it
+   *  did; navigating away and back, or reloading, "fixed" it only because
+   *  that gave the race enough real time to resolve before the *next*
+   *  mount attempt, not because either action did anything special).
+   *  cancelled and removed in `unmountWidget()` so a stale watcher never
+   *  fires for a widget that's since been removed or replaced. */
+  private readonly crashedRetryWatchers = new Map<string, () => void>();
 
   /** optional hook called before a widget is permanently removed.
    *  receives the widget entry and the repo so callers can clean up
@@ -487,6 +505,20 @@ export class WidgetManager {
             entry,
             `widget doc not available: ${err instanceof Error ? err.message : String(err)}`
           );
+          // keep waiting in the background (no timeout) — the doc can
+          // still become ready later (e.g. once an ACL update finishes
+          // propagating to whichever peer serves it), and reconcile()
+          // never retries a widget that's already in `liveWidgets` on its
+          // own, so without this the crashed placeholder above would be
+          // permanent until the canvas is torn down and remounted.
+          const cancel = watchDocReady(this.repo, entry.docId as DocumentId, () => {
+            this.crashedRetryWatchers.delete(entry.id);
+            if (this.liveWidgets.get(entry.id)?.crashed) {
+              this.unmountWidget(entry.id, false);
+              void this.mountWidget(entry);
+            }
+          });
+          this.crashedRetryWatchers.set(entry.id, cancel);
           return;
         }
 
@@ -952,6 +984,13 @@ export class WidgetManager {
   private unmountWidget(id: string, permanent = true): void {
     const live = this.liveWidgets.get(id);
     if (!live) return;
+
+    // cancel any pending crashed-placeholder retry watcher for this widget
+    // (see `crashedRetryWatchers`'s doc comment) — it must never fire for
+    // a widget that's since been removed or is about to be remounted for
+    // real by the caller.
+    this.crashedRetryWatchers.get(id)?.();
+    this.crashedRetryWatchers.delete(id);
 
     try {
       live.ctrl.destroy();

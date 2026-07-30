@@ -1,6 +1,7 @@
 import { Assets, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
 import {
+  getFriendInfo,
   getKnockRelayedBy,
   getKnockSocialDoc,
   getProtocol,
@@ -11,6 +12,7 @@ import {
   recordKnockRelay,
   sendCanvasInviteAccept,
   sendCanvasInviteDecline,
+  wasManuallyRetried,
 } from "../../src/p2p/friendz-bridge";
 import { getStoredIdentity } from "../../src/p2p/identity";
 import { approveKnock, declineKnock } from "../../src/standalone/friendz-wiring";
@@ -25,7 +27,6 @@ import {
   type WidgetFactory,
   type WidgetMountContext,
 } from "../../src/widgets/widget-types";
-
 // ---------------------------------------------------------------------------
 // schema
 // ---------------------------------------------------------------------------
@@ -88,16 +89,48 @@ const canvasDeletedNotifSchema = z.object({
   status: z.enum(["unread", "dismissed"]).default("unread"),
 });
 
+/** an outgoing canvas access-request ("knock") — written by
+ *  `requestCanvasAccess()` (boot.ts) when the "request access" pill
+ *  (canvas-card.ts) is tapped for a remote, not-yet-authorized canvas.
+ *  `delivered`/`ackerNodeId` track the canvas owner's own ack
+ *  (`canvas-knock-ack`, friendz-wiring.ts's `onCanvasKnockAck`);
+ *  `hubAcked`/`hubAckedNodeId` track a *hub's* ack — a `friend-accept`
+ *  arriving from one of `hubNodeIds` (see `wireFriendHandlers`'s
+ *  `onFriendAccepted` callback, boot.ts) — which only happens once the
+ *  hub's vouched-based auto-accept has put the requester on its
+ *  friends-only gossip network, a strong (if indirect) signal the request
+ *  is at least in flight toward the owner even while the owner is offline.
+ *  `status` flips to "cancelled" (never deleted outright, so a re-request
+ *  stays possible and the outbox keeps a log) when the pending canvas card
+ *  is trashed — see `clearOutboxForCanvas()` (boot.ts). */
+const accessRequestSchema = z.object({
+  knockId: z.string(),
+  canvasDocId: z.string(),
+  canvasTitle: z.string().default(""),
+  ownerNodeId: z.string(),
+  hubNodeIds: z.array(z.string()).default([]),
+  sentAt: z.string(),
+  delivered: z.boolean().default(false),
+  ackerNodeId: z.string().default(""),
+  hubAcked: z.boolean().default(false),
+  hubAckedNodeId: z.string().default(""),
+  hubAckedAt: z.string().default(""),
+  status: z.enum(["pending", "cancelled"]).default("pending"),
+  cancelledAt: z.string().default(""),
+});
+
 export const messagezSchema = z.object({
   invites: z.array(canvasInviteSchema).default([]),
   shares: z.array(canvasShareSchema).default([]),
   deletions: z.array(canvasDeletedNotifSchema).default([]),
+  accessRequests: z.array(accessRequestSchema).default([]),
   canvasInvitesFrom: z.enum(["everyone", "friends", "nobody"]).default("everyone"),
 });
 
 export type CanvasInvite = z.infer<typeof canvasInviteSchema>;
 export type CanvasShare = z.infer<typeof canvasShareSchema>;
 export type CanvasDeletedNotif = z.infer<typeof canvasDeletedNotifSchema>;
+export type CanvasAccessRequest = z.infer<typeof accessRequestSchema>;
 export type MessagezState = z.infer<typeof messagezSchema>;
 
 /**
@@ -112,6 +145,24 @@ interface KnockRowRefs {
   approveBtn: Container;
   rejectBtn: Container;
   ignoreBtn: Container;
+}
+
+/**
+ * a knock row to render — either from the currently-open canvas
+ * (`canvasTitle: undefined`, `store` is `ctx.canvasStore`) or from some
+ * OTHER canvas the local peer admins (`canvasTitle` set, `store` built
+ * via `ctx.otherCanvasKnocks.getStore()`) — see
+ * `widget-types.ts`'s `OtherCanvasKnocksSource` doc comment for why
+ * cross-canvas knocks exist at all. `rebuildKnockRows()` no longer
+ * assumes a single shared canvas/store for every row it draws.
+ */
+interface KnockRowEntry {
+  knock: PendingCanvasKnock;
+  store: CanvasStore;
+  canvasDocId: string;
+  /** set only for a cross-canvas entry, so its row can be labeled with
+   *  which canvas it's for. */
+  canvasTitle?: string;
 }
 
 /**
@@ -408,6 +459,15 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
     // table for the asymmetry), so the existing `ctx.doc.on("change", ...)`
     // subscription below doesn't cover it.
     const unsubCanvasStore = ctx.canvasStore?.onChange(() => {
+      layout(currentWidth, currentHeight);
+    });
+
+    // re-render whenever a knock arrives/resolves/is dismissed on any OTHER
+    // canvas the local peer admins — see `OtherCanvasKnocksSource`'s doc
+    // comment and a real user request ("i want to see these knock access
+    // requests on the narthex or any canvas, not just when i have that
+    // canvas open").
+    const unsubOtherCanvasKnocks = ctx.otherCanvasKnocks?.onChange(() => {
       layout(currentWidth, currentHeight);
     });
 
@@ -1226,26 +1286,33 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
     // rebuild pending-knock rows (docs/knock-and-hub-relay-plan.md section 7.2)
     //
     // structurally the same template as an invite row (identity area, a
-    // metadata line, action buttons) but reads from the currently-open
-    // canvas's own `CanvasStore` rather than this widget's own `ctx.doc` —
-    // see the asymmetry note above `visibleKnocks` in layout().
+    // metadata line, action buttons) but reads from each entry's OWN
+    // `CanvasStore` — which may be the currently-open canvas, or (see
+    // `KnockRowEntry`'s doc comment) some other canvas the local peer
+    // admins — rather than this widget's own `ctx.doc`; see the asymmetry
+    // note above `visibleKnocks` in layout().
+    //
+    // known limitation: `knockRowRefs`/`knockMetaInfo`/`knockRowRoles`
+    // (and the e2e test-hook API built on them) are keyed by
+    // `requesterNodeId` alone, not `canvasDocId:requesterNodeId` — carried
+    // forward from before cross-canvas rows existed. the same requester
+    // knocking on two different admin canvases at once (a rare edge case)
+    // would collide; the later-processed row wins for test-hook lookups.
     // -----------------------------------------------------------------------
 
     const rebuildKnockRows = (
-      knocks: PendingCanvasKnock[],
+      entries: KnockRowEntry[],
       contentW: number,
       startY: number
     ): number => {
-      const store = ctx.canvasStore;
       knockRowRefs.clear();
       knockMetaInfo.clear();
       knockRowRoles.clear();
-      if (!store) return 0;
-      const canvasDocId = store.handle.documentId;
+      if (entries.length === 0) return 0;
 
       // newest first
-      const sorted = [...knocks].sort(
-        (a, b) => new Date(b.knockedAt).getTime() - new Date(a.knockedAt).getTime()
+      const sorted = [...entries].sort(
+        (a, b) => new Date(b.knock.knockedAt).getTime() - new Date(a.knock.knockedAt).getTime()
       );
 
       const leftW = COLOR_STRIPE_WIDTH + 4 + THUMB_SIZE + THUMB_MARGIN;
@@ -1253,7 +1320,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
       const maxMsgChars = Math.max(10, Math.floor((contentW - leftW - 20) / (ROW_SUB_SIZE * 0.55)));
 
       for (let i = 0; i < sorted.length; i++) {
-        const knock = sorted[i];
+        const { knock, store, canvasDocId, canvasTitle } = sorted[i];
         const rowY = startY + i * KNOCK_ROW_HEIGHT;
 
         const rowContainer = new Container();
@@ -1336,10 +1403,12 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         msgText.y = 25;
         rowContainer.addChild(msgText);
 
-        // line 3: from: username · time · relayed/via hub (section 7.3)
+        // line 3: from: username · time · on "canvas" (cross-canvas rows
+        // only) · relayed/via hub (section 7.3)
         const relayedBy = getKnockRelayedBy(canvasDocId, knock.requesterNodeId);
         const isHub = !!relayedBy && store.isHubNode(relayedBy);
         let metaLabel = `from: ${displayName}  \u00b7  ${relativeTime(knock.knockedAt)}`;
+        if (canvasTitle) metaLabel += `  \u00b7  on "${truncate(canvasTitle, 24)}"`;
         if (isHub) metaLabel += " \u00b7 via hub";
         else if (relayedBy) metaLabel += " \u00b7 relayed";
         knockMetaInfo.set(knock.requesterNodeId, {
@@ -1618,23 +1687,35 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
     // rebuild outbox rows
     // -----------------------------------------------------------------------
 
-    const rebuildOutboxRows = (shares: CanvasShare[], contentW: number) => {
+    // an outbox row is either a sent canvas invite (`CanvasShare`) or a sent
+    // canvas access-request (`CanvasAccessRequest`, see messagezSchema's doc
+    // comment) — rendered mixed into one list, sorted together, per the
+    // "why isn't my access-request in the outbox at all" report this was
+    // added to fix.
+    type OutboxItem =
+      | { kind: "share"; data: CanvasShare }
+      | { kind: "accessRequest"; data: CanvasAccessRequest };
+
+    const isItemResolved = (item: OutboxItem): boolean =>
+      item.kind === "share"
+        ? item.data.delivered || item.data.accepted || item.data.declined
+        : item.data.delivered || item.data.hubAcked || item.data.status === "cancelled";
+
+    const rebuildOutboxRows = (items: OutboxItem[], contentW: number) => {
       while (outboxListInner.children.length > 0) {
         outboxListInner.removeChildAt(0).destroy({ children: true });
       }
 
       // filter out resolved items unless toggle is on
-      const visible = showResolved
-        ? shares
-        : shares.filter((s) => !s.delivered && !s.accepted && !s.declined);
+      const visible = showResolved ? items : items.filter((item) => !isItemResolved(item));
 
-      // sort: undelivered first, then by sentAt descending
+      // sort: undelivered/unresolved first, then by sentAt descending
       const sorted = [...visible].sort((a, b) => {
-        const aResolved = a.delivered || a.accepted || a.declined;
-        const bResolved = b.delivered || b.accepted || b.declined;
+        const aResolved = isItemResolved(a);
+        const bResolved = isItemResolved(b);
         if (!aResolved && bResolved) return -1;
         if (aResolved && !bResolved) return 1;
-        return new Date(b.sentAt).getTime() - new Date(a.sentAt).getTime();
+        return new Date(b.data.sentAt).getTime() - new Date(a.data.sentAt).getTime();
       });
 
       const leftW = COLOR_STRIPE_WIDTH + 4 + THUMB_SIZE + THUMB_MARGIN;
@@ -1644,7 +1725,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
       );
 
       for (let i = 0; i < sorted.length; i++) {
-        const share = sorted[i];
+        const item = sorted[i];
         const rowY = i * ROW_HEIGHT;
 
         const rowContainer = new Container();
@@ -1660,6 +1741,180 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
           rowBg.fill({ color: ROW_ALT_BG, alpha: 0.5 });
         }
         rowContainer.addChild(rowBg);
+
+        if (item.kind === "accessRequest") {
+          const req = item.data;
+
+          const thumbColor = BORDER;
+          const thumbX = COLOR_STRIPE_WIDTH + 4;
+          const thumbY = (ROW_HEIGHT - THUMB_SIZE) / 2;
+
+          const stripe = new Graphics();
+          stripe.eventMode = "none";
+          stripe.rect(0, 0, COLOR_STRIPE_WIDTH, ROW_HEIGHT);
+          stripe.fill({ color: thumbColor });
+          rowContainer.addChild(stripe);
+
+          const thumbBg = new Graphics();
+          thumbBg.eventMode = "none";
+          thumbBg.roundRect(thumbX, thumbY, THUMB_SIZE, THUMB_SIZE, THUMB_RADIUS);
+          thumbBg.fill({ color: thumbColor, alpha: 0.25 });
+          rowContainer.addChild(thumbBg);
+
+          const titleInitial = (req.canvasTitle || "?").charAt(0).toUpperCase();
+          const thumbLetter = new Text({
+            text: titleInitial,
+            style: {
+              fontFamily: FONT,
+              fontSize: 14,
+              fontWeight: "bold",
+              fill: thumbColor,
+              align: "center",
+            },
+            resolution: RESOLUTION,
+          });
+          thumbLetter.eventMode = "none";
+          thumbLetter.anchor.set(0.5);
+          thumbLetter.x = thumbX + THUMB_SIZE / 2;
+          thumbLetter.y = thumbY + THUMB_SIZE / 2;
+          rowContainer.addChild(thumbLetter);
+
+          const textX = leftW;
+          const titleLabel = req.canvasTitle
+            ? truncate(req.canvasTitle, maxNameChars)
+            : `canvas ${req.canvasDocId.slice(0, 8)}...`;
+
+          const titleText = new Text({
+            text: titleLabel,
+            style: {
+              fontFamily: FONT,
+              fontSize: ROW_NAME_SIZE,
+              fontWeight: "bold",
+              fill: TEXT_COLOR,
+            },
+            resolution: RESOLUTION,
+          });
+          titleText.eventMode = "none";
+          titleText.x = textX;
+          titleText.y = 22;
+          rowContainer.addChild(titleText);
+
+          const ownerName = getFriendInfo(req.ownerNodeId)?.username || req.ownerNodeId.slice(0, 8) + "...";
+          const hubSuffix =
+            req.hubNodeIds.length > 0
+              ? ` \u00b7 ${req.hubNodeIds.length} hub${req.hubNodeIds.length > 1 ? "s" : ""}`
+              : "";
+          const metaLabel = `request to: ${ownerName}${hubSuffix}  \u00b7  ${relativeTime(req.sentAt)}`;
+          const metaText = new Text({
+            text: metaLabel,
+            style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          metaText.eventMode = "none";
+          metaText.x = textX;
+          metaText.y = 42;
+          rowContainer.addChild(metaText);
+
+          const cancelled = req.status === "cancelled";
+          const resolved = req.delivered || req.hubAcked;
+          // a cancelled request can be resent too (see the user-facing
+          // "resend" button below) — not just an actively-pending,
+          // never-delivered one — since `retryCanvasAccessRequest()`
+          // (boot.ts) re-runs `requestCanvasAccess()` regardless of the
+          // matched entry's status, minting a fresh knockId/outbox entry.
+          // only a real ack (delivered/hubAcked) or an already-used manual
+          // retry this session disables it.
+          const canResend = !resolved && !wasManuallyRetried(req.canvasDocId);
+
+          if (resolved) {
+            const iconColor = req.delivered ? DELIVERED_COLOR : ACCEPT_COLOR;
+            const labelText = req.delivered ? "delivered" : "delivered to hub";
+            const sIcon = new Text({
+              text: "\u2713",
+              style: { fontFamily: FONT, fontSize: 12, fontWeight: "bold", fill: iconColor },
+              resolution: RESOLUTION,
+            });
+            sIcon.eventMode = "none";
+            sIcon.x = contentW - ROW_PADDING_X - 90;
+            sIcon.y = (ROW_HEIGHT - 12) / 2;
+            rowContainer.addChild(sIcon);
+
+            const sLabel = new Text({
+              text: labelText,
+              style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+              resolution: RESOLUTION,
+            });
+            sLabel.eventMode = "none";
+            sLabel.x = sIcon.x + 16;
+            sLabel.y = (ROW_HEIGHT - ROW_SUB_SIZE) / 2;
+            rowContainer.addChild(sLabel);
+          } else if (canResend) {
+            const resendW = 56;
+            const resendH = ACTION_BTN_SIZE;
+            const resendBtn = new Container();
+            resendBtn.eventMode = "static";
+            resendBtn.cursor = "pointer";
+
+            const resendBg = new Graphics();
+            resendBg.roundRect(0, 0, resendW, resendH, 4);
+            resendBg.fill({ color: 0xf59e0b, alpha: 0.15 });
+            resendBg.stroke({ color: 0xf59e0b, width: 1, alpha: 0.6 });
+            resendBtn.addChild(resendBg);
+
+            const resendLabel = new Text({
+              text: "resend",
+              style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: 0xf59e0b },
+              resolution: RESOLUTION,
+            });
+            resendLabel.x = (resendW - resendLabel.width) / 2;
+            resendLabel.y = (resendH - resendLabel.height) / 2;
+            resendBtn.addChild(resendLabel);
+
+            // a cancelled entry also gets a small muted "cancelled" tag to
+            // the left of the button, so resending doesn't erase the
+            // context of why this row is sitting in the resolved section.
+            if (cancelled) {
+              const cancelledTag = new Text({
+                text: "cancelled \u00b7",
+                style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: DECLINE_COLOR },
+                resolution: RESOLUTION,
+              });
+              cancelledTag.eventMode = "none";
+              cancelledTag.x = contentW - resendW - ROW_PADDING_X - cancelledTag.width - 6;
+              cancelledTag.y = (ROW_HEIGHT - ROW_SUB_SIZE) / 2;
+              rowContainer.addChild(cancelledTag);
+            }
+
+            resendBtn.x = contentW - resendW - ROW_PADDING_X;
+            resendBtn.y = (ROW_HEIGHT - resendH) / 2;
+
+            const canvasDocId = req.canvasDocId;
+            resendBtn.on("pointertap", (e) => {
+              e.stopPropagation();
+              window.dispatchEvent(
+                new CustomEvent("skein:retry-canvas-access-request", { detail: { canvasDocId } })
+              );
+              layout(currentWidth, currentHeight);
+            });
+
+            rowContainer.addChild(resendBtn);
+          } else {
+            // already manually retried this session — disabled until reload
+            const sLabel = new Text({
+              text: cancelled ? "cancelled \u00b7 resent" : "sending\u2026 (resent)",
+              style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+              resolution: RESOLUTION,
+            });
+            sLabel.eventMode = "none";
+            sLabel.x = contentW - ROW_PADDING_X - sLabel.width;
+            sLabel.y = (ROW_HEIGHT - ROW_SUB_SIZE) / 2;
+            rowContainer.addChild(sLabel);
+          }
+
+          continue;
+        }
+
+        const share = item.data;
 
         // thumbnail area
         const thumbColor = isTransparent(share.canvasColor) ? BORDER : safeColor(share.canvasColor);
@@ -1914,11 +2169,17 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
 
       const invites = state.invites ?? [];
       const shares = state.shares ?? [];
+      const accessRequests = state.accessRequests ?? [];
       const deletions = state.deletions ?? [];
 
       // pendingKnocks lives on the currently-open canvas's own document, not
       // this messagez doc (see docs/knock-and-hub-relay-plan.md section 1's
       // table for the asymmetry) — read it straight from `ctx.canvasStore`.
+      // knocks from every OTHER canvas the local peer admins also show up
+      // here, via `ctx.otherCanvasKnocks` — see `KnockRowEntry`'s doc
+      // comment and a real user request ("i want to see these knock
+      // access requests on the narthex or any canvas, not just when i
+      // have that canvas open").
       const canvasStore = ctx.canvasStore;
       const canvasDocId = canvasStore?.handle.documentId ?? "";
       const dismissedKnocks = canvasDocId ? getDismissedKnocks(canvasDocId) : new Set<string>();
@@ -1929,10 +2190,20 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
             return canvasStore.resolveKnockDecision(k).outcome === "pending";
           })
         : [];
-      const pendingKnockCount = canvasStore
-        ? visibleKnocks.filter((k) => canvasStore.resolveKnockDecision(k).outcome === "pending")
-            .length
-        : 0;
+
+      const currentCanvasEntries: KnockRowEntry[] = canvasStore
+        ? visibleKnocks.map((knock) => ({ knock, store: canvasStore, canvasDocId }))
+        : [];
+      const otherEntries: KnockRowEntry[] = (ctx.otherCanvasKnocks?.list() ?? []).flatMap((e) => {
+        const store = ctx.otherCanvasKnocks!.getStore(e.canvasDocId);
+        if (!store) return [];
+        return [{ knock: e.knock, store, canvasDocId: e.canvasDocId, canvasTitle: e.canvasTitle }];
+      });
+      const allKnockEntries: KnockRowEntry[] = [...currentCanvasEntries, ...otherEntries];
+
+      const pendingKnockCount = allKnockEntries.filter(
+        (e) => e.store.resolveKnockDecision(e.knock).outcome === "pending"
+      ).length;
 
       const pendingCount =
         invites.filter((inv: CanvasInvite) => inv.status === "pending").length +
@@ -1954,12 +2225,13 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
       // narrow messagez panel, these could be squeezed off the visible
       // area entirely instead of just wrapping).
       const tabBtnY = y + (TAB_HEIGHT - (TAB_FONT_SIZE - 1)) / 2;
-      const currentTabItems = viewMode === "inbox" ? invites.length : shares.length;
+      const currentTabItems =
+        viewMode === "inbox" ? invites.length : shares.length + accessRequests.length;
       const btnGap = 12;
 
       clearAllText.visible = currentTabItems > 0;
       toggleResolvedText.text = showResolved ? "hide resolved" : "show resolved";
-      toggleResolvedText.visible = viewMode === "outbox" && shares.length > 0;
+      toggleResolvedText.visible = viewMode === "outbox" && currentTabItems > 0;
       toggleAcceptedText.text = showAccepted ? "hide accepted" : "show accepted";
       toggleAcceptedText.visible = viewMode === "inbox" && invites.length > 0;
 
@@ -2033,9 +2305,10 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         rebuildInboxRows(visibleInvites, contentW);
 
         // append pending-knock rows below invites (docs/knock-and-hub-relay-plan.md
-        // section 7.2) — read from the currently-open canvas's own doc, not
-        // this messagez doc, see the asymmetry note above `visibleKnocks`.
-        totalInboxHeight += rebuildKnockRows(visibleKnocks, contentW, totalInboxHeight);
+        // section 7.2) — from the currently-open canvas's own doc AND every
+        // other canvas the local peer admins, see the asymmetry note above
+        // `visibleKnocks` and `KnockRowEntry`'s doc comment.
+        totalInboxHeight += rebuildKnockRows(allKnockEntries, contentW, totalInboxHeight);
 
         // append deletion notification rows below invites
         if (visibleDeletions.length > 0) {
@@ -2201,7 +2474,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         if (
           visibleInvites.length === 0 &&
           visibleDeletions.length === 0 &&
-          visibleKnocks.length === 0
+          allKnockEntries.length === 0
         ) {
           inboxEmptyText.text =
             invites.length > 0 || deletions.length > 0 ? "all resolved" : "no messages yet";
@@ -2242,20 +2515,24 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         outboxListContainer.hitArea = new Rectangle(0, 0, contentW, outboxAreaHeight);
 
         // rebuild rows
-        rebuildOutboxRows(shares, contentW);
+        const outboxItems: OutboxItem[] = [
+          ...shares.map((s): OutboxItem => ({ kind: "share", data: s })),
+          ...accessRequests.map((r): OutboxItem => ({ kind: "accessRequest", data: r })),
+        ];
+        rebuildOutboxRows(outboxItems, contentW);
 
         // clamp scroll
         clampOutboxScroll();
         outboxListInner.y = -scrollY;
 
         // empty state
-        if (shares.length === 0) {
-          outboxEmptyText.text = "no shares yet";
+        if (outboxItems.length === 0) {
+          outboxEmptyText.text = "no shares or requests yet";
           outboxEmptyText.visible = true;
           outboxEmptyText.x = PADDING_X + (contentW - outboxEmptyText.width) / 2;
           outboxEmptyText.y = outboxAreaY + outboxAreaHeight / 2 - 6;
         } else if (totalOutboxHeight === 0) {
-          outboxEmptyText.text = "all shares resolved";
+          outboxEmptyText.text = "all resolved";
           outboxEmptyText.visible = true;
           outboxEmptyText.x = PADDING_X + (contentW - outboxEmptyText.width) / 2;
           outboxEmptyText.y = outboxAreaY + outboxAreaHeight / 2 - 6;
@@ -2329,6 +2606,7 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
         unsubKnockAcked();
         unsubKnockRelayed();
         unsubCanvasStore?.();
+        unsubOtherCanvasKnocks?.();
         for (const timer of knockNoticeTimers.values()) clearTimeout(timer);
         knockNoticeTimers.clear();
         container.destroy({ children: true });

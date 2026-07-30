@@ -7,6 +7,7 @@ import { log } from "@freqhole/reliquary/utils";
 import {
   acceptFriendRequest,
   isOnline as bridgeIsOnline,
+  isKnownHubNodeId,
   recordFriendRequestOutcome,
   rejectFriendRequest,
   requestProfile,
@@ -443,7 +444,14 @@ export function createRequestsTab(ctx: TabContext): TabController {
         row.addChild(nameText);
 
         const statusText = new Text({
-          text: "pending\u2026",
+          // labeled "pending... · hub" instead of plain "pending..." when
+          // this outbound request's target is a known share-link hub
+          // (recorded via `recordKnownHubNodeIds()`, friendz-bridge.ts) —
+          // mirrors friends-tab.ts's own "pending · hub" badge, so a canvas
+          // share that sends requests to both the owner AND a hub shows
+          // which row is which instead of looking like an unexplained
+          // duplicate.
+          text: isKnownHubNodeId(outReq.toNodeId) ? "pending\u2026 \u00b7 hub" : "pending\u2026",
           style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
           resolution: RESOLUTION,
         });
