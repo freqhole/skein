@@ -263,6 +263,18 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(data_dir: PathBuf, port: u16, show_dashboard: bool) -> anyhow::Result<()> {
+    // print a quick loading message immediately - the live dashboard (see
+    // dashboard.rs) doesn't draw its first frame until well after this
+    // point (keypair load, db open, iroh endpoint bind, hub service boot),
+    // which can otherwise leave the terminal looking hung for a moment.
+    // the dashboard's first redraw clears the screen (`\x1b[2J\x1b[H`), so
+    // this gets replaced automatically once it's ready - no extra
+    // bookkeeping needed. skipped when --log-stdout is set, since then the
+    // terminal is used for log lines instead (see setup_tracing).
+    if show_dashboard {
+        println!("skein tumulus loading, just a moment...");
+    }
+
     let secret = load_or_generate(&data_dir)?;
     let node_id = secret.public();
 

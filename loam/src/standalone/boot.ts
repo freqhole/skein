@@ -32,6 +32,7 @@ import {
   recordKnockAck,
   recordKnockRelay,
   recordKnownHubNodeIds,
+  requestProfile,
   sendAclChange,
   sendCanvasInvite,
   sendFriendRequest,
@@ -1567,6 +1568,7 @@ class SkeinRouter {
               role: this.currentCanvas!.store.getRole(String(p.nodeId)),
               avatarDataUrl: friendByNodeId.get(String(p.nodeId))?.avatarDataUrl,
               isOnline: this.friendzProtocol?.isOnline(String(p.nodeId)) ?? false,
+              bio: friendByNodeId.get(String(p.nodeId))?.bio,
             }));
           log.debug(
             TAG,
@@ -1984,6 +1986,39 @@ class SkeinRouter {
           shareOptions.onClose = () => teardownSubscriptions();
           let shareHandle = showShareDialog(shareOptions);
 
+          // a friend's `isHub` flag is only ever set from an incoming
+          // friend-request/profile-response message (see friendz-wiring.ts's
+          // onProfileResponse comment: "sticky hub flag ... only ever set
+          // true, never reset") - if that peer became a hub (or the
+          // handshake message was simply missed) AFTER the friendship was
+          // already established, the persisted flag stays stale/false
+          // forever with nothing to correct it. mirrors friends-tab.ts's
+          // on-demand "live profile refresh" for the friend-detail view:
+          // ask each online candidate directly, once per dialog session: a
+          // response lands in onProfileResponse, which corrects
+          // friend.isHub on the social doc, and the socialListener below
+          // rebuilds this dialog to reflect it.
+          const hubProfileRefreshRequestedFor = new Set<string>();
+          const refreshStaleHubFlags = (opts: ShareDialogOptions): void => {
+            const candidates = new Set<string>();
+            for (const p of opts.peers ?? []) candidates.add(p.nodeId);
+            for (const f of opts.friends ?? []) candidates.add(f.nodeId);
+            for (const nodeId of candidates) {
+              if (hubProfileRefreshRequestedFor.has(nodeId)) continue;
+              if (!(this.friendzProtocol?.isOnline(nodeId) ?? false)) continue;
+              hubProfileRefreshRequestedFor.add(nodeId);
+              requestProfile(nodeId).catch((err) => {
+                log.warn(
+                  TAG,
+                  "share dialog: live profile refresh failed for",
+                  nodeId.slice(0, 16) + "...",
+                  err
+                );
+              });
+            }
+          };
+          refreshStaleHubFlags(shareOptions);
+
           let rebuildQueued = false;
           const rebuild = () => {
             if (!shareActive || rebuildQueued) return;
@@ -2002,6 +2037,7 @@ class SkeinRouter {
               shareOptions = buildShareOptions();
               shareOptions.onClose = teardownSubscriptions;
               shareHandle = showShareDialog(shareOptions);
+              refreshStaleHubFlags(shareOptions);
               log.debug(TAG, "share dialog: rebuilt", "docId=" + docId);
             });
           };
@@ -2015,12 +2051,25 @@ class SkeinRouter {
             rebuild();
           };
           this.messagezDocHandle?.on("change", messagezListener);
+          // the social doc is where friend.isHub (and username/avatar/bio)
+          // actually lives - without this subscription, an isHub flag fixed
+          // up by refreshStaleHubFlags()'s requestProfile() above (or any
+          // other friend-info change) would silently never reach an
+          // already-open dialog until the user manually closed and
+          // reopened it, same bug class messagezListener/unsubStore already
+          // fix for canvas/messagez state.
+          const socialListener = () => {
+            log.debug(TAG, "share dialog: social doc change fired, queueing rebuild");
+            rebuild();
+          };
+          const unsubSocial = this.socialDoc?.on("change", socialListener);
 
           const teardownSubscriptions = (): void => {
             if (isRebuilding) return;
             shareActive = false;
             unsubStore();
             this.messagezDocHandle?.off("change", messagezListener);
+            unsubSocial?.();
           };
           shareOptions.onClose = teardownSubscriptions;
 
