@@ -215,15 +215,6 @@ async fn render_frame(
 /// node id when no username is on record.
 async fn display_name_for(userz: &userz::Directory, node_id: &str) -> String {
     let record = userz.get(node_id).await;
-    // TEMP DEBUG — remove once the "weird username" report is root-caused.
-    // {:?} on the whole record shows display_name *and* alias together, so
-    // we can tell whether a stale/wrong alias (not display_name) is what's
-    // actually surfacing.
-    tracing::info!(
-        peer = %node_id,
-        record = ?record,
-        "TEMP display_name_for resolved record"
-    );
     match record {
         Ok(Some(record)) => match record.display_name {
             Some(name) if !name.is_empty() => name,
