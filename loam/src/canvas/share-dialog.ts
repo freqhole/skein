@@ -381,7 +381,11 @@ function buildPeerRow(
   isAlreadyFriend?: boolean,
   avatarDataUrl?: string,
   isOnline?: boolean,
-  bio?: string
+  bio?: string,
+  /** true when this peer is a recorded reliquary hub (see
+   *  CanvasStore.isHubNode()) — hides the role toggle, since hub role
+   *  isn't a thing a sharer changes from this dialog. */
+  isHubPeer?: boolean
 ): Container {
   const row = new Container();
 
@@ -453,7 +457,7 @@ function buildPeerRow(
   // applies when the peer genuinely isn't already a friend (see
   // isAlreadyFriend param / knownFriendNodeIds).
   const showFriendBtn = !!onAddFriend && !isAlreadyFriend;
-  const showRoleToggle = !!onChangeRole && role !== "admin";
+  const showRoleToggle = !!onChangeRole && role !== "admin" && !isHubPeer;
   const showAdminLabel = !showRoleToggle && role === "admin";
 
   let cursor = scrollBoxWidth - ROW_RIGHT_MARGIN;
@@ -1281,7 +1285,8 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
         knownFriends.has(peer.nodeId),
         peer.avatarDataUrl,
         peer.isOnline,
-        peer.bio
+        peer.bio,
+        /* isHubPeer */ true
       );
       peerRow.y = hubFriendY;
       hubFriendSection.addChild(peerRow);

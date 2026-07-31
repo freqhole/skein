@@ -13,8 +13,8 @@ name = "tumulus"
 path = "src/main.rs"
 
 [dependencies]
-freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.6" }
-haruspex = { git = "https://github.com/freqhole/tomb", tag = "v0.2.6", features = ["iroh"] }
+freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.7" }
+haruspex = { git = "https://github.com/freqhole/tomb", tag = "v0.2.7", features = ["iroh"] }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 tokio = { workspace = true }
@@ -53,7 +53,7 @@ tempfile = { workspace = true }
 # unifies with the [dependencies] haruspex entry above for test/bench builds
 # only, adding haruspex::testing (open_in_memory + per-store constructors)
 # without pulling it into the production lib build.
-haruspex = { git = "https://github.com/freqhole/tomb", tag = "v0.2.6", features = [
+haruspex = { git = "https://github.com/freqhole/tomb", tag = "v0.2.7", features = [
     "iroh",
     "test-utils",
 ] }

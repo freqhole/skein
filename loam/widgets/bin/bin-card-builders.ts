@@ -606,7 +606,7 @@ function buildShelfCard(state: CardRenderState, ctx: CardBuildContext): Rendered
 
       const mask = new Graphics();
       mask.rect(0, 0, spineW, endcapH).fill({ color: 0xffffff });
-      content.addChild(mask);
+      card.addChild(mask);
       content.addChild(sprite);
       sprite.mask = mask;
 
@@ -772,7 +772,7 @@ function buildCrateCard(state: CardRenderState, ctx: CardBuildContext): Rendered
 
       const mask = new Graphics();
       mask.rect(0, 0, endcapW, slotH).fill({ color: 0xffffff });
-      content.addChild(mask);
+      card.addChild(mask);
       content.addChild(sprite);
       sprite.mask = mask;
 
@@ -949,7 +949,7 @@ function buildDrawerCard(state: CardRenderState, ctx: CardBuildContext): Rendere
 
       const mask = new Graphics();
       mask.rect(0, 0, endcapW, slotH).fill({ color: 0xffffff });
-      content.addChild(mask);
+      container.addChild(mask);
       sprite.mask = mask;
       content.addChild(sprite);
 

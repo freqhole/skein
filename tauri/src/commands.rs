@@ -464,6 +464,15 @@ async fn dispatch(
             Ok(json!({ "available": crate::pdf::pdf_backend_available().await }))
         }
 
+        // additional-formats capability probe (epub/docx/odt/rtf/md/html) —
+        // purely additive, doesn't affect pdf/ps/txt which only need magick.
+        // used to decide whether the peedeeeff widget's file picker (and
+        // the file/bin widgets' multi-file-upload document routing) should
+        // offer the broader format list.
+        "pandoc_check_available" => {
+            Ok(json!({ "available": crate::pdf::pandoc_backend_available().await }))
+        }
+
         // generate a thumbnail for a stored blob. supports image/*, application/pdf,
         // and video/* source types. returns { data: <base64>, mime } or { data: null }.
         "blob_thumbnail" => blob_thumbnail(decode("blob_thumbnail", payload)?, state).await,
@@ -1797,7 +1806,9 @@ async fn blob_iroh_probe(
 
 #[derive(Debug, Deserialize)]
 struct PdfRenderPagesArgs {
-    /// blake3 hex of the source pdf blob (already inserted via blob_insert).
+    /// blake3 hex of the source document blob (already inserted via
+    /// blob_insert). format (pdf/postscript/plain-text) is inferred from
+    /// the blob's stored filename.
     blake3: String,
 }
 
@@ -1833,19 +1844,22 @@ async fn blob_thumbnail(args: BlobThumbnailArgs, state: &AppState) -> Result<Val
     Ok(result)
 }
 
-/// render every page of a pdf to per-page png blobs.
+/// render every page of a document (pdf, postscript, or plain text) to
+/// per-page png blobs.
 ///
 /// flow:
-/// 1. look up the source pdf bytes by blake3 in `blobz`
-/// 2. shell out to `magick` to render pages to a temp dir
-/// 3. insert each rendered page as its own blob in `blobz`
-/// 4. return a list of `{ page_blob_id, page_number, total_pages, blake3,
+/// 1. look up the source document bytes by blake3 in `blobz`
+/// 2. detect the document format from the blob's filename
+/// 3. shell out to `magick` to render pages to a temp dir
+/// 4. insert each rendered page as its own blob in `blobz`
+/// 5. return a list of `{ page_blob_id, page_number, total_pages, blake3,
 ///    size, mime, filename }` matching the existing `DocumentPageInfo` shape
 ///
-/// renders are deduped at the blob layer: if the same pdf+pages have already
-/// been rendered, `blobz.insert` returns the existing rows and we don't
-/// re-render. (we do still re-run magick today; future optimization could
-/// cache render results keyed by source blake3 to skip the work entirely.)
+/// renders are deduped at the blob layer: if the same document+pages have
+/// already been rendered, `blobz.insert` returns the existing rows and we
+/// don't re-render. (we do still re-run magick today; future optimization
+/// could cache render results keyed by source blake3 to skip the work
+/// entirely.)
 async fn pdf_render_pages(
     args: PdfRenderPagesArgs,
     state: &AppState,
@@ -1860,29 +1874,34 @@ async fn pdf_render_pages(
             source: serde::de::Error::custom(format!("no blob with blake3 {}", args.blake3)),
         })?;
 
-    let pdf_bytes = tokio::fs::read(state.storage.blobz.path_for(&source_blob))
+    let format = source_blob
+        .filename
+        .as_deref()
+        .and_then(crate::pdf::DocumentFormat::from_filename)
+        .unwrap_or(crate::pdf::DocumentFormat::Pdf);
+
+    let source_bytes = tokio::fs::read(state.storage.blobz.path_for(&source_blob))
         .await
         .map_err(|e| {
             DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(format!(
-                "read pdf bytes: {e}"
+                "read document bytes: {e}"
             )))
         })?;
 
-    let pages = crate::pdf::render_pdf_pages(&pdf_bytes)
+    let pages = crate::pdf::render_document_pages(&source_bytes, format)
         .await
         .map_err(|e| DispatchError::InvalidPayload {
             action: "pdf_render_pages",
-            source: serde::de::Error::custom(format!("pdf render: {e}")),
+            source: serde::de::Error::custom(format!("document render: {e}")),
         })?;
 
     let total_pages = pages.len() as i64;
     let stem = source_blob
         .filename
         .as_deref()
-        .map(|n| {
-            n.trim_end_matches(".pdf")
-                .trim_end_matches(".PDF")
-                .to_string()
+        .map(|n| match n.rsplit_once('.') {
+            Some((stem, _ext)) => stem.to_string(),
+            None => n.to_string(),
         })
         .unwrap_or_else(|| "document".to_string());
 

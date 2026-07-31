@@ -12,3 +12,4 @@
 /tumulus/hub-dev-data/
 node_modules
 tumulus.log
+/build
