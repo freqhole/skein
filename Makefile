@@ -123,9 +123,16 @@ bump-tomb-deps: ## bump skein's pinned tomb/lib versions, npm + cargo git tag (N
 #
 # cross-platform tumulus cli binaries + skein tauri desktop/android apps, all
 # versioned in lockstep off Cargo.toml's [workspace.package] version. builds
-# run natively on each target platform's own runner (no docker) - unlike
-# tomb, skein doesn't cross-compile linux builds from macOS, so there's no
-# need for a container to pin an older glibc.
+# run natively on each target platform's own runner (no docker) - this is
+# what ci (.github/workflows/release.yml) uses for build-linux/
+# build-linux-arm64, on real ubuntu-24.04/ubuntu-24.04-arm hosted runners.
+#
+# build-linux-docker/build-linux-arm64-docker are separate, ADDITIONAL
+# targets (not used by ci) that cross-compile the same tumulus cli linux
+# targets from macOS via docker instead (see Dockerfile.build) - mirrors
+# tomb's own build-linux/build-pi docker approach - so you don't have to
+# wait on ci or an actual linux machine just to get a tumulus binary to test
+# on e.g. a raspberry pi.
 #
 # run `make info` to see available commands, `make build-all` to build
 # everything for the current platform.
@@ -161,7 +168,7 @@ build-all: ## build tumulus cli + tauri app for the current platform (mac arm64 
 
 # ---- tumulus cli binaries --------------------------------------------------
 
-.PHONY: build-mac-arm build-mac-intel build-linux build-linux-arm64
+.PHONY: build-mac-arm build-mac-intel build-linux build-linux-arm64 build-linux-docker build-linux-arm64-docker
 
 build-mac-arm: dev-data ## build tumulus cli for macOS arm64 (signs if APPLE_SIGNING_IDENTITY set)
 	@echo "building tumulus cli for macOS arm64..."
@@ -193,19 +200,71 @@ build-mac-intel: dev-data ## build tumulus cli for macOS x86_64 (signs if APPLE_
 		echo "skipping signing (APPLE_SIGNING_IDENTITY not set)"; \
 	fi
 
-build-linux: dev-data ## build tumulus cli for linux x86_64 (native, no docker)
+build-linux: dev-data ## build tumulus cli for linux x86_64 (native, no docker - run on a linux runner, e.g. ci)
 	@echo "building tumulus cli for linux x86_64..."
 	cargo build --package tumulus --release --target $(LINUX_TARGET)
 	@mkdir -p $(BUILD_DIR)/$(VERSION)
 	cp target/$(LINUX_TARGET)/release/tumulus $(BUILD_DIR)/$(VERSION)/tumulus_$(VERSION)_linux-x86_64
 	@echo "built: $(BUILD_DIR)/$(VERSION)/tumulus_$(VERSION)_linux-x86_64"
 
-build-linux-arm64: dev-data ## build tumulus cli for linux aarch64 (native, no docker - run on an arm64 runner)
+build-linux-arm64: dev-data ## build tumulus cli for linux aarch64 (native, no docker - run on an arm64 runner, e.g. ci)
 	@echo "building tumulus cli for linux aarch64..."
 	cargo build --package tumulus --release --target $(LINUX_ARM64_TARGET)
 	@mkdir -p $(BUILD_DIR)/$(VERSION)
 	cp target/$(LINUX_ARM64_TARGET)/release/tumulus $(BUILD_DIR)/$(VERSION)/tumulus_$(VERSION)_linux-aarch64
 	@echo "built: $(BUILD_DIR)/$(VERSION)/tumulus_$(VERSION)_linux-aarch64"
+
+build-linux-docker: dev-data ## build tumulus cli for linux x86_64 (docker cross-compile from macOS, not used by ci)
+	@echo "building tumulus cli for linux x86_64 using docker..."
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	cp ../tomb/Cargo.toml "$$tmp/"; \
+	mkdir -p "$$tmp/lib"; \
+	cp -R ../tomb/lib/reliquary "$$tmp/lib/"; \
+	cp -R ../tomb/lib/haruspex "$$tmp/lib/"; \
+	docker build -f Dockerfile.build -t skein-linux-builder . \
+		--platform linux/amd64 \
+		--build-arg TARGET_ARCH=$(LINUX_TARGET) \
+		--build-context reliquary="$$tmp"
+	@mkdir -p $(BUILD_DIR)/$(VERSION)
+	docker run --rm -v $(PWD)/$(BUILD_DIR)/$(VERSION):/output skein-linux-builder \
+		sh -c "cp /app/target/$(LINUX_TARGET)/release/tumulus /output/tumulus_$(VERSION)_linux-x86_64"
+	@echo "built: $(BUILD_DIR)/$(VERSION)/tumulus_$(VERSION)_linux-x86_64"
+	$(MAKE) docker-cleanup IMAGE=skein-linux-builder
+
+build-linux-arm64-docker: dev-data ## build tumulus cli for linux aarch64/raspberry pi (docker cross-compile from macOS, not used by ci)
+	@echo "building tumulus cli for linux aarch64 using docker..."
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	cp ../tomb/Cargo.toml "$$tmp/"; \
+	mkdir -p "$$tmp/lib"; \
+	cp -R ../tomb/lib/reliquary "$$tmp/lib/"; \
+	cp -R ../tomb/lib/haruspex "$$tmp/lib/"; \
+	docker build -f Dockerfile.build -t skein-pi-builder . \
+		--build-arg TARGET_ARCH=$(LINUX_ARM64_TARGET) \
+		--build-context reliquary="$$tmp"
+	@mkdir -p $(BUILD_DIR)/$(VERSION)
+	docker run --rm -v $(PWD)/$(BUILD_DIR)/$(VERSION):/output skein-pi-builder \
+		sh -c "cp /app/target/$(LINUX_ARM64_TARGET)/release/tumulus /output/tumulus_$(VERSION)_linux-aarch64"
+	@echo "built: $(BUILD_DIR)/$(VERSION)/tumulus_$(VERSION)_linux-aarch64"
+	$(MAKE) docker-cleanup IMAGE=skein-pi-builder
+
+# remove a single named docker image + prune dangling images and unused build
+# cache. usage: $(MAKE) docker-cleanup IMAGE=<image-name>. non-aggressive:
+# leaves other tagged images, named volumes, and running containers alone.
+# safe to run even if the image is missing.
+.PHONY: docker-cleanup
+docker-cleanup:
+	@if [ -z "$(IMAGE)" ]; then \
+		echo "docker-cleanup: IMAGE not set, skipping image rm"; \
+	else \
+		echo "docker-cleanup: removing image $(IMAGE) (if present)..."; \
+		docker image rm -f $(IMAGE) >/dev/null 2>&1 || true; \
+	fi
+	@echo "docker-cleanup: pruning dangling images..."
+	@docker image prune -f >/dev/null 2>&1 || true
+	@echo "docker-cleanup: pruning unused build cache..."
+	@docker builder prune -f >/dev/null 2>&1 || true
 
 # ---- skein tauri desktop/android apps --------------------------------------
 
@@ -385,8 +444,10 @@ info: ## show available release build commands
 	@echo "tumulus cli binaries:"
 	@echo "  make build-mac-arm      - macOS arm64 (signs if APPLE_SIGNING_IDENTITY set)"
 	@echo "  make build-mac-intel    - macOS x86_64 (signs if APPLE_SIGNING_IDENTITY set)"
-	@echo "  make build-linux        - linux x86_64 (native, no docker)"
-	@echo "  make build-linux-arm64  - linux aarch64 (native, no docker)"
+	@echo "  make build-linux        - linux x86_64 (native, no docker - run on a linux runner, e.g. ci)"
+	@echo "  make build-linux-arm64  - linux aarch64 (native, no docker - run on an arm64 runner, e.g. ci)"
+	@echo "  make build-linux-docker        - linux x86_64 (docker cross-compile from macOS, not used by ci)"
+	@echo "  make build-linux-arm64-docker  - linux aarch64/raspberry pi (docker cross-compile from macOS, not used by ci)"
 	@echo ""
 	@echo "tauri desktop/android apps:"
 	@echo "  make build-tauri-mac-arm      - macOS arm64 .dmg (signs if APPLE_SIGNING_IDENTITY set)"

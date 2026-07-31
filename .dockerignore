@@ -1,0 +1,17 @@
+target/
+node_modules/
+loam/node_modules/
+tauri/gen/
+tauri/target/
+build/
+\*.log
+logz.txt
+
+# docker-specific ignores
+
+Dockerfile\*
+.dockerignore
+.git/
+.gitignore
+README.md
+docs/
