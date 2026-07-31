@@ -210,11 +210,13 @@ async fn handle_stream(
         }
     };
 
-    let body = serde_json::to_vec(&response).map_err(|e| format!("failed to encode response: {e}"))?;
+    let body =
+        serde_json::to_vec(&response).map_err(|e| format!("failed to encode response: {e}"))?;
     send.write_all(&body)
         .await
         .map_err(|e| format!("failed to write response: {e}"))?;
-    send.finish().map_err(|e| format!("failed to finish stream: {e}"))?;
+    send.finish()
+        .map_err(|e| format!("failed to finish stream: {e}"))?;
 
     Ok(())
 }
@@ -231,7 +233,11 @@ fn err_response(id: u64, status: u16, message: impl Into<String>) -> ProxyRespon
     )
 }
 
-async fn handle_thumbnail_data(handler: &SkeinProxyHandler, id: u64, body: &Value) -> ProxyResponse {
+async fn handle_thumbnail_data(
+    handler: &SkeinProxyHandler,
+    id: u64,
+    body: &Value,
+) -> ProxyResponse {
     let Some(blake3) = body
         .get("blob_id")
         .or_else(|| body.get("id"))
@@ -261,7 +267,11 @@ async fn handle_thumbnail_data(handler: &SkeinProxyHandler, id: u64, body: &Valu
     }
 }
 
-async fn handle_document_pages(handler: &SkeinProxyHandler, id: u64, body: &Value) -> ProxyResponse {
+async fn handle_document_pages(
+    handler: &SkeinProxyHandler,
+    id: u64,
+    body: &Value,
+) -> ProxyResponse {
     let Some(blake3) = body
         .get("blake3")
         .or_else(|| body.get("blob_id"))

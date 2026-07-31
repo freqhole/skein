@@ -46,13 +46,15 @@ pub async fn generate_thumbnail(
         return thumbnail_image(blob_bytes, size);
     }
 
-    let format = filename.and_then(crate::pdf::DocumentFormat::from_filename).or({
-        if mime == "application/pdf" {
-            Some(crate::pdf::DocumentFormat::Pdf)
-        } else {
-            None
-        }
-    });
+    let format = filename
+        .and_then(crate::pdf::DocumentFormat::from_filename)
+        .or({
+            if mime == "application/pdf" {
+                Some(crate::pdf::DocumentFormat::Pdf)
+            } else {
+                None
+            }
+        });
 
     if let Some(format) = format {
         return thumbnail_document(blob_bytes, format, size).await;

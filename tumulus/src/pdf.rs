@@ -409,7 +409,11 @@ async fn render_first_text_page(input_bytes: &[u8], size: u32) -> Result<Vec<u8>
     const LINES_PER_PAGE: usize = 54;
 
     let text = String::from_utf8_lossy(input_bytes);
-    let first_chunk: String = text.lines().take(LINES_PER_PAGE).collect::<Vec<_>>().join("\n");
+    let first_chunk: String = text
+        .lines()
+        .take(LINES_PER_PAGE)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let run_id = uuid_like();
     let work_dir: PathBuf = std::env::temp_dir().join(format!("skein_hub_thumb_{run_id}"));
