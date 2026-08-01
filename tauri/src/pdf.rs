@@ -418,6 +418,12 @@ async fn render_via_pandoc(
 
     let status = Command::new(&pandoc_path)
         .env("PATH", magick_delegate_path_env())
+        // pandoc's epub/media handling opens temp files relative to the
+        // process's cwd (ghc's `openTempFile "."`), not a system temp dir.
+        // a gui-launched app inherits a cwd that's often read-only (e.g.
+        // the app bundle itself on macos), so pin it to our writable
+        // work_dir instead.
+        .current_dir(&work_dir)
         .arg(&input_path)
         .arg("-o")
         .arg(&output_path)
