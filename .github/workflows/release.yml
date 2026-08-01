@@ -277,7 +277,12 @@ jobs:
           # scripts even when cross-compiling) owned by root - reclaim it so
           # the native `cargo tauri build` step below (running as the
           # unprivileged runner user, same shared target dir) can write to it.
-          sudo chown -R "$(id -u):$(id -g)" target
+          # also reclaim tumulus/dev-data/ - root's sqlx compile-time query
+          # macros open the sqlite dev db during this build, leaving
+          # root-owned -wal/-shm/-journal sidecar files behind that block the
+          # native step below from reopening the same db as the runner user
+          # ("unable to open database file").
+          sudo chown -R "$(id -u):$(id -g)" target tumulus/dev-data
           cp target/x86_64-unknown-linux-gnu/release/tumulus \
             "build/${{ needs.create-release.outputs.version }}/tumulus_${{ needs.create-release.outputs.version }}_linux-x86_64"
       - name: build skein deb/rpm (linux x86_64)
@@ -340,7 +345,12 @@ jobs:
           # scripts even when cross-compiling) owned by root - reclaim it so
           # the native `cargo tauri build` step below (running as the
           # unprivileged runner user, same shared target dir) can write to it.
-          sudo chown -R "$(id -u):$(id -g)" target
+          # also reclaim tumulus/dev-data/ - root's sqlx compile-time query
+          # macros open the sqlite dev db during this build, leaving
+          # root-owned -wal/-shm/-journal sidecar files behind that block the
+          # native step below from reopening the same db as the runner user
+          # ("unable to open database file").
+          sudo chown -R "$(id -u):$(id -g)" target tumulus/dev-data
           cp target/aarch64-unknown-linux-gnu/release/tumulus \
             "build/${{ needs.create-release.outputs.version }}/tumulus_${{ needs.create-release.outputs.version }}_linux-aarch64"
       - name: build skein deb/rpm (linux aarch64)
