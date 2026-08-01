@@ -1,4 +1,4 @@
-import type { DocumentId, Repo } from "@automerge/automerge-repo";
+import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics, Sprite, Text, Texture, Assets } from "pixi.js";
 
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
@@ -10,7 +10,7 @@ import {
 } from "../../src/widgets/file-utils";
 import { fileSchema } from "../file";
 import { kickOffDocumentProcessing } from "../peedeeeff/render-client";
-import { peedeeeffSchema } from "../peedeeeff/types";
+import { peedeeeffSchema, type PeedeeeffState } from "../peedeeeff/types";
 import { snatchAllInBin } from "./bin-actions";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import type {
@@ -497,10 +497,14 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
             // dispatch in tauri mode) — fire-and-forget so it doesn't block
             // the rest of the batch; nobody will ever mount this widget to
             // trigger it otherwise, since it lives in a bin.
+            // docHandle's declared type is a union (isDoc ? peedeeeff : file schema)
+            // so it needs a narrowing cast here — we're inside the isDoc branch, so
+            // it's always a peedeeeff doc at runtime.
+            const peedeeeffDocHandle = docHandle as unknown as DocHandle<PeedeeeffState>;
             void kickOffDocumentProcessing(
               {
-                current: () => docHandle.doc(),
-                change: (fn) => docHandle.change(fn),
+                current: () => peedeeeffDocHandle.doc(),
+                change: (fn) => peedeeeffDocHandle.change(fn),
               },
               result.blobId,
               store

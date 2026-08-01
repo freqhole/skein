@@ -33,6 +33,7 @@ import { log } from "@freqhole/reliquary/utils";
 import { getStoredIdentity, getMiddenNode } from "../p2p/identity";
 import {
   requestDocumentPagesFromPeers,
+  sendSkeinProxyRequest,
   type SkeinProxyNode,
 } from "../p2p/skein-proxy-client";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";

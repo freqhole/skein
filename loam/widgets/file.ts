@@ -32,7 +32,8 @@ import { createMediaOverlay, type MediaOverlayHandle } from "../src/widgets/medi
 import { createGifHoverOverlay, type GifHoverOverlayHandle } from "../src/widgets/gif-hover-overlay";
 import { peerNameFor } from "../src/canvas/peer-names";
 import { kickOffDocumentProcessing } from "./peedeeeff/render-client";
-import { peedeeeffSchema } from "./peedeeeff/types";
+import { peedeeeffSchema, type PeedeeeffState } from "./peedeeeff/types";
+import type { DocHandle } from "@automerge/automerge-repo";
 import type {
   CompactInfo,
   WidgetController,
@@ -1328,10 +1329,14 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
               // kick off page rendering (hub/peer proxy in browser mode,
               // local dispatch in tauri mode) — nobody will ever mount this
               // widget to trigger it otherwise, since it lives in a bin.
+              // childDocHandle's declared type is a union (isDoc ? peedeeeff : file
+              // schema) so it needs a narrowing cast here — we're inside the isDoc
+              // branch, so it's always a peedeeeff doc at runtime.
+              const peedeeeffDocHandle = childDocHandle as unknown as DocHandle<PeedeeeffState>;
               await kickOffDocumentProcessing(
                 {
-                  current: () => childDocHandle.doc(),
-                  change: (fn) => childDocHandle.change(fn),
+                  current: () => peedeeeffDocHandle.doc(),
+                  change: (fn) => peedeeeffDocHandle.change(fn),
                 },
                 result.blobId,
                 store
