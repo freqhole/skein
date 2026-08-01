@@ -53,7 +53,19 @@ export function createScrollableContent(
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
     const g = scrollBoxRef.getGlobalPosition();
-    const inside = px >= g.x && px <= g.x + currentWidth && py >= g.y && py <= g.y + currentHeight;
+    // currentWidth/currentHeight are LOCAL (world-space) widget dimensions,
+    // but g is in GLOBAL (screen) space — these only match at 1x canvas
+    // zoom. scale by the accumulated world transform so the hit test tracks
+    // the widget's actual on-screen size (e.g. when zoomed out, the widget
+    // is visually smaller than currentWidth/currentHeight, and without this
+    // the hit area overshoots past the widget's right/bottom screen edge).
+    const scaleX = scrollBoxRef.worldTransform.a;
+    const scaleY = scrollBoxRef.worldTransform.d;
+    const inside =
+      px >= g.x &&
+      px <= g.x + currentWidth * scaleX &&
+      py >= g.y &&
+      py <= g.y + currentHeight * scaleY;
     // prime/correct ScrollBox's isOver (its own document-capture handler
     // runs right after this one), and flag the event so viewport.ts's pan
     // handler leaves it alone.
