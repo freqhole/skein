@@ -1846,8 +1846,58 @@ export async function pickFiles(): Promise<PickedFile[]> {
  *  always available in tauri mode (gated separately at boot by
  *  `pdf_check_available`, which hides the whole widget if magick/gs are
  *  missing) and always offered in browser mode (rendering is delegated to
- *  a hub/tauri peer regardless — see file-utils.ts's `getDocumentPages`). */
-const DOCUMENT_EXTENSIONS = new Set(["pdf", "ps", "eps", "txt", "text", "log"]);
+ *  a hub/tauri peer regardless — see file-utils.ts's `getDocumentPages`).
+ *  plain text is NOT in this set — see `PLAIN_TEXT_EXTENSIONS` below, which
+ *  routes those to a notepad widget instead of rasterization. */
+const DOCUMENT_EXTENSIONS = new Set(["pdf", "ps", "eps"]);
+
+/** extensions routed to a `notepad` widget (raw text dropped straight into
+ *  its `text` field) instead of the peedeeeff rasterization pipeline — a
+ *  per-page magick `caption:` render used to be used for these, but that
+ *  meant one subprocess invocation per ~54 lines, which could take minutes
+ *  for a large file for no real benefit over just... showing the text. */
+const PLAIN_TEXT_EXTENSIONS = new Set(["txt", "rtf", "log", "csv", "tsv", "json", "xml", "yaml", "yml"]);
+
+/**
+ * true if `filename`'s extension should be routed to a notepad widget
+ * (raw text, no rasterization) during multi-file-upload document routing.
+ */
+export function isPlainTextFilename(filename: string): boolean {
+  const ext = filename.split(".").pop()?.toLowerCase();
+  return !!ext && PLAIN_TEXT_EXTENSIONS.has(ext);
+}
+
+/**
+ * read a picked file's full contents as a utf-8 string — used to seed a
+ * notepad widget's initial text for a plain-text file pick/drop. in
+ * browser mode reads the `File` object directly; in tauri mode dispatches
+ * to rust's `read_text_file` (the file only ever has a `path`, never a
+ * `File`, in that mode).
+ */
+export async function readPickedFileText(picked: PickedFile): Promise<string> {
+  if (picked.file) {
+    return await picked.file.text();
+  }
+  if (picked.path) {
+    const result = (await dispatch("read_text_file", { path: picked.path })) as { text: string };
+    return result.text;
+  }
+  throw new Error("readPickedFileText: no file content available (no path or File)");
+}
+
+/** extensions routed to the `markdown` widget (raw markdown dropped
+ *  straight into its `text` field, rendered natively) instead of the
+ *  pandoc+peedeeeff rasterization pipeline. */
+const MARKDOWN_EXTENSIONS = new Set(["md", "markdown"]);
+
+/**
+ * true if `filename`'s extension should be routed to a markdown widget
+ * during multi-file-upload document routing.
+ */
+export function isMarkdownFilename(filename: string): boolean {
+  const ext = filename.split(".").pop()?.toLowerCase();
+  return !!ext && MARKDOWN_EXTENSIONS.has(ext);
+}
 
 /** additional formats rasterizable only when `pandoc` + `typst` are both
  *  available (converted to pdf first, then rasterized via the same
@@ -1859,9 +1909,6 @@ const PANDOC_DOCUMENT_EXTENSIONS = new Set([
   "epub",
   "docx",
   "odt",
-  "rtf",
-  "md",
-  "markdown",
   "html",
   "htm",
 ]);
@@ -1881,9 +1928,9 @@ export function setPandocFormatsAvailable(available: boolean): void {
 
 /**
  * true if `filename`'s extension matches a format the peedeeeff widget can
- * rasterize (pdf, postscript, plain text, and — when pandoc+typst are
- * available — epub/docx/odt/rtf/md/html). used to route document files to
- * an auto-created peedeeeff widget during multi-file uploads.
+ * rasterize (pdf, postscript, and — when pandoc+typst are available —
+ * epub/docx/odt/html). used to route document files to an
+ * auto-created peedeeeff widget during multi-file uploads.
  */
 export function isDocumentFilename(filename: string): boolean {
   const ext = filename.split(".").pop()?.toLowerCase();
@@ -1894,8 +1941,8 @@ export function isDocumentFilename(filename: string): boolean {
 
 /**
  * open a file picker filtered to document formats the peedeeeff widget can
- * rasterize: pdf, postscript (ps/eps), plain text, and — when pandoc+typst
- * are available — epub/docx/odt/rtf/md/html (converted to pdf first). in
+ * rasterize: pdf, postscript (ps/eps), and — when pandoc+typst are
+ * available — epub/docx/odt/html (converted to pdf first). in
  * Tauri mode, uses the native dialog with an extension filter. in browser
  * mode, uses a hidden input with a matching `accept` list. returns null if
  * the user cancels.

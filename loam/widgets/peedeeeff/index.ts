@@ -1,7 +1,11 @@
 /**
  * peedeeeff widget — document page viewer with navigation, snatch, and
- * save/reveal. accepts pdf, postscript (ps/eps), and plain text documents;
- * all are rasterized page-by-page via the same rust-side magick pipeline.
+ * save/reveal. accepts pdf and postscript (ps/eps) documents (plus
+ * epub/docx/odt/html when pandoc+typst are available); all are rasterized
+ * page-by-page via the same rust-side magick pipeline. plain text
+ * (.txt/.log/etc) is handled by the notepad widget and markdown
+ * (.md/.markdown) by the markdown widget instead — see
+ * `isPlainTextFilename`/`isMarkdownFilename` in file-utils.ts.
  *
  * this is the orchestrator module. it wires together:
  * - types.ts — schema, types, constants

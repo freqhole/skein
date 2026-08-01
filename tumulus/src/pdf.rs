@@ -4,19 +4,18 @@
 //!
 //! current backend: shells out to `magick` (ImageMagick), which in turn
 //! shells out to `gs` (ghostscript) to actually rasterize pdf/postscript
-//! pages, or uses magick's own `caption:` text renderer for plain text
-//! files (no `gs` needed for that path). works on any host where the
-//! operator has installed imagemagick (and, for pdf/ps, ghostscript) —
-//! e.g. `apt install imagemagick ghostscript` on the raspberry pi this hub
-//! typically runs on.
+//! pages. works on any host where the operator has installed imagemagick
+//! and ghostscript — e.g. `apt install imagemagick ghostscript` on the
+//! raspberry pi this hub typically runs on.
 //!
-//! supported formats today: pdf, ps/eps (postscript), txt/text/log (plain
-//! text, paginated and rendered via magick's `caption:` pseudo-format).
-//! deliberately NOT supported without new dependencies: epub, docx, odt,
-//! rtf, etc. — these are zip/xml container formats magick can't parse on
-//! its own. adding them would mean either a libreoffice/pandoc subprocess
-//! step (convert to pdf first, then reuse this pipeline unchanged) or
-//! format-specific rust crates.
+//! supported formats today: pdf, ps/eps (postscript). deliberately NOT
+//! supported without new dependencies: epub, docx, odt, rtf, etc. — these
+//! are zip/xml container formats magick can't parse on its own. adding
+//! them would mean either a libreoffice/pandoc subprocess step (convert to
+//! pdf first, then reuse this pipeline unchanged) or format-specific rust
+//! crates. plain text (.txt/.text/.log) is also NOT rendered here — it's
+//! shown directly in a notepad widget instead (see loam's `file-utils.ts`
+//! `isPlainTextFilename`).
 //!
 //! NOTE: this module is intentionally a near-duplicate of
 //! `tauri/src/pdf.rs` (kept in sync by hand for now). both tauri and
@@ -113,15 +112,12 @@ pub enum PdfRenderError {
 }
 
 /// which document format is being rendered — determines how we invoke
-/// `magick` (multi-page delegate render vs. per-page `caption:` text render).
+/// `magick`'s multi-page delegate render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentFormat {
     Pdf,
     /// .ps / .eps — magick+gs handles these exactly like pdf.
     Postscript,
-    /// .txt / .text / .log — no gs delegate involved, rendered via magick's
-    /// built-in `caption:` pseudo-format, one page per magick invocation.
-    PlainText,
 }
 
 impl DocumentFormat {
@@ -133,7 +129,6 @@ impl DocumentFormat {
         match ext.as_str() {
             "pdf" => Some(Self::Pdf),
             "ps" | "eps" => Some(Self::Postscript),
-            "txt" | "text" | "log" => Some(Self::PlainText),
             _ => None,
         }
     }
@@ -142,7 +137,6 @@ impl DocumentFormat {
         match self {
             Self::Pdf => "pdf",
             Self::Postscript => "ps",
-            Self::PlainText => "txt",
         }
     }
 }
@@ -158,7 +152,6 @@ pub async fn render_document_pages(
         DocumentFormat::Pdf | DocumentFormat::Postscript => {
             render_via_magick_delegate(input_bytes, format.input_extension()).await
         }
-        DocumentFormat::PlainText => render_plain_text_pages(input_bytes).await,
     }
 }
 
@@ -243,94 +236,10 @@ async fn render_via_magick_delegate(
     Ok(pages)
 }
 
-/// paginate a plain text file into fixed-size line chunks and render each
-/// chunk to its own page image via magick's `caption:@file` reader (no `gs`
-/// delegate involved — this is magick's own built-in text-to-image path).
-async fn render_plain_text_pages(input_bytes: &[u8]) -> Result<Vec<Vec<u8>>, PdfRenderError> {
-    const LINES_PER_PAGE: usize = 54;
-
-    let text = String::from_utf8_lossy(input_bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    let chunks: Vec<&[&str]> = if lines.is_empty() {
-        vec![&[][..]]
-    } else {
-        lines.chunks(LINES_PER_PAGE).collect()
-    };
-
-    let run_id = uuid_like();
-    let work_dir: PathBuf = std::env::temp_dir().join(format!("skein_hub_pdf_{run_id}"));
-    tokio::fs::create_dir_all(&work_dir).await?;
-
-    let Some(magick_path) = resolve_magick().await else {
-        let _ = tokio::fs::remove_dir_all(&work_dir).await;
-        return Err(PdfRenderError::MagickMissing);
-    };
-
-    let mut pages = Vec::with_capacity(chunks.len());
-    for (idx, chunk) in chunks.iter().enumerate() {
-        let page_text = chunk.join("\n");
-        let text_path = work_dir.join(format!("page-{idx:03}.txt"));
-        tokio::fs::write(&text_path, &page_text).await?;
-
-        let output_path = work_dir.join(format!("page-{idx:03}.png"));
-        let caption_arg = format!("caption:@{}", text_path.to_string_lossy());
-
-        // letter-ish page at 150dpi, monospace so line breaks stay predictable.
-        let status = Command::new(&magick_path)
-            .env("PATH", magick_delegate_path_env())
-            .arg("-size")
-            .arg("1275x1650")
-            .arg("-background")
-            .arg("white")
-            .arg("-fill")
-            .arg("black")
-            .arg("-font")
-            .arg("Courier")
-            .arg("-pointsize")
-            .arg("22")
-            .arg("-gravity")
-            .arg("NorthWest")
-            .arg(&caption_arg)
-            .arg(&output_path)
-            .output()
-            .await;
-
-        let output = match status {
-            Ok(o) => o,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = tokio::fs::remove_dir_all(&work_dir).await;
-                return Err(PdfRenderError::MagickMissing);
-            }
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&work_dir).await;
-                return Err(PdfRenderError::Io(e));
-            }
-        };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            warn!(stderr = %stderr, "magick failed rendering text page");
-            let _ = tokio::fs::remove_dir_all(&work_dir).await;
-            return Err(PdfRenderError::MagickFailed {
-                status: output.status.code().unwrap_or(-1),
-                stderr,
-            });
-        }
-
-        pages.push(tokio::fs::read(&output_path).await?);
-    }
-
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
-    info!(pages = pages.len(), "hub: rendered plain-text pages");
-    Ok(pages)
-}
-
 /// render only the first page of a document, at thumbnail resolution —
 /// used by thumbnail generation, which shouldn't pay for a full multi-page
 /// render just to get a cover image. mirrors tauri's `thumbnail.rs`
-/// `input.pdf[0]` page-selection trick for pdf/postscript; plain text just
-/// renders the first chunk of lines directly instead of paginating the
-/// whole document first.
+/// `input.pdf[0]` page-selection trick for pdf/postscript.
 pub async fn render_first_page_thumbnail(
     input_bytes: &[u8],
     format: DocumentFormat,
@@ -340,7 +249,6 @@ pub async fn render_first_page_thumbnail(
         DocumentFormat::Pdf | DocumentFormat::Postscript => {
             render_first_page_via_magick(input_bytes, format.input_extension(), size).await
         }
-        DocumentFormat::PlainText => render_first_text_page(input_bytes, size).await,
     }
 }
 
@@ -393,79 +301,6 @@ async fn render_first_page_via_magick(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         warn!(stderr = %stderr, "magick thumbnail failed");
-        let _ = tokio::fs::remove_dir_all(&work_dir).await;
-        return Err(PdfRenderError::MagickFailed {
-            status: output.status.code().unwrap_or(-1),
-            stderr,
-        });
-    }
-
-    let png_bytes = tokio::fs::read(&output_path).await;
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
-    png_bytes.map_err(PdfRenderError::Io)
-}
-
-async fn render_first_text_page(input_bytes: &[u8], size: u32) -> Result<Vec<u8>, PdfRenderError> {
-    const LINES_PER_PAGE: usize = 54;
-
-    let text = String::from_utf8_lossy(input_bytes);
-    let first_chunk: String = text
-        .lines()
-        .take(LINES_PER_PAGE)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let run_id = uuid_like();
-    let work_dir: PathBuf = std::env::temp_dir().join(format!("skein_hub_thumb_{run_id}"));
-    tokio::fs::create_dir_all(&work_dir).await?;
-
-    let Some(magick_path) = resolve_magick().await else {
-        let _ = tokio::fs::remove_dir_all(&work_dir).await;
-        return Err(PdfRenderError::MagickMissing);
-    };
-
-    let text_path = work_dir.join("page.txt");
-    tokio::fs::write(&text_path, &first_chunk).await?;
-    let output_path = work_dir.join("thumb.png");
-    let caption_arg = format!("caption:@{}", text_path.to_string_lossy());
-    let resize_arg = format!("{size}x{size}");
-
-    let status = Command::new(&magick_path)
-        .env("PATH", magick_delegate_path_env())
-        .arg("-size")
-        .arg("1275x1650")
-        .arg("-background")
-        .arg("white")
-        .arg("-fill")
-        .arg("black")
-        .arg("-font")
-        .arg("Courier")
-        .arg("-pointsize")
-        .arg("22")
-        .arg("-gravity")
-        .arg("NorthWest")
-        .arg(&caption_arg)
-        .arg("-resize")
-        .arg(&resize_arg)
-        .arg(&output_path)
-        .output()
-        .await;
-
-    let output = match status {
-        Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let _ = tokio::fs::remove_dir_all(&work_dir).await;
-            return Err(PdfRenderError::MagickMissing);
-        }
-        Err(e) => {
-            let _ = tokio::fs::remove_dir_all(&work_dir).await;
-            return Err(PdfRenderError::Io(e));
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        warn!(stderr = %stderr, "magick text thumbnail failed");
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
         return Err(PdfRenderError::MagickFailed {
             status: output.status.code().unwrap_or(-1),

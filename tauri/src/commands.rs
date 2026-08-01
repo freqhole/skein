@@ -465,13 +465,19 @@ async fn dispatch(
         }
 
         // additional-formats capability probe (epub/docx/odt/rtf/md/html) —
-        // purely additive, doesn't affect pdf/ps/txt which only need magick.
+        // purely additive, doesn't affect pdf/ps which only need magick.
         // used to decide whether the peedeeeff widget's file picker (and
         // the file/bin widgets' multi-file-upload document routing) should
         // offer the broader format list.
         "pandoc_check_available" => {
             Ok(json!({ "available": crate::pdf::pandoc_backend_available().await }))
         }
+
+        // read a small local text file (.txt/.text/.log) as utf-8 — used to
+        // seed a notepad widget's initial text when one of these files is
+        // picked/dropped, instead of routing it through the pdf/imagemagick
+        // document pipeline (see loam's `isPlainTextFilename`).
+        "read_text_file" => read_text_file(decode("read_text_file", payload)?).await,
 
         // generate a thumbnail for a stored blob. supports image/*, application/pdf,
         // and video/* source types. returns { data: <base64>, mime } or { data: null }.
@@ -1829,6 +1835,26 @@ struct PdfRenderPagesArgs {
     /// blob_insert). format (pdf/postscript/plain-text) is inferred from
     /// the blob's stored filename.
     blake3: String,
+}
+
+// ---------------------------------------------------------------------------
+// plain text file reading (notepad widget)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ReadTextFileArgs {
+    /// absolute path on the local filesystem (e.g. from the tauri native
+    /// file picker) to read as utf-8 text.
+    path: String,
+}
+
+/// read a small local file's full contents as utf-8 text, replacing invalid
+/// byte sequences (lossy) rather than failing outright.
+async fn read_text_file(args: ReadTextFileArgs) -> Result<Value, DispatchError> {
+    let bytes = tokio::fs::read(&args.path).await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })?;
+    Ok(json!({ "text": String::from_utf8_lossy(&bytes).into_owned() }))
 }
 
 // ---------------------------------------------------------------------------

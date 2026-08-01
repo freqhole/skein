@@ -5,10 +5,15 @@ import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import {
   getThumbnailDataUrl,
   isDocumentFilename,
+  isMarkdownFilename,
+  isPlainTextFilename,
   pickFiles,
+  readPickedFileText,
   uploadFile,
 } from "../../src/widgets/file-utils";
 import { fileSchema } from "../file";
+import { markdownSchema } from "../markdown";
+import { notepadSchema } from "../notepad";
 import { kickOffDocumentProcessing } from "../peedeeeff/render-client";
 import { peedeeeffSchema, type PeedeeeffState } from "../peedeeeff/types";
 import { snatchAllInBin } from "./bin-actions";
@@ -441,13 +446,18 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
         }
 
         // create a child widget entry in the canvas doc — document files
-        // (pdf/ps/eps/txt) become peedeeeff children instead of plain file
-        // children, per the multi-file-upload auto-doc-widget feature.
+        // (pdf/ps/eps) become peedeeeff children, markdown files become
+        // markdown children, plain text files (txt/log/csv/etc) become
+        // notepad children (raw text, no rasterization), everything else
+        // stays a plain file child, per the multi-file-upload
+        // auto-doc-widget feature.
         const childId = crypto.randomUUID();
-        const isDoc = isDocumentFilename(file.filename);
+        const isMarkdown = isMarkdownFilename(file.filename);
+        const isPlainText = !isMarkdown && isPlainTextFilename(file.filename);
+        const isDoc = !isMarkdown && !isPlainText && isDocumentFilename(file.filename);
         store.addWidget({
           id: childId,
-          type: isDoc ? "peedeeeff" : "file",
+          type: isMarkdown ? "markdown" : isPlainText ? "notepad" : isDoc ? "peedeeeff" : "file",
           x: 0,
           y: 0,
           width: 200,
@@ -461,16 +471,31 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
         // the widget manager skips widgets with parentId, so no automerge doc
         // was created during reconcile. create the per-widget doc ourselves.
-        const defaults = isDoc ? peedeeeffSchema.parse({}) : fileSchema.parse({});
+        const defaults = isMarkdown
+          ? markdownSchema.parse({})
+          : isPlainText
+            ? notepadSchema.parse({})
+            : isDoc
+              ? peedeeeffSchema.parse({})
+              : fileSchema.parse({});
         const docHandle = repo.create(defaults);
         store.setDocId(childId, docHandle.documentId);
 
         // upload the file and write result into the child's automerge doc.
         // on failure, clean up the child widget so we don't leave empty cards.
         try {
+          if (isMarkdown || isPlainText) {
+            // no blob upload for markdown/plain text — read it straight
+            // into the widget's own text field.
+            const text = await readPickedFileText(file);
+            docHandle.change((draft: any) => {
+              draft.text = text;
+            });
+          } else {
           const result = await uploadFile(file, { waitForCompletion: true });
 
           if (isDoc) {
+
             docHandle.change((draft: any) => {
               draft.blobId = result.blobId;
               draft.filename = file.filename;
@@ -539,6 +564,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
                 log.debug("bin", "thumbnail generation failed for", result.blobId);
               }
             }
+          }
           }
 
           // add the item to the bin's items list only on success

@@ -14,8 +14,11 @@ import {
   getLocalNodeId,
   getThumbnailDataUrl,
   isDocumentFilename,
+  isMarkdownFilename,
+  isPlainTextFilename,
   pauseSnatchDownload,
   pickFiles,
+  readPickedFileText,
   revealBlobInFinder,
   saveBlobToDisk,
   snatchBlob,
@@ -33,6 +36,8 @@ import { createGifHoverOverlay, type GifHoverOverlayHandle } from "../src/widget
 import { peerNameFor } from "../src/canvas/peer-names";
 import { kickOffDocumentProcessing } from "./peedeeeff/render-client";
 import { peedeeeffSchema, type PeedeeeffState } from "./peedeeeff/types";
+import { markdownSchema } from "./markdown";
+import { notepadSchema } from "./notepad";
 import type { DocHandle } from "@automerge/automerge-repo";
 import type {
   CompactInfo,
@@ -1263,23 +1268,28 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       }
 
       // upload each file and create child widgets in the bin. document
-      // files (pdf/ps/eps/txt) become peedeeeff children instead of plain
-      // file children — see isDocumentFilename's doc comment. single-file
-      // uploads (picked.length === 1, handled elsewhere in this function)
-      // are NOT affected by this — this auto-doc-widget behavior is
-      // multi-file-batch-only, per the feature's design.
+      // files (pdf/ps/eps) become peedeeeff children, markdown files
+      // become markdown children, plain text files (txt/log/csv/etc)
+      // become notepad children (raw text, no rasterization) — see
+      // isDocumentFilename/isMarkdownFilename/isPlainTextFilename's doc
+      // comments. single-file uploads (picked.length === 1, handled
+      // elsewhere in this function) are NOT affected by this — this
+      // auto-doc-widget behavior is multi-file-batch-only, per the
+      // feature's design.
       const items: Array<{ widgetId: string; slot: { col: number; row: number } }> = [];
 
       for (let i = 0; i < picked.length; i++) {
         const file = picked[i];
         const slot = { col: i % cols, row: Math.floor(i / cols) };
         const childId = crypto.randomUUID();
-        const isDoc = isDocumentFilename(file.filename);
+        const isMarkdown = isMarkdownFilename(file.filename);
+        const isPlainText = !isMarkdown && isPlainTextFilename(file.filename);
+        const isDoc = !isMarkdown && !isPlainText && isDocumentFilename(file.filename);
 
         // create a child widget entry nested in the bin
         store.addWidget({
           id: childId,
-          type: isDoc ? "peedeeeff" : "file",
+          type: isMarkdown ? "markdown" : isPlainText ? "notepad" : isDoc ? "peedeeeff" : "file",
           x: 0,
           y: 0,
           width: 200,
@@ -1293,12 +1303,33 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
         // the widget manager skips widgets with parentId, so no automerge doc
         // was created during reconcile. create the per-widget doc ourselves.
-        const childDefaults = isDoc ? peedeeeffSchema.parse({}) : fileSchema.parse({});
+        const childDefaults = isMarkdown
+          ? markdownSchema.parse({})
+          : isPlainText
+            ? notepadSchema.parse({})
+            : isDoc
+              ? peedeeeffSchema.parse({})
+              : fileSchema.parse({});
         const childDocHandle = repo.create(childDefaults);
         store.setDocId(childId, childDocHandle.documentId);
 
         // add the item to the bin immediately so it appears as a card
         items.push({ widgetId: childId, slot });
+
+        if (isMarkdown || isPlainText) {
+          // no blob upload for markdown/plain text — read it straight into
+          // the widget's own text field.
+          readPickedFileText(file)
+            .then((text) => {
+              childDocHandle.change((draft: any) => {
+                draft.text = text;
+              });
+            })
+            .catch((err) => {
+              log.warn("file-widget", `auto-bin notepad/markdown read failed for ${file.filename}:`, err);
+            });
+          continue;
+        }
 
         if (isDoc) {
           // fire-and-forget upload — don't await each one sequentially
@@ -1427,6 +1458,41 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       try {
         const picked = await pickFiles();
         if (!picked || picked.length === 0) return;
+
+        // single markdown/plain-text file: no blob upload — replace this
+        // file widget with a markdown/notepad widget holding the raw text,
+        // same as the bin/multi-file routing (see isMarkdownFilename,
+        // isPlainTextFilename).
+        if (picked.length === 1) {
+          const file = picked[0];
+          const isMarkdown = isMarkdownFilename(file.filename);
+          const isPlainText = !isMarkdown && isPlainTextFilename(file.filename);
+          if (isMarkdown || isPlainText) {
+            const store = ctx.canvasStore;
+            if (!store) return;
+
+            const selfEntry = store.getWidget(ctx.widgetId);
+            if (!selfEntry) return;
+
+            const text = await readPickedFileText(file);
+            store.addWidget({
+              id: crypto.randomUUID(),
+              type: isMarkdown ? "markdown" : "notepad",
+              x: selfEntry.x,
+              y: selfEntry.y,
+              width: selfEntry.width,
+              height: selfEntry.height,
+              zIndex: selfEntry.zIndex,
+              title: file.filename.replace(/\.[^.]+$/, ""),
+              props: { text },
+              collapsed: false,
+              docId: null,
+              parentId: null,
+            });
+            store.removeWidget(ctx.widgetId);
+            return;
+          }
+        }
 
         // single file: upload into this widget as before
         if (picked.length === 1) {
