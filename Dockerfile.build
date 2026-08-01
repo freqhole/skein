@@ -1,0 +1,65 @@
+ARG BASE_IMAGE=debian:bookworm
+FROM ${BASE_IMAGE}
+
+# build argument to specify target architecture (x86_64-unknown-linux-gnu or
+# aarch64-unknown-linux-gnu - the raspberry pi target)
+ARG TARGET_ARCH=aarch64-unknown-linux-gnu
+
+# install build dependencies. unlike tomb's audio player, tumulus has no
+# openssl/alsa system deps - sqlx's sqlite feature bundles+compiles sqlite3
+# from source via the `cc` crate, and iroh's tls stack is `ring` (also just
+# needs a c compiler/assembler) - so build-essential is all that's needed.
+RUN apt-get update && \
+    apt-get install -y \
+    curl \
+    build-essential \
+    pkg-config
+
+# install cross-compilation tools for aarch64 (raspberry pi 4/5, 64-bit os)
+RUN if [ "$TARGET_ARCH" = "aarch64-unknown-linux-gnu" ]; then \
+    apt-get update && \
+    apt-get install -y gcc-aarch64-linux-gnu; \
+    fi
+
+# clean up apt cache
+RUN rm -rf /var/lib/apt/lists/*
+
+# install rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# add the target architecture
+RUN rustup target add $TARGET_ARCH
+
+# set the cross-compilation linker for aarch64. `cc-rs` already knows to try
+# "aarch64-linux-gnu-gcc" (debian's naming) for this target by default, but
+# cargo itself needs the linker spelled out explicitly.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+
+WORKDIR /app
+COPY . .
+
+# skein's cargo deps on haruspex/reliquary can be in "local" mode (path
+# dependencies on the sibling tomb/lib/{reliquary,haruspex}/rust checkouts,
+# toggled via `make deps-local` - see tumulus/Cargo.toml) rather than the
+# published git tag - e.g. while testing an unreleased fix before it's
+# tagged. the docker build context above is scoped to skein/ alone and
+# can't see that sibling repo, so a minimal staging dir (tomb's root
+# Cargo.toml, needed since reliquary/haruspex are themselves members of
+# tomb's cargo workspace and inherit `edition` etc. from its
+# [workspace.package] - plus lib/reliquary/rust and lib/haruspex/rust
+# themselves) is assembled by the Makefile and supplied here as an
+# additional named build context (`--build-context reliquary=<tmpdir>`),
+# deliberately NOT the whole tomb/ repo (its build/ dir alone is several GB
+# of release artifacts, and its .dockerignore isn't scoped for this use
+# case). harmless (just unused) when deps are in git-tag mode instead.
+COPY --from=reliquary . /tomb
+
+# build tumulus for the specified target architecture. sqlx's compile-time
+# query!/query_as! macros need DATABASE_URL pointed at a real, already
+# migrated sqlite db - tumulus/build.rs sets this to
+# tumulus/dev-data/skein-hub.db (resolved from CARGO_MANIFEST_DIR), and
+# `make dev-data` (a prerequisite of the make targets that build this image)
+# guarantees that db exists + is migrated on the host before `docker build`
+# captures the build context above.
+RUN cargo build --release --target $TARGET_ARCH -p tumulus
