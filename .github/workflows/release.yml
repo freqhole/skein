@@ -21,9 +21,17 @@
 #   - uploads use --clobber so retries (and re-pushes of the PR) overwrite cleanly.
 #   - signing/notarization happens when the matching secrets are present and is
 #     skipped gracefully otherwise (the make targets already no-op without them).
-#   - unlike tomb, linux builds run natively (no docker) since skein has no
-#     existing Dockerfile infrastructure - ubuntu-24.04/ubuntu-24.04-arm hosted
-#     runners provide genuine x86_64/arm64, so no cross-compilation is needed.
+#   - the tumulus cli binary for both linux jobs is compiled inside a
+#     debian:bookworm container (glibc 2.36) rather than directly on the
+#     ubuntu-24.04/ubuntu-24.04-arm runner (glibc 2.39) - glibc is backwards-
+#     but not forwards-compatible, so a binary linked against the runner's
+#     own newer glibc can't run on older linux (e.g. raspberry pi os). the
+#     runner's arch already matches the target (no qemu/cross toolchain
+#     needed), and ci's cargo deps are already in git-tag mode, so this is a
+#     plain `docker run ... cargo build`, not the local macOS cross-compile
+#     path (see Dockerfile.build / `make build-linux(-arm64)-docker`, which
+#     stages the sibling tomb/lib checkout - not needed/used here). the
+#     skein .deb/.rpm tauri bundles still build natively on the runner.
 name: release
 
 on:
@@ -225,7 +233,7 @@ jobs:
             "build/$V/skein_${V}_x86_64.dmg" \
             --clobber
 
-  # ---- linux x86_64: tumulus cli + skein .deb/.rpm (native, no docker) ------
+  # ---- linux x86_64: tumulus cli (older-glibc container) + skein .deb/.rpm --
   linux-x86_64:
     name: linux x86_64 (cli + deb/rpm)
     needs: create-release
@@ -250,10 +258,22 @@ jobs:
       - name: install loam deps
         run: npm ci
         working-directory: loam
-      # `make build-linux` depends on `dev-data`, which (re)creates the
-      # sqlite dev db tumulus's sqlx compile-time query macros need.
-      - name: build tumulus cli (linux x86_64)
-        run: make build-linux
+      # (re)creates the sqlite dev db tumulus's sqlx compile-time query
+      # macros need - `make dev-data` alone (not the full `make build-linux`),
+      # since the actual compile happens in the container step below.
+      - name: set up sqlite dev db
+        run: make dev-data
+      # runs on the same host arch as the target (no cross toolchain needed) -
+      # just pins an older glibc than this runner's own ubuntu-24.04 ships,
+      # so the resulting binary runs on older linux too. see the linux jobs'
+      # header comment above for why this isn't `make build-linux(-docker)`.
+      - name: build tumulus cli (linux x86_64, glibc-pinned)
+        run: |
+          mkdir -p build/${{ needs.create-release.outputs.version }}
+          docker run --rm -v "$PWD":/work -w /work rust:1-bookworm \
+            cargo build --release --target x86_64-unknown-linux-gnu -p tumulus
+          cp target/x86_64-unknown-linux-gnu/release/tumulus \
+            "build/${{ needs.create-release.outputs.version }}/tumulus_${{ needs.create-release.outputs.version }}_linux-x86_64"
       - name: build skein deb/rpm (linux x86_64)
         run: make build-tauri-linux-intel
       - name: upload assets
@@ -269,7 +289,7 @@ jobs:
             "build/$V/skein_${V}_x86_64.rpm" \
             --clobber
 
-  # ---- linux arm64: tumulus cli + skein .deb/.rpm (native arm runner) -------
+  # ---- linux arm64: tumulus cli (older-glibc container) + skein .deb/.rpm --
   linux-arm64:
     name: linux arm64 (cli + deb/rpm)
     needs: create-release
@@ -294,10 +314,23 @@ jobs:
       - name: install loam deps
         run: npm ci
         working-directory: loam
-      # `make build-linux-arm64` depends on `dev-data`, which (re)creates
-      # the sqlite dev db tumulus's sqlx compile-time query macros need.
-      - name: build tumulus cli (linux aarch64)
-        run: make build-linux-arm64
+      # (re)creates the sqlite dev db tumulus's sqlx compile-time query
+      # macros need - `make dev-data` alone (not the full `make
+      # build-linux-arm64`), since the actual compile happens below.
+      - name: set up sqlite dev db
+        run: make dev-data
+      # runs on the same host arch as the target (no cross toolchain needed,
+      # docker just pulls the aarch64 rust:1-bookworm image here) - pins an
+      # older glibc than this runner's own ubuntu-24.04-arm ships, so the
+      # resulting binary actually runs on a raspberry pi. see the linux jobs'
+      # header comment above for why this isn't `make build-linux-arm64(-docker)`.
+      - name: build tumulus cli (linux aarch64, glibc-pinned)
+        run: |
+          mkdir -p build/${{ needs.create-release.outputs.version }}
+          docker run --rm -v "$PWD":/work -w /work rust:1-bookworm \
+            cargo build --release --target aarch64-unknown-linux-gnu -p tumulus
+          cp target/aarch64-unknown-linux-gnu/release/tumulus \
+            "build/${{ needs.create-release.outputs.version }}/tumulus_${{ needs.create-release.outputs.version }}_linux-aarch64"
       - name: build skein deb/rpm (linux aarch64)
         run: make build-tauri-linux-arm64
       - name: upload assets
