@@ -3,23 +3,27 @@
 //!
 //! current backend: shells out to `magick` (ImageMagick), which in turn
 //! shells out to `gs` (ghostscript) to actually rasterize pdf/postscript
-//! pages, or uses magick's own `caption:` text renderer for plain text
-//! files (no `gs` needed for that path). this matches the tomb prototype's
-//! pattern and works on any platform where the user has imagemagick (and,
-//! for pdf/ps, ghostscript) installed (`brew install imagemagick
-//! ghostscript`, `apt install imagemagick ghostscript`, etc.). the helpful
-//! error includes install hints when either binary is missing.
+//! pages. this matches the tomb prototype's pattern and works on any
+//! platform where the user has imagemagick and ghostscript installed
+//! (`brew install imagemagick ghostscript`, `apt install imagemagick
+//! ghostscript`, etc.). the helpful error includes install hints when
+//! either binary is missing.
 //!
-//! supported formats today: pdf, ps/eps (postscript), txt/text/log (plain
-//! text). additionally, epub/docx/odt/rtf/md/html are supported when
-//! `pandoc` and `typst` are both on `PATH` (or a known fallback install
-//! location — see `COMMON_BIN_DIRS`): these container/markup formats get
-//! converted to pdf first via `pandoc ... --pdf-engine=typst` (typst is a
-//! much lighter pdf engine than latex — single static binary, no package
-//! manager ecosystem), then rasterized through the same magick+gs pipeline
-//! as a native pdf. this is a purely additive capability — pandoc/typst
-//! being absent doesn't affect pdf/ps/txt rendering, which only ever needed
+//! supported formats today: pdf, ps/eps (postscript). additionally,
+//! epub/docx/odt/rtf/md/html are supported when `pandoc` and `typst` are
+//! both on `PATH` (or a known fallback install location — see
+//! `COMMON_BIN_DIRS`): these container/markup formats get converted to pdf
+//! first via `pandoc ... --pdf-engine=typst` (typst is a much lighter pdf
+//! engine than latex — single static binary, no package manager
+//! ecosystem), then rasterized through the same magick+gs pipeline as a
+//! native pdf. this is a purely additive capability — pandoc/typst being
+//! absent doesn't affect pdf/ps rendering, which only ever needed
 //! magick+gs.
+//!
+//! plain text (.txt/.text/.log) is NOT rendered here — it's shown directly
+//! in a notepad widget instead (no rasterization needed, and no per-page
+//! magick subprocess cost for large files). see loam's `file-utils.ts`
+//! `isPlainTextFilename`/`readPickedFileText`.
 //!
 //! TODO(macos-native): swap in a PDFKit-based implementation behind
 //! `#[cfg(target_os = "macos")]` once we're distributing skein outside of
@@ -173,9 +177,6 @@ pub enum DocumentFormat {
     Pdf,
     /// .ps / .eps — magick+gs handles these exactly like pdf.
     Postscript,
-    /// .txt / .text / .log — no gs delegate involved, rendered via magick's
-    /// built-in `caption:` pseudo-format, one page per magick invocation.
-    PlainText,
     /// epub/docx/odt/rtf/md/html — converted to pdf via
     /// `pandoc ... --pdf-engine=typst` first (see `pandoc_backend_available`),
     /// then rasterized through the same magick delegate path as a native
@@ -191,7 +192,6 @@ impl DocumentFormat {
         match ext.as_str() {
             "pdf" => Some(Self::Pdf),
             "ps" | "eps" => Some(Self::Postscript),
-            "txt" | "text" | "log" => Some(Self::PlainText),
             "epub" | "docx" | "odt" | "rtf" | "md" | "markdown" | "html" | "htm" => {
                 Some(Self::PandocConvertible(ext))
             }
@@ -200,13 +200,12 @@ impl DocumentFormat {
     }
 
     /// input extension for the magick-delegate render path. only valid for
-    /// the variants that path handles directly (pdf/postscript) — plain
-    /// text and pandoc-convertible formats go through their own functions.
+    /// the variants that path handles directly (pdf/postscript) — pandoc-
+    /// convertible formats go through their own function.
     fn input_extension(&self) -> &'static str {
         match self {
             Self::Pdf => "pdf",
             Self::Postscript => "ps",
-            Self::PlainText => "txt",
             Self::PandocConvertible(_) => unreachable!("pandoc formats don't use input_extension"),
         }
     }
@@ -223,7 +222,6 @@ pub async fn render_document_pages(
         DocumentFormat::Pdf | DocumentFormat::Postscript => {
             render_via_magick_delegate(input_bytes, format.input_extension()).await
         }
-        DocumentFormat::PlainText => render_plain_text_pages(input_bytes).await,
         DocumentFormat::PandocConvertible(ext) => render_via_pandoc(input_bytes, ext).await,
     }
 }
@@ -311,88 +309,6 @@ async fn render_via_magick_delegate(
     Ok(pages)
 }
 
-/// paginate a plain text file into fixed-size line chunks and render each
-/// chunk to its own page image via magick's `caption:@file` reader (no `gs`
-/// delegate involved — this is magick's own built-in text-to-image path).
-async fn render_plain_text_pages(input_bytes: &[u8]) -> Result<Vec<Vec<u8>>, PdfRenderError> {
-    const LINES_PER_PAGE: usize = 54;
-
-    let text = String::from_utf8_lossy(input_bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    let chunks: Vec<&[&str]> = if lines.is_empty() {
-        vec![&[][..]]
-    } else {
-        lines.chunks(LINES_PER_PAGE).collect()
-    };
-
-    let run_id = uuid_like();
-    let work_dir: PathBuf = std::env::temp_dir().join(format!("skein_pdf_{run_id}"));
-    tokio::fs::create_dir_all(&work_dir).await?;
-
-    let Some(magick_path) = resolve_magick().await else {
-        let _ = tokio::fs::remove_dir_all(&work_dir).await;
-        return Err(PdfRenderError::MagickMissing);
-    };
-
-    let mut pages = Vec::with_capacity(chunks.len());
-    for (idx, chunk) in chunks.iter().enumerate() {
-        let page_text = chunk.join("\n");
-        let text_path = work_dir.join(format!("page-{idx:03}.txt"));
-        tokio::fs::write(&text_path, &page_text).await?;
-
-        let output_path = work_dir.join(format!("page-{idx:03}.png"));
-        let caption_arg = format!("caption:@{}", text_path.to_string_lossy());
-
-        // letter-ish page at 150dpi, monospace so line breaks stay predictable.
-        let status = Command::new(&magick_path)
-            .env("PATH", magick_delegate_path_env())
-            .arg("-size")
-            .arg("1275x1650")
-            .arg("-background")
-            .arg("white")
-            .arg("-fill")
-            .arg("black")
-            .arg("-font")
-            .arg("Courier")
-            .arg("-pointsize")
-            .arg("22")
-            .arg("-gravity")
-            .arg("NorthWest")
-            .arg(&caption_arg)
-            .arg(&output_path)
-            .output()
-            .await;
-
-        let output = match status {
-            Ok(o) => o,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = tokio::fs::remove_dir_all(&work_dir).await;
-                return Err(PdfRenderError::MagickMissing);
-            }
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&work_dir).await;
-                return Err(PdfRenderError::Io(e));
-            }
-        };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            warn!(stderr = %stderr, "magick failed rendering text page");
-            let _ = tokio::fs::remove_dir_all(&work_dir).await;
-            return Err(PdfRenderError::MagickFailed {
-                status: output.status.code().unwrap_or(-1),
-                stderr,
-            });
-        }
-
-        pages.push(tokio::fs::read(&output_path).await?);
-    }
-
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
-    info!(pages = pages.len(), "rendered plain-text pages");
-    Ok(pages)
-}
-
 /// convert an epub/docx/odt/rtf/md/html document to pdf via
 /// `pandoc ... --pdf-engine=typst`, then rasterize the resulting pdf through
 /// the existing magick delegate path — no new page-rendering code needed,
@@ -418,6 +334,12 @@ async fn render_via_pandoc(
 
     let status = Command::new(&pandoc_path)
         .env("PATH", magick_delegate_path_env())
+        // pandoc's epub/media handling opens temp files relative to the
+        // process's cwd (ghc's `openTempFile "."`), not a system temp dir.
+        // a gui-launched app inherits a cwd that's often read-only (e.g.
+        // the app bundle itself on macos), so pin it to our writable
+        // work_dir instead.
+        .current_dir(&work_dir)
         .arg(&input_path)
         .arg("-o")
         .arg(&output_path)

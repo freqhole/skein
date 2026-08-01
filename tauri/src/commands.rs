@@ -38,6 +38,34 @@ static DOWNLOAD_CANCELS: LazyLock<StdMutex<HashMap<String, Arc<AtomicBool>>>> =
 /// when dropped, so the registry never accumulates stale entries.
 struct DownloadCancelGuard(String);
 
+/// best-effort magic-byte sniff for the two video container formats skein's
+/// own upload paths actually produce (mp4/mov and webm) — mirrors the JS
+/// `sniffVideoMimeFromBytes()` in `loam/src/widgets/file-utils.ts`. used only
+/// by `blob_iroh_download_impl`'s native fast path, where the downloaded
+/// bytes never cross into JS so the browser-mode sniff fix can't reach them.
+/// returns `None` for anything else (callers keep whatever mime they had).
+fn sniff_video_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 12 {
+        return None;
+    }
+
+    // webm/mkv: EBML magic number 0x1A45DFA3
+    if bytes[0..4] == [0x1a, 0x45, 0xdf, 0xa3] {
+        return Some("video/webm");
+    }
+
+    // mp4/mov/quicktime: an "ftyp" box at byte offset 4
+    if bytes[4..8] == *b"ftyp" {
+        return if bytes[8..10] == *b"qt" {
+            Some("video/quicktime")
+        } else {
+            Some("video/mp4")
+        };
+    }
+
+    None
+}
+
 impl Drop for DownloadCancelGuard {
     fn drop(&mut self) {
         if let Ok(mut map) = DOWNLOAD_CANCELS.lock() {
@@ -312,23 +340,34 @@ pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkStat
     )
     .await?;
 
-    // pre-warm the FsStore for every blob already in blobz. without this,
-    // the first peer to ask for a pre-existing blob has to wait for
-    // `add_path` (BAO tree compute) inside the dispatch handler, and for
-    // large files that easily exceeds the browser's snatch timeout.
-    // best-effort: errors are logged and ignored — the lazy
-    // `blob_iroh_ensure` path still works as a fallback.
-    match state.storage.blobz.list(i64::MAX, 0).await {
-        Ok((blobs, _total)) => {
-            tracing::info!(count = blobs.len(), "pre-warming iroh-blobs FsStore");
-            for blob in blobs {
-                prewarm_fs_store(state, &blob).await;
+    // pre-warm the FsStore for every blob already in blobz, so the first
+    // peer to ask for a pre-existing blob doesn't have to wait for
+    // `add_path` (BAO tree compute) inside the dispatch handler — for large
+    // files that easily exceeds the browser's snatch timeout. run as a
+    // detached background task rather than awaiting it here: this loop
+    // used to block the tauri window from ever appearing (boot calls this
+    // function via `runtime.block_on`), and `prewarm_fs_store_for`'s own
+    // `has()` pre-check only skips blobs already imported in a PAST
+    // session — the very first pass over a large, long-lived library still
+    // has real work to do (or after any bulk import), so it must not sit
+    // in the boot path. best-effort either way: errors are logged and
+    // ignored, and the lazy `blob_iroh_ensure` path still covers any blob
+    // this catch-up pass hasn't reached yet if a peer asks for it first.
+    let prewarm_storage = Arc::clone(&state.storage);
+    tokio::spawn(async move {
+        match prewarm_storage.blobz.list(i64::MAX, 0).await {
+            Ok((blobs, _total)) => {
+                tracing::info!(count = blobs.len(), "pre-warming iroh-blobs FsStore");
+                for blob in blobs {
+                    prewarm_fs_store_for(&prewarm_storage, &blob).await;
+                }
+                tracing::info!("pre-warming iroh-blobs FsStore: catch-up pass complete");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "prewarm: failed to list blobz, skipping FsStore seed");
             }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "prewarm: failed to list blobz, skipping FsStore seed");
-        }
-    }
+    });
 
     tracing::info!(node_id = %node_id, "iroh endpoint bound");
     Ok(NetworkState {
@@ -465,13 +504,19 @@ async fn dispatch(
         }
 
         // additional-formats capability probe (epub/docx/odt/rtf/md/html) —
-        // purely additive, doesn't affect pdf/ps/txt which only need magick.
+        // purely additive, doesn't affect pdf/ps which only need magick.
         // used to decide whether the peedeeeff widget's file picker (and
         // the file/bin widgets' multi-file-upload document routing) should
         // offer the broader format list.
         "pandoc_check_available" => {
             Ok(json!({ "available": crate::pdf::pandoc_backend_available().await }))
         }
+
+        // read a small local text file (.txt/.text/.log) as utf-8 — used to
+        // seed a notepad widget's initial text when one of these files is
+        // picked/dropped, instead of routing it through the pdf/imagemagick
+        // document pipeline (see loam's `isPlainTextFilename`).
+        "read_text_file" => read_text_file(decode("read_text_file", payload)?).await,
 
         // generate a thumbnail for a stored blob. supports image/*, application/pdf,
         // and video/* source types. returns { data: <base64>, mime } or { data: null }.
@@ -1169,12 +1214,41 @@ async fn blob_get_path(args: BlobGetArgs, state: &AppState) -> Result<Value, Dis
 /// for video files. errors are logged and swallowed: the lazy
 /// `blob_iroh_ensure` path will still work as a fallback.
 async fn prewarm_fs_store(state: &AppState, blob: &BlobRecord) {
-    let path = state.storage.blobz.path_for(blob);
+    prewarm_fs_store_for(&state.storage, blob).await;
+}
+
+/// same as [`prewarm_fs_store`] but takes a bare `StorageNode` reference
+/// rather than the full `AppState`, so it can run inside a detached
+/// `tokio::spawn` task (see `build_network_state`'s boot-time catch-up
+/// pass) that only holds an `Arc<StorageNode>` clone, not a borrow of
+/// `AppState` itself.
+async fn prewarm_fs_store_for(storage: &freqhole_reliquary::node::StorageNode, blob: &BlobRecord) {
+    let path = storage.blobz.path_for(blob);
     if !path.exists() {
         tracing::warn!(blake3 = %blob.blake3, "prewarm: blob file missing on disk");
         return;
     }
-    match state.storage.fs_store.blobs().add_path(path).await {
+
+    // cheap pre-check: skip `add_path` entirely if this blake3 is already
+    // imported. the FsStore persists across app launches, so without this
+    // check every boot re-pays the full `add_path` cost (read + BAO tree
+    // compute) for every blob the user has EVER kept, even ones already
+    // warmed in a previous session — same rationale as `blob_iroh_ensure`'s
+    // `has()` pre-check above.
+    if let Ok(hash) = blob.blake3.parse::<iroh_blobs::Hash>() {
+        match storage.fs_store.blobs().has(hash).await {
+            Ok(true) => {
+                tracing::debug!(blake3 = %blob.blake3, "prewarm: already imported, skipping");
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!(blake3 = %blob.blake3, error = %e, "prewarm: has() check failed, falling back to add_path")
+            }
+        }
+    }
+
+    match storage.fs_store.blobs().add_path(path).await {
         Ok(_tag) => {
             tracing::debug!(blake3 = %blob.blake3, "prewarm: imported into FsStore");
         }
@@ -1651,6 +1725,29 @@ async fn blob_iroh_download_impl(
         })
         .await
         .map_err(|e| DispatchError::Stream(format!("export to blobz path: {e}")))?;
+
+    // the peer-reported mime is often missing/generic for extensionless
+    // files (mirrors the gap fixed for the browser-mode snatch path in
+    // file-utils.ts) — this fast path never brings the bytes into JS, so
+    // sniff the first bytes of the just-exported file ourselves when needed.
+    let mut mime = args.mime;
+    let needs_sniff = match mime.as_deref() {
+        None => true,
+        Some(m) => m.is_empty() || m == "application/octet-stream",
+    };
+    if needs_sniff {
+        if let Ok(mut file) = tokio::fs::File::open(&target).await {
+            use tokio::io::AsyncReadExt;
+            let mut header = [0u8; 12];
+            if file.read_exact(&mut header).await.is_ok() {
+                if let Some(sniffed) = sniff_video_mime_from_bytes(&header) {
+                    tracing::debug!(blake3 = %args.blake3, mime = sniffed, "blob_iroh_download: sniffed video mime");
+                    mime = Some(sniffed.to_string());
+                }
+            }
+        }
+    }
+
     let blob = state
         .storage
         .blobz
@@ -1658,7 +1755,7 @@ async fn blob_iroh_download_impl(
             &args.blake3,
             NewBlobMeta {
                 filename: args.filename,
-                mime: args.mime,
+                mime,
                 ..Default::default()
             },
         )
@@ -1829,6 +1926,26 @@ struct PdfRenderPagesArgs {
     /// blob_insert). format (pdf/postscript/plain-text) is inferred from
     /// the blob's stored filename.
     blake3: String,
+}
+
+// ---------------------------------------------------------------------------
+// plain text file reading (notepad widget)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ReadTextFileArgs {
+    /// absolute path on the local filesystem (e.g. from the tauri native
+    /// file picker) to read as utf-8 text.
+    path: String,
+}
+
+/// read a small local file's full contents as utf-8 text, replacing invalid
+/// byte sequences (lossy) rather than failing outright.
+async fn read_text_file(args: ReadTextFileArgs) -> Result<Value, DispatchError> {
+    let bytes = tokio::fs::read(&args.path).await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })?;
+    Ok(json!({ "text": String::from_utf8_lossy(&bytes).into_owned() }))
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ import { LassoTool } from "./lasso-tool";
 import { PresenceManager } from "./presence-manager";
 import { PresenceRenderer } from "./presence-renderer";
 import { PropertyTray } from "./property-tray";
+import type { BreadcrumbItem } from "./toolbar";
 import { Toolbar } from "./toolbar";
 import { Viewport } from "./viewport";
 import { WidgetManager } from "./widget-manager";
@@ -37,6 +38,14 @@ export interface InitCanvasOptions {
   isNarthex?: boolean;
   /** callback to navigate back to the narthex — toolbar shows a home button when set */
   onNavigateHome?: () => void;
+  /**
+   * ancestor canvas breadcrumbs (narthex -> ... -> immediate parent), fed
+   * by the app-level router's cross-canvas navigation history — see
+   * `WidgetManager.setAncestorCrumbs()`'s doc comment. omitted (or empty)
+   * when this canvas has no navigation history (e.g. a cold open, or the
+   * narthex itself).
+   */
+  ancestorCrumbs?: BreadcrumbItem[];
   /** callback to share the current canvas — toolbar shows a share button when set */
   onShare?: () => void;
   /** callback to toggle the social overlay panel — toolbar shows avatar button when set */
@@ -293,6 +302,9 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
   widgetManager.setToolbar(toolbar);
   if (options.onNavigateHome) {
     widgetManager.setNavigateHome(options.onNavigateHome);
+  }
+  if (options.ancestorCrumbs?.length) {
+    widgetManager.setAncestorCrumbs(options.ancestorCrumbs);
   }
 
   widgetManager.start();

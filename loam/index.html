@@ -2,7 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
     <title>skein</title>
     <style>
       @font-face {
@@ -77,6 +80,11 @@
       #canvas-root {
         width: 100vw;
         height: 100vh;
+        /* the only place the top system-bar inset (android edge-to-edge)
+           is accounted for - pixi's resizeTo plugin reads this element's
+           (border-box) client size, so the whole stage shifts down and
+           shrinks accordingly and no widget needs its own safe-area logic. */
+        padding-top: env(safe-area-inset-top, 0px);
         touch-action: none;
         position: relative;
       }

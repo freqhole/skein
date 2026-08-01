@@ -14,8 +14,11 @@ import {
   getLocalNodeId,
   getThumbnailDataUrl,
   isDocumentFilename,
+  isMarkdownFilename,
+  isPlainTextFilename,
   pauseSnatchDownload,
   pickFiles,
+  readPickedFileText,
   revealBlobInFinder,
   saveBlobToDisk,
   snatchBlob,
@@ -33,6 +36,8 @@ import { createGifHoverOverlay, type GifHoverOverlayHandle } from "../src/widget
 import { peerNameFor } from "../src/canvas/peer-names";
 import { kickOffDocumentProcessing } from "./peedeeeff/render-client";
 import { peedeeeffSchema, type PeedeeeffState } from "./peedeeeff/types";
+import { markdownSchema } from "./markdown";
+import { notepadSchema } from "./notepad";
 import type { DocHandle } from "@automerge/automerge-repo";
 import type {
   CompactInfo,
@@ -1263,23 +1268,28 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       }
 
       // upload each file and create child widgets in the bin. document
-      // files (pdf/ps/eps/txt) become peedeeeff children instead of plain
-      // file children — see isDocumentFilename's doc comment. single-file
-      // uploads (picked.length === 1, handled elsewhere in this function)
-      // are NOT affected by this — this auto-doc-widget behavior is
-      // multi-file-batch-only, per the feature's design.
+      // files (pdf/ps/eps) become peedeeeff children, markdown files
+      // become markdown children, plain text files (txt/log/csv/etc)
+      // become notepad children (raw text, no rasterization) — see
+      // isDocumentFilename/isMarkdownFilename/isPlainTextFilename's doc
+      // comments. single-file uploads (picked.length === 1, handled
+      // elsewhere in this function) are NOT affected by this — this
+      // auto-doc-widget behavior is multi-file-batch-only, per the
+      // feature's design.
       const items: Array<{ widgetId: string; slot: { col: number; row: number } }> = [];
 
       for (let i = 0; i < picked.length; i++) {
         const file = picked[i];
         const slot = { col: i % cols, row: Math.floor(i / cols) };
         const childId = crypto.randomUUID();
-        const isDoc = isDocumentFilename(file.filename);
+        const isMarkdown = isMarkdownFilename(file.filename);
+        const isPlainText = !isMarkdown && isPlainTextFilename(file.filename);
+        const isDoc = !isMarkdown && !isPlainText && isDocumentFilename(file.filename);
 
         // create a child widget entry nested in the bin
         store.addWidget({
           id: childId,
-          type: isDoc ? "peedeeeff" : "file",
+          type: isMarkdown ? "markdown" : isPlainText ? "notepad" : isDoc ? "peedeeeff" : "file",
           x: 0,
           y: 0,
           width: 200,
@@ -1293,12 +1303,33 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
         // the widget manager skips widgets with parentId, so no automerge doc
         // was created during reconcile. create the per-widget doc ourselves.
-        const childDefaults = isDoc ? peedeeeffSchema.parse({}) : fileSchema.parse({});
+        const childDefaults = isMarkdown
+          ? markdownSchema.parse({})
+          : isPlainText
+            ? notepadSchema.parse({})
+            : isDoc
+              ? peedeeeffSchema.parse({})
+              : fileSchema.parse({});
         const childDocHandle = repo.create(childDefaults);
         store.setDocId(childId, childDocHandle.documentId);
 
         // add the item to the bin immediately so it appears as a card
         items.push({ widgetId: childId, slot });
+
+        if (isMarkdown || isPlainText) {
+          // no blob upload for markdown/plain text — read it straight into
+          // the widget's own text field.
+          readPickedFileText(file)
+            .then((text) => {
+              childDocHandle.change((draft: any) => {
+                draft.text = text;
+              });
+            })
+            .catch((err) => {
+              log.warn("file-widget", `auto-bin notepad/markdown read failed for ${file.filename}:`, err);
+            });
+          continue;
+        }
 
         if (isDoc) {
           // fire-and-forget upload — don't await each one sequentially
@@ -1316,7 +1347,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
               // thumbnailDataUrl doc comment for why this is needed at all
               // (bins never mount a child's full widget lifecycle).
               try {
-                const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200 });
+                const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200, square: true });
                 if (thumbDataUrl) {
                   childDocHandle.change((draft: any) => {
                     draft.thumbnailDataUrl = thumbDataUrl;
@@ -1428,6 +1459,41 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         const picked = await pickFiles();
         if (!picked || picked.length === 0) return;
 
+        // single markdown/plain-text file: no blob upload — replace this
+        // file widget with a markdown/notepad widget holding the raw text,
+        // same as the bin/multi-file routing (see isMarkdownFilename,
+        // isPlainTextFilename).
+        if (picked.length === 1) {
+          const file = picked[0];
+          const isMarkdown = isMarkdownFilename(file.filename);
+          const isPlainText = !isMarkdown && isPlainTextFilename(file.filename);
+          if (isMarkdown || isPlainText) {
+            const store = ctx.canvasStore;
+            if (!store) return;
+
+            const selfEntry = store.getWidget(ctx.widgetId);
+            if (!selfEntry) return;
+
+            const text = await readPickedFileText(file);
+            store.addWidget({
+              id: crypto.randomUUID(),
+              type: isMarkdown ? "markdown" : "notepad",
+              x: selfEntry.x,
+              y: selfEntry.y,
+              width: selfEntry.width,
+              height: selfEntry.height,
+              zIndex: selfEntry.zIndex,
+              title: file.filename.replace(/\.[^.]+$/, ""),
+              props: { text },
+              collapsed: false,
+              docId: null,
+              parentId: null,
+            });
+            store.removeWidget(ctx.widgetId);
+            return;
+          }
+        }
+
         // single file: upload into this widget as before
         if (picked.length === 1) {
           const file = picked[0];
@@ -1530,6 +1596,22 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
                   const blobIds = pages.map((p) => p.page_blob_id);
                   const totalPages = pages[0]?.total_pages ?? pages.length;
 
+                  // best-effort thumbnail from the first page — bins never
+                  // mount a peedeeeff widget's full lifecycle, so this needs
+                  // to be persisted at creation time (see peedeeeff's
+                  // thumbnailDataUrl doc comment).
+                  let firstPageThumb = "";
+                  try {
+                    firstPageThumb =
+                      (await getThumbnailDataUrl(blobIds[0], { size: 200, square: true })) ?? "";
+                  } catch {
+                    log.debug(
+                      "file-widget",
+                      "peedeeeff first-page thumbnail generation failed for",
+                      blobIds[0]?.slice(0, 8)
+                    );
+                  }
+
                   const pdfId = crypto.randomUUID();
                   store.addWidget({
                     id: pdfId,
@@ -1549,6 +1631,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
                       pageCount: totalPages,
                       pageBlobIds: blobIds,
                       pageBlake3s: pages.map((p) => p.blake3 || ""),
+                      thumbnailDataUrl: firstPageThumb,
                     },
                     collapsed: false,
                     docId: null,
@@ -2138,7 +2221,21 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     let prevBlobId = ctx.doc.current.blobId;
     let prevThumbDataUrl = ctx.doc.current.thumbnailDataUrl;
+    // the widget frame's toolbar title comes from the canvas entry's
+    // `entry.title` (set via the property tray's generic title control),
+    // but file.ts declares its OWN doc-backed "title" editableProp instead
+    // (needed so the bin label — which reads `state.title` — has something
+    // to show), which suppresses that generic control entirely (see
+    // property-tray.ts's `hasOwnTitleProp`). mirror doc-backed title changes
+    // into `entry.title` here so the toolbar stays in sync the same way it
+    // does for every other widget type.
+    let prevTitle = ctx.doc.current.title;
     const unsub = ctx.doc.on("change", (state) => {
+      if (state.title !== prevTitle) {
+        prevTitle = state.title;
+        ctx.canvasStore?.setWidgetTitle(ctx.widgetId, state.title);
+      }
+
       drawBg(currentWidth, currentHeight);
 
       // cross-peer upload lock: while another peer uploads into this widget,
@@ -2192,6 +2289,13 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         positionInfoBar(currentWidth, currentHeight);
       }
     });
+
+    // sync the toolbar title once at mount too — covers widgets that already
+    // had a doc-backed title before this fix landed, or whose `entry.title`
+    // has drifted out of sync for any other reason.
+    if (ctx.doc.current.title !== (ctx.canvasStore?.getWidget(ctx.widgetId)?.title ?? "")) {
+      ctx.canvasStore?.setWidgetTitle(ctx.widgetId, ctx.doc.current.title);
+    }
 
     // kick off initial load if a blob ID is already set
     if (ctx.doc.current.blobId) {
@@ -2279,6 +2383,47 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       log.debug("file-widget", "local copy freed — blob is remote again");
     }
 
+    /** convert this existing file widget into a peedeeeff widget — same
+     *  end state as uploading a pdf directly (see the tauri single-pdf
+     *  upload flow above), but starting from an already-uploaded document
+     *  file. page rendering happens after mount, via peedeeeff's own
+     *  resumeProcessingIfNeeded() (it self-heals whenever blobId is set
+     *  but pageBlobIds is empty) — no need to duplicate that here. */
+    function handleConvertToPeedeeeff() {
+      const state = ctx.doc.current;
+      const store = ctx.canvasStore;
+      if (!store || store.isLocalViewer()) return;
+      if (!state.blobId || !isDocumentFilename(state.filename)) return;
+
+      const selfEntry = store.getWidget(ctx.widgetId);
+      if (!selfEntry) return;
+
+      store.addWidget({
+        id: crypto.randomUUID(),
+        type: "peedeeeff",
+        x: selfEntry.x,
+        y: selfEntry.y,
+        width: Math.max(selfEntry.width, 480),
+        height: Math.max(selfEntry.height, 640),
+        zIndex: selfEntry.zIndex,
+        title: (state.title && state.title.trim()) || state.filename.replace(/\.[^./\\]+$/, ""),
+        props: {
+          blobId: state.blobId,
+          filename: state.filename,
+          mime: state.mime,
+          blake3: state.blake3 ?? "",
+          size: state.size,
+          thumbnailDataUrl: state.thumbnailDataUrl ?? "",
+        },
+        collapsed: false,
+        docId: null,
+        parentId: null,
+      });
+
+      // remove this file widget — the peedeeeff widget replaces it
+      store.removeWidget(ctx.widgetId);
+    }
+
     return {
       container,
       // property-tray extras: thumbnail override actions (all file types —
@@ -2287,6 +2432,15 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       widgetActions: [
         { id: "choose-thumbnail", label: "choose thumbnail", onClick: () => void handleChooseThumbnail() },
         { id: "remove-thumbnail", label: "remove thumbnail", onClick: handleRemoveThumbnail },
+        ...(ctx.doc.current.blobId && isDocumentFilename(ctx.doc.current.filename)
+          ? [
+              {
+                id: "convert-to-peedeeeff",
+                label: "convert to peedeeeff",
+                onClick: handleConvertToPeedeeeff,
+              },
+            ]
+          : []),
         ...(isTauriMode()
           ? []
           : [

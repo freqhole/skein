@@ -21,6 +21,7 @@ use std::time::Instant;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::Manager;
 use tauri::WindowEvent;
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::Mutex;
 use tumulus::{db, friendz, userz};
 
@@ -34,6 +35,14 @@ const LOG_FILE_NAME: &str = "skein.log";
 const MAX_LOG_LINES: usize = 10_000;
 
 fn default_data_dir() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        // no android-specific env var for this; tauri's android runtime sets
+        // HOME (falling back to TMPDIR) to the app's private, writable storage.
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("TMPDIR")) {
+            return PathBuf::from(home).join(APP_IDENTIFIER);
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         if let Ok(home) = std::env::var("HOME") {
@@ -222,6 +231,15 @@ async fn build_state() -> anyhow::Result<AppState> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // android only: install rustls' ring crypto provider before anything can
+    // construct a TLS client (reqwest, wry's WebViewClient, etc.) - rustls
+    // 0.23 panics ("no provider set") if no default provider is installed,
+    // which aborts the whole process. desktop targets are unaffected.
+    #[cfg(target_os = "android")]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let log_path = setup_tracing();
     if let Some(path) = &log_path {
         tracing::info!(log_file = %path.display(), "logging to file");
@@ -245,10 +263,43 @@ pub fn run() {
         .manage(runtime)
         .invoke_handler(tauri::generate_handler![commands::skein_dispatch])
         .setup(move |app| {
+            // windows are built here (not declared in tauri.conf.json's
+            // `app.windows`) so android gets exactly one window and no
+            // trace of the desktop-only settings window - mirrors
+            // tomb/client/charnel's pattern. a declarative `app.windows`
+            // array plus a per-platform config override was tried first
+            // and DID correctly reduce the merged android config down to
+            // just "main", but the android webview still ended up loading
+            // settings.html's content anyway - so window creation is fully
+            // explicit instead of relying on platform config merging.
+            let main_builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default());
+            #[cfg(desktop)]
+            let main_builder = main_builder
+                .title("skein")
+                .inner_size(1280.0, 800.0)
+                .resizable(true)
+                .fullscreen(false);
+            main_builder.build()?;
+
             // -- app menu with settings shortcut (cmd+, / ctrl+,) ----------
-            // (desktop only: mobile has no window menu bar / menu events)
+            // (desktop only: mobile has no window menu bar / menu events, and
+            // no settings window at all)
             #[cfg(desktop)]
             {
+                let settings_builder = WebviewWindowBuilder::new(
+                    app,
+                    "settings",
+                    WebviewUrl::App(PathBuf::from("settings.html")),
+                )
+                .title("skein settings")
+                .inner_size(520.0, 480.0)
+                .min_inner_size(360.0, 320.0)
+                .resizable(true)
+                .visible(false)
+                .center()
+                .focused(true);
+                settings_builder.build()?;
+
                 let settings_item = MenuItemBuilder::with_id("open_settings", "Settings...")
                     .accelerator("CmdOrCtrl+,")
                     .build(app)?;
@@ -307,18 +358,19 @@ pub fn run() {
                         show_settings_window(app);
                     }
                 });
-            }
 
-            // intercept close on the settings window: hide instead of destroy
-            // so the menu/shortcut can re-show it without recreating state.
-            if let Some(settings_win) = app.get_webview_window("settings") {
-                let win = settings_win.clone();
-                settings_win.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = win.hide();
-                    }
-                });
+                // intercept close on the settings window: hide instead of
+                // destroy so the menu/shortcut can re-show it without
+                // recreating state.
+                if let Some(settings_win) = app.get_webview_window("settings") {
+                    let win = settings_win.clone();
+                    settings_win.on_window_event(move |event| {
+                        if let WindowEvent::CloseRequested { api, .. } = event {
+                            api.prevent_close();
+                            let _ = win.hide();
+                        }
+                    });
+                }
             }
 
             Ok(())

@@ -1,5 +1,23 @@
 # skein
 
+## 0.1.5
+
+### Patch Changes
+
+- 5a99c04: try to improve share canvas dialog; tidy tumlus; bump tomb/lib/ depz;
+- 194999f: bump tomb 0.2.8 && fix blob request bao calc; dedupe file holderz list; try to fix tumulus glibc version for raspi linux-arm64 buildz;
+- 9d96b58: try to handle cold-open share linkz better
+- 5cd73e5: open social widget for new userz
+- b69f941: load video thumbz better
+- 14bddd4: lots of minor stuff: add title to file widgetz (so bin labelz better); try again to sort hub nodez in share dialog; yank file widget's `→ disk` button and fix pause button position; fix copy node id button style; peedeeeff takez more file formatz with pandoc + typst; hub does more processing (for peedeeeff, etc).
+- a6da7ae: refactor doc open to be signal-based rather than timer-based; but also keep the timer for a number of call sitez so that it doesn't hang forever
+- c57af7d: add thumbnailz to widgetz to show in binz; add border and cell dividerz to binz; fix click area of "click to add" file + peedeeeff widgetz and try to make sure only creator can add first file; prevent autohide when layer flyout is open; fix unfurl text encoding bugz; persist narthex zoom + position when navigating away + back; try to get thumbnail image from videoz + pdfz in tauri app;
+- 848dd49: tumulus use sqlite WAL and add file loggin'
+- 39ebcbe: tidy'n the bin widget layout and such- make tidy re-size content, cells fit better, boost resolution of voice recordingz + doodles and many other aesthetic improvementz
+- 96efdd2: use cwd tumulus-data for data dir of not otherwise specified
+- 82cc9a1: handle gifz better; try to improve video + audio tumbnail gen;
+- a703a5b: some backfill migrationz; add setup file logger;
+
 ## 0.1.4
 
 ### Patch Changes

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { FONT_OPTIONS } from "../src/fonts/font-loader";
 import { createDomOverlay, type DomOverlayHandle } from "../src/widgets/dom-overlay";
 import { colorToCss } from "../src/widgets/format";
+import { createScrollableContent } from "../src/widgets/scrollable-content";
 import {
   isTransparent,
   safeColor,
@@ -89,25 +90,26 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
     drawBg(currentWidth, currentHeight, false);
     container.addChild(bg);
 
-    // content container — holds text and gets clipped
-    const content = new Container();
-    content.x = PADDING;
-    content.y = PADDING;
-    container.addChild(content);
-
-    // clip mask for content area
-    const clipMask = new Graphics();
-    const drawClipMask = (w: number, h: number) => {
-      clipMask.clear();
-      clipMask.rect(PADDING, PADDING, w - PADDING * 2, h - PADDING * 2);
-      clipMask.fill({ color: 0xffffff });
-    };
-    drawClipMask(currentWidth, currentHeight);
-    container.addChild(clipMask);
-    content.mask = clipMask;
-
-    // main text display
+    // scrollable content area — holds text; overflow scrolls instead of
+    // being silently clipped (see scrollable-content.ts for the wheel/pan
+    // handling this needs to coexist with the canvas viewport's own pan).
     const contentWidth = () => Math.max(currentWidth - PADDING * 2, 1);
+    const contentHeight = () => Math.max(currentHeight - PADDING * 2, 1);
+    const scrollable = createScrollableContent(
+      container,
+      ctx.canvasElement,
+      PADDING,
+      PADDING,
+      contentWidth(),
+      contentHeight()
+    );
+    const content = scrollable.content;
+    content.cursor = "text";
+
+    const reflow = () => {
+      const h = Math.max(textDisplay.height, placeholder.height);
+      scrollable.reflow(contentWidth(), h);
+    };
 
     const textDisplay = new Text({
       text: ctx.doc.current.text,
@@ -144,6 +146,7 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
     };
 
     updatePlaceholderVisibility();
+    reflow();
 
     // DOM overlay for inline editing
     let activeOverlay: DomOverlayHandle | null = null;
@@ -178,6 +181,7 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
           textDisplay.visible = true;
           drawBg(currentWidth, currentHeight, false);
           updatePlaceholderVisibility();
+          reflow();
         },
         onRevert: () => {
           editing = false;
@@ -186,6 +190,7 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
           textDisplay.visible = true;
           drawBg(currentWidth, currentHeight, false);
           updatePlaceholderVisibility();
+          reflow();
         },
         css: {
           fontFamily: state.fontFamily,
@@ -200,11 +205,13 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
       });
     };
 
-    // double-click to enter edit mode
+    // double-click to enter edit mode. registered on both `bg` (the border
+    // area outside the scrollable content) and `content` (the scrollable
+    // area itself, which now sits on top of `bg` and would otherwise
+    // swallow clicks that land on the text) — a click on either fires the
+    // same handler.
     let lastTapTime = 0;
-    bg.eventMode = "static";
-    bg.cursor = "text";
-    bg.on("pointertap", () => {
+    const handleDoubleTap = () => {
       if (editing) return;
       const now = Date.now();
       if (now - lastTapTime < 400) {
@@ -213,7 +220,11 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
       } else {
         lastTapTime = now;
       }
-    });
+    };
+    bg.eventMode = "static";
+    bg.cursor = "text";
+    bg.on("pointertap", handleDoubleTap);
+    content.on("pointertap", handleDoubleTap);
 
     // subscribe to remote doc changes
     const unsub = ctx.doc.on("change", (state) => {
@@ -229,6 +240,7 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
       placeholder.style.fontSize = state.fontSize;
       drawBg(currentWidth, currentHeight, editing);
       updatePlaceholderVisibility();
+      reflow();
     });
 
     return {
@@ -244,6 +256,7 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
           activeOverlay = null;
         }
         unsub();
+        scrollable.destroy();
         container.destroy({ children: true });
       },
 
@@ -254,8 +267,9 @@ export const notepadWidget: WidgetFactory<typeof notepadSchema> = {
         currentWidth = width;
         currentHeight = height;
         drawBg(width, height, false);
-        drawClipMask(width, height);
+        scrollable.resize(contentWidth(), contentHeight());
         updateWordWrap();
+        reflow();
       },
     };
   },

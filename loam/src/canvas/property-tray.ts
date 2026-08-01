@@ -344,14 +344,20 @@ export class PropertyTray {
     const fieldWidth = this.trayWidth - TRAY_PAD_H * 2;
     let y = 0;
 
-    // title field (always shown)
-    this.titleControl = this.createTitleControl(widgetId, entry.title ?? "", fieldWidth);
-    this.contentContainer.addChild(this.titleControl.container);
-    this.titleControl.container.y = Math.round(y);
-    y += this.titleControl.height + ROW_GAP;
-
     // widget-specific prop controls (only if doc exists and factory has editable props)
     const props = controllerProps ?? factory.editableProps ?? [];
+
+    // title field — always shown, EXCEPT when the widget already declares its
+    // own "title" editable prop (e.g. the file widget's doc-backed title,
+    // which feeds the bin label) — showing both would be a duplicate input.
+    const hasOwnTitleProp = props.some((p) => p.key === "title");
+    if (!hasOwnTitleProp) {
+      this.titleControl = this.createTitleControl(widgetId, entry.title ?? "", fieldWidth);
+      this.contentContainer.addChild(this.titleControl.container);
+      this.titleControl.container.y = Math.round(y);
+      y += this.titleControl.height + ROW_GAP;
+    }
+
     if (doc && props.length) {
       for (let i = 0; i < props.length; i++) {
         const prop = props[i];

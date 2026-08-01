@@ -84,7 +84,7 @@ export const REQUEST_ROW_HEIGHT_BIO = 66;
 export const ACTION_BTN_SIZE = 24;
 
 // settings
-export const SETTINGS_ROW_HEIGHT = 36;
+export const SETTINGS_ROW_HEIGHT = 16;
 export const OPTION_PILL_HEIGHT = 26;
 export const OPTION_PILL_RADIUS = 13;
 export const OPTION_PILL_GAP = 6;

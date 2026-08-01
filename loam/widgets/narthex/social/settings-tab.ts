@@ -144,7 +144,7 @@ function buildPillRow<T extends string>(
   label.x = 0;
   label.y = sy;
   parent.addChild(label);
-  sy += LABEL_SIZE + 8;
+  sy += LABEL_SIZE + 4;
 
   let px = 0;
   const activeValue = opts.readValue();
@@ -264,7 +264,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
       rowLabel.x = 0;
       rowLabel.y = offsetY;
       container.addChild(rowLabel);
-      offsetY += LABEL_SIZE + 8;
+      offsetY += LABEL_SIZE + 4;
 
       // status dot
       const DOT_R = 4;
@@ -362,6 +362,19 @@ export function createSettingsTab(ctx: TabContext): TabController {
           draft.friendRequestsFrom = value;
         });
         bridgeSetFriendRequestsFrom(value);
+      },
+    });
+
+    // 2b. sound effects — on | off (a single toggle covers all of them:
+    // friend online, new message, friend request — see src/sfx/index.ts)
+    offsetY += buildPillRow<"on" | "off">(container, offsetY, {
+      label: "sound effects",
+      options: ["on", "off"],
+      readValue: () => (ctx.doc.current.soundEffectsEnabled !== false ? "on" : "off"),
+      onSelect: (value) => {
+        ctx.doc.change((draft) => {
+          draft.soundEffectsEnabled = value === "on";
+        });
       },
     });
 

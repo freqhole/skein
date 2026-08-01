@@ -1,6 +1,6 @@
 [package]
 name = "skein"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "skein desktop shell"
 
@@ -16,7 +16,11 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools", "protocol-asset"] }
+tauri = { version = "2", features = [
+    "macos-private-api",
+    "devtools",
+    "protocol-asset",
+] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
@@ -43,6 +47,16 @@ reqwest = { version = "0.12", default-features = false, features = [
 
 tumulus = { path = "../tumulus" }
 freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.8" }
+
+# android only: wry's android WebViewClient.handleRequest (and skein's own
+# reqwest clients) build a rustls-backed client, which panics ("no provider
+# set") if no default CryptoProvider is installed. we install ring at app
+# startup. desktop targets keep using their existing tls stacks unchanged.
+[target."cfg(target_os = \"android\")".dependencies]
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

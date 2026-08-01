@@ -5,11 +5,16 @@ import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import {
   getThumbnailDataUrl,
   isDocumentFilename,
+  isMarkdownFilename,
+  isPlainTextFilename,
   pickFiles,
+  readPickedFileText,
   uploadFile,
 } from "../../src/widgets/file-utils";
 import { fileSchema } from "../file";
-import { kickOffDocumentProcessing } from "../peedeeeff/render-client";
+import { markdownSchema } from "../markdown";
+import { notepadSchema } from "../notepad";
+import { kickOffDocumentProcessing, regenerateThumbnail } from "../peedeeeff/render-client";
 import { peedeeeffSchema, type PeedeeeffState } from "../peedeeeff/types";
 import { snatchAllInBin } from "./bin-actions";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
@@ -405,6 +410,27 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
     // -- add files flow ------------------------------------------------------
 
+    // best-effort: a peedeeeff widget dragged into a bin from elsewhere on
+    // the canvas may already have rendered pages but never got a thumbnail
+    // (e.g. created before auto-thumbnailing existed, or its own auto-set
+    // attempt failed) - regenerate one now so the bin doesn't show blank.
+    async function regenerateThumbnailIfMissing(widgetId: string) {
+      if (!store || !repo) return;
+      const entry = store.getWidget(widgetId);
+      if (!entry || entry.type !== "peedeeeff" || !entry.docId) return;
+      try {
+        const handle = await repo.find<PeedeeeffState>(entry.docId as any);
+        await handle.whenReady();
+        if (handle.doc()?.thumbnailDataUrl) return;
+        await regenerateThumbnail({
+          current: () => handle.doc(),
+          change: (fn) => handle.change(fn),
+        });
+      } catch {
+        log.debug("bin", "drop-time thumbnail regeneration failed for", widgetId);
+      }
+    }
+
     async function handleAddFiles() {
       if (!store || !repo) return;
       if (store.isLocalViewer()) return;
@@ -441,13 +467,18 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
         }
 
         // create a child widget entry in the canvas doc — document files
-        // (pdf/ps/eps/txt) become peedeeeff children instead of plain file
-        // children, per the multi-file-upload auto-doc-widget feature.
+        // (pdf/ps/eps) become peedeeeff children, markdown files become
+        // markdown children, plain text files (txt/log/csv/etc) become
+        // notepad children (raw text, no rasterization), everything else
+        // stays a plain file child, per the multi-file-upload
+        // auto-doc-widget feature.
         const childId = crypto.randomUUID();
-        const isDoc = isDocumentFilename(file.filename);
+        const isMarkdown = isMarkdownFilename(file.filename);
+        const isPlainText = !isMarkdown && isPlainTextFilename(file.filename);
+        const isDoc = !isMarkdown && !isPlainText && isDocumentFilename(file.filename);
         store.addWidget({
           id: childId,
-          type: isDoc ? "peedeeeff" : "file",
+          type: isMarkdown ? "markdown" : isPlainText ? "notepad" : isDoc ? "peedeeeff" : "file",
           x: 0,
           y: 0,
           width: 200,
@@ -461,16 +492,31 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
         // the widget manager skips widgets with parentId, so no automerge doc
         // was created during reconcile. create the per-widget doc ourselves.
-        const defaults = isDoc ? peedeeeffSchema.parse({}) : fileSchema.parse({});
+        const defaults = isMarkdown
+          ? markdownSchema.parse({})
+          : isPlainText
+            ? notepadSchema.parse({})
+            : isDoc
+              ? peedeeeffSchema.parse({})
+              : fileSchema.parse({});
         const docHandle = repo.create(defaults);
         store.setDocId(childId, docHandle.documentId);
 
         // upload the file and write result into the child's automerge doc.
         // on failure, clean up the child widget so we don't leave empty cards.
         try {
+          if (isMarkdown || isPlainText) {
+            // no blob upload for markdown/plain text — read it straight
+            // into the widget's own text field.
+            const text = await readPickedFileText(file);
+            docHandle.change((draft: any) => {
+              draft.text = text;
+            });
+          } else {
           const result = await uploadFile(file, { waitForCompletion: true });
 
           if (isDoc) {
+
             docHandle.change((draft: any) => {
               draft.blobId = result.blobId;
               draft.filename = file.filename;
@@ -483,7 +529,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
             // thumbnailDataUrl doc comment for why this is needed at all
             // (bins never mount a child's full widget lifecycle).
             try {
-              const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200 });
+              const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200, square: true });
               if (thumbDataUrl) {
                 docHandle.change((draft: any) => {
                   draft.thumbnailDataUrl = thumbDataUrl;
@@ -539,6 +585,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
                 log.debug("bin", "thumbnail generation failed for", result.blobId);
               }
             }
+          }
           }
 
           // add the item to the bin's items list only on success
@@ -1030,6 +1077,8 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
                 draft.items.push({ widgetId: draggedWidgetId, slot });
                 draft.rows = computeRows(draft.items.length, Math.max(1, draft.cols));
               });
+
+              void regenerateThumbnailIfMissing(draggedWidgetId);
 
               renderer?.showSlotHighlight(null);
               return true;

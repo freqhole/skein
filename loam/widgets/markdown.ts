@@ -11,6 +11,7 @@ import { z } from "zod";
 import { FONT_OPTIONS } from "../src/fonts/font-loader";
 import { createDomOverlay, type DomOverlayHandle } from "../src/widgets/dom-overlay";
 import { colorToCss } from "../src/widgets/format";
+import { createScrollableContent } from "../src/widgets/scrollable-content";
 import {
   isTransparent,
   safeColor,
@@ -171,24 +172,20 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
     drawBg(currentWidth, currentHeight, false);
     container.addChild(bg);
 
-    // content container — holds rendered elements and gets clipped
-    const content = new Container();
-    content.x = PADDING;
-    content.y = PADDING;
-    container.addChild(content);
-
-    // clip mask to prevent overflow
-    const clipMask = new Graphics();
-    const drawClipMask = (w: number, h: number) => {
-      clipMask.clear();
-      clipMask.rect(PADDING, PADDING, w - PADDING * 2, h - PADDING * 2);
-      clipMask.fill({ color: 0xffffff });
-    };
-    drawClipMask(currentWidth, currentHeight);
-    container.addChild(clipMask);
-    content.mask = clipMask;
-
+    // scrollable content area — holds rendered markdown elements; overflow
+    // scrolls instead of being silently clipped (see scrollable-content.ts
+    // for the wheel/pan handling this needs alongside the canvas viewport).
     const contentWidth = () => Math.max(currentWidth - PADDING * 2, 1);
+    const contentHeight = () => Math.max(currentHeight - PADDING * 2, 1);
+    const scrollable = createScrollableContent(
+      container,
+      ctx.canvasElement,
+      PADDING,
+      PADDING,
+      contentWidth(),
+      contentHeight()
+    );
+    const content = scrollable.content;
 
     // rendered elements for the parsed markdown output.
     // lines with inline code use HTMLText; plain lines use Text.
@@ -537,8 +534,15 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
       }
     }
 
+    // measure rendered content height and update the scrollable area
+    function reflow() {
+      const h = renderedElements.reduce((max, el) => Math.max(max, el.y + el.height), 0);
+      scrollable.reflow(contentWidth(), h);
+    }
+
     // initial render
     renderMarkdown(ctx.doc.current.text, ctx.doc.current);
+    reflow();
 
     // DOM overlay for inline editing
     let activeOverlay: DomOverlayHandle | null = null;
@@ -574,12 +578,14 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
           }
           renderMarkdown(ctx.doc.current.text, ctx.doc.current);
           drawBg(currentWidth, currentHeight, false);
+          reflow();
         },
         onRevert: () => {
           editing = false;
           activeOverlay = null;
           renderMarkdown(ctx.doc.current.text, ctx.doc.current);
           drawBg(currentWidth, currentHeight, false);
+          reflow();
         },
         css: {
           fontFamily: state.fontFamily,
@@ -594,11 +600,13 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
       });
     };
 
-    // double-click to enter edit mode
+    // double-click to enter edit mode. registered on both `bg` (the border
+    // area outside the scrollable content) and `content` (the scrollable
+    // area itself, which now sits on top of `bg` and would otherwise
+    // swallow clicks that land on the rendered markdown) — a click on
+    // either fires the same handler.
     let lastTapTime = 0;
-    bg.eventMode = "static";
-    bg.cursor = "default";
-    bg.on("pointertap", () => {
+    const handleDoubleTap = () => {
       if (editing) return;
       const now = Date.now();
       if (now - lastTapTime < 400) {
@@ -607,12 +615,17 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
       } else {
         lastTapTime = now;
       }
-    });
+    };
+    bg.eventMode = "static";
+    bg.cursor = "default";
+    bg.on("pointertap", handleDoubleTap);
+    content.on("pointertap", handleDoubleTap);
 
     // subscribe to remote doc changes
     const unsub = ctx.doc.on("change", (state) => {
       if (!editing) {
         renderMarkdown(state.text, state);
+        reflow();
       }
       drawBg(currentWidth, currentHeight, editing);
     });
@@ -630,6 +643,7 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
           activeOverlay = null;
         }
         unsub();
+        scrollable.destroy();
         container.destroy({ children: true });
       },
 
@@ -640,8 +654,9 @@ export const markdownWidget: WidgetFactory<typeof markdownSchema> = {
         currentWidth = width;
         currentHeight = height;
         drawBg(width, height, false);
-        drawClipMask(width, height);
+        scrollable.resize(contentWidth(), contentHeight());
         renderMarkdown(ctx.doc.current.text, ctx.doc.current);
+        reflow();
       },
     };
   },

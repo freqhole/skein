@@ -46,6 +46,7 @@ describe("socialSchema", () => {
       relayedFriendRequestOutcomes: [],
       profileVisibility: "friends",
       friendRequestsFrom: "everyone",
+      soundEffectsEnabled: true,
     });
   });
 
@@ -116,6 +117,7 @@ describe("socialSchema", () => {
       ],
       profileVisibility: "everyone" as const,
       friendRequestsFrom: "nobody" as const,
+      soundEffectsEnabled: true,
     };
     const result = socialSchema.parse(full);
     expect(result).toEqual(full);

@@ -8,9 +8,9 @@
 //! for now):
 //! - image/*: decoded + resized in-process via the `image` crate (through
 //!   `freqhole_reliquary::media`), returned as webp.
-//! - application/pdf, application/postscript, text/plain (or a recognized
-//!   document filename extension): first page only, via `magick`, returned
-//!   as png. format is inferred from the stored filename's extension when
+//! - application/pdf, application/postscript (or a recognized document
+//!   filename extension): first page only, via `magick`, returned as png.
+//!   format is inferred from the stored filename's extension when
 //!   available (see `crate::pdf::DocumentFormat::from_filename`), falling
 //!   back to the mime type only for `application/pdf`.
 //! - everything else: returns `{ data: null }`.
