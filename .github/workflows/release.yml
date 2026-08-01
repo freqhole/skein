@@ -270,20 +270,19 @@ jobs:
       - name: build tumulus cli (linux x86_64, glibc-pinned)
         run: |
           mkdir -p build/${{ needs.create-release.outputs.version }}
+          # --target-dir isolates this from target/, which the native `cargo
+          # tauri build` step below also uses. sharing target/ let cargo reuse
+          # this container's cached tumulus build-script output (baked-in
+          # DATABASE_URL=sqlite:/work/tumulus/... from CARGO_MANIFEST_DIR
+          # inside the container) for the native build too, which then failed
+          # with "unable to open database file" since /work doesn't exist
+          # outside the container.
           docker run --rm -v "$PWD":/work -w /work rust:1-bookworm \
-            cargo build --release --target x86_64-unknown-linux-gnu -p tumulus
-          # the container runs as root, so it leaves target/ (including
-          # target/release/, which cargo also writes to for host build
-          # scripts even when cross-compiling) owned by root - reclaim it so
-          # the native `cargo tauri build` step below (running as the
-          # unprivileged runner user, same shared target dir) can write to it.
-          # also reclaim tumulus/dev-data/ - root's sqlx compile-time query
-          # macros open the sqlite dev db during this build, leaving
-          # root-owned -wal/-shm/-journal sidecar files behind that block the
-          # native step below from reopening the same db as the runner user
-          # ("unable to open database file").
-          sudo chown -R "$(id -u):$(id -g)" target tumulus/dev-data
-          cp target/x86_64-unknown-linux-gnu/release/tumulus \
+            cargo build --release --target x86_64-unknown-linux-gnu \
+            --target-dir target/docker-tumulus -p tumulus
+          # container runs as root - reclaim so rust-cache can archive it.
+          sudo chown -R "$(id -u):$(id -g)" target/docker-tumulus
+          cp target/docker-tumulus/x86_64-unknown-linux-gnu/release/tumulus \
             "build/${{ needs.create-release.outputs.version }}/tumulus_${{ needs.create-release.outputs.version }}_linux-x86_64"
       - name: build skein deb/rpm (linux x86_64)
         run: make build-tauri-linux-intel
@@ -338,20 +337,19 @@ jobs:
       - name: build tumulus cli (linux aarch64, glibc-pinned)
         run: |
           mkdir -p build/${{ needs.create-release.outputs.version }}
+          # --target-dir isolates this from target/, which the native `cargo
+          # tauri build` step below also uses. sharing target/ let cargo reuse
+          # this container's cached tumulus build-script output (baked-in
+          # DATABASE_URL=sqlite:/work/tumulus/... from CARGO_MANIFEST_DIR
+          # inside the container) for the native build too, which then failed
+          # with "unable to open database file" since /work doesn't exist
+          # outside the container.
           docker run --rm -v "$PWD":/work -w /work rust:1-bookworm \
-            cargo build --release --target aarch64-unknown-linux-gnu -p tumulus
-          # the container runs as root, so it leaves target/ (including
-          # target/release/, which cargo also writes to for host build
-          # scripts even when cross-compiling) owned by root - reclaim it so
-          # the native `cargo tauri build` step below (running as the
-          # unprivileged runner user, same shared target dir) can write to it.
-          # also reclaim tumulus/dev-data/ - root's sqlx compile-time query
-          # macros open the sqlite dev db during this build, leaving
-          # root-owned -wal/-shm/-journal sidecar files behind that block the
-          # native step below from reopening the same db as the runner user
-          # ("unable to open database file").
-          sudo chown -R "$(id -u):$(id -g)" target tumulus/dev-data
-          cp target/aarch64-unknown-linux-gnu/release/tumulus \
+            cargo build --release --target aarch64-unknown-linux-gnu \
+            --target-dir target/docker-tumulus -p tumulus
+          # container runs as root - reclaim so rust-cache can archive it.
+          sudo chown -R "$(id -u):$(id -g)" target/docker-tumulus
+          cp target/docker-tumulus/aarch64-unknown-linux-gnu/release/tumulus \
             "build/${{ needs.create-release.outputs.version }}/tumulus_${{ needs.create-release.outputs.version }}_linux-aarch64"
       - name: build skein deb/rpm (linux aarch64)
         run: make build-tauri-linux-arm64
