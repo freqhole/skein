@@ -1664,15 +1664,19 @@ export function createFriendsTab(ctx: TabContext): TabController {
 
       const copyBtnBg = new Graphics();
       copyBtnBg.eventMode = "none";
+      const copyLabelStyle = { fontFamily: FONT, fontSize: 9, fill: ACCENT };
       const copyLabel = new Text({
         text: "copy",
-        style: { fontFamily: FONT, fontSize: 9, fill: ACCENT },
+        style: copyLabelStyle,
         resolution: RESOLUTION,
       });
       copyLabel.eventMode = "none";
       const copyPadX = 8;
       const copyPadY = 3;
-      const copyW = copyLabel.width + copyPadX * 2;
+      // size the button for whichever label ("copy" / "copied!") is wider, so it
+      // never needs to resize (and never overflows) when the label swaps in.
+      const copiedLabelWidth = new Text({ text: "copied!", style: copyLabelStyle, resolution: RESOLUTION }).width;
+      const copyW = Math.max(copyLabel.width, copiedLabelWidth) + copyPadX * 2;
       const copyH = copyLabel.height + copyPadY * 2;
       copyBtnBg.roundRect(0, 0, copyW, copyH, 3);
       copyBtnBg.fill({ color: FIELD_BG });

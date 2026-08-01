@@ -27,15 +27,15 @@ const loamDir = path.resolve(dirname, "..");
 // their ts/wasm-pack build output dirs there.
 const packages = {
     "@freqhole/haruspex": {
-        npm: "^0.2.6",
+        npm: "^0.2.7",
         local: "file:../../tomb/lib/haruspex/ts",
     },
     "@freqhole/midden": {
-        npm: "^0.2.6",
+        npm: "^0.2.7",
         local: "file:../../tomb/lib/midden/pkg",
     },
     "@freqhole/reliquary": {
-        npm: "^0.2.6",
+        npm: "^0.2.7",
         local: "file:../../tomb/lib/reliquary/ts",
     },
 };

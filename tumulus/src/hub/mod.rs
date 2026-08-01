@@ -310,6 +310,18 @@ impl HubPeerService {
             friendz_store.clone(),
         );
 
+        // skein/1 proxy: lets browser peers (who have no native rendering
+        // backend of their own) ask the hub to generate real thumbnails and
+        // render document pages — see `protocol::skein_proxy`'s module doc
+        // comment for why this needs its own from-scratch rust
+        // implementation of a wire protocol otherwise only implemented in
+        // the loam TypeScript frontend.
+        let skein_proxy = crate::protocol::skein_proxy::new_handler(
+            fs_store,
+            blobz.clone(),
+            friendz_store.clone(),
+        );
+
         // resume tracking canvases from previous runs (moved before hub_admin
         // so the admin handler can receive a clone of the live set).
         let canvas_doc_ids = {
@@ -354,9 +366,10 @@ impl HubPeerService {
             .accept(ENSURE_ALPN, blob_proxy)
             .accept(iroh_blobs::ALPN, blobs_protocol)
             .accept(crate::protocol::hub_admin::HUB_ADMIN_ALPN, hub_admin)
+            .accept(crate::protocol::skein_proxy::SKEIN_PROXY_ALPN, skein_proxy)
             .spawn();
         tracing::info!(
-            "iroh router started: automerge-repo + friendz + skein-blob-proxy + iroh-blobs + skein-hub-admin"
+            "iroh router started: automerge-repo + friendz + skein-blob-proxy + iroh-blobs + skein-hub-admin + skein-proxy"
         );
 
         // construct the change-driven blob snatcher.

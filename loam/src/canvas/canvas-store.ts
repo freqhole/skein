@@ -12,6 +12,7 @@ import type {
 import { canvasRoleSchema, emptyCanvasDoc } from "./canvas-doc";
 import { resolveDocReady } from "../p2p/doc-ready";
 import { normalizeCanvasDoc } from "./automerge-values";
+import type { FriendEntry } from "../../widgets/narthex/social/schema";
 
 /**
  * default bound for `CanvasStore.open()` when a caller passes no
@@ -378,6 +379,33 @@ export class CanvasStore {
    *  canvas (see `CanvasDocument.hubNodeIds`). */
   isHubNode(nodeId: string): boolean {
     return (this.doc().hubNodeIds ?? []).includes(nodeId);
+  }
+
+  /**
+   * backfill `hubNodeIds` for any current canvas peer who's a known hub
+   * friend but never went through the one path that used to populate it
+   * (the manual "invite friend" button in the share dialog, see
+   * `addHubNodeId()`'s only call site in boot.ts) — e.g. a hub that
+   * auto-accepted a reciprocal friend request, or whose `isHub` flag was
+   * only confirmed later via a profile response. matches peers against
+   * `friends` by any of a friend's `nodeIds` entries (same lookup pattern
+   * as `isFriend()` in friendz-bridge.ts). safe to call repeatedly —
+   * delegates to `addHubNodeId()`, itself a dedupe/no-op-if-present.
+   */
+  reconcileHubNodeIds(friends: FriendEntry[]): void {
+    const hubFriendNodeIds = new Set<string>();
+    for (const friend of friends) {
+      if (friend.isHub !== true) continue;
+      for (const n of friend.nodeIds ?? []) {
+        if (n.nodeId) hubFriendNodeIds.add(n.nodeId);
+      }
+    }
+    if (hubFriendNodeIds.size === 0) return;
+    for (const nodeId of Object.keys(this.peers())) {
+      if (hubFriendNodeIds.has(nodeId) && !this.isHubNode(nodeId)) {
+        this.addHubNodeId(nodeId);
+      }
+    }
   }
 
   // -- access control ----------------------------------------------------------

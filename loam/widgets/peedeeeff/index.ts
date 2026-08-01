@@ -1,5 +1,7 @@
 /**
- * peedeeeff widget — PDF page viewer with navigation, snatch, and save/reveal.
+ * peedeeeff widget — document page viewer with navigation, snatch, and
+ * save/reveal. accepts pdf, postscript (ps/eps), and plain text documents;
+ * all are rasterized page-by-page via the same rust-side magick pipeline.
  *
  * this is the orchestrator module. it wires together:
  * - types.ts — schema, types, constants
@@ -12,9 +14,8 @@ import { Container, Graphics, Text } from "pixi.js";
 import { log } from "@freqhole/reliquary/utils";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import {
-  getDocumentPages,
   getLocalNodeId,
-  pickPdfFile,
+  pickDocumentFile,
   uploadFile,
   type PeersMap,
 } from "../../src/widgets/file-utils";
@@ -27,6 +28,12 @@ import type {
 } from "../../src/widgets/widget-types";
 import { createPillButton, drawChevron, drawGoToStartButton, fitSpriteToRegion } from "./drawing";
 import { createPageCache } from "./pages";
+import {
+  releaseProcessingClaim,
+  renderAndPopulatePages,
+  tryClaimProcessing,
+  type RenderableDoc,
+} from "./render-client";
 import { checkPdfLocality, revealPdfInFinder, savePdfToDisk, snatchPdfContent } from "./snatch";
 import {
   clamp,
@@ -47,15 +54,15 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
   type: "peedeeeff",
   metadata: {
     name: "peedeeeff",
-    description: "PDF page viewer — displays rendered document pages with navigation",
-    version: "0.3.0",
+    description: "document page viewer — displays rendered document pages with navigation",
+    version: "0.4.0",
     category: "media",
     defaultWidth: 480,
     defaultHeight: 640,
-    // pdf rendering requires the native (rust/imagemagick) pipeline. browser
-    // peers can still receive existing peedeeeff widgets via automerge sync,
-    // but they can't add a new one from scratch.
-    tauriOnly: true,
+    // rendering itself still requires the native (rust/imagemagick)
+    // pipeline, but browser peers can now ask a hub/tauri peer to render
+    // on their behalf over the skein/1 proxy protocol (see
+    // resumeProcessingIfNeeded/handleUpload below) — no longer tauri-only.
   },
   schema: peedeeeffSchema,
   editableProps: [
@@ -81,6 +88,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
 
   getCompactInfo: (state: PeedeeeffState): CompactInfo => ({
     label: state.filename || "document",
+    thumbnailUrl: state.thumbnailDataUrl || undefined,
     blobId: state.blobId || undefined,
     mime: state.mime || undefined,
     filename: state.filename || undefined,
@@ -161,7 +169,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
     container.addChild(placeholderBorder);
 
     const placeholderText = new Text({
-      text: iAmCreator ? "click to upload PDF" : "waiting for document",
+      text: iAmCreator ? "click to upload document" : "waiting for document",
       style: {
         fontFamily: "system-ui, sans-serif",
         fontSize: 13,
@@ -354,7 +362,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
         placeholderBorder.visible = false;
         placeholderText.visible = false;
         if (actionState === "remote" || actionState === "checking") {
-          statusText.text = "PDF pages not available\nsnatch to download";
+          statusText.text = "document pages not available\nsnatch to download";
           statusText.visible = true;
           snatchBtn.setVisible(actionState === "remote");
         } else if (actionState === "snatching") {
@@ -913,6 +921,55 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
     }
 
     // -----------------------------------------------------------------------
+    // hub/peer-driven rendering — browser peers have no native rendering
+    // backend, so they ask a hub (preferred) or tauri peer to render pages
+    // over the skein/1 proxy protocol. see types.ts's processingClaimedBy/
+    // processingClaimedAt doc comment for why the claim is best-effort only.
+    // shared with non-mounted contexts (multi-file auto-bin creation) via
+    // render-client.ts — see its doc comment.
+    // -----------------------------------------------------------------------
+
+    const renderableDoc: RenderableDoc = {
+      current: () => ctx.doc.current,
+      change: (fn) => ctx.doc.change(fn),
+    };
+
+    /**
+     * called at mount time when a document is uploaded but not yet
+     * rendered (e.g. the uploading peer went offline mid-render, or was a
+     * browser peer that could only kick off the request, not perform it
+     * locally). only the peer that wins the claim actually issues render
+     * requests — everyone else just waits for the doc to sync in the
+     * result via the normal automerge change subscription.
+     */
+    const resumeProcessingIfNeeded = async () => {
+      const state = ctx.doc.current;
+      if (!state.blobId || state.pageBlobIds.length > 0) return;
+      if (!tryClaimProcessing(renderableDoc, ctx.canvasStore)) return;
+
+      statusText.text = "processing pages...";
+      statusText.visible = true;
+
+      try {
+        const ok = await renderAndPopulatePages(renderableDoc, state.blobId, ctx.canvasStore, {
+          isDestroyed: () => destroyed,
+          onTick: (attempt) => {
+            if (destroyed) return;
+            statusText.text = `processing pages... (${attempt + 1}s)`;
+          },
+        });
+        if (ok) {
+          actionState = "local";
+          updateHeaderActions();
+        } else if (!destroyed) {
+          statusText.text = "page rendering in progress...";
+        }
+      } finally {
+        if (!destroyed) releaseProcessingClaim(renderableDoc, ctx.canvasStore);
+      }
+    };
+
+    // -----------------------------------------------------------------------
     // upload handler (placeholder click)
     // -----------------------------------------------------------------------
 
@@ -923,7 +980,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
       if (!iAmCreator) return;
 
       try {
-        const picked = await pickPdfFile();
+        const picked = await pickDocumentFile();
         if (!picked) return;
 
         // show uploading state
@@ -933,7 +990,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
 
         const result = await uploadFile(picked, { waitForCompletion: true });
 
-        // write the PDF blob info into the doc immediately
+        // write the document blob info into the doc immediately
         ctx.doc.change((draft) => {
           draft.blobId = result.blobId;
           draft.filename = picked.filename;
@@ -942,42 +999,43 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
           draft.size = result.size;
         });
 
+        // set widget title from filename (strip the extension) right away
+        // — don't wait on rendering, which may take a while or fail.
+        const title = picked.filename.replace(/\.[^./\\]+$/, "");
+        ctx.canvasStore?.setWidgetTitle(ctx.widgetId, title);
+
+        if (!tryClaimProcessing(renderableDoc, ctx.canvasStore)) {
+          // someone else is already processing this — just wait for sync.
+          placeholderText.visible = false;
+          statusText.text = "processing pages...";
+          statusText.visible = true;
+          return;
+        }
+
         // now poll for rendered page images
         placeholderText.visible = false;
         statusText.text = "processing pages...";
         statusText.visible = true;
 
-        const maxAttempts = 60;
-        const pollIntervalMs = 1000;
+        let ok = false;
+        try {
+          ok = await renderAndPopulatePages(renderableDoc, result.blobId, ctx.canvasStore, {
+            isDestroyed: () => destroyed,
+            onTick: (attempt) => {
+              if (destroyed) return;
+              statusText.text = `processing pages... (${attempt + 1}s)`;
+            },
+          });
+        } finally {
+          if (!destroyed) releaseProcessingClaim(renderableDoc, ctx.canvasStore);
+        }
 
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-          await new Promise((r) => setTimeout(r, pollIntervalMs));
-
-          const pages = await getDocumentPages(result.blobId);
-          if (pages.length > 0) {
-            // pages are ready — populate the widget doc (including blake3)
-            const blobIds = pages.map((p) => p.page_blob_id);
-            const blake3s = pages.map((p) => p.blake3 || "");
-            const totalPagesCount = pages[0]?.total_pages ?? pages.length;
-
-            ctx.doc.change((draft) => {
-              draft.pageBlobIds = blobIds;
-              draft.pageBlake3s = blake3s;
-              draft.pageCount = totalPagesCount;
-              draft.currentPage = 0;
-            });
-
-            // set widget title from filename (strip .pdf extension)
-            const title = picked.filename.replace(/\.pdf$/i, "");
-            ctx.canvasStore?.setWidgetTitle(ctx.widgetId, title);
-
-            // mark as local since we just uploaded
-            actionState = "local";
-            updateHeaderActions();
-            return;
-          }
-
-          statusText.text = `processing pages... (${attempt + 1}s)`;
+        if (ok) {
+          // mark as local since we just uploaded (or a peer just rendered
+          // for us and the result is already in the doc).
+          actionState = "local";
+          updateHeaderActions();
+          return;
         }
 
         // timed out
@@ -1171,6 +1229,12 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
     } else {
       // have a blob or pages — check locality
       doLocalityCheck();
+
+      // a document was uploaded but never got rendered (e.g. the uploader
+      // went offline mid-render) — try to pick up the job.
+      if (initState.blobId && initState.pageBlobIds.length === 0) {
+        void resumeProcessingIfNeeded();
+      }
     }
 
     // start the nav hide timer

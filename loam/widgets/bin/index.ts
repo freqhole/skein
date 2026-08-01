@@ -1,9 +1,16 @@
-import type { DocumentId, Repo } from "@automerge/automerge-repo";
+import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics, Sprite, Text, Texture, Assets } from "pixi.js";
 
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
-import { getThumbnailDataUrl, pickFiles, uploadFile } from "../../src/widgets/file-utils";
+import {
+  getThumbnailDataUrl,
+  isDocumentFilename,
+  pickFiles,
+  uploadFile,
+} from "../../src/widgets/file-utils";
 import { fileSchema } from "../file";
+import { kickOffDocumentProcessing } from "../peedeeeff/render-client";
+import { peedeeeffSchema, type PeedeeeffState } from "../peedeeeff/types";
 import { snatchAllInBin } from "./bin-actions";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import type {
@@ -433,11 +440,14 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
           slot = { col: 0, row: totalRows };
         }
 
-        // create a child file widget entry in the canvas doc
+        // create a child widget entry in the canvas doc — document files
+        // (pdf/ps/eps/txt) become peedeeeff children instead of plain file
+        // children, per the multi-file-upload auto-doc-widget feature.
         const childId = crypto.randomUUID();
+        const isDoc = isDocumentFilename(file.filename);
         store.addWidget({
           id: childId,
-          type: "file",
+          type: isDoc ? "peedeeeff" : "file",
           x: 0,
           y: 0,
           width: 200,
@@ -451,7 +461,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
         // the widget manager skips widgets with parentId, so no automerge doc
         // was created during reconcile. create the per-widget doc ourselves.
-        const defaults = fileSchema.parse({});
+        const defaults = isDoc ? peedeeeffSchema.parse({}) : fileSchema.parse({});
         const docHandle = repo.create(defaults);
         store.setDocId(childId, docHandle.documentId);
 
@@ -460,23 +470,18 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
         try {
           const result = await uploadFile(file, { waitForCompletion: true });
 
-          // write directly into the handle we already hold (no re-find needed)
-          docHandle.change((draft: any) => {
-            draft.blobId = result.blobId;
-            draft.domain = result.domain;
-            draft.filename = file.filename;
-            draft.mime = result.mime;
-            draft.size = result.size;
-            draft.blake3 = result.blake3 ?? "";
-            draft.thumbnailDataUrl = result.thumbnailDataUrl ?? "";
-          });
+          if (isDoc) {
+            docHandle.change((draft: any) => {
+              draft.blobId = result.blobId;
+              draft.filename = file.filename;
+              draft.mime = result.mime;
+              draft.size = result.size;
+              draft.blake3 = result.blake3 ?? "";
+            });
 
-          // video/audio/pdf thumbnails need ffmpeg/magick, so they're never
-          // ready synchronously at upload time. a bin never mounts its
-          // children's full widget lifecycle (it only reads the persisted
-          // doc via getCompactInfo), so nothing else will ever generate and
-          // persist one later - fetch and write it now, best-effort.
-          if (!result.thumbnailDataUrl) {
+            // best-effort persisted thumbnail — see peedeeeff's
+            // thumbnailDataUrl doc comment for why this is needed at all
+            // (bins never mount a child's full widget lifecycle).
             try {
               const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200 });
               if (thumbDataUrl) {
@@ -485,8 +490,54 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
                 });
               }
             } catch {
-              // thumbnail generation is best-effort — don't fail the upload
-              log.debug("bin", "thumbnail generation failed for", result.blobId);
+              log.debug("bin", "doc thumbnail generation failed for", result.blobId);
+            }
+
+            // kick off page rendering (hub/peer proxy in browser mode, local
+            // dispatch in tauri mode) — fire-and-forget so it doesn't block
+            // the rest of the batch; nobody will ever mount this widget to
+            // trigger it otherwise, since it lives in a bin.
+            // docHandle's declared type is a union (isDoc ? peedeeeff : file schema)
+            // so it needs a narrowing cast here — we're inside the isDoc branch, so
+            // it's always a peedeeeff doc at runtime.
+            const peedeeeffDocHandle = docHandle as unknown as DocHandle<PeedeeeffState>;
+            void kickOffDocumentProcessing(
+              {
+                current: () => peedeeeffDocHandle.doc(),
+                change: (fn) => peedeeeffDocHandle.change(fn),
+              },
+              result.blobId,
+              store
+            );
+          } else {
+            // write directly into the handle we already hold (no re-find needed)
+            docHandle.change((draft: any) => {
+              draft.blobId = result.blobId;
+              draft.domain = result.domain;
+              draft.filename = file.filename;
+              draft.mime = result.mime;
+              draft.size = result.size;
+              draft.blake3 = result.blake3 ?? "";
+              draft.thumbnailDataUrl = result.thumbnailDataUrl ?? "";
+            });
+
+            // video/audio/pdf thumbnails need ffmpeg/magick, so they're never
+            // ready synchronously at upload time. a bin never mounts its
+            // children's full widget lifecycle (it only reads the persisted
+            // doc via getCompactInfo), so nothing else will ever generate and
+            // persist one later - fetch and write it now, best-effort.
+            if (!result.thumbnailDataUrl) {
+              try {
+                const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200 });
+                if (thumbDataUrl) {
+                  docHandle.change((draft: any) => {
+                    draft.thumbnailDataUrl = thumbDataUrl;
+                  });
+                }
+              } catch {
+                // thumbnail generation is best-effort — don't fail the upload
+                log.debug("bin", "thumbnail generation failed for", result.blobId);
+              }
             }
           }
 

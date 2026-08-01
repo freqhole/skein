@@ -49,6 +49,7 @@ import { createCanvasScopedSharePolicy } from "../p2p/canvas-scoped-share-policy
 import { buildShareUrl, decodeShareString, encodeShareString } from "../p2p/share-string";
 import { resolveFriendDisplay, SqliteSocialDoc } from "../p2p/sqlite-social-doc";
 import { dispatch, isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
+import { setPandocFormatsAvailable } from "../widgets/file-utils";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
 import { createSkeinHarness, type SkeinHarnessNoStore } from "../harness/skein-harness";
 import { syncCanvasMetadataToCards, watchCanvasDocsForUpdates } from "./canvas-watchers";
@@ -391,12 +392,15 @@ class SkeinRouter {
     }
     this.anonDeviceId = await getOrCreateAnonDeviceId();
 
-    // peedeeeff (pdf viewer) needs the rust-side `magick` binary to render
-    // pages — hide it from the flyout entirely when it's missing, rather
-    // than letting users add a widget that can never render anything. only
-    // relevant in tauri mode (browser mode already hides it via
-    // `tauriOnly`). best-effort: a dispatch failure here must not block
-    // boot, so peedeeeff just stays visible and fails per-widget instead.
+    // peedeeeff (document viewer) needs the rust-side `magick` binary to
+    // render pages locally — hide it from the flyout entirely when it's
+    // missing in tauri mode, rather than letting users add a widget that
+    // can never render anything on its own. browser peers can still add it
+    // — they ask a hub/tauri peer to render on their behalf over the
+    // skein/1 proxy protocol (see peedeeeff/index.ts's handleUpload /
+    // resumeProcessingIfNeeded) — so this check doesn't apply to them.
+    // best-effort: a dispatch failure here must not block boot, so
+    // peedeeeff just stays visible and fails per-widget instead.
     if (isTauriMode()) {
       try {
         const result = await dispatch("pdf_check_available");
@@ -406,7 +410,19 @@ class SkeinRouter {
       } catch (err) {
         log.debug(TAG, "pdf_check_available dispatch failed (non-fatal):", err);
       }
+
+      // additional-formats probe (epub/docx/odt/rtf/md/html) — purely
+      // additive, doesn't affect the hard pdf/ps/txt gate above. browser
+      // mode always offers the broader list (see file-utils.ts's default),
+      // since rendering there is delegated to a peer regardless.
+      try {
+        const result = await dispatch("pandoc_check_available");
+        setPandocFormatsAvailable(!!result?.available);
+      } catch (err) {
+        log.debug(TAG, "pandoc_check_available dispatch failed (non-fatal):", err);
+      }
     }
+
 
     // resolve or create the narthex document id
     this.narthexDocId = await getMetaValue(NARTHEX_DOC_KEY);
@@ -1499,6 +1515,14 @@ class SkeinRouter {
           // bug: pending-invite/role/accepted-state changes never showed up
           // in an already-open share dialog).
           const buildShareOptions = (): ShareDialogOptions => {
+          // self-heal canvases where a hub friend ended up as a peer
+          // through any path other than the manual "invite friend" button
+          // (auto-accepted reciprocal request, friend-accept message,
+          // profile-response correcting isHub, or just already being a
+          // synced peer) — see `CanvasStore.reconcileHubNodeIds()`'s doc
+          // comment. cheap/no-op when there's nothing to backfill, so
+          // safe to run on every dialog (re)build.
+          this.currentCanvas!.store.reconcileHubNodeIds(this.socialDoc?.current?.friends ?? []);
           // hub node ids this canvas has been explicitly shared with (see
           // canvas-doc.ts's `hubNodeIds`) — recomputed fresh each rebuild so
           // the link picks up a hub invited *after* the dialog was opened,

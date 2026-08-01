@@ -10,7 +10,8 @@
  * locally (e.g. a peer uploaded it), we proxy the thumbnail request
  * through connected canvas peers via the node's proxy_request method (a
  * skein/1 stream exchange, real for a tauri node - see tauri-transport.ts -
- * and a no-op for a browser node, which has no working skein/1 sender).
+ * and via `p2p/skein-proxy-client.ts`'s `open_bi`-based sender for a
+ * browser node).
  *
  * snatch: download a full blob from a canvas peer via iroh-blobs verified
  * transfer, then ingest it into the local grimoire (creating a media_blobz
@@ -30,6 +31,11 @@
 import { dispatch, isTauriMode } from "../p2p/tauri-transport";
 import { log } from "@freqhole/reliquary/utils";
 import { getStoredIdentity, getMiddenNode } from "../p2p/identity";
+import {
+  requestDocumentPagesFromPeers,
+  sendSkeinProxyRequest,
+  type SkeinProxyNode,
+} from "../p2p/skein-proxy-client";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save, open } from "@tauri-apps/plugin-dialog";
@@ -103,7 +109,19 @@ function guessMimeFromFilename(filename: string): string {
     case "txt":
       return "text/plain";
     case "md":
+    case "markdown":
       return "text/markdown";
+    case "epub":
+      return "application/epub+zip";
+    case "docx":
+      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    case "odt":
+      return "application/vnd.oasis.opendocument.text";
+    case "rtf":
+      return "application/rtf";
+    case "html":
+    case "htm":
+      return "text/html";
     case "json":
       return "application/json";
     default:
@@ -1731,11 +1749,16 @@ export async function getLocalBlobUrl(blobId: string, blake3?: string): Promise<
 }
 
 /**
- * fetch the list of rendered page image blobs for a PDF document.
+ * fetch the list of rendered page image blobs for a document.
  * returns an array of page info objects, or an empty array if no pages
- * are available yet (the rendering job may still be running).
+ * are available yet (the rendering job may still be running, or — in
+ * browser mode — no candidate peer could be reached).
  *
- * only works in Tauri mode — browser peers don't have direct grimoire access.
+ * in tauri mode, renders locally via the `pdf_render_pages` dispatch (the
+ * tauri host itself has the imagemagick/ghostscript pipeline). in browser
+ * mode, `peerNodeIds` (hub peers should be listed first) are tried in
+ * order over the `skein/1` proxy protocol — see `p2p/skein-proxy-client.ts`
+ * — since a browser peer has no native rendering backend of its own.
  */
 export interface DocumentPageInfo {
   page_blob_id: string;
@@ -1747,29 +1770,47 @@ export interface DocumentPageInfo {
   filename: string | null;
 }
 
-export async function getDocumentPages(blobId: string): Promise<DocumentPageInfo[]> {
-  if (!isTauriMode()) {
-    return [];
-  }
-
-  // session cache — pdf rendering is expensive, and the peedeeeff widget
-  // polls this function repeatedly. cache the result by source blake3 so
-  // subsequent polls return immediately.
+export async function getDocumentPages(
+  blobId: string,
+  peerNodeIds: string[] = []
+): Promise<DocumentPageInfo[]> {
+  // session cache — document rendering is expensive, and the peedeeeff
+  // widget polls this function repeatedly. cache the result by source
+  // blake3 so subsequent polls return immediately.
   const cached = pdfPagesCache.get(blobId);
   if (cached) return cached;
 
-  try {
-    const pages = (await dispatch("pdf_render_pages", {
-      blake3: blobId,
-    })) as DocumentPageInfo[] | null;
+  if (isTauriMode()) {
+    try {
+      const pages = (await dispatch("pdf_render_pages", {
+        blake3: blobId,
+      })) as DocumentPageInfo[] | null;
 
-    const result = Array.isArray(pages) ? pages : [];
-    if (result.length > 0) {
-      pdfPagesCache.set(blobId, result);
+      const result = Array.isArray(pages) ? pages : [];
+      if (result.length > 0) {
+        pdfPagesCache.set(blobId, result);
+      }
+      return result;
+    } catch (err) {
+      log.warn(TAG, "getDocumentPages failed:", err);
+      return [];
     }
-    return result;
+  }
+
+  if (peerNodeIds.length === 0) {
+    return [];
+  }
+
+  try {
+    const node = (await getMiddenNode()) as unknown as SkeinProxyNode;
+    const pages = await requestDocumentPagesFromPeers(node, peerNodeIds, blobId);
+    if (pages && pages.length > 0) {
+      pdfPagesCache.set(blobId, pages);
+      return pages;
+    }
+    return [];
   } catch (err) {
-    log.warn(TAG, "getDocumentPages failed:", err);
+    log.warn(TAG, "getDocumentPages: peer render request failed:", err);
     return [];
   }
 }
@@ -1800,24 +1841,85 @@ export async function pickFiles(): Promise<PickedFile[]> {
   return pickFilesBrowser();
 }
 
-/**
- * open a file picker filtered to PDF files only.
- * in Tauri mode, uses the native dialog with a .pdf extension filter.
- * in browser mode, uses a hidden input with accept=".pdf".
- * returns null if the user cancels.
- */
-export async function pickPdfFile(): Promise<PickedFile | null> {
-  if (isTauriMode()) {
-    return pickPdfFileTauri();
-  }
-  return pickPdfFileBrowser();
+/** extensions the peedeeeff widget can rasterize directly via magick+gs —
+ *  kept in sync with `pickDocumentFile`'s dialog filter/accept list below.
+ *  always available in tauri mode (gated separately at boot by
+ *  `pdf_check_available`, which hides the whole widget if magick/gs are
+ *  missing) and always offered in browser mode (rendering is delegated to
+ *  a hub/tauri peer regardless — see file-utils.ts's `getDocumentPages`). */
+const DOCUMENT_EXTENSIONS = new Set(["pdf", "ps", "eps", "txt", "text", "log"]);
+
+/** additional formats rasterizable only when `pandoc` + `typst` are both
+ *  available (converted to pdf first, then rasterized via the same
+ *  magick+gs pipeline as a native pdf — see tauri's `pdf.rs`). gated by
+ *  `pandocFormatsAvailable` in tauri mode (probed at boot, see boot.ts's
+ *  `pandoc_check_available` dispatch); always offered in browser mode,
+ *  since rendering there is always delegated to a peer anyway. */
+const PANDOC_DOCUMENT_EXTENSIONS = new Set([
+  "epub",
+  "docx",
+  "odt",
+  "rtf",
+  "md",
+  "markdown",
+  "html",
+  "htm",
+]);
+
+/** whether the local tauri host has `pandoc` + `typst` available — set once
+ *  at boot (see boot.ts) via a `pandoc_check_available` dispatch. defaults
+ *  to `true` so browser mode (which never calls the setter, since it has no
+ *  local backend to probe and always delegates rendering to a peer instead)
+ *  offers the broader format list unconditionally. */
+let pandocFormatsAvailable = true;
+
+/** set from boot.ts once the local `pandoc_check_available` capability
+ *  probe resolves (tauri mode only). */
+export function setPandocFormatsAvailable(available: boolean): void {
+  pandocFormatsAvailable = available;
 }
 
-async function pickPdfFileTauri(): Promise<PickedFile | null> {
+/**
+ * true if `filename`'s extension matches a format the peedeeeff widget can
+ * rasterize (pdf, postscript, plain text, and — when pandoc+typst are
+ * available — epub/docx/odt/rtf/md/html). used to route document files to
+ * an auto-created peedeeeff widget during multi-file uploads.
+ */
+export function isDocumentFilename(filename: string): boolean {
+  const ext = filename.split(".").pop()?.toLowerCase();
+  if (!ext) return false;
+  if (DOCUMENT_EXTENSIONS.has(ext)) return true;
+  return pandocFormatsAvailable && PANDOC_DOCUMENT_EXTENSIONS.has(ext);
+}
+
+/**
+ * open a file picker filtered to document formats the peedeeeff widget can
+ * rasterize: pdf, postscript (ps/eps), plain text, and — when pandoc+typst
+ * are available — epub/docx/odt/rtf/md/html (converted to pdf first). in
+ * Tauri mode, uses the native dialog with an extension filter. in browser
+ * mode, uses a hidden input with a matching `accept` list. returns null if
+ * the user cancels.
+ */
+export async function pickDocumentFile(): Promise<PickedFile | null> {
+  if (isTauriMode()) {
+    return pickDocumentFileTauri();
+  }
+  return pickDocumentFileBrowser();
+}
+
+function documentPickerExtensions(): string[] {
+  const extensions = [...DOCUMENT_EXTENSIONS];
+  if (pandocFormatsAvailable) {
+    extensions.push(...PANDOC_DOCUMENT_EXTENSIONS);
+  }
+  return extensions;
+}
+
+async function pickDocumentFileTauri(): Promise<PickedFile | null> {
   try {
     const result = await open({
       multiple: false,
-      filters: [{ name: "PDF", extensions: ["pdf"] }],
+      filters: [{ name: "documents", extensions: documentPickerExtensions() }],
     });
 
     if (result === null) return null;
@@ -1834,16 +1936,19 @@ async function pickPdfFileTauri(): Promise<PickedFile | null> {
       file: null,
     };
   } catch (err) {
-    log.error(TAG, "PDF file picker failed:", err);
+    log.error(TAG, "document file picker failed:", err);
     return null;
   }
 }
 
-async function pickPdfFileBrowser(): Promise<PickedFile | null> {
+async function pickDocumentFileBrowser(): Promise<PickedFile | null> {
   const input = document.createElement("input");
   input.type = "file";
-  input.accept = ".pdf,application/pdf";
+  input.accept = documentPickerExtensions()
+    .map((ext) => `.${ext}`)
+    .join(",");
   input.style.display = "none";
+
 
   document.body.appendChild(input);
 
@@ -2264,10 +2369,11 @@ async function fetchThumbnailLocal(blobId: string, size: number): Promise<string
 /**
  * try fetching thumbnail data by proxying the request through canvas peers.
  * iterates connected peers and tries each one until one succeeds.
- * uses the same /api/blobs/thumbnail_data endpoint on the remote side
- * via the node's proxy_request method, so the peer does all the thumbnail
- * chain walking. only a tauri node's proxy_request (skein/1) actually
- * reaches a peer - a browser node's proxy_request has no working sender.
+ * uses the same /api/blobs/thumbnail_data endpoint on the remote side via
+ * the skein/1 proxy protocol (`p2p/skein-proxy-client.ts`), so the peer
+ * does all the thumbnail chain walking. works for both tauri and browser
+ * nodes — both support the underlying `open_bi` primitive the client
+ * builds on.
  */
 async function fetchThumbnailFromPeers(
   blobId: string,
@@ -2281,29 +2387,20 @@ async function fetchThumbnailFromPeers(
   }
 
   try {
-    const node = await getMiddenNode();
-    const nodeAny = node as any;
-
-    if (typeof nodeAny.proxy_request !== "function") {
-      return null;
-    }
+    const node = (await getMiddenNode()) as unknown as SkeinProxyNode;
 
     const fetchFromPeer = async (peerAddr: string): Promise<string> => {
-      const result = await withPeerTimeout<any>(
-        nodeAny.proxy_request(
-          peerAddr,
-          "POST",
-          "/api/blobs/thumbnail_data",
-          JSON.stringify({ blob_id: blobId, size })
-        )
+      const result = await withPeerTimeout(
+        sendSkeinProxyRequest(node, peerAddr, "POST", "/api/blobs/thumbnail_data", {
+          blob_id: blobId,
+          size,
+        })
       );
 
       if (result.status !== 200) throw new Error("non-200 status");
+      if (!result.body.success || !result.body.data) throw new Error("unsuccessful response");
 
-      const parsed = JSON.parse(result.body);
-      if (!parsed.success || !parsed.data) throw new Error("unsuccessful response");
-
-      const { data, mime } = parsed.data;
+      const { data, mime } = result.body.data as { data?: string; mime?: string };
       if (!data || !mime) throw new Error("missing data or mime");
 
       log.debug(

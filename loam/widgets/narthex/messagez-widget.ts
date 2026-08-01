@@ -2139,30 +2139,45 @@ export const messagezWidget: WidgetFactory<typeof messagezSchema> = {
 
       if (staleInvites.length > 0 || staleShares.length > 0 || staleDeletions.length > 0) {
         ctx.doc.change((draft) => {
+          // mutate arrays in place (splice) instead of reassigning to a
+          // filtered copy - automerge throws "RangeError: Cannot create a
+          // reference to an existing document object" if a doc array is
+          // reassigned to a new array built from its own doc-owned elements.
           if (staleInvites.length > 0) {
-            draft.invites = draft.invites.filter(
-              (inv: CanvasInvite) =>
-                inv.status === "pending" ||
-                !inv.receivedAt ||
-                now - new Date(inv.receivedAt).getTime() <= CLEANUP_MS
-            );
+            for (let i = draft.invites.length - 1; i >= 0; i--) {
+              const inv = draft.invites[i];
+              if (
+                inv.status !== "pending" &&
+                inv.receivedAt &&
+                now - new Date(inv.receivedAt).getTime() > CLEANUP_MS
+              ) {
+                draft.invites.splice(i, 1);
+              }
+            }
           }
           if (staleShares.length > 0) {
-            // #TODO: FIX THIS, is throwing RangeError: Cannot create a reference to an existing document object
-            // draft.shares = draft.shares.filter(
-            //   (s: CanvasShare) =>
-            //     (!s.accepted && !s.declined) ||
-            //     !s.sentAt ||
-            //     now - new Date(s.sentAt).getTime() <= CLEANUP_MS
-            // );
+            for (let i = draft.shares.length - 1; i >= 0; i--) {
+              const s = draft.shares[i];
+              if (
+                (s.accepted || s.declined) &&
+                s.sentAt &&
+                now - new Date(s.sentAt).getTime() > CLEANUP_MS
+              ) {
+                draft.shares.splice(i, 1);
+              }
+            }
           }
           if (staleDeletions.length > 0) {
-            draft.deletions = draft.deletions.filter(
-              (d: CanvasDeletedNotif) =>
-                d.status !== "dismissed" ||
-                !d.deletedAt ||
-                now - new Date(d.deletedAt).getTime() <= CLEANUP_MS
-            );
+            for (let i = draft.deletions.length - 1; i >= 0; i--) {
+              const d = draft.deletions[i];
+              if (
+                d.status === "dismissed" &&
+                d.deletedAt &&
+                now - new Date(d.deletedAt).getTime() > CLEANUP_MS
+              ) {
+                draft.deletions.splice(i, 1);
+              }
+            }
           }
         });
       }

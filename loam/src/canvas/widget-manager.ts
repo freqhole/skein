@@ -3,7 +3,7 @@ import { Container, Graphics } from "pixi.js";
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { KeyboardDriver } from "../widgets/keyboard-driver";
 import { createWidgetDoc } from "../widgets/widget-doc";
-import { resolveDocReadyCached, watchDocReady } from "../p2p/doc-ready";
+import { markResolved, resolveDocReadyCached, watchDocReady } from "../p2p/doc-ready";
 import type { WidgetRegistry } from "../widgets/widget-registry";
 import type { WidgetController, WidgetDoc, WidgetMountContext } from "../widgets/widget-types";
 import type { CanvasDocument, WidgetEntry } from "./canvas-doc";
@@ -514,6 +514,16 @@ export class WidgetManager {
           const cancel = watchDocReady(this.repo, entry.docId as DocumentId, () => {
             this.crashedRetryWatchers.delete(entry.id);
             if (this.liveWidgets.get(entry.id)?.crashed) {
+              // watchDocReady just confirmed the doc is actually ready, but
+              // resolveDocReadyCached's negative-result cache doesn't know
+              // that yet (it can still be inside the cooldown window from
+              // the failed attempt above) — without clearing it here,
+              // mountWidget()'s retry would short-circuit back to null
+              // immediately, re-crash, and re-arm another watchDocReady on
+              // this same already-ready handle, which fires instantly and
+              // repeats forever (a tight infinite loop, no delay between
+              // iterations, observed to crash the tab).
+              markResolved(entry.docId as string);
               this.unmountWidget(entry.id, false);
               void this.mountWidget(entry);
             }

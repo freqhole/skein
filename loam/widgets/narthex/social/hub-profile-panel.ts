@@ -1782,15 +1782,19 @@ export function mountHubProfilePanel(
           copyBtn.cursor = "pointer";
           copyBtn.x = textX + nodeIdText.width + 6;
           copyBtn.y = 17;
+          const copyLabelStyle = { fontFamily: FONT, fontSize: 8, fill: ACCENT };
           const copyLabel = new Text({
             text: "copy",
-            style: { fontFamily: FONT, fontSize: 8, fill: ACCENT },
+            style: copyLabelStyle,
             resolution: RESOLUTION,
           });
           copyLabel.eventMode = "none";
           const copyPadX = 5;
           const copyPadY = 2;
-          const copyW = copyLabel.width + copyPadX * 2;
+          // size the button for whichever label ("copy" / "copied!") is wider, so it
+          // never needs to resize (and never overflows) when the label swaps in.
+          const copiedLabelWidth = new Text({ text: "copied!", style: copyLabelStyle, resolution: RESOLUTION }).width;
+          const copyW = Math.max(copyLabel.width, copiedLabelWidth) + copyPadX * 2;
           const copyH = copyLabel.height + copyPadY * 2;
           const copyBg = new Graphics();
           copyBg.eventMode = "none";

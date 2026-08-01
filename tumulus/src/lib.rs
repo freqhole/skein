@@ -20,9 +20,11 @@ pub mod hub;
 pub mod hub_repo;
 
 pub mod maintenance;
+pub mod pdf;
 pub mod protocol;
 pub mod service;
 pub mod settingz;
 pub mod snatch;
 pub mod sync;
+pub mod thumbnail;
 pub mod userz;

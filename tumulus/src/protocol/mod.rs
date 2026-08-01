@@ -9,3 +9,4 @@
 
 pub mod blob_proxy;
 pub mod hub_admin;
+pub mod skein_proxy;
