@@ -2302,7 +2302,10 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       widgetInfoRows: () => {
         const state = ctx.doc.current;
         if (!state.blobId) return [];
-        const holders = (state.snatchedBy ?? []).map(String);
+        // dedupe: concurrent CRDT inserts of the same node id (e.g. two
+        // racing "record myself as a snatcher" writes) can leave the same
+        // id in `snatchedBy` more than once.
+        const holders = [...new Set((state.snatchedBy ?? []).map(String))];
         if (holders.length === 0) {
           return [{ label: "have it", value: "nobody yet" }];
         }
