@@ -14,7 +14,7 @@ import {
 import { fileSchema } from "../file";
 import { markdownSchema } from "../markdown";
 import { notepadSchema } from "../notepad";
-import { kickOffDocumentProcessing } from "../peedeeeff/render-client";
+import { kickOffDocumentProcessing, regenerateThumbnail } from "../peedeeeff/render-client";
 import { peedeeeffSchema, type PeedeeeffState } from "../peedeeeff/types";
 import { snatchAllInBin } from "./bin-actions";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
@@ -410,6 +410,27 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
     // -- add files flow ------------------------------------------------------
 
+    // best-effort: a peedeeeff widget dragged into a bin from elsewhere on
+    // the canvas may already have rendered pages but never got a thumbnail
+    // (e.g. created before auto-thumbnailing existed, or its own auto-set
+    // attempt failed) - regenerate one now so the bin doesn't show blank.
+    async function regenerateThumbnailIfMissing(widgetId: string) {
+      if (!store || !repo) return;
+      const entry = store.getWidget(widgetId);
+      if (!entry || entry.type !== "peedeeeff" || !entry.docId) return;
+      try {
+        const handle = await repo.find<PeedeeeffState>(entry.docId as any);
+        await handle.whenReady();
+        if (handle.doc()?.thumbnailDataUrl) return;
+        await regenerateThumbnail({
+          current: () => handle.doc(),
+          change: (fn) => handle.change(fn),
+        });
+      } catch {
+        log.debug("bin", "drop-time thumbnail regeneration failed for", widgetId);
+      }
+    }
+
     async function handleAddFiles() {
       if (!store || !repo) return;
       if (store.isLocalViewer()) return;
@@ -508,7 +529,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
             // thumbnailDataUrl doc comment for why this is needed at all
             // (bins never mount a child's full widget lifecycle).
             try {
-              const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200 });
+              const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200, square: true });
               if (thumbDataUrl) {
                 docHandle.change((draft: any) => {
                   draft.thumbnailDataUrl = thumbDataUrl;
@@ -1056,6 +1077,8 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
                 draft.items.push({ widgetId: draggedWidgetId, slot });
                 draft.rows = computeRows(draft.items.length, Math.max(1, draft.cols));
               });
+
+              void regenerateThumbnailIfMissing(draggedWidgetId);
 
               renderer?.showSlotHighlight(null);
               return true;

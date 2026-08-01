@@ -141,6 +141,12 @@ export class WidgetManager {
   /** callback to navigate home (narthex) — used as the first breadcrumb */
   private onNavigateHome: (() => void) | null = null;
 
+  /** ancestor canvas crumbs (narthex -> ... -> immediate parent), supplied by
+   *  the app-level router so it can track cross-canvas navigation history
+   *  (see boot.ts's `navHistory`). rendered between the "narthex" crumb and
+   *  this canvas's own title crumb — see updateBreadcrumbs(). */
+  private ancestorCrumbs: BreadcrumbItem[] = [];
+
   /** listeners notified on every tick of a live drag (own or batch) — see
    *  `onLiveMove()`. lets external UI anchored to a widget's screen
    *  position (the property tray, DOM text-input overlays) follow the
@@ -196,6 +202,13 @@ export class WidgetManager {
   /** set the navigate-home callback (shown as the "narthex" breadcrumb) */
   setNavigateHome(handler: (() => void) | null): void {
     this.onNavigateHome = handler;
+  }
+
+  /** set the ancestor canvas crumbs (narthex router history) and refresh the
+   *  breadcrumb bar immediately — see the `ancestorCrumbs` field doc comment. */
+  setAncestorCrumbs(crumbs: BreadcrumbItem[]): void {
+    this.ancestorCrumbs = crumbs;
+    this.updateBreadcrumbs();
   }
 
   /**
@@ -413,6 +426,12 @@ export class WidgetManager {
       const handler = this.onNavigateHome;
       crumbs.push({ label: "narthex", onClick: () => handler() });
     }
+
+    // ancestor canvas crumbs (cross-canvas navigation history) — bounded by
+    // the router (boot.ts) to at most one entry (the immediate parent) plus
+    // a leading non-clickable "..." when there's deeper history, so this
+    // never grows unbounded regardless of how many canvases were visited.
+    crumbs.push(...this.ancestorCrumbs);
 
     // canvas title crumb — on the narthex (no onNavigateHome), skip if untitled
     const canvasTitle = this.store.metadata().title;

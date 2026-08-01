@@ -16,6 +16,7 @@
     "frontendDist": "../loam/dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",

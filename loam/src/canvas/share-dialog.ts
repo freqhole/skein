@@ -616,7 +616,9 @@ function buildFriendInviteRow(
   rowHeight: number,
   actionBtnWidth: number,
   isRemoved: () => boolean,
-  onInvite?: (friend: FriendInfo, role: InvitableRole) => void | Promise<void>
+  onInvite?: (friend: FriendInfo, role: InvitableRole) => void | Promise<void>,
+  /** hub friends aren't invited with a member/viewer role — see buildPeerRow's isHubPeer. */
+  isHubFriend?: boolean
 ): { container: Container; nameText: Text } {
   const row = new Container();
 
@@ -676,10 +678,13 @@ function buildFriendInviteRow(
 
 
   // role toggle — chooses member (default) or viewer before inviting.
+  // hub friends skip this (hub role isn't a thing a sharer picks here).
   let selectedRole: InvitableRole = "member";
-  const roleToggle = buildRoleToggle(theme, selectedRole, (role) => {
-    selectedRole = role;
-  });
+  const roleToggle = isHubFriend
+    ? null
+    : buildRoleToggle(theme, selectedRole, (role) => {
+        selectedRole = role;
+      });
 
   // invite button — right-aligned, role toggle sits just to its left
   const inviteBtnText = new Text({
@@ -714,9 +719,11 @@ function buildFriendInviteRow(
   inviteBtn.y = (rowHeight - inviteH) / 2;
   row.addChild(inviteBtn);
 
-  roleToggle.container.x = inviteBtn.x - roleToggle.width - ROW_GAP;
-  roleToggle.container.y = (rowHeight - roleToggle.height) / 2;
-  row.addChild(roleToggle.container);
+  if (roleToggle) {
+    roleToggle.container.x = inviteBtn.x - roleToggle.width - ROW_GAP;
+    roleToggle.container.y = (rowHeight - roleToggle.height) / 2;
+    row.addChild(roleToggle.container);
+  }
 
   inviteBtn.onPress.connect(async () => {
     // show sending feedback
@@ -1301,7 +1308,8 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
         rowHeight,
         actionBtnWidth,
         isRemoved,
-        options.onInviteFriend
+        options.onInviteFriend,
+        /* isHubFriend */ true
       );
       friendRow.y = hubFriendY;
       hubFriendSection.addChild(friendRow);

@@ -51,7 +51,10 @@ import {
   classifyDomain,
   deleteBlob,
 } from "../storage/blob-store";
-import { generateThumbnailDataUrl as generateThumbnailDataUrlWorker } from "@freqhole/reliquary/worker";
+import {
+  generateThumbnailDataUrl as generateThumbnailDataUrlWorker,
+  resizeImageToWebpDataUrl,
+} from "@freqhole/reliquary/worker";
 import {
   discardPausedDownload as transferDiscardPausedDownload,
   pauseSnatchDownload as transferPauseSnatchDownload,
@@ -127,6 +130,35 @@ function guessMimeFromFilename(filename: string): string {
     default:
       return "application/octet-stream";
   }
+}
+
+/** magic-byte sniffing for video containers, used when a blob's mime is
+ *  missing/generic (`application/octet-stream` or empty) and the filename
+ *  has no (or an unknown) extension to guess from — this happens for
+ *  "snatched" (p2p-transferred) video files, since a browser's own `File`
+ *  object reports an empty `type` for extensionless files, and that empty
+ *  mime is what ends up synced into the widget's automerge doc and
+ *  re-used at snatch/download time. without a real mime, `<video>`
+ *  elements refuse to play the resulting blob: URL — browsers don't sniff
+ *  media container formats themselves the way they sniff e.g. images.
+ *  only covers the two container formats skein's own upload paths
+ *  actually produce (mp4/mov and webm) — returns null for anything else,
+ *  so callers should keep whatever mime they already had in that case. */
+export function sniffVideoMimeFromBytes(bytes: Uint8Array): string | null {
+  if (bytes.length < 12) return null;
+
+  // webm/mkv: EBML magic number 0x1A45DFA3
+  if (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) {
+    return "video/webm";
+  }
+
+  // mp4/mov/quicktime: an "ftyp" box at byte offset 4
+  if (bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
+    const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+    return brand.startsWith("qt") ? "video/quicktime" : "video/mp4";
+  }
+
+  return null;
 }
 
 /** decode a base64 string to a fresh Uint8Array. browser-native, no deps. */
@@ -323,6 +355,8 @@ export interface ThumbnailOptions {
   size?: number;
   /** canvas peers to try for P2P fallback — keys are peer IDs, values have nodeId */
   peers?: Record<string, { nodeId: string }>;
+  /** center-crop to a square instead of preserving aspect ratio (default: false) */
+  square?: boolean;
 }
 
 /** peers map type — extracted for reuse across functions */
@@ -406,8 +440,8 @@ const thumbnailCache = new Map<string, string>();
 /** session-scoped locality cache — avoids repeated IDB lookups for blobs we already know are local */
 const localityCache = new Map<string, BlobLocalityInfo>();
 
-function cacheKey(blobId: string, size: number): string {
-  return `${blobId}:${size}`;
+function cacheKey(blobId: string, size: number, square?: boolean): string {
+  return `${blobId}:${size}:${square ? "sq" : "nat"}`;
 }
 
 /**
@@ -988,6 +1022,19 @@ async function snatchFromBrowserPeer(
 
   if (downloaded.mime && downloaded.mime !== info.mime) {
     info = { ...info, mime: downloaded.mime };
+  }
+
+  // no usable mime from either the widget doc or the sender (common for a
+  // file that had no extension to begin with — see sniffVideoMimeFromBytes's
+  // doc comment) — sniff the actual bytes so the blob we're about to store
+  // locally gets a real mime, and every downstream playback path (OPFS blob
+  // URL, tauri asset URL, base64 fallback) just works without needing its
+  // own sniffing logic.
+  if (!info.mime || info.mime === "application/octet-stream") {
+    const sniffed = sniffVideoMimeFromBytes(downloaded.bytes);
+    if (sniffed) {
+      info = { ...info, mime: sniffed };
+    }
   }
 
   if (options?.signal?.aborted) {
@@ -2341,16 +2388,17 @@ export async function getThumbnailDataUrl(
   // support legacy call signature: getThumbnailDataUrl(blobId, 200)
   const opts: ThumbnailOptions = typeof options === "number" ? { size: options } : (options ?? {});
   const size = opts.size ?? 200;
+  const square = opts.square ?? false;
 
   // 1. check in-memory cache
-  const key = cacheKey(blobId, size);
+  const key = cacheKey(blobId, size, square);
   const cached = thumbnailCache.get(key);
   if (cached) {
     return cached;
   }
 
   // 2. try local grimoire (blob exists on this machine)
-  const localResult = await fetchThumbnailLocal(blobId, size);
+  const localResult = await fetchThumbnailLocal(blobId, size, square);
   if (localResult) {
     thumbnailCache.set(key, localResult);
     return localResult;
@@ -2373,7 +2421,11 @@ export async function getThumbnailDataUrl(
  * try fetching thumbnail data from the local grimoire instance.
  * returns a data URL on success, null on failure.
  */
-async function fetchThumbnailLocal(blobId: string, size: number): Promise<string | null> {
+async function fetchThumbnailLocal(
+  blobId: string,
+  size: number,
+  square = false
+): Promise<string | null> {
   if (!isTauriMode()) {
     // browser mode: try generating thumbnail from OPFS data.
     // use resolveBlob to handle the case where the automerge doc's blobId
@@ -2390,6 +2442,14 @@ async function fetchThumbnailLocal(blobId: string, size: number): Promise<string
       if (!data) return null;
 
       const blob = new Blob([data], { type: record.mime });
+      if (square) {
+        return await resizeImageToWebpDataUrl(blob, {
+          maxWidth: size,
+          maxHeight: size,
+          quality: 0.75,
+          cropSquare: true,
+        });
+      }
       return await generateThumbnailDataUrl(blob, size);
     } catch {
       return null;

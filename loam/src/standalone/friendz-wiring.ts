@@ -26,6 +26,7 @@ import { DEFAULT_ENSURE_ALPN } from "@freqhole/reliquary/ensure";
 import { isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
 import { log } from "@freqhole/reliquary/utils";
 import { getBlobRecordByBlake3 } from "../storage/blob-store";
+import { playFriendOnlineSound, playFriendRequestSound, playNewMessageSound } from "../sfx";
 
 export interface FriendzWiringDeps {
   repo: Repo;
@@ -484,6 +485,7 @@ export async function initFriendzWiring(
       return;
     }
 
+    let isNewInvite = false;
     messagezHandle.change((draft: any) => {
       if (!draft.invites) draft.invites = [];
 
@@ -524,6 +526,7 @@ export async function initFriendzWiring(
       };
 
       draft.invites.push(inviteRecord);
+      isNewInvite = true;
       log.debug(
         TAG,
         "wrote invite to inbox — total invites:",
@@ -532,6 +535,10 @@ export async function initFriendzWiring(
         JSON.stringify(inviteRecord)
       );
     });
+
+    if (isNewInvite && sDoc.current.soundEffectsEnabled !== false) {
+      playNewMessageSound();
+    }
 
     // send ACK back to the sender
     protocol
@@ -693,7 +700,7 @@ export async function initFriendzWiring(
   // exported as a standalone function (rather than inlined here) so it can
   // also be exercised directly in tests without needing the full narthex/
   // social/messagez setup this function requires.
-  wireKnockHandlers({ protocol, repo, irohAdapter, localNodeId, narthexDocId });
+  wireKnockHandlers({ protocol, repo, irohAdapter, localNodeId, narthexDocId, sDoc });
 
 
   // wire outbound requests through the bridge
@@ -1353,6 +1360,10 @@ export async function initFriendzWiring(
       f.nodeIds?.some((n: any) => n.nodeId === peerNodeId)
     );
     const isFriend = !!friendEntry;
+
+    if (isFriend && sDoc.current.soundEffectsEnabled !== false) {
+      playFriendOnlineSound();
+    }
 
     // (1) retry pending outbound friend-request to this peer
     const outbound = sDoc.current.outboundRequests ?? [];
@@ -2242,6 +2253,10 @@ export function applyIncomingFriendRequest(
     `onFriendRequest from ${fromNodeId.slice(0, 16)}... didAdd=${didAdd} reciprocal=${reciprocal} pending-count=${pendingCount}`
   );
 
+  if (didAdd && sDoc.current.soundEffectsEnabled !== false) {
+    playFriendRequestSound();
+  }
+
   if (reciprocal) {
     // auto-accept: tell the peer we accept and add them to friends if needed
     protocol.sendFriendAccept(fromNodeId).catch((err) => {
@@ -2496,6 +2511,11 @@ export interface KnockHandlersDeps {
    *  delivered once its `canvas-knock-ack` arrives, mirroring the existing
    *  canvas-invite outbox's `onCanvasInviteAck` handling above. */
   messagezHandle?: DocHandle<any> | null;
+  /** the local social doc, if known — used only to gate the "new message"
+   *  sound effect (see src/sfx/index.ts) on the user's
+   *  `soundEffectsEnabled` preference. optional so tests exercising the
+   *  ack/relay paths without a full narthex/social setup don't need one. */
+  sDoc?: SocialDoc;
   /** see `KnockRelayInfo`'s doc comment. only fires for the *direct*
    *  `canvas-knock` relay case (sender != requester); gossip-digest-merged
    *  knocks fire it via `mergeGossipDigestKnocks()`'s own parameter instead,
@@ -2531,6 +2551,7 @@ export function wireKnockHandlers(deps: KnockHandlersDeps): void {
     localNodeId,
     narthexDocId,
     messagezHandle,
+    sDoc,
     onKnockRelayed,
     onKnockAcked,
     onKnockApproved,
@@ -2566,6 +2587,10 @@ export function wireKnockHandlers(deps: KnockHandlersDeps): void {
       }
 
       store.recordKnock(msg.requesterNodeId, msg.requesterUsername, msg.message, msg.knockId);
+
+      if (sDoc?.current.soundEffectsEnabled !== false) {
+        playNewMessageSound();
+      }
 
       if (fromNodeId !== msg.requesterNodeId) {
         onKnockRelayed?.({

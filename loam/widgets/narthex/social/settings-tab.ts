@@ -365,6 +365,19 @@ export function createSettingsTab(ctx: TabContext): TabController {
       },
     });
 
+    // 2b. sound effects — on | off (a single toggle covers all of them:
+    // friend online, new message, friend request — see src/sfx/index.ts)
+    offsetY += buildPillRow<"on" | "off">(container, offsetY, {
+      label: "sound effects",
+      options: ["on", "off"],
+      readValue: () => (ctx.doc.current.soundEffectsEnabled !== false ? "on" : "off"),
+      onSelect: (value) => {
+        ctx.doc.change((draft) => {
+          draft.soundEffectsEnabled = value === "on";
+        });
+      },
+    });
+
     // 3. export identity section
     const hasIdentity = !!ctx.doc.current.profile.nodeId;
 

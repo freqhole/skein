@@ -14,7 +14,7 @@
 
 import { log } from "@freqhole/reliquary/utils";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
-import { getDocumentPages } from "../../src/widgets/file-utils";
+import { getDocumentPages, getThumbnailDataUrl } from "../../src/widgets/file-utils";
 import { PROCESSING_CLAIM_STALE_MS, type PeedeeeffState } from "./types";
 
 const TAG = "peedeeeff.render-client";
@@ -33,6 +33,7 @@ export interface PeedeeeffDraft {
   pageBlake3s: string[];
   pageCount: number;
   currentPage: number;
+  thumbnailDataUrl: string;
   processingClaimedBy: string;
   processingClaimedAt: number;
 }
@@ -44,6 +45,21 @@ export function getRenderPeerNodeIds(canvasStore: CanvasStore | undefined): stri
   const ids = Object.keys(canvasStore.peers()).filter((id) => id !== localId);
   ids.sort((a, b) => Number(canvasStore.isHubNode(b)) - Number(canvasStore.isHubNode(a)));
   return ids;
+}
+
+/** re-derive the square thumbnail from the doc's already-rendered first
+ *  page. used by peedeeeff's own "regenerate thumbnail" button and by
+ *  bins that gain a peedeeeff child with no thumbnail yet (e.g. one
+ *  dragged in from the canvas rather than created fresh in the bin). */
+export async function regenerateThumbnail(doc: RenderableDoc): Promise<boolean> {
+  const firstPageBlobId = doc.current().pageBlobIds[0];
+  if (!firstPageBlobId) return false;
+  const dataUrl = await getThumbnailDataUrl(firstPageBlobId, { size: 200, square: true });
+  if (!dataUrl) return false;
+  doc.change((draft) => {
+    draft.thumbnailDataUrl = dataUrl;
+  });
+  return true;
 }
 
 /** claim the processing job for this peer, unless someone else already
@@ -102,11 +118,33 @@ export async function renderAndPopulatePages(
       const blake3s = pages.map((p) => p.blake3 || "");
       const totalPagesCount = pages[0]?.total_pages ?? pages.length;
 
+      // backfill a bin-visible thumbnail from the first rendered page if one
+      // isn't already set. callers may have already tried to generate one
+      // from the raw (unrendered) source blob before calling this function,
+      // but that only ever succeeds for image mimes (browser mode has no
+      // pdf rasterizer) - the rendered page is always an image, so this is
+      // the one path guaranteed to work for every source format, in both
+      // browser and tauri mode, regardless of who created this doc. bins
+      // never mount a child's full widget lifecycle, so this is the only
+      // chance to persist one for bins to display later.
+      let thumbnailDataUrl: string | undefined;
+      if (!doc.current().thumbnailDataUrl) {
+        try {
+          thumbnailDataUrl =
+            (await getThumbnailDataUrl(blobIds[0], { size: 200, square: true })) ?? undefined;
+        } catch {
+          // best-effort only
+        }
+      }
+
       doc.change((draft) => {
         draft.pageBlobIds = blobIds;
         draft.pageBlake3s = blake3s;
         draft.pageCount = totalPagesCount;
         draft.currentPage = 0;
+        if (thumbnailDataUrl) {
+          draft.thumbnailDataUrl = thumbnailDataUrl;
+        }
       });
       return true;
     }

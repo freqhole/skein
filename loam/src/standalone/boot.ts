@@ -10,6 +10,7 @@ import { registerPeerName } from "../canvas/peer-names";
 import { CanvasStore } from "../canvas/canvas-store";
 import type { ConnectionStateSource } from "../canvas/connection-status";
 import { initCanvas, type SkeinCanvas } from "../canvas/init";
+import type { BreadcrumbItem } from "../canvas/toolbar";
 import { findEmptySpot } from "../canvas/layout-placement";
 import { ensureMyProfileDoc, type ProfileStore } from "../canvas/profile-doc";
 import { showShareDialog, type FriendInfo, type ShareDialogOptions } from "../canvas/share-dialog";
@@ -176,6 +177,31 @@ class SkeinRouter {
   // put the canvas hash back) — the confirmed root cause of the flaky
   // narthex reload e2e AND a real ux bug.
   private pendingNavToNarthex = false;
+  /** cross-canvas navigation history (narthex excluded — narthex always
+   *  resets this to empty via navigateToNarthex()), used to build the
+   *  toolbar's ancestor breadcrumbs (see widget-manager.ts's
+   *  `setAncestorCrumbs()`). pushed to in `navigateToCanvas()` right before
+   *  tearing down the outgoing canvas, EXCEPT when the navigation was
+   *  triggered by clicking an ancestor crumb itself (see
+   *  `suppressNextHistoryPush`/`navigateToAncestorCrumb()`) — clicking a
+   *  crumb means "go back to this point", not "go deeper". a canvas can be
+   *  reached via more than one path (narthex, a canvas-card embedded on
+   *  any other canvas via widgets/canvas-link-picker.ts, a share link) —
+   *  all of them funnel through `window.location.hash = docId` and this
+   *  single `navigateToCanvas()`, so this is the one place that needs
+   *  instrumenting. capped to a modest length as a safety net against
+   *  unbounded growth in a very long session; the toolbar only ever
+   *  displays the last entry anyway (see `buildAncestorCrumbs()`). */
+  private navHistory: Array<{ docId: string; title: string }> = [];
+  /** max entries retained in `navHistory` — a generous safety cap, not a
+   *  user-visible limit (the toolbar only ever shows the last one). */
+  private static readonly MAX_NAV_HISTORY = 20;
+  /** set by `navigateToAncestorCrumb()` right before it changes the hash,
+   *  so the very next `navigateToCanvas()` run knows not to push the
+   *  (now-leaving) canvas back onto `navHistory` — that would immediately
+   *  re-grow the history it was just told to rewind. consumed (cleared) the
+   *  moment `navigateToCanvas()` reads it. */
+  private suppressNextHistoryPush = false;
   /** stashed by joinCanvasFromNarthex so navigateToCanvas can write it into the doc */
   private pendingPeerNodeId: string | null = null;
   /** the docId `joinCanvasFromNarthex()` is about to navigate to via
@@ -964,6 +990,10 @@ class SkeinRouter {
         history.replaceState(null, "", window.location.pathname);
       }
 
+      // landing on the narthex resets cross-canvas navigation history —
+      // whatever the user does next starts a fresh breadcrumb trail.
+      this.navHistory = [];
+
       log.debug(TAG, "navigating to narthex, doc:", this.narthexDocId);
 
       const canvas = await initCanvas({
@@ -1234,6 +1264,7 @@ class SkeinRouter {
       localNodeId: this.localNodeId,
       narthexDocId: this.narthexDocId ?? undefined,
       messagezHandle: this.messagezDocHandle,
+      sDoc: this.socialDoc ?? undefined,
       onKnockRelayed: (info) => recordKnockRelay(info),
       onKnockAcked: (info) => recordKnockAck(info),
       onKnockApproved: (info) => {
@@ -1429,6 +1460,40 @@ class SkeinRouter {
     }
   }
 
+  /** build the toolbar's ancestor breadcrumbs from `navHistory` — bounded
+   *  to at most one clickable crumb (the immediate parent canvas) plus a
+   *  leading non-clickable "..." whenever there's deeper history, per the
+   *  "narthex + last 2 canvases max" spec (narthex crumb + this one +
+   *  the current canvas's own title crumb, both rendered separately by
+   *  widget-manager.ts's `updateBreadcrumbs()`). */
+  private buildAncestorCrumbs(): BreadcrumbItem[] {
+    if (this.navHistory.length === 0) return [];
+
+    const crumbs: BreadcrumbItem[] = [];
+    if (this.navHistory.length > 1) {
+      crumbs.push({ label: "..." });
+    }
+    const parent = this.navHistory[this.navHistory.length - 1];
+    crumbs.push({
+      label: parent.title,
+      onClick: () => this.navigateToAncestorCrumb(parent.docId),
+    });
+    return crumbs;
+  }
+
+  /** clicking an ancestor crumb means "go back to this point" — rewind
+   *  `navHistory` to just before that ancestor (dropping it and anything
+   *  deeper, since those are all now the outgoing side of the upcoming
+   *  navigation, not history), then change the hash to trigger the normal
+   *  onHashChange() -> navigateToCanvas() path. */
+  private navigateToAncestorCrumb(docId: string): void {
+    const idx = this.navHistory.findIndex((entry) => entry.docId === docId);
+    if (idx === -1) return;
+    this.navHistory = this.navHistory.slice(0, idx);
+    this.suppressNextHistoryPush = true;
+    window.location.hash = docId;
+  }
+
   /** navigate to a specific canvas by document id */
   private async navigateToCanvas(docId: string, opts?: { coldOpen?: boolean }): Promise<void> {
     if (this.navigating) return;
@@ -1456,6 +1521,23 @@ class SkeinRouter {
 
       // flush pending canvas update notifications to peers before leaving
       this.flushCanvasUpdates?.();
+
+      // push the outgoing canvas onto the cross-canvas nav history before
+      // tearing it down — unless this navigation is itself the result of
+      // clicking an ancestor crumb (that path already rewound history to
+      // where it needs to be; pushing here would immediately re-grow it).
+      if (!this.suppressNextHistoryPush && this.currentCanvas) {
+        const outgoingDocId = this.currentCanvas.store.handle.documentId;
+        const isOutgoingNarthex = outgoingDocId === this.narthexDocId;
+        if (!isOutgoingNarthex && outgoingDocId !== docId) {
+          const outgoingTitle = this.currentCanvas.store.metadata().title || "untitled canvas";
+          this.navHistory.push({ docId: outgoingDocId, title: outgoingTitle });
+          if (this.navHistory.length > SkeinRouter.MAX_NAV_HISTORY) {
+            this.navHistory.shift();
+          }
+        }
+      }
+      this.suppressNextHistoryPush = false;
 
       this.destroyCurrent();
 
@@ -1486,6 +1568,7 @@ class SkeinRouter {
           log.debug(TAG, "home button clicked, navigating to narthex");
           window.location.hash = "";
         },
+        ancestorCrumbs: this.buildAncestorCrumbs(),
         onShare: async () => {
           if (!this.currentCanvas) return;
           // the toolbar itself no longer hides the share button for

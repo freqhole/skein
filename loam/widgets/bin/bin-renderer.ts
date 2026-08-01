@@ -184,6 +184,12 @@ export class BinRenderer {
       this.setupDrawerScroll(contentWidth);
     } else {
       this.teardownDrawerScroll();
+      // explicit hit area covering the whole content viewport, not just the
+      // union of card bounds — without this, hovering over gaps between
+      // cards (or anywhere below/around them) doesn't reach the widget
+      // frame's own pointerenter/pointerleave, so the border+toolbar only
+      // show while the cursor is directly over a card.
+      this.container.hitArea = new Rectangle(0, 0, contentWidth, this.visibleHeight);
     }
 
     // ensure the cell borders overlay is in the correct parent, and drawn

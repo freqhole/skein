@@ -223,6 +223,11 @@ export const socialSchema = z.object({
   /** privacy settings */
   profileVisibility: z.enum(["friends", "everyone", "nobody"]).default("friends"),
   friendRequestsFrom: z.enum(["everyone", "nobody"]).default("everyone"),
+
+  /** short synthesized sound effects (friend online, new message, friend
+   *  request) — see src/sfx/index.ts. a single on/off toggle covering all
+   *  of them (settings-tab.ts's UI is tight on space); defaults on. */
+  soundEffectsEnabled: z.boolean().default(true),
 });
 
 // ---------------------------------------------------------------------------

@@ -273,6 +273,13 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
 
     profileVisibility: raw.settings.profile_visibility as "friends" | "everyone" | "nobody",
     friendRequestsFrom: raw.settings.friend_requests_from as "everyone" | "nobody",
+
+    // sound-effects toggle (src/sfx/index.ts) isn't backed by grimoire/sqlite
+    // yet either — same follow-up-work situation as shareGroups/
+    // relayedFriendRequests above. defaults to enabled; a tauri-mode toggle
+    // works optimistically until the next unrelated social-state-changed
+    // event triggers a refetch and resets it back to this default.
+    soundEffectsEnabled: true,
   };
 }
 

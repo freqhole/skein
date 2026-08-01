@@ -15,7 +15,7 @@
  */
 
 import { Container, Graphics, Text } from "pixi.js";
-import { log } from "@freqhole/reliquary/utils";
+import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import {
   getLocalNodeId,
@@ -34,6 +34,7 @@ import { createPillButton, drawChevron, drawGoToStartButton, fitSpriteToRegion }
 import { createPageCache } from "./pages";
 import {
   releaseProcessingClaim,
+  regenerateThumbnail,
   renderAndPopulatePages,
   tryClaimProcessing,
   type RenderableDoc,
@@ -53,6 +54,15 @@ import {
 // ---------------------------------------------------------------------------
 // widget factory
 // ---------------------------------------------------------------------------
+
+/** drop a trailing extension (e.g. ".pdf", ".epub") for display purposes -
+ *  bin labels/titles read better without it. leaves dotfiles/no-extension
+ *  names untouched. */
+function stripFileExtension(filename: string): string {
+  const idx = filename.lastIndexOf(".");
+  if (idx <= 0 || idx === filename.length - 1) return filename;
+  return filename.slice(0, idx);
+}
 
 export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
   type: "peedeeeff",
@@ -91,7 +101,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
   ],
 
   getCompactInfo: (state: PeedeeeffState): CompactInfo => ({
-    label: state.filename || "document",
+    label: stripFileExtension(state.filename) || "document",
     thumbnailUrl: state.thumbnailDataUrl || undefined,
     blobId: state.blobId || undefined,
     mime: state.mime || undefined,
@@ -1245,6 +1255,36 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
     resetNavHideTimer();
 
     // -----------------------------------------------------------------------
+    // thumbnail override — user-chosen thumbnail replaces the auto-captured
+    // first-page image both on this widget's own face and as its compact-card
+    // thumbnail when nested inside a bin. see file.ts's identical handlers.
+    // -----------------------------------------------------------------------
+
+    async function handleChooseThumbnail() {
+      if (ctx.canvasStore?.isLocalViewer()) return;
+      const dataUrl = await pickImageAsDataUrl({ maxWidth: 500, maxHeight: 500 });
+      if (!dataUrl) return;
+      ctx.doc.change((draft) => {
+        draft.thumbnailDataUrl = dataUrl;
+      });
+    }
+
+    function handleRemoveThumbnail() {
+      if (ctx.canvasStore?.isLocalViewer()) return;
+      ctx.doc.change((draft) => {
+        draft.thumbnailDataUrl = "";
+      });
+    }
+
+    /** re-derive the square thumbnail from the current first page — useful
+     *  after a user-chosen thumbnail was set, or if the auto-captured one
+     *  was generated before square-cropping was added. */
+    async function handleRegenerateThumbnail() {
+      if (ctx.canvasStore?.isLocalViewer()) return;
+      await regenerateThumbnail(ctx.doc);
+    }
+
+    // -----------------------------------------------------------------------
     // controller
     // -----------------------------------------------------------------------
 
@@ -1256,6 +1296,16 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
           id: "page-info",
           label: totalPages() > 0 ? `${localPage + 1}/${totalPages()}` : "no pages",
           isInfo: true,
+        },
+      ],
+
+      widgetActions: [
+        { id: "choose-thumbnail", label: "choose thumbnail", onClick: () => void handleChooseThumbnail() },
+        { id: "remove-thumbnail", label: "remove thumbnail", onClick: handleRemoveThumbnail },
+        {
+          id: "regenerate-thumbnail",
+          label: "regenerate thumbnail",
+          onClick: () => void handleRegenerateThumbnail(),
         },
       ],
 
