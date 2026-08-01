@@ -272,6 +272,12 @@ jobs:
           mkdir -p build/${{ needs.create-release.outputs.version }}
           docker run --rm -v "$PWD":/work -w /work rust:1-bookworm \
             cargo build --release --target x86_64-unknown-linux-gnu -p tumulus
+          # the container runs as root, so it leaves target/ (including
+          # target/release/, which cargo also writes to for host build
+          # scripts even when cross-compiling) owned by root - reclaim it so
+          # the native `cargo tauri build` step below (running as the
+          # unprivileged runner user, same shared target dir) can write to it.
+          sudo chown -R "$(id -u):$(id -g)" target
           cp target/x86_64-unknown-linux-gnu/release/tumulus \
             "build/${{ needs.create-release.outputs.version }}/tumulus_${{ needs.create-release.outputs.version }}_linux-x86_64"
       - name: build skein deb/rpm (linux x86_64)
@@ -329,6 +335,12 @@ jobs:
           mkdir -p build/${{ needs.create-release.outputs.version }}
           docker run --rm -v "$PWD":/work -w /work rust:1-bookworm \
             cargo build --release --target aarch64-unknown-linux-gnu -p tumulus
+          # the container runs as root, so it leaves target/ (including
+          # target/release/, which cargo also writes to for host build
+          # scripts even when cross-compiling) owned by root - reclaim it so
+          # the native `cargo tauri build` step below (running as the
+          # unprivileged runner user, same shared target dir) can write to it.
+          sudo chown -R "$(id -u):$(id -g)" target
           cp target/aarch64-unknown-linux-gnu/release/tumulus \
             "build/${{ needs.create-release.outputs.version }}/tumulus_${{ needs.create-release.outputs.version }}_linux-aarch64"
       - name: build skein deb/rpm (linux aarch64)
