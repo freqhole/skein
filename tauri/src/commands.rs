@@ -1218,10 +1218,29 @@ async fn blob_iroh_ensure(args: BlobGetArgs, state: &AppState) -> Result<Value, 
     if !path.exists() {
         return Ok(json!({ "available": false, "reason": "blob file missing on disk" }));
     }
-    // import by reference into the iroh-blobs store. iroh-blobs computes
-    // blake3 internally and dedupes on hash, so re-imports are cheap (only
-    // the outboard metadata is recomputed).
-    match state.storage.fs_store.blobs().add_path(path).await {
+
+    // cheap pre-check: skip `add_path` entirely if this blake3 is already
+    // imported. without this, every ensure request re-pays the cost of
+    // `add_path` below, which for a large blob (hundreds of mb+) can take
+    // far longer than a probing peer's timeout, even though the import
+    // only ever needs to happen once.
+    if let Ok(hash) = args.blake3.parse::<iroh_blobs::Hash>() {
+        match state.storage.fs_store.blobs().has(hash).await {
+            Ok(true) => return Ok(json!({ "available": true })),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!(blake3 = %args.blake3, error = %e, "blob_iroh_ensure: has() check failed, falling back to add_path")
+            }
+        }
+    }
+
+    // import by reference into the iroh-blobs store - the first import of a
+    // large file requires hashing the whole thing, which can take much
+    // longer than a probing peer's timeout.
+    let started = std::time::Instant::now();
+    let result = state.storage.fs_store.blobs().add_path(path).await;
+    tracing::debug!(blake3 = %args.blake3, elapsed_ms = started.elapsed().as_millis(), ok = result.is_ok(), "blob_iroh_ensure: add_path complete");
+    match result {
         Ok(_tag) => Ok(json!({ "available": true })),
         Err(e) => Ok(json!({
             "available": false,

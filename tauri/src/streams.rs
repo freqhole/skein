@@ -483,16 +483,29 @@ pub async fn write_raw_and_finish(
         slot.send.clone()
     };
     let mut send = send.lock().await;
+    tracing::debug!(
+        handle = args.handle,
+        bytes = bytes.len(),
+        "write_raw_and_finish: writing"
+    );
     send.write_all(&bytes)
         .await
         .map_err(|e| StreamError::Write(e.to_string()))?;
     send.finish()
         .map_err(|e| StreamError::Write(format!("finish: {e}")))?;
+    tracing::debug!(
+        handle = args.handle,
+        "write_raw_and_finish: finished, awaiting stopped()"
+    );
     // wait for the peer to acknowledge our finish before returning. if we
     // skip this, the JS layer can call `close_stream` (which drops the slot
     // and therefore the send stream) while quinn is still draining the send
     // buffer, and the peer's `read_to_end` errors with "connection lost".
     let _ = send.stopped().await;
+    tracing::debug!(
+        handle = args.handle,
+        "write_raw_and_finish: stopped() resolved"
+    );
     Ok(Value::Null)
 }
 
@@ -519,10 +532,19 @@ pub async fn read_to_end(
         slot.recv.clone()
     };
     let mut recv = recv.lock().await;
+    tracing::debug!(
+        handle = args.handle,
+        "read_to_end: awaiting peer's read_to_end"
+    );
     let buf = recv
         .read_to_end(args.max_size)
         .await
         .map_err(|e| StreamError::Read(e.to_string()))?;
+    tracing::debug!(
+        handle = args.handle,
+        bytes = buf.len(),
+        "read_to_end: complete"
+    );
     Ok(json!({ "data": B64.encode(&buf) }))
 }
 
