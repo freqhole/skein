@@ -144,7 +144,7 @@ function buildPillRow<T extends string>(
   label.x = 0;
   label.y = sy;
   parent.addChild(label);
-  sy += LABEL_SIZE + 8;
+  sy += LABEL_SIZE + 4;
 
   let px = 0;
   const activeValue = opts.readValue();
@@ -264,7 +264,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
       rowLabel.x = 0;
       rowLabel.y = offsetY;
       container.addChild(rowLabel);
-      offsetY += LABEL_SIZE + 8;
+      offsetY += LABEL_SIZE + 4;
 
       // status dot
       const DOT_R = 4;
