@@ -536,7 +536,7 @@ export async function initFriendzWiring(
       );
     });
 
-    if (isNewInvite && sDoc.current.soundEffectsEnabled !== false) {
+    if (isNewInvite && sDoc.current.soundEffectsMessagesEnabled !== false) {
       playNewMessageSound();
     }
 
@@ -1361,7 +1361,9 @@ export async function initFriendzWiring(
     );
     const isFriend = !!friendEntry;
 
-    if (isFriend && sDoc.current.soundEffectsEnabled !== false) {
+    // hub relays aren't a person coming online — only chime for a friend's
+    // own device, never a hub node coming back up.
+    if (isFriend && !friendEntry?.isHub && sDoc.current.soundEffectsFriendsOnlineEnabled !== false) {
       playFriendOnlineSound();
     }
 
@@ -2253,7 +2255,7 @@ export function applyIncomingFriendRequest(
     `onFriendRequest from ${fromNodeId.slice(0, 16)}... didAdd=${didAdd} reciprocal=${reciprocal} pending-count=${pendingCount}`
   );
 
-  if (didAdd && sDoc.current.soundEffectsEnabled !== false) {
+  if (didAdd && sDoc.current.soundEffectsMessagesEnabled !== false) {
     playFriendRequestSound();
   }
 
@@ -2513,8 +2515,8 @@ export interface KnockHandlersDeps {
   messagezHandle?: DocHandle<any> | null;
   /** the local social doc, if known — used only to gate the "new message"
    *  sound effect (see src/sfx/index.ts) on the user's
-   *  `soundEffectsEnabled` preference. optional so tests exercising the
-   *  ack/relay paths without a full narthex/social setup don't need one. */
+   *  `soundEffectsMessagesEnabled` preference. optional so tests exercising
+   *  the ack/relay paths without a full narthex/social setup don't need one. */
   sDoc?: SocialDoc;
   /** see `KnockRelayInfo`'s doc comment. only fires for the *direct*
    *  `canvas-knock` relay case (sender != requester); gossip-digest-merged
@@ -2588,7 +2590,7 @@ export function wireKnockHandlers(deps: KnockHandlersDeps): void {
 
       store.recordKnock(msg.requesterNodeId, msg.requesterUsername, msg.message, msg.knockId);
 
-      if (sDoc?.current.soundEffectsEnabled !== false) {
+      if (sDoc?.current.soundEffectsMessagesEnabled !== false) {
         playNewMessageSound();
       }
 

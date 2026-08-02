@@ -144,7 +144,7 @@ function buildPillRow<T extends string>(
   label.x = 0;
   label.y = sy;
   parent.addChild(label);
-  sy += LABEL_SIZE + 4;
+  sy += LABEL_SIZE + 12;
 
   let px = 0;
   const activeValue = opts.readValue();
@@ -182,7 +182,7 @@ function buildPillRow<T extends string>(
     });
     pillText.eventMode = "none";
     pillText.x = (pillW - pillText.width) / 2;
-    pillText.y = (OPTION_PILL_HEIGHT - OPTION_FONT_SIZE) / 2;
+    pillText.y = (OPTION_PILL_HEIGHT - pillText.height) / 2;
     pill.addChild(pillText);
 
     // capture value for the closure
@@ -198,6 +198,69 @@ function buildPillRow<T extends string>(
 
   // total vertical space consumed: label height + gap + pill row + section spacing
   return sy - y + OPTION_PILL_HEIGHT + SETTINGS_ROW_HEIGHT;
+}
+
+// ---------------------------------------------------------------------------
+// compact inline switch — several of these share one row (used for the
+// sound-effects toggles, where vertical space is too tight for a full
+// label-then-pill-row per toggle)
+// ---------------------------------------------------------------------------
+
+const SWITCH_W = 48;
+const SWITCH_H = OPTION_PILL_HEIGHT;
+
+interface InlineToggleOptions {
+  label: string;
+  value: boolean;
+  onToggle: (next: boolean) => void;
+}
+
+/** render `label` + a compact on/off switch at (x, y). returns the width
+ *  consumed so callers can lay out several of these side by side. */
+function buildInlineToggle(parent: Container, x: number, y: number, opts: InlineToggleOptions): number {
+  const labelText = new Text({
+    text: opts.label,
+    style: { fontFamily: FONT, fontSize: OPTION_FONT_SIZE, fill: MUTED_TEXT },
+    resolution: RESOLUTION,
+  });
+  labelText.eventMode = "none";
+  labelText.x = x;
+  labelText.y = y + (SWITCH_H - labelText.height) / 2;
+  parent.addChild(labelText);
+
+  const swX = x + labelText.width + 6;
+  const sw = new Container();
+  sw.eventMode = "static";
+  sw.cursor = "pointer";
+  sw.hitArea = new Rectangle(0, 0, SWITCH_W, SWITCH_H);
+  sw.x = swX;
+  sw.y = y;
+
+  const bg = new Graphics();
+  bg.roundRect(0, 0, SWITCH_W, SWITCH_H, SWITCH_H / 2);
+  if (opts.value) {
+    bg.fill({ color: ACCENT });
+  } else {
+    bg.fill({ color: FIELD_BG });
+    bg.stroke({ color: FIELD_BORDER, width: 1 });
+  }
+  sw.addChild(bg);
+
+  const knobR = (SWITCH_H - 4) / 2;
+  const knob = new Graphics();
+  knob.circle(0, 0, knobR);
+  knob.fill({ color: opts.value ? 0xffffff : MUTED_TEXT });
+  knob.x = opts.value ? SWITCH_W - knobR - 2 : knobR + 2;
+  knob.y = SWITCH_H / 2;
+  sw.addChild(knob);
+
+  sw.on("pointertap", (e) => {
+    e.stopPropagation();
+    opts.onToggle(!opts.value);
+  });
+
+  parent.addChild(sw);
+  return swX + SWITCH_W - x;
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +347,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
       });
       stateText.eventMode = "none";
       stateText.x = DOT_R * 2 + 6;
-      stateText.y = offsetY + (OPTION_PILL_HEIGHT - OPTION_FONT_SIZE) / 2;
+      stateText.y = offsetY + (OPTION_PILL_HEIGHT - stateText.height) / 2;
       container.addChild(stateText);
 
       // toggle button
@@ -321,7 +384,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
       });
       btnText.eventMode = "none";
       btnText.x = (btnW - btnText.width) / 2;
-      btnText.y = (OPTION_PILL_HEIGHT - OPTION_FONT_SIZE) / 2;
+      btnText.y = (OPTION_PILL_HEIGHT - btnText.height) / 2;
       btn.addChild(btnText);
 
       btn.on("pointertap", (e) => {
@@ -365,18 +428,45 @@ export function createSettingsTab(ctx: TabContext): TabController {
       },
     });
 
-    // 2b. sound effects — on | off (a single toggle covers all of them:
-    // friend online, new message, friend request — see src/sfx/index.ts)
-    offsetY += buildPillRow<"on" | "off">(container, offsetY, {
-      label: "sound effects",
-      options: ["on", "off"],
-      readValue: () => (ctx.doc.current.soundEffectsEnabled !== false ? "on" : "off"),
-      onSelect: (value) => {
-        ctx.doc.change((draft) => {
-          draft.soundEffectsEnabled = value === "on";
-        });
-      },
-    });
+    // 2b. sound effects — two compact switches sharing a single row (a
+    // full pill-row-per-toggle costs too much vertical height here — see
+    // src/sfx/index.ts for what each category covers)
+    {
+      const rowLabel = new Text({
+        text: "sound effects",
+        style: { fontFamily: FONT, fontSize: LABEL_SIZE, fill: LABEL_COLOR },
+        resolution: RESOLUTION,
+      });
+      rowLabel.eventMode = "none";
+      rowLabel.x = 0;
+      rowLabel.y = offsetY;
+      container.addChild(rowLabel);
+      offsetY += LABEL_SIZE + 12;
+
+      let rx = 0;
+      rx +=
+        buildInlineToggle(container, rx, offsetY, {
+          label: "friends online",
+          value: ctx.doc.current.soundEffectsFriendsOnlineEnabled !== false,
+          onToggle: (next) => {
+            ctx.doc.change((draft) => {
+              draft.soundEffectsFriendsOnlineEnabled = next;
+            });
+          },
+        }) + 16;
+
+      buildInlineToggle(container, rx, offsetY, {
+        label: "messages",
+        value: ctx.doc.current.soundEffectsMessagesEnabled !== false,
+        onToggle: (next) => {
+          ctx.doc.change((draft) => {
+            draft.soundEffectsMessagesEnabled = next;
+          });
+        },
+      });
+
+      offsetY += OPTION_PILL_HEIGHT + SETTINGS_ROW_HEIGHT;
+    }
 
     // 3. export identity section
     const hasIdentity = !!ctx.doc.current.profile.nodeId;
@@ -435,7 +525,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
         });
         exportBtnText.eventMode = "none";
         exportBtnText.x = (btnW - exportBtnText.width) / 2;
-        exportBtnText.y = (BUTTON_HEIGHT - TEXT_SIZE) / 2;
+        exportBtnText.y = (BUTTON_HEIGHT - exportBtnText.height) / 2;
         exportBtn.addChild(exportBtnText);
 
         exportBtn.x = 0;
@@ -527,7 +617,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
         });
         exportCopyLabel.eventMode = "none";
         exportCopyLabel.x = (copyBtnW - exportCopyLabel.width) / 2;
-        exportCopyLabel.y = (24 - 10) / 2;
+        exportCopyLabel.y = (24 - exportCopyLabel.height) / 2;
         copyBtn.addChild(exportCopyLabel);
 
         copyBtn.x = 0;
@@ -547,7 +637,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
         hideBtn.addChild(hideBtnText);
         hideBtn.hitArea = new Rectangle(0, 0, hideBtnText.width + 8, 24);
         hideBtn.x = copyBtnW + 12;
-        hideBtn.y = (24 - 10) / 2;
+        hideBtn.y = (24 - hideBtnText.height) / 2;
         copyRow.addChild(hideBtn);
 
         copyBtn.on("pointertap", (e) => {
@@ -640,7 +730,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
     });
     destroyBtnText.eventMode = "none";
     destroyBtnText.x = (destroyBtnW - destroyBtnText.width) / 2;
-    destroyBtnText.y = (BUTTON_HEIGHT - TEXT_SIZE) / 2;
+    destroyBtnText.y = (BUTTON_HEIGHT - destroyBtnText.height) / 2;
     destroyBtn.addChild(destroyBtnText);
 
     destroyBtn.x = 0;
@@ -662,6 +752,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
 
       destroyBtnText.text = "destroying...";
       destroyBtnText.x = (destroyBtnW - destroyBtnText.width) / 2;
+      destroyBtnText.y = (BUTTON_HEIGHT - destroyBtnText.height) / 2;
       destroyBtn.eventMode = "none";
 
       destroyAllLocalData().catch((err) => {
@@ -669,6 +760,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
         destroyBtnText.text = "failed — try again";
         destroyBtnText.style.fill = REJECT_COLOR;
         destroyBtnText.x = (destroyBtnW - destroyBtnText.width) / 2;
+        destroyBtnText.y = (BUTTON_HEIGHT - destroyBtnText.height) / 2;
         destroyBtn.eventMode = "static";
       });
     });

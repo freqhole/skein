@@ -274,12 +274,13 @@ function mapSnapshot(raw: RawSocialSnapshot, maps: IdMaps): SocialState {
     profileVisibility: raw.settings.profile_visibility as "friends" | "everyone" | "nobody",
     friendRequestsFrom: raw.settings.friend_requests_from as "everyone" | "nobody",
 
-    // sound-effects toggle (src/sfx/index.ts) isn't backed by grimoire/sqlite
-    // yet either — same follow-up-work situation as shareGroups/
-    // relayedFriendRequests above. defaults to enabled; a tauri-mode toggle
+    // sound-effects toggles (src/sfx/index.ts) aren't backed by grimoire/
+    // sqlite yet either — same follow-up-work situation as shareGroups/
+    // relayedFriendRequests above. default to enabled; a tauri-mode toggle
     // works optimistically until the next unrelated social-state-changed
     // event triggers a refetch and resets it back to this default.
-    soundEffectsEnabled: true,
+    soundEffectsFriendsOnlineEnabled: true,
+    soundEffectsMessagesEnabled: true,
   };
 }
 
@@ -406,9 +407,35 @@ export class SqliteSocialDoc implements SocialDoc {
 
   /** refetch the full snapshot from sqlite and update state */
   private async refetch(): Promise<void> {
+    const prevProfile = this.state.profile;
     const raw = (await dispatch("social_get_state")) as RawSocialSnapshot;
     this.state = mapSnapshot(raw, this.maps);
     this.notifyListeners();
+
+    // identity was just generated (node_id went from empty -> set): any
+    // username/bio/avatar/color the user typed into the profile form
+    // *before* clicking "generate identity" was silently dropped, because
+    // social_update_profile requires an existing node_id and fails
+    // otherwise (dispatchDiff only logs a warning on rejection — a real
+    // user-reported bug where the profile showed the boot-time default
+    // "skein" username instead of whatever was actually typed). re-push
+    // those locally-known values now that an identity (and thus a node_id)
+    // actually exists.
+    if (!prevProfile.nodeId && this.state.profile.nodeId) {
+      const payload: Record<string, unknown> = {};
+      if (prevProfile.username) payload.alias = prevProfile.username;
+      if (prevProfile.bio) payload.bio = prevProfile.bio;
+      if (prevProfile.avatarDataUrl) payload.avatar_url = prevProfile.avatarDataUrl;
+      if (prevProfile.accentColor) payload.accent_color = prevProfile.accentColor;
+      if (Object.keys(payload).length > 0) {
+        try {
+          await dispatch("social_update_profile", payload);
+          await this.refetch();
+        } catch (err) {
+          log.warn(TAG, "post-identity profile resync failed:", err);
+        }
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
