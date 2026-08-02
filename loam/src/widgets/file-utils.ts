@@ -2443,11 +2443,13 @@ async function fetchThumbnailLocal(
 
       const blob = new Blob([data], { type: record.mime });
       if (square) {
+        // fit (not crop) — document/page thumbnails shouldn't lose content
+        // off the edges the way avatar/profile-picture cropping can.
         return await resizeImageToWebpDataUrl(blob, {
           maxWidth: size,
           maxHeight: size,
           quality: 0.75,
-          cropSquare: true,
+          fitSquare: true,
         });
       }
       return await generateThumbnailDataUrl(blob, size);
@@ -2461,6 +2463,7 @@ async function fetchThumbnailLocal(
     const response = (await dispatch("blob_thumbnail", {
       blake3: blobId,
       size,
+      fit: square,
     })) as { data: string | null; mime?: string } | null;
 
     if (!response?.data || !response.mime) {

@@ -2035,10 +2035,15 @@ async fn read_text_file(args: ReadTextFileArgs) -> Result<Value, DispatchError> 
 struct BlobThumbnailArgs {
     blake3: String,
     size: Option<u32>,
+    /// when true, fit the whole image inside the square (padding with
+    /// transparent pixels) instead of center-cropping it - used for
+    /// document/page thumbnails, where cropping can cut off real content.
+    fit: Option<bool>,
 }
 
 async fn blob_thumbnail(args: BlobThumbnailArgs, state: &AppState) -> Result<Value, DispatchError> {
     let size = args.size.unwrap_or(200);
+    let fit = args.fit.unwrap_or(false);
 
     let blob = state
         .storage
@@ -2050,7 +2055,7 @@ async fn blob_thumbnail(args: BlobThumbnailArgs, state: &AppState) -> Result<Val
     let path = state.storage.blobz.path_for(&blob);
     let mime = blob.mime.as_deref().unwrap_or("application/octet-stream");
 
-    let result = crate::thumbnail::generate_thumbnail(&path, mime, size)
+    let result = crate::thumbnail::generate_thumbnail(&path, mime, size, fit)
         .await
         .map_err(|e| {
             DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
