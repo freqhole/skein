@@ -16,6 +16,7 @@ import {
   type EndpointState,
 } from "../../../src/p2p/endpoint-control";
 import { exportIdentityBundle } from "../../../src/p2p/identity";
+import { playFriendOnlineSound, playNewMessageSound } from "../../../src/sfx";
 import { createSkeinInput, type SkeinInputHandle } from "../../../src/widgets/skein-input";
 import {
   ACCENT,
@@ -452,6 +453,8 @@ export function createSettingsTab(ctx: TabContext): TabController {
             ctx.doc.change((draft) => {
               draft.soundEffectsFriendsOnlineEnabled = next;
             });
+            // preview the sound so the toggle's effect is audible right away
+            if (next) playFriendOnlineSound();
           },
         }) + 16;
 
@@ -462,6 +465,7 @@ export function createSettingsTab(ctx: TabContext): TabController {
           ctx.doc.change((draft) => {
             draft.soundEffectsMessagesEnabled = next;
           });
+          if (next) playNewMessageSound();
         },
       });
 
