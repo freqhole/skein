@@ -280,8 +280,12 @@ jobs:
           docker run --rm -v "$PWD":/work -w /work rust:1-bookworm \
             cargo build --release --target x86_64-unknown-linux-gnu \
             --target-dir target/docker-tumulus -p tumulus
-          # container runs as root - reclaim so rust-cache can archive it.
-          sudo chown -R "$(id -u):$(id -g)" target/docker-tumulus
+          # container runs as root, and since target/ itself didn't exist
+          # yet, docker's bind mount creates it (and everything under it) as
+          # root too - reclaim the whole tree, not just docker-tumulus/, or
+          # the native `cargo tauri build` step below fails trying to create
+          # target/release under a still-root-owned target/ parent.
+          sudo chown -R "$(id -u):$(id -g)" target
           cp target/docker-tumulus/x86_64-unknown-linux-gnu/release/tumulus \
             "build/${{ needs.create-release.outputs.version }}/tumulus_${{ needs.create-release.outputs.version }}_linux-x86_64"
       - name: build skein deb/rpm (linux x86_64)
@@ -347,8 +351,12 @@ jobs:
           docker run --rm -v "$PWD":/work -w /work rust:1-bookworm \
             cargo build --release --target aarch64-unknown-linux-gnu \
             --target-dir target/docker-tumulus -p tumulus
-          # container runs as root - reclaim so rust-cache can archive it.
-          sudo chown -R "$(id -u):$(id -g)" target/docker-tumulus
+          # container runs as root, and since target/ itself didn't exist
+          # yet, docker's bind mount creates it (and everything under it) as
+          # root too - reclaim the whole tree, not just docker-tumulus/, or
+          # the native `cargo tauri build` step below fails trying to create
+          # target/release under a still-root-owned target/ parent.
+          sudo chown -R "$(id -u):$(id -g)" target
           cp target/docker-tumulus/aarch64-unknown-linux-gnu/release/tumulus \
             "build/${{ needs.create-release.outputs.version }}/tumulus_${{ needs.create-release.outputs.version }}_linux-aarch64"
       - name: build skein deb/rpm (linux aarch64)
