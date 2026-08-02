@@ -1021,13 +1021,31 @@ async fn social_set_friend_alias(
     args: SocialSetFriendAliasArgs,
     state: &AppState,
 ) -> Result<Value, DispatchError> {
-    let alias = if args.alias.is_empty() {
-        None
-    } else {
-        Some(args.alias.as_str())
-    };
+    // the friend list (social_get_state) reads alias from friendz_store
+    // (haruspex's FriendEdge.alias), not userz's peerz.alias — this used to
+    // write to userz.set_alias, which meant edits landed in a column nothing
+    // ever reads back. upsert_full COALESCE-merges other fields, so we need
+    // to write the existing status/direction/group_name/doc_id back rather
+    // than letting them default. read first (same pattern as
+    // social_update_friend above).
     state.userz.touch(&args.friend_user_id).await?;
-    state.userz.set_alias(&args.friend_user_id, alias).await?;
+    let existing = state
+        .friendz_store
+        .get(&args.friend_user_id)
+        .await?
+        .ok_or(DispatchError::NotFound)?;
+
+    state
+        .friendz_store
+        .upsert_full(
+            &args.friend_user_id,
+            existing.status,
+            existing.direction,
+            Some(args.alias.as_str()),
+            existing.group_name.as_deref(),
+            existing.narthex_doc_id.as_deref(),
+        )
+        .await?;
     Ok(Value::Null)
 }
 
@@ -2425,5 +2443,77 @@ mod tests {
         .expect_err("unparseable peer_addr should be rejected before any network use");
 
         assert!(err.to_string().contains("parse peer_addr"));
+    }
+
+    #[tokio::test]
+    async fn social_set_friend_alias_persists_and_is_visible_in_social_get_state() {
+        let (state, _tmp) = make_test_state().await;
+        let node_id = "friend-node-1".to_string();
+
+        social_add_friend(
+            SocialAddFriendArgs {
+                node_id: node_id.clone(),
+                alias: None,
+            },
+            &state,
+        )
+        .await
+        .expect("social_add_friend");
+
+        social_set_friend_alias(
+            SocialSetFriendAliasArgs {
+                friend_user_id: node_id.clone(),
+                alias: "new-nickname".to_string(),
+            },
+            &state,
+        )
+        .await
+        .expect("social_set_friend_alias");
+
+        // regression: alias used to be written to userz's peerz.alias, a
+        // table social_get_state never reads for the friend list — so the
+        // edit silently never showed up. it must land in friendz_store
+        // (read by social_get_state below) instead.
+        let full_state = social_get_state(&state).await.expect("social_get_state");
+        let friends = full_state["friends"].as_array().expect("friends array");
+        let friend = friends
+            .iter()
+            .find(|f| f["id"].as_str() == Some(node_id.as_str()))
+            .expect("friend present");
+        assert_eq!(friend["alias"].as_str(), Some("new-nickname"));
+    }
+
+    #[tokio::test]
+    async fn social_set_friend_alias_can_clear_alias_back_to_empty() {
+        let (state, _tmp) = make_test_state().await;
+        let node_id = "friend-node-2".to_string();
+
+        social_add_friend(
+            SocialAddFriendArgs {
+                node_id: node_id.clone(),
+                alias: Some("initial-alias".to_string()),
+            },
+            &state,
+        )
+        .await
+        .expect("social_add_friend");
+
+        social_set_friend_alias(
+            SocialSetFriendAliasArgs {
+                friend_user_id: node_id.clone(),
+                alias: String::new(),
+            },
+            &state,
+        )
+        .await
+        .expect("social_set_friend_alias");
+
+        let full_state = social_get_state(&state).await.expect("social_get_state");
+        let friends = full_state["friends"].as_array().expect("friends array");
+        let friend = friends
+            .iter()
+            .find(|f| f["id"].as_str() == Some(node_id.as_str()))
+            .expect("friend present");
+        assert_eq!(friend["alias"].as_str(), Some(""));
     }
 }

@@ -112,11 +112,42 @@ describe("SqliteSocialDoc", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("skein_dispatch", {
       action: "social_add_friend",
-      payload: { node_id: "node-3", alias: "hub-friend" },
+      payload: { node_id: "node-3", alias: undefined },
     });
     expect(invokeMock).toHaveBeenCalledWith("skein_dispatch", {
       action: "social_mark_friend_as_hub",
       payload: { node_id: "node-3" },
+    });
+  });
+
+  it("does not send a new friend's own username as their alias on social_add_friend", async () => {
+    // regression: a brand-new FriendEntry always starts with alias: "" —
+    // falling back to f.username here wrote the friend's OWN name into the
+    // "local nickname for this friend" column, which then looked like a
+    // real, intentionally-set alias.
+    invokeMock.mockResolvedValueOnce(baseSnapshot()).mockResolvedValue(undefined);
+
+    const doc = await SqliteSocialDoc.create();
+    invokeMock.mockClear();
+
+    doc.change((draft) => {
+      draft.friends.push({
+        id: "friend-4",
+        alias: "",
+        username: "their-own-name",
+        group: "",
+        nodeIds: [{ nodeId: "node-4", addedAt: "", lastSeenAt: "" }],
+        createdAt: "",
+        isHub: false,
+      });
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(invokeMock).toHaveBeenCalledWith("skein_dispatch", {
+      action: "social_add_friend",
+      payload: { node_id: "node-4", alias: undefined },
     });
   });
 
@@ -201,6 +232,47 @@ describe("SqliteSocialDoc", () => {
       (call) => (call[1] as { action?: string })?.action === "social_mark_friend_as_hub"
     );
     expect(hubCalls).toHaveLength(0);
+  });
+
+  it("dispatches social_set_friend_alias with friend_user_id + new alias when a friend's alias changes", async () => {
+    invokeMock.mockResolvedValueOnce(
+      baseSnapshot({
+        friends: [
+          {
+            id: "friend-6",
+            group_name: "",
+            created_at: 0,
+            friend_user_id: "node-6",
+            username: "some-friend",
+            alias: "old-nickname",
+            bio: "",
+            avatar_url: "",
+            accent_color: 0,
+            is_hub: false,
+            node_ids: [{ node_id: "node-6", display_name: "", bio: "", avatar_url: "", accent_color: 0, instance_name: null, last_seen_at: null, created_at: 0 }],
+          },
+        ],
+      })
+    );
+    invokeMock.mockResolvedValue(undefined);
+
+    const doc = await SqliteSocialDoc.create();
+    invokeMock.mockClear();
+
+    doc.change((draft) => {
+      const friend = draft.friends.find((f) => f.id === "friend-6");
+      if (friend) {
+        friend.alias = "new-nickname";
+      }
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(invokeMock).toHaveBeenCalledWith("skein_dispatch", {
+      action: "social_set_friend_alias",
+      payload: { friend_user_id: "node-6", alias: "new-nickname" },
+    });
   });
 
   it("maps remote_bio/remote_avatar_url/remote_accent_color into pendingRequests and outboundRequests", async () => {
