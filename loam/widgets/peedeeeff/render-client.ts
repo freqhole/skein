@@ -50,12 +50,33 @@ export function getRenderPeerNodeIds(canvasStore: CanvasStore | undefined): stri
 /** re-derive the square thumbnail from the doc's already-rendered first
  *  page. used by peedeeeff's own "regenerate thumbnail" button and by
  *  bins that gain a peedeeeff child with no thumbnail yet (e.g. one
- *  dragged in from the canvas rather than created fresh in the bin). */
-export async function regenerateThumbnail(doc: RenderableDoc): Promise<boolean> {
+ *  dragged in from the canvas rather than created fresh in the bin).
+ *  pass `canvasStore` so the first page's bytes can be fetched from a
+ *  connected peer when they're not already resident on this device (e.g.
+ *  a different peer rendered the pages and this one never fetched them) —
+ *  without it, this can only ever succeed on the peer that did the
+ *  rendering. */
+export async function regenerateThumbnail(
+  doc: RenderableDoc,
+  canvasStore?: CanvasStore
+): Promise<boolean> {
   const firstPageBlobId = doc.current().pageBlobIds[0];
-  if (!firstPageBlobId) return false;
-  const dataUrl = await getThumbnailDataUrl(firstPageBlobId, { size: 200, square: true });
-  if (!dataUrl) return false;
+  if (!firstPageBlobId) {
+    log.warn(TAG, "regenerateThumbnail: doc has no pageBlobIds yet, nothing to derive from");
+    return false;
+  }
+  const dataUrl = await getThumbnailDataUrl(firstPageBlobId, {
+    size: 200,
+    square: true,
+    peers: canvasStore?.peers(),
+  });
+  if (!dataUrl) {
+    log.warn(
+      TAG,
+      `regenerateThumbnail: getThumbnailDataUrl returned nothing for page blob ${firstPageBlobId.slice(0, 12)}...`
+    );
+    return false;
+  }
   doc.change((draft) => {
     draft.thumbnailDataUrl = dataUrl;
   });
@@ -131,7 +152,11 @@ export async function renderAndPopulatePages(
       if (!doc.current().thumbnailDataUrl) {
         try {
           thumbnailDataUrl =
-            (await getThumbnailDataUrl(blobIds[0], { size: 200, square: true })) ?? undefined;
+            (await getThumbnailDataUrl(blobIds[0], {
+              size: 200,
+              square: true,
+              peers: canvasStore?.peers(),
+            })) ?? undefined;
         } catch {
           // best-effort only
         }

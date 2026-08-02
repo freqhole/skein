@@ -1,6 +1,8 @@
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { Assets, Container, Graphics, Rectangle, Texture } from "pixi.js";
+import { log } from "@freqhole/reliquary/utils";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
+import { watchDocReady } from "../../src/p2p/doc-ready";
 import { isGifDataUrl } from "../../src/widgets/gif-utils";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import type { CompactInfo } from "../../src/widgets/widget-types";
@@ -53,6 +55,10 @@ export class BinRenderer {
 
   /** unsubscribe functions for child doc change listeners */
   private docUnsubs = new Map<string, () => void>();
+
+  /** pending watchDocReady cancel functions, one per widget ID, while
+   *  waiting for a cold (post-reload) child handle to become ready */
+  private docReadyCancels = new Map<string, () => void>();
 
   /** graphics overlay for drop-target slot highlighting */
   private slotHighlight: Graphics;
@@ -410,6 +416,13 @@ export class BinRenderer {
       unsub();
       this.docUnsubs.delete(widgetId);
     }
+
+    // cancel any still-pending watchDocReady wait for this card
+    const cancelReady = this.docReadyCancels.get(widgetId);
+    if (cancelReady) {
+      cancelReady();
+      this.docReadyCancels.delete(widgetId);
+    }
   }
 
   private cleanupCardResources(card: RenderedCard): void {
@@ -464,10 +477,12 @@ export class BinRenderer {
             /* ignored */
           }
         }
+        log.warn("bin", "loadCardTexture: loaded texture has no usable GPU source", url.slice(0, 32));
         return null;
       }
       return tex;
-    } catch {
+    } catch (err) {
+      log.warn("bin", "loadCardTexture failed:", err);
       return null;
     }
   }
@@ -603,30 +618,29 @@ export class BinRenderer {
   // -----------------------------------------------------------------------
 
   /**
-   * ensure a child widget's automerge handle is in the repo cache.
-   * after a page reload, handles for parented widgets are not pre-loaded
-   * because the widget manager skips mounting them. this method kicks off
-   * repo.find() and re-renders the card once the handle is ready.
+   * ensure a child widget's automerge handle is ready, re-rendering the
+   * card once it is. after a page reload, handles for parented widgets
+   * are not pre-loaded because the widget manager skips mounting them —
+   * but a handle can also already sit in the repo's cache in a
+   * not-yet-ready state (e.g. some unrelated earlier `repo.find()` for the
+   * same doc id), which a bare `repo.find().then(whenReady)` would never
+   * retry from. `watchDocReady` handles both: it re-checks readiness even
+   * for an already-cached handle, and survives the doc-ready-before-
+   * change-event timing quirk, so this can't get stuck showing the
+   * widget's fallback type-name label forever.
    */
   private ensureHandle(widgetId: string, docId: string): void {
-    // already cached — nothing to do
-    if (this.repo.handles[docId as DocumentId]) return;
+    if (this.docReadyCancels.has(widgetId)) return;
 
-    // repo.find() returns Promise<DocHandle>. once found, wait for the doc
-    // to be ready, then re-render the card with real compact info.
-    this.repo
-      .find<any>(docId as DocumentId)
-      .then((handle) => handle.whenReady())
-      .then(() => {
-        if (this.destroyed) return;
-        // re-render the card with fresh compact info now that the handle is available
-        this.onChildDocChanged(widgetId);
-        // set up change subscription if we haven't already
-        this.subscribeToChildDoc(widgetId);
-      })
-      .catch(() => {
-        // handle not available — card will use fallback label
-      });
+    const cancel = watchDocReady(this.repo, docId as DocumentId, () => {
+      this.docReadyCancels.delete(widgetId);
+      if (this.destroyed) return;
+      // re-render the card with fresh compact info now that the handle is ready
+      this.onChildDocChanged(widgetId);
+      // set up change subscription if we haven't already
+      this.subscribeToChildDoc(widgetId);
+    });
+    this.docReadyCancels.set(widgetId, cancel);
   }
 
   /**

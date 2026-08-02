@@ -2451,7 +2451,8 @@ async function fetchThumbnailLocal(
         });
       }
       return await generateThumbnailDataUrl(blob, size);
-    } catch {
+    } catch (err) {
+      log.warn(TAG, `fetchThumbnailLocal (browser) failed for ${blobId.slice(0, 12)}...:`, err);
       return null;
     }
   }
@@ -2463,12 +2464,20 @@ async function fetchThumbnailLocal(
     })) as { data: string | null; mime?: string } | null;
 
     if (!response?.data || !response.mime) {
+      log.warn(
+        TAG,
+        `fetchThumbnailLocal (tauri) got an empty response for ${blobId.slice(0, 12)}...`
+      );
       return null;
     }
 
     return `data:${response.mime};base64,${response.data}`;
-  } catch {
-    // not an error — just means the blob isn't available locally
+  } catch (err) {
+    // most commonly means the blob isn't available locally, but log it —
+    // this used to be swallowed entirely, making "thumbnail never shows up"
+    // reports (bin widgets, peedeeeff regenerate button) impossible to
+    // diagnose from the console.
+    log.warn(TAG, `fetchThumbnailLocal (tauri) failed for ${blobId.slice(0, 12)}...:`, err);
     return null;
   }
 }

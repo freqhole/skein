@@ -1281,7 +1281,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
      *  was generated before square-cropping was added. */
     async function handleRegenerateThumbnail() {
       if (ctx.canvasStore?.isLocalViewer()) return;
-      await regenerateThumbnail(renderableDoc);
+      await regenerateThumbnail(renderableDoc, ctx.canvasStore);
     }
 
     // -----------------------------------------------------------------------

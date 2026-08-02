@@ -1,4 +1,5 @@
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
+import { resolveDocReady } from "../../src/p2p/doc-ready";
 import { Container, Graphics, Sprite, Text, Texture, Assets } from "pixi.js";
 
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
@@ -419,13 +420,21 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       const entry = store.getWidget(widgetId);
       if (!entry || entry.type !== "peedeeeff" || !entry.docId) return;
       try {
-        const handle = await repo.find<PeedeeeffState>(entry.docId as any);
-        await handle.whenReady();
-        if (handle.doc()?.thumbnailDataUrl) return;
-        await regenerateThumbnail({
-          current: () => handle.doc(),
-          change: (fn) => handle.change(fn),
+        // resolveDocReady (unlike a bare whenReady()) keeps waiting even if
+        // the doc's handle is already cached in a not-yet-ready state, so
+        // this doesn't silently give up on a cold/slow-syncing child doc.
+        const handle = await resolveDocReady<PeedeeeffState>(repo, entry.docId as DocumentId, {
+          timeoutMs: 15_000,
         });
+        if (!handle) return;
+        if (handle.doc()?.thumbnailDataUrl) return;
+        await regenerateThumbnail(
+          {
+            current: () => handle.doc(),
+            change: (fn) => handle.change(fn),
+          },
+          store ?? undefined
+        );
       } catch {
         log.debug("bin", "drop-time thumbnail regeneration failed for", widgetId);
       }
