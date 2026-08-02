@@ -8,6 +8,7 @@
 //! because the process started.
 
 mod commands;
+mod epub_repair;
 mod pdf;
 mod streams;
 mod thumbnail;

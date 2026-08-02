@@ -96,6 +96,19 @@ impl Drop for UploadCancelGuard {
     }
 }
 
+/// best-effort removal of a synthesized temp file (currently: a repaired
+/// epub zip — see `epub_repair.rs`) on every exit path from
+/// `blob_insert_from_path_impl`. `adopt_local_file` already moves the file
+/// into managed storage on success, so removal here is a no-op then; on any
+/// failure before that point, this is what actually cleans it up.
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// raii guard that removes a hash from the `blobs_in_flight` set when dropped.
 /// ensures the gc protect callback never sees a stale in-flight entry if the
 /// download completes, errors, or is cancelled. mirrors `DownloadCancelGuard`.
@@ -1448,6 +1461,26 @@ async fn blob_insert_from_path_impl(
             .map(|s| s.to_string())
     });
 
+    // some epub-editing tools/sync flows leave `mimetype`/`META-INF`/`OPS`
+    // loose on disk under a `.epub`-named directory instead of the zip
+    // archive the epub (OCF) spec actually requires — repair it into a
+    // proper epub at a temp path and upload that instead of erroring on
+    // the raw directory (see epub_repair.rs). `_repair_guard` best-effort
+    // deletes the temp zip on every exit path; `adopt_local_file` below
+    // already consumes/moves it away on success, so removal there is a
+    // harmless no-op.
+    let mut repair_guard: Option<TempFileGuard> = None;
+    let upload_path = if crate::epub_repair::looks_like_epub_directory(&path) {
+        let zip_path = crate::epub_repair::repair(&path).await.map_err(|e| {
+            DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+        })?;
+        repair_guard = Some(TempFileGuard(zip_path.clone()));
+        zip_path
+    } else {
+        path.clone()
+    };
+    let is_repaired_epub = repair_guard.is_some();
+
     // streams the file through blake3 in fixed-size chunks (see
     // `register_external_path`'s doc comment in `freqhole_reliquary::blobz`)
     // — never loads the whole file into memory, and registers it as an
@@ -1455,6 +1488,8 @@ async fn blob_insert_from_path_impl(
     // file picker found it, rather than also being copied into reliquary's
     // blob-files dir) so a multi-gigabyte upload costs one streaming read
     // pass, not a read + a full-file copy + a full-file base64 round-trip.
+    // (a repaired epub is a synthesized temp file, not the user's original,
+    // so it's adopted — moved into managed storage — instead; see below.)
     let upload_id = args.upload_id.clone();
 
     // register a cancel flag so `blob_insert_cancel` can abort the hashing pass.
@@ -1469,44 +1504,70 @@ async fn blob_insert_from_path_impl(
         None
     };
 
-    let blob = state
-        .storage
-        .blobz
-        .register_external_path(
-            &path,
-            NewBlobMeta {
-                filename,
-                mime: args.mime,
-                ..Default::default()
-            },
-            on_progress,
-            Some(&cancel_flag),
-        )
-        .await
-        .map_err(|e| {
-            if matches!(e, freqhole_reliquary::blobz::BlobStoreError::Cancelled) {
-                DispatchError::Stream("upload cancelled".to_string())
-            } else {
-                DispatchError::Blob(e)
-            }
-        })?;
+    // mirror decision must happen before adopting a repaired epub below —
+    // `adopt_local_file` moves the temp zip away, so reading it any later
+    // would fail. harmless to check size early for the normal (external)
+    // path too, since that file is never moved.
+    let mirror_bytes = match tokio::fs::metadata(&upload_path).await {
+        Ok(meta) if meta.len() <= MIRROR_DATA_MAX_BYTES => {
+            Some(tokio::fs::read(&upload_path).await.map_err(|e| {
+                DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(format!(
+                    "read {}: {}",
+                    upload_path.display(),
+                    e
+                )))
+            })?)
+        }
+        _ => None,
+    };
+
+    let blob = if is_repaired_epub {
+        state
+            .storage
+            .blobz
+            .adopt_local_file(
+                &upload_path,
+                NewBlobMeta {
+                    filename,
+                    mime: args.mime,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(DispatchError::Blob)?
+    } else {
+        state
+            .storage
+            .blobz
+            .register_external_path(
+                &upload_path,
+                NewBlobMeta {
+                    filename,
+                    mime: args.mime,
+                    ..Default::default()
+                },
+                on_progress,
+                Some(&cancel_flag),
+            )
+            .await
+            .map_err(|e| {
+                if matches!(e, freqhole_reliquary::blobz::BlobStoreError::Cancelled) {
+                    DispatchError::Stream("upload cancelled".to_string())
+                } else {
+                    DispatchError::Blob(e)
+                }
+            })?
+    };
+    drop(repair_guard);
     prewarm_fs_store(state, &blob).await;
 
     // mirror the bytes back to the JS caller only for small files — see
     // `MIRROR_DATA_MAX_BYTES`'s doc comment. `null` (not an empty string)
     // signals "no mirror" explicitly so the JS side can't mistake it for a
     // genuinely-empty (0-byte) file.
-    let data = if blob.size <= MIRROR_DATA_MAX_BYTES {
-        let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(format!(
-                "read {}: {}",
-                path.display(),
-                e
-            )))
-        })?;
-        Value::String(B64.encode(&bytes))
-    } else {
-        Value::Null
+    let data = match mirror_bytes {
+        Some(bytes) => Value::String(B64.encode(&bytes)),
+        None => Value::Null,
     };
 
     Ok(json!({
