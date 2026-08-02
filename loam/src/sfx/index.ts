@@ -11,10 +11,11 @@
  *
  * this module has no concept of a "sound effects enabled" setting — that's
  * a user preference (see widgets/narthex/social/schema.ts's
- * `soundEffectsEnabled`), and gating on it is the caller's job (see
- * src/standalone/friendz-wiring.ts's onPeerBecameOnline/onFriendRequest/
- * onCanvasKnock handlers). keeping that decision out of this module is
- * what makes it trivially reusable/testable on its own.
+ * `soundEffectsFriendsOnlineEnabled`/`soundEffectsMessagesEnabled`), and
+ * gating on it is the caller's job (see src/standalone/friendz-wiring.ts's
+ * onPeerBecameOnline/onFriendRequest/onCanvasKnock handlers). keeping that
+ * decision out of this module is what makes it trivially reusable/testable
+ * on its own.
  */
 
 let sharedContext: AudioContext | null = null;
@@ -63,6 +64,14 @@ function playTone(ctx: AudioContext, note: Note, startAt: number, gain: number):
 
   osc.connect(gainNode);
   gainNode.connect(ctx.destination);
+  // disconnect once finished — without this the audio graph accumulates a
+  // dead oscillator + gain node pair per tone for the lifetime of the
+  // shared context, which over a long-running session can add up to
+  // audible glitching/underrun as the graph grows.
+  osc.onended = () => {
+    osc.disconnect();
+    gainNode.disconnect();
+  };
   osc.start(startAt);
   osc.stop(startAt + note.duration + 0.02);
 }

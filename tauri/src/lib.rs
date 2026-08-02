@@ -219,9 +219,25 @@ async fn build_state() -> anyhow::Result<AppState> {
     )
     .exists()
     {
-        let net = commands::build_network_state(&app_state).await?;
-        tracing::info!(node_id = %net.node_id, "restored existing identity on boot");
-        *app_state.network.lock().await = Some(net);
+        // this used to propagate failures with `?`, which meant `run()`'s
+        // `.expect("build tauri app state")` would hard-crash the whole
+        // process on every single boot if binding the endpoint ever failed
+        // for a returning user (e.g. a transient network/permission issue
+        // on a real android device) — since the keypair file persists,
+        // that failure would repeat forever with no way for the user to
+        // recover short of reinstalling. instead: log it and boot into the
+        // same offline-first state as a brand-new user: `ensure_network`
+        // lazily retries the same `build_network_state` call the next time
+        // the frontend actually needs the network.
+        match commands::build_network_state(&app_state).await {
+            Ok(net) => {
+                tracing::info!(node_id = %net.node_id, "restored existing identity on boot");
+                *app_state.network.lock().await = Some(net);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to restore network on boot -- continuing offline, will retry lazily");
+            }
+        }
     } else {
         tracing::info!("no identity yet -- P2P endpoint deferred until user-initiated");
     }

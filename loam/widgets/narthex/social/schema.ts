@@ -224,10 +224,13 @@ export const socialSchema = z.object({
   profileVisibility: z.enum(["friends", "everyone", "nobody"]).default("friends"),
   friendRequestsFrom: z.enum(["everyone", "nobody"]).default("everyone"),
 
-  /** short synthesized sound effects (friend online, new message, friend
-   *  request) — see src/sfx/index.ts. a single on/off toggle covering all
-   *  of them (settings-tab.ts's UI is tight on space); defaults on. */
-  soundEffectsEnabled: z.boolean().default(true),
+  /** short synthesized sound effects — see src/sfx/index.ts. split into two
+   *  toggles so a user can mute one category without the other: friends
+   *  (personal devices, not hub relays) coming online, vs. new-message-
+   *  style notifications (messages, friend requests, canvas knocks). both
+   *  default on. */
+  soundEffectsFriendsOnlineEnabled: z.boolean().default(true),
+  soundEffectsMessagesEnabled: z.boolean().default(true),
 });
 
 // ---------------------------------------------------------------------------

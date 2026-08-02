@@ -1146,7 +1146,16 @@ export function createFriendsTab(ctx: TabContext): TabController {
   }
 
   const rebuildDetailView = (friend: FriendEntry, contentW: number) => {
-    // clean up any existing input handles before destroying children
+    // clean up any existing input handles before destroying children — but
+    // preserve any alias text the user is actively mid-typing. this view
+    // rebuilds on every doc "change" event (see the doc.on("change", ...)
+    // subscription below), which fires for ANY change anywhere in the
+    // shared social doc — presence probes, gossip digest merges, profile
+    // refreshes, other friends' status — not just this friend, so without
+    // this the alias input was getting silently destroyed/recreated with
+    // the old saved value mid-edit (a real user-reported bug: typing a new
+    // alias appeared to do nothing).
+    const preservedAliasValue = editingAlias && aliasInputHandle ? aliasInputHandle.value : null;
     if (aliasInputHandle) {
       aliasInputHandle.destroy();
       aliasInputHandle = null;
@@ -1473,7 +1482,7 @@ export function createFriendsTab(ctx: TabContext): TabController {
         canvasElement: ctx.canvasElement,
         width: contentW,
         height: FIELD_HEIGHT,
-        value: friend.alias,
+        value: preservedAliasValue ?? friend.alias,
         onChange: () => {},
       });
       aliasInputHandle.input.x = 0;
