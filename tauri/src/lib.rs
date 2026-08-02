@@ -157,19 +157,9 @@ fn setup_tracing() -> Option<PathBuf> {
     result
 }
 
-/// build the always-on `AppState`: endpoint, pool, and stores.
-///
-/// the iroh endpoint is NOT created here unconditionally -- that would
-/// generate a brand-new P2P identity the very first time the app is ever
-/// launched, before the user has done anything at all. instead: if a
-/// keypair already exists on disk (a returning user, who already
-/// consented to P2P in an earlier session), the endpoint is bound eagerly
-/// below, same as before. if no keypair exists yet, `network` is left
-/// `None` and stays that way until the frontend actually needs it --
-/// [`commands::ensure_network`] lazily builds it (generating a keypair for
-/// the first time, if needed) the moment the user shares/joins a canvas,
-/// fetches a blob from a peer, or clicks "generate identity" in the profile
-/// widget.
+/// build the always-on `AppState`: pool and stores. `network` always
+/// starts `None` here -- see `restore_network_on_boot` for why the iroh
+/// endpoint is never bound this early.
 async fn build_state() -> anyhow::Result<AppState> {
     let data_dir = resolve_data_dir();
     tokio::fs::create_dir_all(&data_dir).await?;
@@ -213,36 +203,50 @@ async fn build_state() -> anyhow::Result<AppState> {
         app_config_path,
     };
 
-    if freqhole_reliquary::identity::keypair_path(
-        &app_state.data_dir,
+    Ok(app_state)
+}
+
+/// restore a returning user's iroh endpoint (if a keypair already exists on
+/// disk) once the app is fully up and running.
+///
+/// this must NOT run any earlier than `tauri::Builder`'s `.setup()` -- a
+/// real android crash dump (abort message: `android context was not
+/// initialized`) showed the endpoint being bound from `run()`'s
+/// `runtime.block_on(build_state())`, *before* `Builder::run()` ever
+/// starts: iroh's network-interface watcher (`netwatch`/`netdev`) needs
+/// android's JNI `ndk-context`, which tao/tauri only wires up while
+/// building the actual activity/webview -- so binding here every boot
+/// (for any returning user with a keypair on disk) reliably aborted the
+/// whole process, permanently, since the keypair persists across restarts.
+/// tomb's charnel android app never hits this: it only ever binds its
+/// iroh endpoint from inside an already-running tauri command
+/// (`toggle_federation_enabled` -> `P2pState::start()`), never from its
+/// own pre-`Builder` boot path -- this mirrors that by deferring the bind
+/// to a task spawned from `.setup()` instead.
+///
+/// errors are logged and swallowed, same as before: `ensure_network` lazily
+/// retries the same `build_network_state` call the next time the frontend
+/// actually needs the network.
+async fn restore_network_on_boot(state: tauri::State<'_, AppState>) {
+    if !freqhole_reliquary::identity::keypair_path(
+        &state.data_dir,
         freqhole_reliquary::identity::DEFAULT_KEYPAIR_FILENAME,
     )
     .exists()
     {
-        // this used to propagate failures with `?`, which meant `run()`'s
-        // `.expect("build tauri app state")` would hard-crash the whole
-        // process on every single boot if binding the endpoint ever failed
-        // for a returning user (e.g. a transient network/permission issue
-        // on a real android device) — since the keypair file persists,
-        // that failure would repeat forever with no way for the user to
-        // recover short of reinstalling. instead: log it and boot into the
-        // same offline-first state as a brand-new user: `ensure_network`
-        // lazily retries the same `build_network_state` call the next time
-        // the frontend actually needs the network.
-        match commands::build_network_state(&app_state).await {
-            Ok(net) => {
-                tracing::info!(node_id = %net.node_id, "restored existing identity on boot");
-                *app_state.network.lock().await = Some(net);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to restore network on boot -- continuing offline, will retry lazily");
-            }
-        }
-    } else {
         tracing::info!("no identity yet -- P2P endpoint deferred until user-initiated");
+        return;
     }
 
-    Ok(app_state)
+    match commands::build_network_state(&state).await {
+        Ok(net) => {
+            tracing::info!(node_id = %net.node_id, "restored existing identity on boot");
+            *state.network.lock().await = Some(net);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to restore network on boot -- continuing offline, will retry lazily");
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -296,6 +300,14 @@ pub fn run() {
                 .resizable(true)
                 .fullscreen(false);
             main_builder.build()?;
+
+            // spawned (not awaited) so `.setup()` returns immediately --
+            // see `restore_network_on_boot`'s doc comment for why this
+            // can't run any earlier than here.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                restore_network_on_boot(handle.state::<AppState>()).await;
+            });
 
             // -- app menu with settings shortcut (cmd+, / ctrl+,) ----------
             // (desktop only: mobile has no window menu bar / menu events, and
