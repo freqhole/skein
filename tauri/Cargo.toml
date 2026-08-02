@@ -16,11 +16,17 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [
+tauri = { version = "=2.10.3", features = [
     "macos-private-api",
     "devtools",
     "protocol-asset",
 ] }
+# pinned exactly alongside tauri (not otherwise used directly) so tao stays on
+# 0.34.8 -- tauri-runtime-wry 2.11.x pulls in tao 0.35.x, which regressed
+# ndk-context init on android and crashes real devices (see charnel's own
+# lockfile, still on this same combo, for the known-good reference point).
+tauri-runtime = "=2.10.1"
+tauri-runtime-wry = "=2.10.1"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"

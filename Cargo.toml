@@ -69,8 +69,8 @@ async-trait = "0.1"
 # already contains the fix (Cargo.toml there still says version = "0.35.3",
 # so it satisfies tauri-runtime-wry's requirement) until a real 0.36-based
 # tauri release ships and this patch can be removed.
-[patch.crates-io]
-tao = { git = "https://github.com/tauri-apps/tao", rev = "dad6b990d0bc0aca382de3631a86870928ef78f6" }
+#[patch.crates-io]
+#tao = { git = "https://github.com/tauri-apps/tao", rev = "dad6b990d0bc0aca382de3631a86870928ef78f6" }
 
 # release profile optimizations for smaller binaries
 [profile.release]
