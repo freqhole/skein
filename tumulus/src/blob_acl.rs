@@ -322,8 +322,15 @@ impl AccessGate for BlobAclGate {
 /// [`freqhole_reliquary::gate::build_gated_blobs_events`], which owns the
 /// generic interception-loop mechanics; this module only supplies the
 /// access decision via `BlobAclGate`'s [`AccessGate`] implementation above.
-pub fn build_gated_blobs_events(gate: BlobAclGate) -> EventSender {
-    freqhole_reliquary::gate::build_gated_blobs_events(Arc::new(gate))
+///
+/// when `transfers` is supplied, outgoing (this node serving a peer) blob
+/// transfer progress is also tracked into it - see
+/// [`freqhole_reliquary::gate::TransferRegistry`].
+pub fn build_gated_blobs_events(
+    gate: BlobAclGate,
+    transfers: Option<Arc<freqhole_reliquary::gate::TransferRegistry>>,
+) -> EventSender {
+    freqhole_reliquary::gate::build_gated_blobs_events(Arc::new(gate), transfers)
 }
 
 // ---------------------------------------------------------------------------

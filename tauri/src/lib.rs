@@ -200,6 +200,7 @@ async fn build_state() -> anyhow::Result<AppState> {
         downloader_cell: Arc::new(std::sync::RwLock::new(None)),
         friendz_store,
         userz: userz_dir,
+        transfers: freqhole_reliquary::gate::TransferRegistry::new(),
         process_started_at: Instant::now(),
         app_config_path,
     };

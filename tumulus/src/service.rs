@@ -238,7 +238,10 @@ impl Service {
         let blob_acl_gate = crate::blob_acl::BlobAclGate::friend_only(friendz_store.clone());
         let blobs_protocol = BlobsProtocol::new(
             fs_store,
-            Some(crate::blob_acl::build_gated_blobs_events(blob_acl_gate)),
+            Some(crate::blob_acl::build_gated_blobs_events(
+                blob_acl_gate,
+                None,
+            )),
         );
         let blob_proxy = crate::protocol::blob_proxy::new_handler(
             fs_store,

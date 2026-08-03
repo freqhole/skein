@@ -14,7 +14,22 @@
 
 import type { Repo } from "@automerge/automerge-repo";
 import { z } from "zod";
+import { configureLogging, type LogLevel } from "@freqhole/reliquary/utils";
 import { createTestRegistry } from "../../widgets/index";
+
+// this harness (unlike standalone/boot.ts) never called configureLogging,
+// so log.debug()/log.trace() calls were silently dropped (default level is
+// "warn") in every e2e test using this bootstrap. same VITE_LOG_LEVEL/
+// VITE_LOG_FILTER env-var hookup as boot.ts.
+configureLogging({
+  level:
+    (import.meta.env.VITE_LOG_LEVEL as LogLevel | undefined) ??
+    (import.meta.env.DEV ? "debug" : "warn"),
+  filter: (import.meta.env.VITE_LOG_FILTER as string | undefined)
+    ?.split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+});
 import { initCanvas } from "../canvas/init";
 import { PresenceManager } from "../canvas/presence-manager";
 import { ProfileStore } from "../canvas/profile-doc";

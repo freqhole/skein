@@ -124,6 +124,20 @@ export interface HubAdminSoftDeletedBlob {
 }
 
 /**
+ * a single outgoing blob transfer in progress on the hub (this hub
+ * serving, some peer snatching), as reported by
+ * `AdminResponse::ActiveTransfers` — see `TransferSummary` in
+ * `hub_admin.rs`.
+ */
+export interface HubAdminActiveTransfer {
+  peer: string;
+  blake3: string;
+  bytesSent: number;
+  totalSize: number;
+  elapsedMs: number;
+}
+
+/**
  * request payloads for `iroh/skein-hub-admin/1`, mirroring
  * `reliquary::protocol::hub_admin::AdminRequest`.
  */
@@ -148,7 +162,8 @@ export type HubAdminRequest =
   | { kind: "getHubProfile" }
   | { kind: "setHubProfile"; username: string | null; bio: string | null; accentColor: number | null }
   | { kind: "setHubAvatar"; imageBase64: string }
-  | { kind: "canvasBlobs"; canvasDocId: string; offset: number; limit: number };
+  | { kind: "canvasBlobs"; canvasDocId: string; offset: number; limit: number }
+  | { kind: "activeTransfers" };
 
 /**
  * response payloads for `iroh/skein-hub-admin/1`, mirroring
@@ -171,7 +186,8 @@ export type HubAdminResponse =
   | { kind: "softDeleted"; blobs: HubAdminSoftDeletedBlob[]; total: number }
   | { kind: "canvasUnsynced"; canvasDocId: string; swept: number }
   | { kind: "hubProfile"; profile: HubAdminHubProfile }
-  | { kind: "canvasBlobs"; canvasDocId: string; blobs: HubAdminBlobUsageSummary[]; total: number };
+  | { kind: "canvasBlobs"; canvasDocId: string; blobs: HubAdminBlobUsageSummary[]; total: number }
+  | { kind: "activeTransfers"; transfers: HubAdminActiveTransfer[] };
 
 /**
  * build the CBOR-ready wire value for an `HubAdminRequest`, matching
@@ -232,6 +248,8 @@ export function toWireAdminRequest(request: HubAdminRequest): unknown {
       return { SetHubAvatar: { image_base64: request.imageBase64 } };
     case "canvasBlobs":
       return { CanvasBlobs: { canvas_doc_id: request.canvasDocId, offset: request.offset, limit: request.limit } };
+    case "activeTransfers":
+      return "ActiveTransfers";
   }
 }
 
@@ -447,6 +465,21 @@ export function fromWireAdminResponse(wire: unknown): HubAdminResponse {
         })),
       };
     }
+    if ("ActiveTransfers" in obj) {
+      const v = obj.ActiveTransfers as {
+        transfers: Array<{ peer: string; blake3: string; bytes_sent: number; total_size: number; elapsed_ms: number }>;
+      };
+      return {
+        kind: "activeTransfers",
+        transfers: v.transfers.map((t) => ({
+          peer: t.peer,
+          blake3: t.blake3,
+          bytesSent: toNum(t.bytes_sent),
+          totalSize: toNum(t.total_size),
+          elapsedMs: toNum(t.elapsed_ms),
+        })),
+      };
+    }
   }
   throw new Error(`unrecognized AdminResponse wire shape: ${JSON.stringify(wire)}`);
 }
@@ -614,6 +647,13 @@ export interface HubAdminClient {
    * blobs may overlap with other canvases by design.
    */
   hubAdminCanvasBlobs(peerNodeId: string, canvasDocId: string, offset?: number, limit?: number): Promise<HubAdminResponse>;
+  /**
+   * snapshot of this hub's own outgoing blob transfers currently in flight
+   * (this hub serving, some peer snatching) — mirrors
+   * `AdminRequest::ActiveTransfers` / `TransferSummary` in `hub_admin.rs`.
+   * used e.g. by e2e tests to observe hub->peer transfer progress.
+   */
+  hubAdminActiveTransfers(peerNodeId: string): Promise<HubAdminResponse>;
 }
 
 /** build a `HubAdminClient` bound to the given transport. */
@@ -701,6 +741,9 @@ export function createHubAdminClient(transport: HubAdminTransport): HubAdminClie
     },
     hubAdminCanvasBlobs(peerNodeId, canvasDocId, offset = 0, limit = 50) {
       return sendAdminRequest(transport, peerNodeId, { kind: "canvasBlobs", canvasDocId, offset, limit });
+    },
+    hubAdminActiveTransfers(peerNodeId) {
+      return sendAdminRequest(transport, peerNodeId, { kind: "activeTransfers" });
     },
   };
 }

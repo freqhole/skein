@@ -34,6 +34,7 @@ import { createInlinePlayer, type InlinePlayerHandle } from "../src/widgets/inli
 import { createMediaOverlay, type MediaOverlayHandle } from "../src/widgets/media-overlay";
 import { createGifHoverOverlay, type GifHoverOverlayHandle } from "../src/widgets/gif-hover-overlay";
 import { peerNameFor } from "../src/canvas/peer-names";
+import { subscribeTransferProgress } from "../src/p2p/transfer-progress";
 import { kickOffDocumentProcessing } from "./peedeeeff/render-client";
 import { peedeeeffSchema, type PeedeeeffState } from "./peedeeeff/types";
 import { markdownSchema } from "./markdown";
@@ -432,6 +433,78 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     });
     container.addChild(loadingText);
 
+    // -- outgoing serve-progress text ------------------------------------------
+    //
+    // distinct from `loadingText`'s doc-backed "peer uploading... NN%"
+    // label above (someone else uploading bytes TO this widget) — this one
+    // shows THIS node serving the blob OUT to other peers/hubs snatching
+    // it, fed by `transfer-progress.ts`'s tauri-only poll (see its module
+    // doc comment). up to `MAX_VISIBLE_TRANSFERS_PER_BLOB` lines, hub(s)
+    // first, "+N more" appended when there's more traffic than that.
+    const servingText = new Text({
+      text: "",
+      style: {
+        fontFamily: "system-ui, sans-serif",
+        fontSize: 11,
+        fill: 0x888899,
+        align: "center",
+      },
+      resolution: 2,
+    });
+    servingText.anchor.set(0.5, 1);
+    servingText.x = currentWidth / 2;
+    servingText.visible = false;
+    // added to `container` after the info bar below (not here) so it draws
+    // ON TOP of the info bar's near-opaque background instead of being
+    // hidden underneath it - see the addChild call right after actionContainer.
+
+    // backing so the text stays legible over a thumbnail image - redrawn to
+    // fit servingText's current bounds each time it's shown.
+    const servingTextBg = new Graphics();
+    servingTextBg.visible = false;
+
+    const drawServingTextBg = () => {
+      const paddingX = 6;
+      const paddingY = 3;
+      const w = servingText.width + paddingX * 2;
+      const h = servingText.height + paddingY * 2;
+      servingTextBg.clear();
+      servingTextBg.roundRect(servingText.x - w / 2, servingText.y - h, w, h, 4);
+      servingTextBg.fill({ color: 0x141422, alpha: 0.85 });
+    };
+
+    let unsubTransferProgress: (() => void) | null = null;
+    function updateTransferProgressSubscription(blake3: string | undefined) {
+      unsubTransferProgress?.();
+      unsubTransferProgress = null;
+      servingText.visible = false;
+      servingTextBg.visible = false;
+      if (!blake3) return;
+      unsubTransferProgress = subscribeTransferProgress(
+        blake3,
+        (peerId) => ctx.canvasStore?.isHubNode(peerId) ?? false,
+        (entries, truncatedCount) => {
+          if (entries.length === 0) {
+            servingText.visible = false;
+            servingTextBg.visible = false;
+            return;
+          }
+          const lines = entries.map((entry) => {
+            const isHub = ctx.canvasStore?.isHubNode(entry.peerId) ?? false;
+            const name = peerNameFor(entry.peerId) ?? `${entry.peerId.slice(0, 12)}...`;
+            return `${isHub ? "hub" : "peer"}: ${name} ${Math.round(entry.fraction * 100)}%`;
+          });
+          if (truncatedCount > 0) {
+            lines.push(`+${truncatedCount} more`);
+          }
+          servingText.text = lines.join("\n");
+          drawServingTextBg();
+          servingText.visible = true;
+          servingTextBg.visible = true;
+        }
+      );
+    }
+
     // -- error text -----------------------------------------------------------
 
     const errorText = new Text({
@@ -512,6 +585,13 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     const actionContainer = new Container();
     actionContainer.visible = false;
     infoContainer.addChild(actionContainer);
+
+    // added after infoContainer (not alongside loadingText/errorText above) so
+    // it draws on top of the info bar's background instead of being hidden
+    // underneath it - the info bar covers the bottom of the widget whenever a
+    // file is loaded, which is where this text is positioned (just above it).
+    container.addChild(servingTextBg);
+    container.addChild(servingText);
 
     // snatch button — shown when blob is remote (doubles as resume when
     // paused, or "send friend request" when only a non-friend peer has it)
@@ -690,6 +770,12 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       sizeText.text = formatFileSize(state.size);
       sizeText.x = w - 8 - sizeText.width;
       sizeText.y = barTop + 6;
+
+      // just above the info bar, not at the widget's bottom edge - the info
+      // bar's own background would otherwise paint over it (see the addChild
+      // ordering comment above `actionContainer`).
+      servingText.y = Math.max(0, barTop - 4);
+      if (servingText.visible) drawServingTextBg();
 
       const domain = state.domain || "file";
       domainText.text = domain;
@@ -1663,6 +1749,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             draft.size = result.size;
             draft.blake3 = result.blake3 ?? "";
             draft.thumbnailDataUrl = result.thumbnailDataUrl ?? "";
+            if (!draft.title || !draft.title.trim()) {
+              draft.title = file.filename;
+            }
             // release the upload lock in the same change that publishes the
             // result — peers atomically see "upload done + file present"
             draft.uploadingBy = "";
@@ -1897,6 +1986,11 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             draft.mime = result.mime;
             draft.size = result.size;
             draft.blake3 = result.blake3 ?? "";
+          });
+        }
+        if (!state.title || !state.title.trim()) {
+          ctx.doc.change((draft) => {
+            draft.title = state.filename;
           });
         }
 
@@ -2200,6 +2294,8 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       errorText.x = w / 2;
       errorText.y = h / 2;
       errorText.style.wordWrapWidth = Math.max(40, w - 16);
+      servingText.x = w / 2;
+      servingText.y = Math.max(0, h - 4);
     };
 
     // -- doc change subscription ----------------------------------------------
@@ -2221,6 +2317,12 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     let prevBlobId = ctx.doc.current.blobId;
     let prevThumbDataUrl = ctx.doc.current.thumbnailDataUrl;
+    // blobId is always blake3 for any blob stored via storeBlobFromFile()/
+    // storeBlob() (see reliquary's blob store) - fall back to it for
+    // widgets whose own `blake3` field was never backfilled (e.g. created
+    // before that field existed).
+    let prevBlake3 = ctx.doc.current.blake3;
+    updateTransferProgressSubscription(ctx.doc.current.blake3 || ctx.doc.current.blobId);
     // the widget frame's toolbar title comes from the canvas entry's
     // `entry.title` (set via the property tray's generic title control),
     // but file.ts declares its OWN doc-backed "title" editableProp instead
@@ -2257,9 +2359,19 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         }
       }
 
+      if (state.blake3 !== prevBlake3 && state.blobId === prevBlobId) {
+        // blake3 backfilled/changed independently of blobId (e.g. a legacy
+        // widget whose blake3 was never set finally gets one) - resubscribe
+        // without touching the rest of the blobId-change branch below.
+        prevBlake3 = state.blake3;
+        updateTransferProgressSubscription(state.blake3 || state.blobId);
+      }
+
       if (state.blobId !== prevBlobId) {
         prevBlobId = state.blobId;
+        prevBlake3 = state.blake3;
         prevThumbDataUrl = state.thumbnailDataUrl;
+        updateTransferProgressSubscription(state.blake3 || state.blobId);
         // reset uploaded flag when blobId changes (e.g. from a peer's change)
         uploadedLocally = false;
 
@@ -2501,6 +2613,8 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           activePlayer = null;
         }
         unsub();
+        unsubTransferProgress?.();
+        unsubTransferProgress = null;
         destroyed = true;
         unregisterPendingRetry?.();
         unregisterPendingRetry = null;

@@ -1,6 +1,7 @@
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { Assets, Container, Graphics, Rectangle, Texture } from "pixi.js";
 import { log } from "@freqhole/reliquary/utils";
+import { deepUnwrapAmStrings } from "../../src/canvas/automerge-values";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import { watchDocReady } from "../../src/p2p/doc-ready";
 import { isGifDataUrl } from "../../src/widgets/gif-utils";
@@ -727,10 +728,20 @@ export class BinRenderer {
         return { label: factory.metadata.name };
       }
 
+      // a child doc a rust peer (tumulus's hub, or tauri-side background
+      // processing) has ever written into directly comes back with any
+      // string-typed field as an `ImmutableString` instance rather than a
+      // plain js string (see automerge-values.ts's `deepUnwrapAmStrings`
+      // doc comment) - without this, `factory.schema.parse` throws on the
+      // very first such field (most commonly `thumbnailDataUrl`/`title`),
+      // silently falling back to the generic type-name label below.
+      const unwrapped = deepUnwrapAmStrings(rawDoc);
+
       // parse through zod if the factory has a schema
-      const state = factory.schema ? factory.schema.parse(rawDoc) : rawDoc;
+      const state = factory.schema ? factory.schema.parse(unwrapped) : unwrapped;
       return factory.getCompactInfo(state);
-    } catch {
+    } catch (err) {
+      log.warn("bin", "readCompactInfo: schema.parse failed for", entry.type, "falling back to type name:", err);
       return { label: factory.metadata.name };
     }
   }

@@ -243,6 +243,10 @@ function clearBlobRestriction(blake3Hash: string): void {
   requireNode().clear_blob_restriction(blake3Hash);
 }
 
+function getActiveTransfers(): unknown[] {
+  return (requireNode() as unknown as { get_active_transfers(): unknown[] }).get_active_transfers();
+}
+
 // ---- chunked import sessions -----------------------------------------------
 
 function startImport(): number {
@@ -416,6 +420,7 @@ const api = {
   releaseBlob,
   restrictBlobToPeers,
   clearBlobRestriction,
+  getActiveTransfers,
   startImport,
   importPush,
   importFinish,

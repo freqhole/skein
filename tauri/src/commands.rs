@@ -152,6 +152,13 @@ pub struct AppState {
     pub friendz_store: friendz::Store,
     pub userz: userz::Directory,
 
+    /// outgoing (this node serving a peer) blob transfer progress - always
+    /// present (independent of whether the network is up yet), so the
+    /// `blob_transfer_progress` dispatch action always has something to
+    /// read. wired into `start_with_blobs`' gate every time the network is
+    /// (re)built - see `build_network_state`.
+    pub transfers: Arc<freqhole_reliquary::gate::TransferRegistry>,
+
     pub process_started_at: Instant,
     pub app_config_path: PathBuf,
 }
@@ -350,6 +357,7 @@ pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkStat
         state.storage.fs_store,
         state.friendz_store.clone(),
         state.userz.clone(),
+        state.transfers.clone(),
     )
     .await?;
 
@@ -505,6 +513,7 @@ async fn dispatch(
             blob_iroh_download_cancel(decode("blob_iroh_download_cancel", payload)?).await
         }
         "blob_iroh_probe" => blob_iroh_probe(decode("blob_iroh_probe", payload)?, state).await,
+        "blob_transfer_progress" => blob_transfer_progress(state).await,
 
         // pdf page rendering (peedeeeff widget)
         "pdf_render_pages" => pdf_render_pages(decode("pdf_render_pages", payload)?, state).await,
@@ -1199,6 +1208,27 @@ async fn blob_list(args: BlobListArgs, state: &AppState) -> Result<Value, Dispat
         .await?;
     let dtos: Vec<BlobDto> = blobs.into_iter().map(Into::into).collect();
     Ok(serde_json::to_value(dtos).expect("blob list serialize"))
+}
+
+/// snapshot of every outgoing (this node serving a peer) blob transfer
+/// currently in progress - polled by the loam file widget so it can show a
+/// "peer: NN%" label distinct from the existing (doc-backed, incoming)
+/// upload progress label. see `freqhole_reliquary::gate::TransferRegistry`.
+async fn blob_transfer_progress(state: &AppState) -> Result<Value, DispatchError> {
+    let transfers: Vec<Value> = state
+        .transfers
+        .snapshot()
+        .into_iter()
+        .map(|t| {
+            json!({
+                "peerId": t.peer,
+                "blake3": t.blake3,
+                "bytesSent": t.bytes_sent,
+                "totalSize": t.total_size,
+            })
+        })
+        .collect();
+    Ok(json!(transfers))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2190,6 +2220,7 @@ mod tests {
             downloader_cell: Arc::new(std::sync::RwLock::new(None)),
             friendz_store,
             userz: userz_dir,
+            transfers: freqhole_reliquary::gate::TransferRegistry::new(),
             process_started_at: Instant::now(),
             app_config_path: data_dir.join("skein-app.toml"),
         };

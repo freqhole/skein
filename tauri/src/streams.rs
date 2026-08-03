@@ -150,13 +150,19 @@ impl StreamRegistry {
         fs_store: &'static FsStore,
         friendz_store: friendz::Store,
         userz: userz::Directory,
+        transfers: Arc<freqhole_reliquary::gate::TransferRegistry>,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::start_inner(endpoint, Some((fs_store, friendz_store, userz))).await
+        Self::start_inner(endpoint, Some((fs_store, friendz_store, userz, transfers))).await
     }
 
     async fn start_inner(
         endpoint: Endpoint,
-        blobs: Option<(&'static FsStore, friendz::Store, userz::Directory)>,
+        blobs: Option<(
+            &'static FsStore,
+            friendz::Store,
+            userz::Directory,
+            Arc<freqhole_reliquary::gate::TransferRegistry>,
+        )>,
     ) -> anyhow::Result<Arc<Self>> {
         let (tx, rx) = mpsc::channel(ACCEPT_BUFFER);
         let mut builder = Router::builder(endpoint);
@@ -167,14 +173,16 @@ impl StreamRegistry {
             };
             builder = builder.accept(*alpn, handler);
         }
-        if let Some((fs_store, friendz_store, userz)) = blobs {
+        if let Some((fs_store, friendz_store, userz, transfers)) = blobs {
             // serve verified blob bytes over iroh-blobs/4. this is what
             // browser peers (midden) reach for first when they see we own a
             // blob — see `download_verified_with_ensure_progress` in
             // `midden/src/lib.rs`. handled fully in rust; no JS dispatch.
             let gate = blob_acl::BlobAclGate::friend_or_known_hub(friendz_store, userz);
-            let blobs_protocol =
-                BlobsProtocol::new(fs_store, Some(blob_acl::build_gated_blobs_events(gate)));
+            let blobs_protocol = BlobsProtocol::new(
+                fs_store,
+                Some(blob_acl::build_gated_blobs_events(gate, Some(transfers))),
+            );
             builder = builder.accept(iroh_blobs::ALPN, blobs_protocol);
             tracing::info!(
                 "frontend router: registered iroh_blobs::ALPN (friend-or-known-hub gated)"
