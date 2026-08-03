@@ -1,5 +1,11 @@
 # skein
 
+## 0.1.6
+
+### Patch Changes
+
+- dfdc725: seperate sfx settingz; tidy'n settingz view; add more android permissionz; fix broken alias setting;
+
 ## 0.1.5
 
 ### Patch Changes

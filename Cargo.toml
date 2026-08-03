@@ -3,7 +3,7 @@ members = ["tumulus", "tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 
 [workspace.dependencies]
@@ -56,6 +56,21 @@ time = { version = "0.3", features = [
 tempfile = "3"
 indexmap = "2"
 async-trait = "0.1"
+
+# tao 0.35.x (pulled in by the currently-published tauri-runtime-wry 2.11.4,
+# which pins `tao = "^0.35.0"`) never calls `ndk_context::initialize_android_context()`
+# on android -- a regression vs tao 0.34.x (which charnel still uses) --
+# confirmed by a real android crash dump: `abort message: 'android context
+# was not initialized'`, from netdev's (iroh's netwatch dependency) default
+# `android-extra` feature calling `ndk_context::android_context()`. fixed
+# upstream in https://github.com/tauri-apps/tao/pull/1266, released as tao
+# 0.36.0 -- but no published tauri/tauri-runtime-wry release depends on
+# 0.36 yet (still pins "^0.35.0"). pin to the pre-release-bump commit that
+# already contains the fix (Cargo.toml there still says version = "0.35.3",
+# so it satisfies tauri-runtime-wry's requirement) until a real 0.36-based
+# tauri release ships and this patch can be removed.
+#[patch.crates-io]
+#tao = { git = "https://github.com/tauri-apps/tao", rev = "dad6b990d0bc0aca382de3631a86870928ef78f6" }
 
 # release profile optimizations for smaller binaries
 [profile.release]

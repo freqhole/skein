@@ -139,6 +139,10 @@ pub struct HubPeerService {
     /// feed it peer-offered blob inventory via `offer_peer_blobs` once a
     /// `BlobOffer` message arrives.
     pub(crate) engine: Arc<crate::snatch::HubSnatchEngine>,
+    /// outgoing (this hub serving a peer) blob transfer progress - fed by
+    /// the `iroh-blobs` gate's event stream (see `blob_acl::build_gated_blobs_events`),
+    /// read by the terminal dashboard's "uploads: N in progress" section.
+    pub(crate) transfers: Arc<freqhole_reliquary::gate::TransferRegistry>,
     /// legacy "wake the snatcher now" trigger. preserved as a no-op so that
     /// canvas/messages handlers from the prototype still compile; the
     /// change-driven engine subscribes to `hub_repo.subscribe_doc_changes`
@@ -300,9 +304,13 @@ impl HubPeerService {
         // fetch it, with zero access control of any kind).
         let blob_acl_gate =
             crate::blob_acl::BlobAclGate::for_hub(friendz_store.clone(), hub_repo.clone());
+        let transfers = freqhole_reliquary::gate::TransferRegistry::new();
         let blobs_protocol = BlobsProtocol::new(
             fs_store,
-            Some(crate::blob_acl::build_gated_blobs_events(blob_acl_gate)),
+            Some(crate::blob_acl::build_gated_blobs_events(
+                blob_acl_gate,
+                Some(transfers.clone()),
+            )),
         );
         let blob_proxy = crate::protocol::blob_proxy::new_handler(
             fs_store,
@@ -358,6 +366,7 @@ impl HubPeerService {
             Arc::clone(&canvas_doc_ids),
             Arc::clone(&hub_profile),
             Arc::clone(&profile_changed),
+            Arc::clone(&transfers),
         );
 
         let router = iroh::protocol::Router::builder(endpoint.clone())
@@ -406,6 +415,7 @@ impl HubPeerService {
             profile_changed,
             canvas_doc_ids,
             engine,
+            transfers,
             snatch_trigger: snatch_trigger_legacy,
             userz,
             friendz_store,
@@ -483,6 +493,7 @@ impl HubPeerService {
                 canvas_doc_ids: Arc::clone(&self.canvas_doc_ids),
                 data_dir: self.data_dir.clone(),
                 engine: self.engine.clone(),
+                transfers: self.transfers.clone(),
             };
             let dashboard_cancel = cancel.clone();
             tokio::spawn(crate::dashboard::run(dashboard_ctx, dashboard_cancel))

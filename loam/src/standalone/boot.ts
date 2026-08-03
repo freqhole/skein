@@ -43,7 +43,8 @@ import {
 
 import { ensureIdentity, getMiddenNode, getStoredIdentity, onIdentityChange } from "../p2p/identity";
 import { getOrCreateAnonDeviceId } from "../p2p/anon-device-id";
-import { IrohNetworkAdapter, restrictBlobToPeers, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
+import { IrohNetworkAdapter, restrictBlobToPeers, getActiveTransfers, type MiddenStreamNode } from "../p2p/iroh-network-adapter";
+import { setBrowserTransferSource } from "../p2p/transfer-progress";
 import { createAclFilteringAdapter, createRepoRoleResolver } from "../p2p/acl-filtering-network-adapter";
 import type { RoleResolver } from "../p2p/acl-filtering-network-adapter";
 import { createCanvasScopedSharePolicy } from "../p2p/canvas-scoped-share-policy";
@@ -313,6 +314,12 @@ class SkeinRouter {
 
     // register adapter for module-level endpoint toggle (settings tab)
     registerEndpointAdapter(this.irohAdapter);
+
+    // browser-mode outgoing-transfer-progress source (see
+    // p2p/transfer-progress.ts's header comment) — a no-op in tauri mode
+    // (getActiveTransfers() duck-types to `[]` there, same as
+    // restrictBlobToPeers above), so this is safe to wire unconditionally.
+    setBrowserTransferSource(() => getActiveTransfers(this.irohAdapter));
 
     // dev/test-only: expose the real production IrohNetworkAdapter's p2p
     // bridge (importBlob/fetchBlob/restrictBlobToPeers/etc — see

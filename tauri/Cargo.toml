@@ -1,6 +1,6 @@
 [package]
 name = "skein"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "skein desktop shell"
 
@@ -16,11 +16,17 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [
+tauri = { version = "=2.10.3", features = [
     "macos-private-api",
     "devtools",
     "protocol-asset",
 ] }
+# pinned exactly alongside tauri (not otherwise used directly) so tao stays on
+# 0.34.8 -- tauri-runtime-wry 2.11.x pulls in tao 0.35.x, which regressed
+# ndk-context init on android and crashes real devices (see charnel's own
+# lockfile, still on this same combo, for the known-good reference point).
+tauri-runtime = "=2.10.1"
+tauri-runtime-wry = "=2.10.1"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
@@ -44,9 +50,13 @@ toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
+# re-zips an exploded epub directory (some editing tools leave mimetype/
+# META-INF/OPS loose on disk instead of a real zip archive) back into a
+# proper epub — see epub_repair.rs. same version charnel already uses.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 tumulus = { path = "../tumulus" }
-freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.8" }
+freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.9" }
 
 # android only: wry's android WebViewClient.handleRequest (and skein's own
 # reqwest clients) build a rustls-backed client, which panics ("no provider
@@ -62,7 +72,7 @@ rustls = { version = "0.23", default-features = false, features = [
 image = { version = "0.25", default-features = false, features = ["png"] }
 # test-utils pulls in reliquary::testing (make_local_storage_node etc.) — only
 # activated for test builds, resolver v2 keeps it out of the release binary.
-freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.8", features = [
+freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.9", features = [
     "test-utils",
 ] }
 tempfile = "3"

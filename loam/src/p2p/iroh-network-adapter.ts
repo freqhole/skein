@@ -20,6 +20,9 @@ import {
 } from "@freqhole/reliquary/automerge";
 
 import { getStoredIdentity, onIdentityChange } from "./identity";
+import { log } from "@freqhole/reliquary/utils";
+
+const TAG = "p2p.iroh-network-adapter";
 
 export { IrohNetworkAdapter, SYNC_ALPN };
 export type { BiStreamLike, ConnectionSummary, EndpointState, MiddenStreamNode };
@@ -76,3 +79,35 @@ export async function restrictBlobToPeers(
   // function resolves
   await nodeAny.restrict_blob_to_peers(blake3Hash, peerNodeIds);
 }
+
+/** one outgoing blob transfer in flight on this browser peer (this peer
+ *  serving, some other peer snatching) - see `MiddenNode::get_active_transfers`
+ *  in `midden/src/lib.rs` / `midden/src/transfers.rs`. */
+export interface MiddenActiveTransfer {
+  peerId: string;
+  blake3: string;
+  bytesSent: number;
+  totalSize: number;
+}
+
+/**
+ * snapshot of this browser peer's own outgoing blob transfers currently in
+ * flight - the browser-peer counterpart to tauri's
+ * `p2p/transfer-progress.ts` polling, so the file widget can show upload
+ * progress for browser peers too, not just tauri peers.
+ *
+ * returns `[]` if the underlying transport doesn't expose this method
+ * (e.g. tauri mode, which tracks transfers through a separate native path -
+ * see `transfer-progress.ts`'s tauri dispatch instead).
+ */
+export async function getActiveTransfers(adapter: IrohNetworkAdapter): Promise<MiddenActiveTransfer[]> {
+  const node = await adapter.getNode();
+  const nodeAny = node as unknown as {
+    get_active_transfers?: () => MiddenActiveTransfer[] | Promise<MiddenActiveTransfer[]>;
+  };
+  if (typeof nodeAny.get_active_transfers !== "function") {
+    return [];
+  }
+  return (await nodeAny.get_active_transfers()) ?? [];
+}
+

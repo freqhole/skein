@@ -14,7 +14,7 @@
  * - snatch.ts — locality checking, batch snatch, save/reveal
  */
 
-import { Container, Graphics, Text } from "pixi.js";
+import { ColorMatrixFilter, Container, Graphics, Text } from "pixi.js";
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import {
@@ -98,6 +98,21 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
       type: "color" as const,
       default: 0xffffff,
     },
+    {
+      key: "darkMode",
+      label: "dark mode (invert)",
+      type: "boolean" as const,
+      default: false,
+    },
+    {
+      key: "darkModeContrast",
+      label: "dark mode contrast",
+      type: "number" as const,
+      default: 3,
+      min: 0,
+      max: 10,
+      visibleWhen: { key: "darkMode", value: true },
+    },
   ],
 
   getCompactInfo: (state: PeedeeeffState): CompactInfo => ({
@@ -160,8 +175,11 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
       const isLocal = actionState === "local" || actionState === "snatched";
       bg.clear();
       bg.rect(0, 0, w, h);
-      // use configured background when pages exist and local, black otherwise
-      bg.fill({ color: hasPages && isLocal ? state.background : 0x000000 });
+      // use configured background when pages exist and local, black otherwise —
+      // dark mode always wins so the inverted pages don't sit in a mismatched
+      // light-colored frame
+      const showConfigured = hasPages && isLocal && !state.darkMode;
+      bg.fill({ color: showConfigured ? state.background : 0x000000 });
     };
     drawBg(currentWidth, currentHeight);
 
@@ -246,6 +264,31 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
 
     const pageContainer = new Container();
     container.addChild(pageContainer);
+
+    // display-only invert — pixels on disk are untouched, so toggling is
+    // instant and doesn't require re-rendering or re-caching anything.
+    // resolution must match the render target (not the default of 1) or the
+    // filter's intermediate texture is rendered under-scaled, softening text.
+    const darkModeFilter = new ColorMatrixFilter({ resolution: "inherit" });
+    const applyDarkMode = () => {
+      const state = ctx.doc.current;
+      pageContainer.filters = state.darkMode ? [darkModeFilter] : null;
+      if (state.darkMode) {
+        darkModeFilter.negative(false);
+        // a plain invert makes glyphs look thinner — this is the same reversed-out
+        // print effect that made traditional typesetters cut heavier weights for
+        // white-on-black text (irradiation makes light strokes on a dark ground
+        // read as thinner than the identical dark strokes on a light ground). a
+        // pixel-level fix can't fully undo a perceptual effect, but pushing
+        // contrast harder snaps more of each glyph's anti-aliased edge to solid
+        // white, clawing back some of the lost weight — user-tunable since the
+        // right amount varies per document. pixi's formula has no hard ceiling
+        // at amount=1 (its documented "max"), so the 0-10 dial maps to 0-2 to
+        // leave room to push past that.
+        darkModeFilter.contrast(state.darkModeContrast / 5, true);
+      }
+    };
+    applyDarkMode();
 
     // -----------------------------------------------------------------------
     // snatch button — positioned below status text, centered
@@ -1148,6 +1191,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
 
     const unsub = ctx.doc.on("change", (state) => {
       drawBg(currentWidth, currentHeight);
+      applyDarkMode();
 
       // check if main blobId changed
       if (state.blobId !== prevBlobId) {
@@ -1281,7 +1325,7 @@ export const peedeeeffWidget: WidgetFactory<typeof peedeeeffSchema> = {
      *  was generated before square-cropping was added. */
     async function handleRegenerateThumbnail() {
       if (ctx.canvasStore?.isLocalViewer()) return;
-      await regenerateThumbnail(renderableDoc);
+      await regenerateThumbnail(renderableDoc, ctx.canvasStore);
     }
 
     // -----------------------------------------------------------------------

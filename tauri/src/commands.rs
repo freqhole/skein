@@ -96,6 +96,19 @@ impl Drop for UploadCancelGuard {
     }
 }
 
+/// best-effort removal of a synthesized temp file (currently: a repaired
+/// epub zip — see `epub_repair.rs`) on every exit path from
+/// `blob_insert_from_path_impl`. `adopt_local_file` already moves the file
+/// into managed storage on success, so removal here is a no-op then; on any
+/// failure before that point, this is what actually cleans it up.
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// raii guard that removes a hash from the `blobs_in_flight` set when dropped.
 /// ensures the gc protect callback never sees a stale in-flight entry if the
 /// download completes, errors, or is cancelled. mirrors `DownloadCancelGuard`.
@@ -138,6 +151,13 @@ pub struct AppState {
     pub downloader_cell: Arc<std::sync::RwLock<Option<iroh_blobs::api::downloader::Downloader>>>,
     pub friendz_store: friendz::Store,
     pub userz: userz::Directory,
+
+    /// outgoing (this node serving a peer) blob transfer progress - always
+    /// present (independent of whether the network is up yet), so the
+    /// `blob_transfer_progress` dispatch action always has something to
+    /// read. wired into `start_with_blobs`' gate every time the network is
+    /// (re)built - see `build_network_state`.
+    pub transfers: Arc<freqhole_reliquary::gate::TransferRegistry>,
 
     pub process_started_at: Instant,
     pub app_config_path: PathBuf,
@@ -337,6 +357,7 @@ pub async fn build_network_state(state: &AppState) -> anyhow::Result<NetworkStat
         state.storage.fs_store,
         state.friendz_store.clone(),
         state.userz.clone(),
+        state.transfers.clone(),
     )
     .await?;
 
@@ -492,6 +513,7 @@ async fn dispatch(
             blob_iroh_download_cancel(decode("blob_iroh_download_cancel", payload)?).await
         }
         "blob_iroh_probe" => blob_iroh_probe(decode("blob_iroh_probe", payload)?, state).await,
+        "blob_transfer_progress" => blob_transfer_progress(state).await,
 
         // pdf page rendering (peedeeeff widget)
         "pdf_render_pages" => pdf_render_pages(decode("pdf_render_pages", payload)?, state).await,
@@ -1021,13 +1043,31 @@ async fn social_set_friend_alias(
     args: SocialSetFriendAliasArgs,
     state: &AppState,
 ) -> Result<Value, DispatchError> {
-    let alias = if args.alias.is_empty() {
-        None
-    } else {
-        Some(args.alias.as_str())
-    };
+    // the friend list (social_get_state) reads alias from friendz_store
+    // (haruspex's FriendEdge.alias), not userz's peerz.alias — this used to
+    // write to userz.set_alias, which meant edits landed in a column nothing
+    // ever reads back. upsert_full COALESCE-merges other fields, so we need
+    // to write the existing status/direction/group_name/doc_id back rather
+    // than letting them default. read first (same pattern as
+    // social_update_friend above).
     state.userz.touch(&args.friend_user_id).await?;
-    state.userz.set_alias(&args.friend_user_id, alias).await?;
+    let existing = state
+        .friendz_store
+        .get(&args.friend_user_id)
+        .await?
+        .ok_or(DispatchError::NotFound)?;
+
+    state
+        .friendz_store
+        .upsert_full(
+            &args.friend_user_id,
+            existing.status,
+            existing.direction,
+            Some(args.alias.as_str()),
+            existing.group_name.as_deref(),
+            existing.narthex_doc_id.as_deref(),
+        )
+        .await?;
     Ok(Value::Null)
 }
 
@@ -1168,6 +1208,27 @@ async fn blob_list(args: BlobListArgs, state: &AppState) -> Result<Value, Dispat
         .await?;
     let dtos: Vec<BlobDto> = blobs.into_iter().map(Into::into).collect();
     Ok(serde_json::to_value(dtos).expect("blob list serialize"))
+}
+
+/// snapshot of every outgoing (this node serving a peer) blob transfer
+/// currently in progress - polled by the loam file widget so it can show a
+/// "peer: NN%" label distinct from the existing (doc-backed, incoming)
+/// upload progress label. see `freqhole_reliquary::gate::TransferRegistry`.
+async fn blob_transfer_progress(state: &AppState) -> Result<Value, DispatchError> {
+    let transfers: Vec<Value> = state
+        .transfers
+        .snapshot()
+        .into_iter()
+        .map(|t| {
+            json!({
+                "peerId": t.peer,
+                "blake3": t.blake3,
+                "bytesSent": t.bytes_sent,
+                "totalSize": t.total_size,
+            })
+        })
+        .collect();
+    Ok(json!(transfers))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1430,6 +1491,26 @@ async fn blob_insert_from_path_impl(
             .map(|s| s.to_string())
     });
 
+    // some epub-editing tools/sync flows leave `mimetype`/`META-INF`/`OPS`
+    // loose on disk under a `.epub`-named directory instead of the zip
+    // archive the epub (OCF) spec actually requires — repair it into a
+    // proper epub at a temp path and upload that instead of erroring on
+    // the raw directory (see epub_repair.rs). `_repair_guard` best-effort
+    // deletes the temp zip on every exit path; `adopt_local_file` below
+    // already consumes/moves it away on success, so removal there is a
+    // harmless no-op.
+    let mut repair_guard: Option<TempFileGuard> = None;
+    let upload_path = if crate::epub_repair::looks_like_epub_directory(&path) {
+        let zip_path = crate::epub_repair::repair(&path).await.map_err(|e| {
+            DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+        })?;
+        repair_guard = Some(TempFileGuard(zip_path.clone()));
+        zip_path
+    } else {
+        path.clone()
+    };
+    let is_repaired_epub = repair_guard.is_some();
+
     // streams the file through blake3 in fixed-size chunks (see
     // `register_external_path`'s doc comment in `freqhole_reliquary::blobz`)
     // — never loads the whole file into memory, and registers it as an
@@ -1437,6 +1518,8 @@ async fn blob_insert_from_path_impl(
     // file picker found it, rather than also being copied into reliquary's
     // blob-files dir) so a multi-gigabyte upload costs one streaming read
     // pass, not a read + a full-file copy + a full-file base64 round-trip.
+    // (a repaired epub is a synthesized temp file, not the user's original,
+    // so it's adopted — moved into managed storage — instead; see below.)
     let upload_id = args.upload_id.clone();
 
     // register a cancel flag so `blob_insert_cancel` can abort the hashing pass.
@@ -1451,44 +1534,70 @@ async fn blob_insert_from_path_impl(
         None
     };
 
-    let blob = state
-        .storage
-        .blobz
-        .register_external_path(
-            &path,
-            NewBlobMeta {
-                filename,
-                mime: args.mime,
-                ..Default::default()
-            },
-            on_progress,
-            Some(&cancel_flag),
-        )
-        .await
-        .map_err(|e| {
-            if matches!(e, freqhole_reliquary::blobz::BlobStoreError::Cancelled) {
-                DispatchError::Stream("upload cancelled".to_string())
-            } else {
-                DispatchError::Blob(e)
-            }
-        })?;
+    // mirror decision must happen before adopting a repaired epub below —
+    // `adopt_local_file` moves the temp zip away, so reading it any later
+    // would fail. harmless to check size early for the normal (external)
+    // path too, since that file is never moved.
+    let mirror_bytes = match tokio::fs::metadata(&upload_path).await {
+        Ok(meta) if meta.len() <= MIRROR_DATA_MAX_BYTES => {
+            Some(tokio::fs::read(&upload_path).await.map_err(|e| {
+                DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(format!(
+                    "read {}: {}",
+                    upload_path.display(),
+                    e
+                )))
+            })?)
+        }
+        _ => None,
+    };
+
+    let blob = if is_repaired_epub {
+        state
+            .storage
+            .blobz
+            .adopt_local_file(
+                &upload_path,
+                NewBlobMeta {
+                    filename,
+                    mime: args.mime,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(DispatchError::Blob)?
+    } else {
+        state
+            .storage
+            .blobz
+            .register_external_path(
+                &upload_path,
+                NewBlobMeta {
+                    filename,
+                    mime: args.mime,
+                    ..Default::default()
+                },
+                on_progress,
+                Some(&cancel_flag),
+            )
+            .await
+            .map_err(|e| {
+                if matches!(e, freqhole_reliquary::blobz::BlobStoreError::Cancelled) {
+                    DispatchError::Stream("upload cancelled".to_string())
+                } else {
+                    DispatchError::Blob(e)
+                }
+            })?
+    };
+    drop(repair_guard);
     prewarm_fs_store(state, &blob).await;
 
     // mirror the bytes back to the JS caller only for small files — see
     // `MIRROR_DATA_MAX_BYTES`'s doc comment. `null` (not an empty string)
     // signals "no mirror" explicitly so the JS side can't mistake it for a
     // genuinely-empty (0-byte) file.
-    let data = if blob.size <= MIRROR_DATA_MAX_BYTES {
-        let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(format!(
-                "read {}: {}",
-                path.display(),
-                e
-            )))
-        })?;
-        Value::String(B64.encode(&bytes))
-    } else {
-        Value::Null
+    let data = match mirror_bytes {
+        Some(bytes) => Value::String(B64.encode(&bytes)),
+        None => Value::Null,
     };
 
     Ok(json!({
@@ -1956,10 +2065,15 @@ async fn read_text_file(args: ReadTextFileArgs) -> Result<Value, DispatchError> 
 struct BlobThumbnailArgs {
     blake3: String,
     size: Option<u32>,
+    /// when true, fit the whole image inside the square (padding with
+    /// transparent pixels) instead of center-cropping it - used for
+    /// document/page thumbnails, where cropping can cut off real content.
+    fit: Option<bool>,
 }
 
 async fn blob_thumbnail(args: BlobThumbnailArgs, state: &AppState) -> Result<Value, DispatchError> {
     let size = args.size.unwrap_or(200);
+    let fit = args.fit.unwrap_or(false);
 
     let blob = state
         .storage
@@ -1971,7 +2085,7 @@ async fn blob_thumbnail(args: BlobThumbnailArgs, state: &AppState) -> Result<Val
     let path = state.storage.blobz.path_for(&blob);
     let mime = blob.mime.as_deref().unwrap_or("application/octet-stream");
 
-    let result = crate::thumbnail::generate_thumbnail(&path, mime, size)
+    let result = crate::thumbnail::generate_thumbnail(&path, mime, size, fit)
         .await
         .map_err(|e| {
             DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
@@ -2106,6 +2220,7 @@ mod tests {
             downloader_cell: Arc::new(std::sync::RwLock::new(None)),
             friendz_store,
             userz: userz_dir,
+            transfers: freqhole_reliquary::gate::TransferRegistry::new(),
             process_started_at: Instant::now(),
             app_config_path: data_dir.join("skein-app.toml"),
         };
@@ -2425,5 +2540,77 @@ mod tests {
         .expect_err("unparseable peer_addr should be rejected before any network use");
 
         assert!(err.to_string().contains("parse peer_addr"));
+    }
+
+    #[tokio::test]
+    async fn social_set_friend_alias_persists_and_is_visible_in_social_get_state() {
+        let (state, _tmp) = make_test_state().await;
+        let node_id = "friend-node-1".to_string();
+
+        social_add_friend(
+            SocialAddFriendArgs {
+                node_id: node_id.clone(),
+                alias: None,
+            },
+            &state,
+        )
+        .await
+        .expect("social_add_friend");
+
+        social_set_friend_alias(
+            SocialSetFriendAliasArgs {
+                friend_user_id: node_id.clone(),
+                alias: "new-nickname".to_string(),
+            },
+            &state,
+        )
+        .await
+        .expect("social_set_friend_alias");
+
+        // regression: alias used to be written to userz's peerz.alias, a
+        // table social_get_state never reads for the friend list — so the
+        // edit silently never showed up. it must land in friendz_store
+        // (read by social_get_state below) instead.
+        let full_state = social_get_state(&state).await.expect("social_get_state");
+        let friends = full_state["friends"].as_array().expect("friends array");
+        let friend = friends
+            .iter()
+            .find(|f| f["id"].as_str() == Some(node_id.as_str()))
+            .expect("friend present");
+        assert_eq!(friend["alias"].as_str(), Some("new-nickname"));
+    }
+
+    #[tokio::test]
+    async fn social_set_friend_alias_can_clear_alias_back_to_empty() {
+        let (state, _tmp) = make_test_state().await;
+        let node_id = "friend-node-2".to_string();
+
+        social_add_friend(
+            SocialAddFriendArgs {
+                node_id: node_id.clone(),
+                alias: Some("initial-alias".to_string()),
+            },
+            &state,
+        )
+        .await
+        .expect("social_add_friend");
+
+        social_set_friend_alias(
+            SocialSetFriendAliasArgs {
+                friend_user_id: node_id.clone(),
+                alias: String::new(),
+            },
+            &state,
+        )
+        .await
+        .expect("social_set_friend_alias");
+
+        let full_state = social_get_state(&state).await.expect("social_get_state");
+        let friends = full_state["friends"].as_array().expect("friends array");
+        let friend = friends
+            .iter()
+            .find(|f| f["id"].as_str() == Some(node_id.as_str()))
+            .expect("friend present");
+        assert_eq!(friend["alias"].as_str(), Some(""));
     }
 }

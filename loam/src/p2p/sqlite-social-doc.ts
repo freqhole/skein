@@ -527,7 +527,13 @@ export class SqliteSocialDoc implements SocialDoc {
           promises.push(
             dispatch("social_add_friend", {
               node_id: nodeId,
-              alias: f.alias || f.username || undefined,
+              // alias is the LOCAL user's nickname for this friend, distinct
+              // from the friend's own username — falling back to f.username
+              // here seeded a brand-new friend's alias with their own name
+              // (e.g. a peer whose own username defaulted to "skein" would
+              // show up with alias "skein"), which then looked identical to
+              // a real, intentionally-set alias and couldn't be told apart.
+              alias: f.alias || undefined,
             })
           );
           // isHub arrives pre-set on the draft pushed by friendz-wiring.ts's

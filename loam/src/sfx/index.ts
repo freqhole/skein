@@ -93,17 +93,17 @@ function playSequence(notes: Note[], gain = 0.15): void {
   }
 }
 
-/** a friend came online — short upward two-note ping. */
+/** a friend came online — a single soft blip. */
 export function playFriendOnlineSound(): void {
+  playSequence([{ freq: 520, duration: 0.09 }]);
+}
+
+/** a new message/notification arrived — short upward two-note ping. */
+export function playNewMessageSound(): void {
   playSequence([
     { freq: 660, duration: 0.08 },
     { freq: 880, duration: 0.1 },
   ]);
-}
-
-/** a new message/notification arrived — a single soft blip. */
-export function playNewMessageSound(): void {
-  playSequence([{ freq: 520, duration: 0.09 }]);
 }
 
 /** a friend request arrived — a slightly longer three-note ascending chime. */

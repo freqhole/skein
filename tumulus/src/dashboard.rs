@@ -29,6 +29,7 @@ use crate::protocol::hub_admin::{disk_space, list_pending_knocks};
 use crate::snatch::HubSnatchEngine;
 use crate::userz;
 use freqhole_reliquary::blobz::BlobStore;
+use freqhole_reliquary::gate::TransferRegistry;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -55,6 +56,9 @@ pub struct DashboardContext {
     pub canvas_doc_ids: Arc<Mutex<HashSet<String>>>,
     pub data_dir: PathBuf,
     pub(crate) engine: Arc<HubSnatchEngine>,
+    /// outgoing (this hub serving a peer) blob transfer progress - see
+    /// `crate::blob_acl::build_gated_blobs_events`'s `transfers` parameter.
+    pub(crate) transfers: Arc<TransferRegistry>,
 }
 
 /// drive the dashboard until `cancel` fires.
@@ -173,6 +177,29 @@ async fn render_frame(
         out.push('\n');
     }
 
+    let mut active_uploads = ctx.transfers.snapshot();
+    if active_uploads.is_empty() {
+        out.push_str("uploads: none in progress\n\n");
+    } else {
+        // oldest first, so the same transfer doesn't jump around the list
+        // from one redraw to the next.
+        active_uploads.sort_by_key(|t| t.started_at);
+        out.push_str(&format!("uploads: {} in progress\n", active_uploads.len()));
+        for upload in &active_uploads {
+            let to = display_name_for(&ctx.userz, &upload.peer).await;
+            let percent = if upload.total_size > 0 {
+                (upload.bytes_sent as f64 / upload.total_size as f64 * 100.0).round() as u32
+            } else {
+                0
+            };
+            out.push_str(&format!(
+                "  - {} to {to} ({percent}%)\n",
+                short_node_id(&upload.blake3)
+            ));
+        }
+        out.push('\n');
+    }
+
     let pending_friend_requests = ctx
         .friendz_store
         .list_pending(Some(Direction::Inbound))
@@ -202,9 +229,7 @@ async fn render_frame(
                 .canvas_title(&knock.canvas_doc_id)
                 .await
                 .unwrap_or_else(|| short_node_id(&knock.canvas_doc_id));
-            out.push_str(&format!(
-                "  - canvas request from {who} (canvas {canvas_label})\n"
-            ));
+            out.push_str(&format!("  - canvas request from {who} ({canvas_label})\n"));
         }
     }
 

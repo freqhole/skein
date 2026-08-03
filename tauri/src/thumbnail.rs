@@ -29,15 +29,22 @@ pub enum ThumbnailError {
 
 /// generate a thumbnail for a blob on disk.
 ///
+/// `fit`, when true, scales the whole image to fit inside the square
+/// (padding with transparent pixels) instead of center-cropping it - the
+/// right choice for document/page thumbnails, where cropping can cut off
+/// real content. only affects the image/* path; other source types are
+/// unaffected.
+///
 /// returns a json value of the shape `{ data: <base64-string>, mime: <str> }`
 /// for supported types, or `{ data: null }` for unsupported ones.
 pub async fn generate_thumbnail(
     blob_path: &Path,
     mime: &str,
     size: u32,
+    fit: bool,
 ) -> Result<Value, ThumbnailError> {
     if mime.starts_with("image/") {
-        thumbnail_image(blob_path, size).await
+        thumbnail_image(blob_path, size, fit).await
     } else if mime == "application/pdf" {
         thumbnail_pdf(blob_path, size).await
     } else if mime.starts_with("video/") {
@@ -72,9 +79,14 @@ async fn resolve_ffprobe() -> Option<String> {
 // image
 // ---------------------------------------------------------------------------
 
-async fn thumbnail_image(path: &Path, size: u32) -> Result<Value, ThumbnailError> {
+async fn thumbnail_image(path: &Path, size: u32, fit: bool) -> Result<Value, ThumbnailError> {
     let bytes = tokio::fs::read(path).await?;
-    let webp = freqhole_reliquary::media::resize_to_square_webp(&bytes, size)
+    let mode = if fit {
+        freqhole_reliquary::media::ResizeMode::Contain
+    } else {
+        freqhole_reliquary::media::ResizeMode::CenterCrop
+    };
+    let webp = freqhole_reliquary::media::resize_to_square_webp_with_mode(&bytes, size, mode)
         .map_err(|e| ThumbnailError::Image(e.to_string()))?;
     let b64 = B64.encode(&webp);
     Ok(json!({ "data": b64, "mime": "image/webp" }))
@@ -325,6 +337,20 @@ mod tests {
         buf.into_inner()
     }
 
+    /// build a wide (non-square), fully opaque in-memory PNG - used to
+    /// verify `fit` mode pads rather than crops.
+    fn wide_png() -> Vec<u8> {
+        use image::ImageFormat;
+        let img = image::RgbImage::from_fn(64, 16, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
+    }
+
     #[tokio::test]
     async fn image_resize_returns_webp_base64() {
         let png = tiny_png();
@@ -335,7 +361,9 @@ mod tests {
         let path = dir.join("test.png");
         tokio::fs::write(&path, &png).await.unwrap();
 
-        let result = thumbnail_image(&path, 64).await.expect("thumbnail_image");
+        let result = thumbnail_image(&path, 64, false)
+            .await
+            .expect("thumbnail_image");
         let _ = tokio::fs::remove_dir_all(&dir).await;
 
         assert_eq!(result["mime"], "image/webp");
@@ -350,13 +378,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_resize_with_fit_pads_instead_of_cropping() {
+        let png = wide_png();
+
+        let dir = std::env::temp_dir().join(format!("skein_thumb_test_{}", uuid_like()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("wide.png");
+        tokio::fs::write(&path, &png).await.unwrap();
+
+        let result = thumbnail_image(&path, 32, true)
+            .await
+            .expect("thumbnail_image");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+
+        let b64 = result["data"].as_str().expect("data is a string");
+        let bytes = B64.decode(b64).expect("valid base64");
+        let decoded = image::load_from_memory(&bytes).expect("decode result webp");
+        assert_eq!(
+            image::GenericImageView::dimensions(&decoded),
+            (32, 32),
+            "fit mode still produces a square output"
+        );
+        let rgba = decoded.to_rgba8();
+        assert_eq!(
+            rgba.get_pixel(0, 0)[3],
+            0,
+            "corner should be transparent padding, not cropped content"
+        );
+    }
+
+    #[tokio::test]
     async fn unsupported_mime_returns_null_data() {
         let dir = std::env::temp_dir().join(format!("skein_thumb_test_{}", uuid_like()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let path = dir.join("doc.txt");
         tokio::fs::write(&path, b"hello").await.unwrap();
 
-        let result = generate_thumbnail(&path, "text/plain", 200)
+        let result = generate_thumbnail(&path, "text/plain", 200, false)
             .await
             .expect("generate_thumbnail should not error on unsupported mime");
         let _ = tokio::fs::remove_dir_all(&dir).await;

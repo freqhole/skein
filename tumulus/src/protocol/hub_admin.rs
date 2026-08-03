@@ -43,6 +43,7 @@ use crate::hub::HubProfile;
 use crate::hub_repo::HubRepo;
 use crate::userz;
 use freqhole_reliquary::blobz::{BlobStore, NewBlobMeta};
+use freqhole_reliquary::gate::TransferRegistry;
 
 /// ALPN protocol identifier for remote hub administration.
 pub const HUB_ADMIN_ALPN: &[u8] = b"iroh/skein-hub-admin/1";
@@ -123,6 +124,21 @@ pub struct BlobUsageSummary {
     /// true in `AdminResponse::CanvasBlobs` where the canvas manifest is
     /// shown regardless of soft-deleted status.
     pub soft_deleted: bool,
+}
+
+/// one outgoing blob transfer in progress on the hub, as reported by
+/// `AdminRequest::ActiveTransfers` - the hub-side counterpart to
+/// `transfer-progress.ts`'s tauri-peer polling, so an e2e test (or an admin
+/// panel) can observe the hub actively serving a blob to a peer.
+/// `gate::ActiveTransfer.started_at` is a plain `Instant` (not
+/// serializable), so `elapsed_ms` is computed at snapshot time instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferSummary {
+    pub peer: String,
+    pub blake3: String,
+    pub bytes_sent: u64,
+    pub total_size: u64,
+    pub elapsed_ms: u64,
 }
 
 /// a single soft-deleted blob, as reported by `AdminRequest::ListSoftDeleted`.
@@ -239,6 +255,9 @@ pub enum AdminRequest {
         offset: u64,
         limit: u64,
     },
+    /// snapshot of this hub's own outgoing blob transfers currently in
+    /// flight (this hub serving, some peer snatching) - see `TransferSummary`.
+    ActiveTransfers,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +352,10 @@ pub enum AdminResponse {
         blobs: Vec<BlobUsageSummary>,
         total: u64,
     },
+    /// response to `AdminRequest::ActiveTransfers`.
+    ActiveTransfers {
+        transfers: Vec<TransferSummary>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +409,10 @@ struct Inner {
     /// broadcast loop (hub/mod.rs) waits on this and pushes a
     /// ProfileResponse to every online peer.
     profile_changed: Arc<tokio::sync::Notify>,
+    /// this hub's own outgoing blob-transfer registry, shared with
+    /// `build_gated_blobs_events` (see `hub::HubPeerService::start`) - read
+    /// here only for `AdminRequest::ActiveTransfers`.
+    transfers: Arc<TransferRegistry>,
 }
 
 impl std::fmt::Debug for HubAdminHandler {
@@ -407,6 +434,7 @@ impl HubAdminHandler {
         canvas_doc_ids: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
         hub_profile: Arc<tokio::sync::RwLock<HubProfile>>,
         profile_changed: Arc<tokio::sync::Notify>,
+        transfers: Arc<TransferRegistry>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -420,6 +448,7 @@ impl HubAdminHandler {
                 canvas_doc_ids,
                 hub_profile,
                 profile_changed,
+                transfers,
             }),
         }
     }
@@ -1022,6 +1051,22 @@ async fn handle_request(
                 blobs: page,
                 total,
             }
+        }
+        AdminRequest::ActiveTransfers => {
+            let transfers = handler
+                .inner
+                .transfers
+                .snapshot()
+                .into_iter()
+                .map(|t| TransferSummary {
+                    peer: t.peer,
+                    blake3: t.blake3,
+                    bytes_sent: t.bytes_sent,
+                    total_size: t.total_size,
+                    elapsed_ms: t.started_at.elapsed().as_millis() as u64,
+                })
+                .collect();
+            AdminResponse::ActiveTransfers { transfers }
         }
     }
 }
@@ -1708,6 +1753,7 @@ mod tests {
                 canvas_doc_ids,
                 hub_profile,
                 Arc::clone(&profile_changed),
+                TransferRegistry::new(),
             ),
             adminz_store,
             friendz_store,
@@ -2373,6 +2419,7 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             default_test_hub_profile(),
             Arc::new(tokio::sync::Notify::new()),
+            TransferRegistry::new(),
         );
 
         let admin_node = "admin-node";
@@ -2465,6 +2512,7 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             default_test_hub_profile(),
             Arc::new(tokio::sync::Notify::new()),
+            TransferRegistry::new(),
         );
         let admin_node = "admin-node";
         adminz_store.allow(admin_node).await.unwrap();
@@ -2520,6 +2568,7 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             default_test_hub_profile(),
             Arc::new(tokio::sync::Notify::new()),
+            TransferRegistry::new(),
         );
 
         let stranger = "stranger-node";
@@ -2561,6 +2610,7 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             default_test_hub_profile(),
             Arc::new(tokio::sync::Notify::new()),
+            TransferRegistry::new(),
         );
         (handler, adminz_store)
     }
@@ -3357,6 +3407,7 @@ mod tests {
             Arc::clone(&canvas_doc_ids),
             default_test_hub_profile(),
             Arc::new(tokio::sync::Notify::new()),
+            TransferRegistry::new(),
         );
 
         let resp = handle_request(
@@ -3437,6 +3488,7 @@ mod tests {
             canvas_doc_ids,
             default_test_hub_profile(),
             Arc::new(tokio::sync::Notify::new()),
+            TransferRegistry::new(),
         );
 
         let resp = handle_request(
@@ -3910,6 +3962,7 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             default_test_hub_profile(),
             Arc::new(tokio::sync::Notify::new()),
+            TransferRegistry::new(),
         );
 
         let resp = handle_request(
@@ -4031,6 +4084,7 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             default_test_hub_profile(),
             Arc::new(tokio::sync::Notify::new()),
+            TransferRegistry::new(),
         );
 
         // full listing: 3 blobs, sorted size desc

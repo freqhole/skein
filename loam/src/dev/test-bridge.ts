@@ -4,8 +4,8 @@ import type { SkeinCanvas } from "../canvas/init";
 import type { InvitableRole } from "../canvas/canvas-doc";
 import type { CanvasStore } from "../canvas/canvas-store";
 import type { FriendzProtocol } from "../p2p/friends-protocol";
-import { restrictBlobToPeers } from "../p2p/iroh-network-adapter";
-import type { EndpointState, IrohNetworkAdapter } from "../p2p/iroh-network-adapter";
+import { restrictBlobToPeers, getActiveTransfers } from "../p2p/iroh-network-adapter";
+import type { EndpointState, IrohNetworkAdapter, MiddenActiveTransfer } from "../p2p/iroh-network-adapter";
 import {
   initBridge as initFriendzBridge,
   sendFriendRequest as bridgeSendFriendRequest,
@@ -160,6 +160,13 @@ export interface SkeinP2PBridge {
    * real wiring, not a separate/fake code path.
    */
   restrictBlobToPeers(blake3Hash: string, peerNodeIds: string[]): Promise<void>;
+  /**
+   * snapshot of this peer's own outgoing blob transfers currently in flight
+   * (this peer serving, some other peer snatching) - see
+   * `MiddenNode::get_active_transfers` in `midden/src/lib.rs`. used by e2e
+   * tests to observe browser-peer upload progress in real time.
+   */
+  getActiveTransfers(): Promise<MiddenActiveTransfer[]>;
   /**
    * dial a hub's `iroh/skein-hub-admin/1` remote admin protocol and send a
    * single request, returning its parsed response. opens a raw bidirectional
@@ -770,6 +777,10 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
       // canvas-acl-driven callers use (see canvas/blob-acl-sync.ts) — this
       // test hook and production wiring go through the exact same path.
       return restrictBlobToPeers(adapter, blake3Hash, peerNodeIds);
+    },
+
+    async getActiveTransfers(): Promise<MiddenActiveTransfer[]> {
+      return getActiveTransfers(adapter);
     },
 
   async hubAdminRequest(peerNodeId: string, request: AdminRequest): Promise<AdminResponse> {
