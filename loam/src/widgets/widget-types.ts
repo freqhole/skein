@@ -473,8 +473,9 @@ export interface WidgetPropDef {
   imageMaxHeight?: number;
   /** for image props: center-crop to square before resizing */
   imageCropSquare?: boolean;
-  /** only show this prop when another prop has a specific value */
-  visibleWhen?: { key: string; value: unknown };
+  /** only show this prop when another prop equals a specific value, or (if
+   *  an array) one of several values */
+  visibleWhen?: { key: string; value: unknown | unknown[] };
 }
 
 /**

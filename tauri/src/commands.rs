@@ -21,7 +21,7 @@ use iroh::Endpoint;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tumulus::{friendz, userz};
 
 // ---------------------------------------------------------------------------
@@ -33,6 +33,28 @@ use tumulus::{friendz, userz};
 /// each iteration and aborts when set.
 static DOWNLOAD_CANCELS: LazyLock<StdMutex<HashMap<String, Arc<AtomicBool>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// singleflight registry coalescing concurrent `blob_iroh_download` calls
+/// for the SAME blake3 into one real transfer. the first caller for a given
+/// blake3 becomes the "leader" (runs `blob_iroh_download_run` for real and
+/// broadcasts its outcome here when done); every other caller for that same
+/// blake3 while the leader is still running just awaits the broadcast
+/// instead of starting its own independent download.
+///
+/// this used to not exist: nothing stopped two dispatches of
+/// `blob_iroh_download` for the same blake3 (e.g. the user restarting a
+/// stuck/paused snatch) from running concurrently, each with its own
+/// `DOWNLOAD_CANCELS` entry (last writer wins — cancelling only ever
+/// affected the most-recently-started one) and each racing to
+/// `export_with_opts(TryReference)` the SAME canonical blobz path at the
+/// end. the loser's export ran against a source file the winner had
+/// already renamed away, and could land a corrupt/0-byte file at the
+/// canonical path — which `register_ingested` then happily recorded as a
+/// real blob, since it only re-derives size from disk the first time a row
+/// is created. see docs on the 0-byte blob bug this caused.
+static DOWNLOAD_INFLIGHT: LazyLock<
+    StdMutex<HashMap<String, broadcast::Sender<Result<Value, String>>>>,
+> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 /// RAII guard that removes the cancel flag for `blake3` from `DOWNLOAD_CANCELS`
 /// when dropped, so the registry never accumulates stale entries.
@@ -500,6 +522,18 @@ async fn dispatch(
         "blob_list" => blob_list(decode_or_default(payload), state).await,
         "blob_get" => blob_get(decode("blob_get", payload)?, state).await,
         "blob_get_path" => blob_get_path(decode("blob_get_path", payload)?, state).await,
+        "blob_purge_local" => blob_purge_local(decode("blob_purge_local", payload)?, state).await,
+        "blob_add_canvas_ref" => {
+            blob_add_canvas_ref(decode("blob_add_canvas_ref", payload)?, state).await
+        }
+        "blob_remove_canvas_ref" => {
+            blob_remove_canvas_ref(decode("blob_remove_canvas_ref", payload)?, state).await
+        }
+        "blob_canvas_refs" => blob_canvas_refs(decode("blob_canvas_refs", payload)?, state).await,
+        "blob_remove_all_canvas_refs" => {
+            blob_remove_all_canvas_refs(decode("blob_remove_all_canvas_refs", payload)?, state)
+                .await
+        }
         "blob_insert" => blob_insert(decode("blob_insert", payload)?, state).await,
         "blob_insert_from_path" => {
             blob_insert_from_path(decode("blob_insert_from_path", payload)?, app, state).await
@@ -1236,6 +1270,76 @@ struct BlobGetArgs {
     blake3: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct BlobCanvasRefArgs {
+    blake3: String,
+    canvas_doc_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobCanvasRefsArgs {
+    blake3: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobRemoveAllCanvasRefsArgs {
+    canvas_doc_id: String,
+}
+
+/// record that `canvas_doc_id` currently has a widget referencing
+/// `blake3` — lets a widget-delete cleanup check whether purging the
+/// blob's local bytes would break another widget still using it.
+async fn blob_add_canvas_ref(
+    args: BlobCanvasRefArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    state
+        .storage
+        .blobz
+        .add_canvas_ref(&args.blake3, &args.canvas_doc_id)
+        .await?;
+    Ok(Value::Null)
+}
+
+/// remove a single canvas/blob reference (widget deleted or reassigned).
+async fn blob_remove_canvas_ref(
+    args: BlobCanvasRefArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    state
+        .storage
+        .blobz
+        .remove_canvas_ref(&args.blake3, &args.canvas_doc_id)
+        .await?;
+    Ok(Value::Null)
+}
+
+/// every canvas doc id currently referencing `blake3`.
+async fn blob_canvas_refs(
+    args: BlobCanvasRefsArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    let refs = state
+        .storage
+        .blobz
+        .canvas_refs_for_blob(&args.blake3)
+        .await?;
+    Ok(json!({ "canvasDocIds": refs }))
+}
+
+/// remove every ref row for `canvas_doc_id` (the whole canvas was deleted).
+async fn blob_remove_all_canvas_refs(
+    args: BlobRemoveAllCanvasRefsArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    state
+        .storage
+        .blobz
+        .remove_all_canvas_refs(&args.canvas_doc_id)
+        .await?;
+    Ok(Value::Null)
+}
+
 async fn blob_get(args: BlobGetArgs, state: &AppState) -> Result<Value, DispatchError> {
     let Some(meta) = state.storage.blobz.get(&args.blake3).await? else {
         return Err(DispatchError::NotFound);
@@ -1260,11 +1364,37 @@ async fn blob_get_path(args: BlobGetArgs, state: &AppState) -> Result<Value, Dis
         return Err(DispatchError::NotFound);
     };
     let path = state.storage.blobz.path_for(&meta);
+    // stat the real file rather than trusting the db row's size — a
+    // truncated/corrupt write (e.g. an interrupted snatch) can leave a
+    // 0-byte file on disk while the row still claims the original size,
+    // and the frontend needs the real number to flag that to the user.
+    let actual_size = tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(meta.size);
     Ok(json!({
         "path": path.to_string_lossy(),
         "mime": meta.mime,
-        "size": meta.size,
+        "size": actual_size,
     }))
+}
+
+/// delete the LOCAL copy of a blob (managed file + row) to reclaim disk
+/// space and let it be re-snatched from a peer, e.g. to recover from a
+/// corrupt/truncated local copy. mirrors loam's browser-only
+/// `freeUpLocalBlobCopy`, but here `hard_delete_soft_deleted` only unlinks
+/// managed (non-external) files, so an externally-referenced original file
+/// is never touched.
+async fn blob_purge_local(args: BlobGetArgs, state: &AppState) -> Result<Value, DispatchError> {
+    let blobz = &state.storage.blobz;
+    if blobz.get_any(&args.blake3).await?.is_none() {
+        return Err(DispatchError::NotFound);
+    }
+    blobz
+        .soft_delete(&[args.blake3.clone()], "purge_local")
+        .await?;
+    blobz.hard_delete_soft_deleted(Some(&[args.blake3])).await?;
+    Ok(Value::Null)
 }
 
 /// best-effort: import a freshly-inserted blob into the iroh-blobs FsStore
@@ -1668,14 +1798,82 @@ async fn blob_iroh_download(
     blob_iroh_download_impl(args, &on_progress, state).await
 }
 
+/// thin dedup wrapper around [`blob_iroh_download_run`]: coalesces
+/// concurrent calls for the same blake3 into a single real transfer (see
+/// [`DOWNLOAD_INFLIGHT`]'s doc comment for why this matters). the first
+/// caller for a blake3 becomes the leader and actually runs the download;
+/// any other caller for that same blake3 while it's in flight just awaits
+/// the leader's broadcast result instead.
+async fn blob_iroh_download_impl(
+    args: BlobIrohDownloadArgs,
+    on_progress: &(dyn Fn(u64, u64) + Send + Sync),
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    if args.blake3.len() != 64 {
+        return Err(DispatchError::Stream(format!(
+            "expected 64-char blake3 hex, got {}",
+            args.blake3.len()
+        )));
+    }
+    let blake3 = args.blake3.clone();
+
+    let mut joined: Option<broadcast::Receiver<Result<Value, String>>> = None;
+    {
+        let mut map = DOWNLOAD_INFLIGHT
+            .lock()
+            .map_err(|_| DispatchError::Stream("inflight registry poisoned".to_string()))?;
+        match map.get(&blake3) {
+            Some(tx) => joined = Some(tx.subscribe()),
+            None => {
+                let (tx, _rx) = broadcast::channel(1);
+                map.insert(blake3.clone(), tx);
+            }
+        }
+    }
+
+    if let Some(mut rx) = joined {
+        tracing::info!(
+            blake3 = %blake3,
+            "blob_iroh_download: joining an already in-flight download for this blake3"
+        );
+        return match rx.recv().await {
+            Ok(outcome) => outcome.map_err(DispatchError::Stream),
+            Err(_) => Err(DispatchError::Stream(
+                "in-flight download for this blob ended unexpectedly — please retry".to_string(),
+            )),
+        };
+    }
+
+    let outcome = blob_iroh_download_run(args, on_progress, state).await;
+
+    // leader: broadcast the outcome to any joiners, then remove ourselves
+    // from the registry so a later, fresh call (e.g. resuming after a
+    // deliberate pause) starts a clean new leader instead of joining a
+    // finished one.
+    if let Ok(mut map) = DOWNLOAD_INFLIGHT.lock() {
+        if let Some(tx) = map.remove(&blake3) {
+            let broadcastable = match &outcome {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(broadcastable);
+        }
+    }
+
+    outcome
+}
+
 /// download a blob from a peer over iroh-blobs verified transfer, ingest
 /// it into the local `blobz` store (and FsStore via prewarm), and return
 /// the blob row + base64 bytes so the JS caller can mirror it into OPFS /
 /// IndexedDB the same way `blob_insert_from_path` does.
 ///
 /// mirrors tomb's `reliquary::snatch::BlobSnatcher::download_blob` — the
-/// canonical native-rust impl of the iroh-blobs consumer side.
-async fn blob_iroh_download_impl(
+/// canonical native-rust impl of the iroh-blobs consumer side. only ever
+/// runs as the "leader" for a given blake3 — see
+/// [`blob_iroh_download_impl`], which coalesces concurrent same-blake3
+/// callers into a single call here.
+async fn blob_iroh_download_run(
     args: BlobIrohDownloadArgs,
     on_progress: &(dyn Fn(u64, u64) + Send + Sync),
     state: &AppState,
@@ -1684,13 +1882,6 @@ async fn blob_iroh_download_impl(
     use iroh_blobs::api::downloader::DownloadProgressItem;
     use iroh_blobs::{Hash, HashAndFormat};
     use n0_future::StreamExt;
-
-    if args.blake3.len() != 64 {
-        return Err(DispatchError::Stream(format!(
-            "expected 64-char blake3 hex, got {}",
-            args.blake3.len()
-        )));
-    }
 
     let hash: Hash = args
         .blake3
@@ -1771,7 +1962,7 @@ async fn blob_iroh_download_impl(
                     on_progress(bytes_done, total_size);
                 }
                 if last_log.elapsed() >= std::time::Duration::from_secs(2) {
-                    tracing::info!(
+                    tracing::debug!(
                         blake3 = %args.blake3,
                         bytes_done,
                         elapsed_s = started.elapsed().as_secs(),
@@ -1781,10 +1972,10 @@ async fn blob_iroh_download_impl(
                 }
             }
             other => {
-                // heartbeat at info every ~2s so a hanging/slow relay download
-                // is visible without spamming for fast downloads.
+                // heartbeat at debug every ~2s so a hanging/slow relay download
+                // is still traceable without spamming info logs.
                 if last_log.elapsed() >= std::time::Duration::from_secs(2) {
-                    tracing::info!(
+                    tracing::debug!(
                         blake3 = %args.blake3,
                         events = event_count,
                         elapsed_s = started.elapsed().as_secs(),
@@ -2069,6 +2260,11 @@ struct BlobThumbnailArgs {
     /// transparent pixels) instead of center-cropping it - used for
     /// document/page thumbnails, where cropping can cut off real content.
     fit: Option<bool>,
+    /// force generation to treat the blob as this mime instead of whatever's
+    /// stored on its record - used when a user manually overrides a file's
+    /// domain because auto-detection got the mime wrong; retrying with the
+    /// same (wrong) mime would fail identically.
+    mime_override: Option<String>,
 }
 
 async fn blob_thumbnail(args: BlobThumbnailArgs, state: &AppState) -> Result<Value, DispatchError> {
@@ -2083,7 +2279,10 @@ async fn blob_thumbnail(args: BlobThumbnailArgs, state: &AppState) -> Result<Val
         .ok_or(DispatchError::NotFound)?;
 
     let path = state.storage.blobz.path_for(&blob);
-    let mime = blob.mime.as_deref().unwrap_or("application/octet-stream");
+    let mime = args
+        .mime_override
+        .as_deref()
+        .unwrap_or_else(|| blob.mime.as_deref().unwrap_or("application/octet-stream"));
 
     let result = crate::thumbnail::generate_thumbnail(&path, mime, size, fit)
         .await

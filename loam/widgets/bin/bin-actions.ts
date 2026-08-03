@@ -6,16 +6,23 @@
 
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { log } from "@freqhole/reliquary/utils";
+import { resolveDocReady } from "../../src/p2p/doc-ready";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import {
   getThumbnailDataUrl,
   snatchBlobBatch,
   type FileUploadResult,
+  type PauseGate,
   type PeersMap,
   type SnatchBlobInfo,
 } from "../../src/widgets/file-utils";
 import { fileSchema, type FileState } from "../file";
-import { binSchema } from "./bin-schema";
+import { binSchema, type BinState } from "./bin-schema";
+
+// bounded wait for a child doc to sync before giving up on it — long
+// enough for a cold/slow peer, short enough that one stuck doc doesn't
+// hang the whole "snatch all" pass indefinitely.
+const CHILD_DOC_READY_TIMEOUT_MS = 15_000;
 
 // -----------------------------------------------------------------------
 // types
@@ -43,6 +50,8 @@ export type SnatchAllCallback = (progress: SnatchAllProgress) => void;
 export interface SnatchAllOptions {
   onProgress?: SnatchAllCallback;
   signal?: AbortSignal;
+  /** pauses the download loop between blobs without aborting it — see `PauseGate`. */
+  pauseGate?: PauseGate;
 }
 
 const TAG = "bin.actions";
@@ -71,7 +80,14 @@ async function collectFileChildren(
   const binEntry = store.getWidget(binWidgetId);
   if (!binEntry || !binEntry.docId) return [];
 
-  const handle = repo.handles[binEntry.docId as DocumentId];
+  // `repo.handles[...]` only holds docs this peer has already `repo.find()`'d
+  // this session (e.g. by rendering that widget) — a nested bin that was
+  // never individually opened/rendered would silently look empty. resolve
+  // (and wait for) the handle properly instead, same fix as boot.ts's
+  // otherCanvasStores gap.
+  const handle = await resolveDocReady<BinState>(repo, binEntry.docId as DocumentId, {
+    timeoutMs: CHILD_DOC_READY_TIMEOUT_MS,
+  });
   if (!handle) return [];
 
   const doc = handle.doc();
@@ -104,7 +120,9 @@ async function collectFileChildren(
     if (childEntry.type !== "file") continue;
     if (!childEntry.docId) continue;
 
-    const childHandle = repo.handles[childEntry.docId as DocumentId];
+    const childHandle = await resolveDocReady<FileState>(repo, childEntry.docId as DocumentId, {
+      timeoutMs: CHILD_DOC_READY_TIMEOUT_MS,
+    });
     if (!childHandle) continue;
 
     const childDoc = childHandle.doc();
@@ -183,7 +201,7 @@ export async function snatchAllInBin(
   peers: PeersMap,
   options?: SnatchAllOptions
 ): Promise<SnatchAllProgress> {
-  const { onProgress, signal } = options ?? {};
+  const { onProgress, signal, pauseGate } = options ?? {};
 
   const progress: SnatchAllProgress = {
     total: 0,
@@ -248,6 +266,7 @@ export async function snatchAllInBin(
   try {
     const results = await snatchBlobBatch(blobInfos, peers, {
       signal,
+      pauseGate,
       isPeerOnline: (nodeId: string) => store.isPeerOnline(nodeId),
       onBlobComplete: (index, result) => {
         if (result.existing) {

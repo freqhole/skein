@@ -169,8 +169,16 @@ async fn render_frame(
         for download in &active_downloads {
             let from = display_name_for(&ctx.userz, &download.peer).await;
             let elapsed = download.started_at.elapsed().as_secs();
+            let bytes_received = download
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let percent = if download.total_size > 0 {
+                (bytes_received as f64 / download.total_size as f64 * 100.0).round() as u32
+            } else {
+                0
+            };
             out.push_str(&format!(
-                "  - {} from {from} ({elapsed}s)\n",
+                "  - {} from {from} ({percent}%, {elapsed}s)\n",
                 download.filename
             ));
         }

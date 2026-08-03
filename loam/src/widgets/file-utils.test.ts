@@ -1592,6 +1592,7 @@ describe("getThumbnailDataUrl — tauri blob_thumbnail path", () => {
     expect(mockDispatch).toHaveBeenCalledWith("blob_thumbnail", {
       blake3: "test-blake3-id",
       size: 200,
+      fit: false,
     });
     expect(result).toBe(`data:image/webp;base64,${fakeB64}`);
   });
@@ -1631,6 +1632,7 @@ describe("getThumbnailDataUrl — tauri blob_thumbnail path", () => {
     expect(mockDispatch).toHaveBeenCalledWith("blob_thumbnail", {
       blake3: "some-blob-id",
       size: 64,
+      fit: false,
     });
   });
 });

@@ -43,6 +43,7 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   hasBlobBytes,
   getBlobObjectURL,
+  getBlobFile,
   storeBlob,
   storeBlobFromFile,
   resolveBlob,
@@ -50,6 +51,10 @@ import {
   getBlobDomain,
   classifyDomain,
   deleteBlob,
+  addCanvasRef,
+  removeCanvasRef,
+  getCanvasRefs,
+  removeAllCanvasRefsForCanvas,
 } from "../storage/blob-store";
 import {
   generateThumbnailDataUrl as generateThumbnailDataUrlWorker,
@@ -58,6 +63,7 @@ import {
 import {
   discardPausedDownload as transferDiscardPausedDownload,
   pauseSnatchDownload as transferPauseSnatchDownload,
+  pauseSnatchDownloadByBlake3 as transferPauseSnatchDownloadByBlake3,
   snatchBlob as transferSnatchBlob,
   snatchBlobToDisk as transferSnatchBlobToDisk,
   type BlobCapableNode,
@@ -101,6 +107,29 @@ function guessMimeFromFilename(filename: string): string {
       return "video/webm";
     case "mov":
       return "video/quicktime";
+    case "mkv":
+      return "video/x-matroska";
+    case "avi":
+      return "video/x-msvideo";
+    case "m4v":
+      return "video/mp4";
+    case "flv":
+      return "video/x-flv";
+    case "wmv":
+      return "video/x-ms-wmv";
+    case "3gp":
+      return "video/3gpp";
+    case "3g2":
+      return "video/3gpp2";
+    case "ts":
+    case "mts":
+    case "m2ts":
+      return "video/mp2t";
+    case "mpg":
+    case "mpeg":
+      return "video/mpeg";
+    case "ogv":
+      return "video/ogg";
     case "mp3":
       return "audio/mpeg";
     case "wav":
@@ -109,6 +138,17 @@ function guessMimeFromFilename(filename: string): string {
       return "audio/ogg";
     case "flac":
       return "audio/flac";
+    case "m4a":
+      return "audio/mp4";
+    case "aac":
+      return "audio/aac";
+    case "opus":
+      return "audio/opus";
+    case "wma":
+      return "audio/x-ms-wma";
+    case "aiff":
+    case "aif":
+      return "audio/aiff";
     case "txt":
       return "text/plain";
     case "md":
@@ -290,12 +330,15 @@ export function isDownloadCancelled(err: unknown): boolean {
  * persistent store, pinned against gc — resume by calling snatchBlob again
  * with the same blake3 (only missing ranges transfer).
  *
- * browser mode pauses by downloadId, delegating to the transport package's
- * own `pauseSnatchDownload` against the midden node. tauri mode pauses by
- * blake3 (the native download registry key) — that path has no equivalent
- * in the package (its contract is browser-only) and stays exactly as
- * skein's own tauri IPC call. returns true when an in-flight download was
- * actually flagged.
+ * browser mode pauses by downloadId when given (delegating to the
+ * transport package's own `pauseSnatchDownload`), else falls back to
+ * `pauseSnatchDownloadByBlake3` when only a blake3 is known — needed by
+ * callers with no downloadId of their own, e.g. cleaning up after a
+ * widget that's already been torn down. tauri mode always pauses by
+ * blake3 (the native download registry's key) regardless of downloadId —
+ * that path has no equivalent in the package (its contract is
+ * browser-only) and stays exactly as skein's own tauri IPC call. returns
+ * true when an in-flight download was actually flagged.
  */
 export async function pauseSnatchDownload(opts: {
   downloadId?: string;
@@ -308,9 +351,14 @@ export async function pauseSnatchDownload(opts: {
     }
     return false;
   }
-  if (!opts.downloadId) return false;
   const node = (await getMiddenNode()) as unknown as BlobCapableNode;
-  return transferPauseSnatchDownload(node, opts.downloadId);
+  if (opts.downloadId) {
+    return transferPauseSnatchDownload(node, opts.downloadId);
+  }
+  if (opts.blake3) {
+    return transferPauseSnatchDownloadByBlake3(node, opts.blake3);
+  }
+  return false;
 }
 
 /**
@@ -357,6 +405,13 @@ export interface ThumbnailOptions {
   peers?: Record<string, { nodeId: string }>;
   /** center-crop to a square instead of preserving aspect ratio (default: false) */
   square?: boolean;
+  /** force generation to treat the blob as this mime instead of whatever's
+   *  stored on its record — for a manually-picked domain override (auto-
+   *  detection got the mime wrong, so retrying with the SAME mime would
+   *  fail identically; this makes local/peer generation actually attempt
+   *  the right codepath, e.g. ffmpeg doesn't care about the mime label,
+   *  only real file bytes). */
+  mimeOverride?: string;
 }
 
 /** peers map type — extracted for reuse across functions */
@@ -445,21 +500,27 @@ function cacheKey(blobId: string, size: number, square?: boolean): string {
 }
 
 /**
- * delete the LOCAL copy of a blob (OPFS bytes + IndexedDB record + session
- * caches) to reclaim disk space, without touching the widget doc — the file
- * widget stays on the canvas and the blob becomes snatchable again from
- * whoever still has it (e.g. a hub peer). browser-only: tauri blob storage
- * is the durable native store and is managed separately.
+ * delete the LOCAL copy of a blob (browser: OPFS bytes + IndexedDB record +
+ * session caches; tauri: managed blobz file + row via `blob_purge_local`) to
+ * reclaim disk space, without touching the widget doc — the file widget
+ * stays on the canvas and the blob becomes snatchable again from whoever
+ * still has it (e.g. a hub peer). also useful in tauri to purge a
+ * corrupt/truncated local copy (e.g. a 0-byte file from an interrupted
+ * snatch) and retry from scratch.
  *
  * records can be keyed by either the blake3 or a legacy sha256 blob id, so
- * both ids are cleaned when known.
+ * both ids are cleaned when known (browser mode only — tauri's blobz store
+ * is keyed purely by blake3).
  */
 export async function freeUpLocalBlobCopy(
   blobId: string,
   blake3?: string | null
 ): Promise<void> {
   if (isTauriMode()) {
-    throw new Error("free up space is browser-only — tauri manages native blob storage");
+    const hash = blake3 || blobId;
+    await dispatch("blob_purge_local", { blake3: hash });
+    log.debug(TAG, `freed local copy of blob ${hash.slice(0, 12)}...`);
+    return;
   }
   const ids = [...new Set([blobId, blake3 ?? ""].filter(Boolean))];
   for (const id of ids) {
@@ -473,6 +534,75 @@ export async function freeUpLocalBlobCopy(
     thumbnailCache.delete(cacheKey(id, 50));
   }
   log.debug(TAG, `freed local copy of blob ${blobId.slice(0, 12)}...`);
+}
+
+// ---------------------------------------------------------------------------
+// blob <-> canvas reference index
+// ---------------------------------------------------------------------------
+//
+// tracks which canvas documents currently have a widget referencing a given
+// blob, so a widget-delete cleanup can cheaply tell whether purging a blob's
+// local bytes would break another widget still using it, without iterating
+// every canvas. keyed by blake3 (the canonical id in both storage backends -
+// browser records are keyed `blob_id = blake3`, see reliquary/ts's
+// `store.ts`; the sqlite side's `blobz_canvas_refs` table is keyed by
+// `blake3` directly). falls back to `blobId` when no blake3 is known yet
+// (e.g. mid-upload), matching `checkBlobLocality`'s own resolution order.
+
+/** record that `canvasDocId` has a widget referencing this blob. */
+export async function addBlobCanvasRef(
+  blobId: string,
+  blake3: string | null | undefined,
+  canvasDocId: string
+): Promise<void> {
+  const hash = blake3 || blobId;
+  if (!hash || !canvasDocId) return;
+  if (isTauriMode()) {
+    await dispatch("blob_add_canvas_ref", { blake3: hash, canvas_doc_id: canvasDocId });
+    return;
+  }
+  await addCanvasRef(hash, canvasDocId);
+}
+
+/** remove a single blob/canvas reference (widget deleted or reassigned). */
+export async function removeBlobCanvasRef(
+  blobId: string,
+  blake3: string | null | undefined,
+  canvasDocId: string
+): Promise<void> {
+  const hash = blake3 || blobId;
+  if (!hash || !canvasDocId) return;
+  if (isTauriMode()) {
+    await dispatch("blob_remove_canvas_ref", { blake3: hash, canvas_doc_id: canvasDocId });
+    return;
+  }
+  await removeCanvasRef(hash, canvasDocId);
+}
+
+/** every canvas doc id currently referencing this blob. */
+export async function getBlobCanvasRefs(
+  blobId: string,
+  blake3: string | null | undefined
+): Promise<string[]> {
+  const hash = blake3 || blobId;
+  if (!hash) return [];
+  if (isTauriMode()) {
+    const result = (await dispatch("blob_canvas_refs", { blake3: hash })) as {
+      canvasDocIds?: string[];
+    };
+    return result?.canvasDocIds ?? [];
+  }
+  return getCanvasRefs(hash);
+}
+
+/** remove every ref row for a canvas (the whole canvas was deleted). */
+export async function removeAllBlobCanvasRefs(canvasDocId: string): Promise<void> {
+  if (!canvasDocId) return;
+  if (isTauriMode()) {
+    await dispatch("blob_remove_all_canvas_refs", { canvas_doc_id: canvasDocId });
+    return;
+  }
+  await removeAllCanvasRefsForCanvas(canvasDocId);
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +698,41 @@ export async function checkBlobLocality(
     }
     log.debug(TAG, "blob locality check failed:", err);
     return { locality: "unknown" };
+  }
+}
+
+/**
+ * get a blob's actual on-disk byte size — not the doc's `size` field (the
+ * originally-uploaded size, which stays whatever it was even if the local
+ * copy is later corrupted/truncated) and not the locality metadata's
+ * `size` (browser: the db row's recorded size; can drift from the real
+ * file the same way). used to flag a 0-byte local copy left behind by an
+ * interrupted snatch — `checkBlobLocality`'s bytes-presence check only
+ * catches bytes that are entirely MISSING, not a file that exists but is
+ * empty. returns null when there's no local copy at all.
+ */
+export async function getLocalBlobByteSize(
+  blobId: string,
+  blake3?: string | null
+): Promise<number | null> {
+  if (isTauriMode()) {
+    try {
+      const meta = (await dispatch("blob_get_path", {
+        blake3: blake3 || blobId,
+      })) as { path?: string; size?: number | null } | null;
+      if (!meta?.path) return null;
+      return meta.size ?? null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const record = await resolveBlob(blobId, blake3 ?? undefined);
+    if (!record) return null;
+    const file = await getBlobFile(record.blob_id);
+    return file ? file.size : null;
+  } catch {
+    return null;
   }
 }
 
@@ -947,6 +1112,80 @@ function sortPeersByConnectivity(
 }
 
 // ---------------------------------------------------------------------------
+// global transfer concurrency queue
+// ---------------------------------------------------------------------------
+
+/**
+ * app-wide cap on simultaneous blob transfers, regardless of which widget
+ * or batch started them. without this, several bins (each running its own
+ * sequential download loop) or several file widgets snatching at once
+ * could pile up an unbounded number of concurrent P2P downloads. mirrors
+ * reliquary rust's `max_per_peer_downloads` default (4) — a number already
+ * proven reasonable for this kind of cap, just applied here across peers
+ * rather than per-peer.
+ */
+const MAX_CONCURRENT_TRANSFERS = 4;
+
+interface TransferWaiter {
+  release: () => void;
+  onAbort: () => void;
+}
+
+let activeTransferCount = 0;
+const transferWaiters: TransferWaiter[] = [];
+
+/**
+ * reserve one of the app-wide transfer slots, waiting in FIFO order if
+ * none are free. resolves once a slot is held; rejects with an AbortError
+ * if `signal` fires while still queued. always release the slot via
+ * `releaseTransferSlot()` in a `finally`, whatever the transfer's outcome —
+ * that's what makes the queue resume correctly on finish, stall (timeout),
+ * or abort alike.
+ */
+async function acquireTransferSlot(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    throw new DOMException("cancelled", "AbortError");
+  }
+  if (activeTransferCount < MAX_CONCURRENT_TRANSFERS) {
+    activeTransferCount++;
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    const waiter: TransferWaiter = {
+      release: () => {
+        signal?.removeEventListener("abort", waiter.onAbort);
+        activeTransferCount++;
+        resolve();
+      },
+      onAbort: () => {
+        const idx = transferWaiters.indexOf(waiter);
+        if (idx !== -1) transferWaiters.splice(idx, 1);
+        reject(new DOMException("cancelled", "AbortError"));
+      },
+    };
+    transferWaiters.push(waiter);
+    signal?.addEventListener("abort", waiter.onAbort, { once: true });
+  });
+}
+
+/** release a transfer slot reserved via `acquireTransferSlot()`, waking the next queued caller (if any). */
+function releaseTransferSlot(): void {
+  activeTransferCount--;
+  const next = transferWaiters.shift();
+  next?.release();
+}
+
+/** number of transfers actually in flight right now — for a future queue-status UI (plan doc item #3). */
+export function getActiveTransferCount(): number {
+  return activeTransferCount;
+}
+
+/** number of transfers waiting for a free slot right now — for a future queue-status UI (plan doc item #3). */
+export function getQueuedTransferCount(): number {
+  return transferWaiters.length;
+}
+
+// ---------------------------------------------------------------------------
 // per-peer download (browser)
 // ---------------------------------------------------------------------------
 
@@ -971,6 +1210,22 @@ function sortPeersByConnectivity(
  * package's contract).
  */
 async function snatchFromBrowserPeer(
+  info: SnatchBlobInfo,
+  peerAddrs: string[],
+  options?: SnatchOptions
+): Promise<FileUploadResult> {
+  // every snatch path (single snatchBlob(), and each item of a
+  // snatchBlobBatch()) funnels through here — gating it is enough to cap
+  // transfer concurrency app-wide without touching every call site.
+  await acquireTransferSlot(options?.signal);
+  try {
+    return await snatchFromBrowserPeerUnqueued(info, peerAddrs, options);
+  } finally {
+    releaseTransferSlot();
+  }
+}
+
+async function snatchFromBrowserPeerUnqueued(
   info: SnatchBlobInfo,
   peerAddrs: string[],
   options?: SnatchOptions
@@ -1191,6 +1446,53 @@ export async function snatchBlobToDisk(
 // batch snatch
 // ---------------------------------------------------------------------------
 
+/**
+ * a pausable gate for batch downloads — unlike an `AbortSignal`, pausing
+ * doesn't cancel anything; it just blocks the batch loop from starting its
+ * *next* blob until resumed (the in-flight download, if any, keeps going).
+ * `signal`, if given, unblocks a paused wait with an `AbortError` so a
+ * caller can still cancel outright while paused.
+ */
+export interface PauseGate {
+  isPaused(): boolean;
+  pause(): void;
+  resume(): void;
+  waitIfPaused(signal?: AbortSignal): Promise<void>;
+}
+
+export function createPauseGate(): PauseGate {
+  let paused = false;
+  let waiters: Array<() => void> = [];
+  return {
+    isPaused() {
+      return paused;
+    },
+    pause() {
+      paused = true;
+    },
+    resume() {
+      paused = false;
+      const toRelease = waiters;
+      waiters = [];
+      for (const release of toRelease) release();
+    },
+    async waitIfPaused(signal?: AbortSignal) {
+      if (!paused) return;
+      await new Promise<void>((resolve, reject) => {
+        const onResume = () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        };
+        const onAbort = () => {
+          waiters = waiters.filter((w) => w !== onResume);
+          reject(new DOMException("cancelled", "AbortError"));
+        };
+        waiters.push(onResume);
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    },
+  };
+}
 
 /** options for batch snatch operations */
 export interface BatchSnatchOptions {
@@ -1209,6 +1511,9 @@ export interface BatchSnatchOptions {
    *  for peedeeeff: pass the first page blob (a peer with page 1 has all pages).
    *  for bins: pass any representative blob. */
   probeBlobInfo?: SnatchBlobInfo;
+  /** pauses the loop between blobs (see `PauseGate`'s doc comment) — not
+   *  passed by callers that don't need pausable batches. */
+  pauseGate?: PauseGate;
 }
 
 /**
@@ -1361,6 +1666,7 @@ export async function snatchBlobBatch(
     if (options?.signal?.aborted) {
       throw new DOMException("cancelled", "AbortError");
     }
+    await options?.pauseGate?.waitIfPaused(options?.signal);
 
     // pick the probe blob: user-specified, or first pending blob with blake3
     const probeBlob =
@@ -1392,6 +1698,7 @@ export async function snatchBlobBatch(
       if (options?.signal?.aborted) {
         throw new DOMException("cancelled", "AbortError");
       }
+      await options?.pauseGate?.waitIfPaused(options?.signal);
 
       const info = coercedBlobs[idx];
       const snatchOpts: SnatchOptions = {
@@ -2389,6 +2696,7 @@ export async function getThumbnailDataUrl(
   const opts: ThumbnailOptions = typeof options === "number" ? { size: options } : (options ?? {});
   const size = opts.size ?? 200;
   const square = opts.square ?? false;
+  const mimeOverride = opts.mimeOverride;
 
   // 1. check in-memory cache
   const key = cacheKey(blobId, size, square);
@@ -2398,7 +2706,7 @@ export async function getThumbnailDataUrl(
   }
 
   // 2. try local grimoire (blob exists on this machine)
-  const localResult = await fetchThumbnailLocal(blobId, size, square);
+  const localResult = await fetchThumbnailLocal(blobId, size, square, mimeOverride);
   if (localResult) {
     thumbnailCache.set(key, localResult);
     return localResult;
@@ -2407,7 +2715,7 @@ export async function getThumbnailDataUrl(
   // 3. try P2P fallback — proxy the request through connected canvas peers
   const peers = opts.peers;
   if (peers) {
-    const peerResult = await fetchThumbnailFromPeers(blobId, size, peers);
+    const peerResult = await fetchThumbnailFromPeers(blobId, size, peers, mimeOverride);
     if (peerResult) {
       thumbnailCache.set(key, peerResult);
       return peerResult;
@@ -2417,6 +2725,43 @@ export async function getThumbnailDataUrl(
   return null;
 }
 
+/** minimal doc-access interface for `ensureThumbnailPersisted` — satisfied by
+ *  a `{ current: () => ctx.doc.current, change: (fn) => ctx.doc.change(fn) }`
+ *  wrapper around a mounted `WidgetDoc`, or the same shape around a detached
+ *  `DocHandle` (see peedeeeff/render-client.ts's `RenderableDoc` for the
+ *  precedent this mirrors). */
+export interface ThumbnailPersistDoc {
+  current(): { thumbnailDataUrl: string };
+  change(fn: (draft: { thumbnailDataUrl: string }) => void): void;
+}
+
+/**
+ * best-effort: fetch and persist a thumbnail if the doc doesn't already have
+ * one. swallows failures (logs only) — this is the "try to fetch a
+ * thumbnail, catch, log" pattern that used to be copy-pasted at every
+ * upload/snatch/auto-bin call site in file.ts; callers that need to know
+ * whether it actually succeeded (e.g. `runDomainIngest`, which treats a
+ * missing thumbnail as a real failure) should call `getThumbnailDataUrl`
+ * directly instead.
+ */
+export async function ensureThumbnailPersisted(
+  doc: ThumbnailPersistDoc,
+  blobId: string,
+  opts?: ThumbnailOptions
+): Promise<void> {
+  if (doc.current().thumbnailDataUrl) return;
+  try {
+    const dataUrl = await getThumbnailDataUrl(blobId, opts);
+    if (dataUrl) {
+      doc.change((draft) => {
+        draft.thumbnailDataUrl = dataUrl;
+      });
+    }
+  } catch {
+    log.debug(TAG, "ensureThumbnailPersisted: thumbnail generation failed for", blobId.slice(0, 12));
+  }
+}
+
 /**
  * try fetching thumbnail data from the local grimoire instance.
  * returns a data URL on success, null on failure.
@@ -2424,7 +2769,8 @@ export async function getThumbnailDataUrl(
 async function fetchThumbnailLocal(
   blobId: string,
   size: number,
-  square = false
+  square = false,
+  mimeOverride?: string
 ): Promise<string | null> {
   if (!isTauriMode()) {
     // browser mode: try generating thumbnail from OPFS data.
@@ -2435,8 +2781,10 @@ async function fetchThumbnailLocal(
       const record = await resolveBlob(blobId);
       if (!record) return null;
 
-      // only generate thumbnails for images — video/audio need ffmpeg (Tauri only)
-      if (!record.mime.startsWith("image/")) return null;
+      // only generate thumbnails for images — video/audio need ffmpeg (Tauri
+      // only), so a mimeOverride can't unlock anything here, only images.
+      const mime = mimeOverride ?? record.mime;
+      if (!mime.startsWith("image/")) return null;
 
       const data = await getBlobData(record.blob_id);
       if (!data) return null;
@@ -2464,6 +2812,7 @@ async function fetchThumbnailLocal(
       blake3: blobId,
       size,
       fit: square,
+      mime_override: mimeOverride,
     })) as { data: string | null; mime?: string } | null;
 
     if (!response?.data || !response.mime) {
@@ -2497,7 +2846,8 @@ async function fetchThumbnailLocal(
 async function fetchThumbnailFromPeers(
   blobId: string,
   size: number,
-  peers: Record<string, { nodeId: string }>
+  peers: Record<string, { nodeId: string }>,
+  mimeOverride?: string
 ): Promise<string | null> {
   const peerIds = await getPeerNodeIds(peers);
 
@@ -2513,6 +2863,7 @@ async function fetchThumbnailFromPeers(
         sendSkeinProxyRequest(node, peerAddr, "POST", "/api/blobs/thumbnail_data", {
           blob_id: blobId,
           size,
+          mime_override: mimeOverride,
         })
       );
 

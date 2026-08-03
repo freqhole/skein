@@ -51,7 +51,15 @@ import { createCanvasScopedSharePolicy } from "../p2p/canvas-scoped-share-policy
 import { buildShareUrl, decodeShareString, encodeShareString } from "../p2p/share-string";
 import { resolveFriendDisplay, SqliteSocialDoc } from "../p2p/sqlite-social-doc";
 import { dispatch, isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
-import { setPandocFormatsAvailable } from "../widgets/file-utils";
+import {
+  setPandocFormatsAvailable,
+  freeUpLocalBlobCopy,
+  pauseSnatchDownload,
+  checkBlobLocality,
+  getBlobCanvasRefs,
+  removeBlobCanvasRef,
+  removeAllBlobCanvasRefs,
+} from "../widgets/file-utils";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
 import { createSkeinHarness, type SkeinHarnessNoStore } from "../harness/skein-harness";
 import { syncCanvasMetadataToCards, watchCanvasDocsForUpdates } from "./canvas-watchers";
@@ -157,6 +165,76 @@ function getDismissedKnockIds(canvasDocId: string): Set<string> {
     return new Set(Array.isArray(parsed) ? parsed : []);
   } catch {
     return new Set();
+  }
+}
+
+/**
+ * best-effort cleanup for a file widget that's being permanently removed
+ * (either directly, or as part of a whole canvas-card cascade delete) —
+ * stops any in-flight snatch for its blob and purges the local copy, so a
+ * deleted widget doesn't leave a download running in the background or a
+ * local copy sitting on disk with nothing left referencing it.
+ *
+ * called from `beforeRemoveHook`, so the widget's own doc still exists
+ * (its blobId/blake3 are readable) even though the widget instance itself
+ * has already been torn down (`WidgetController.destroy()` already ran —
+ * see widget-manager.ts's `unmountWidget`) and its in-memory
+ * `activeSnatchBlake3`/`snatchDownloadId` closure state is gone. re-reads
+ * blake3 straight from the persisted doc instead.
+ *
+ * a 0-byte local copy (the concurrent-download corruption bug this fixes
+ * elsewhere) is always purged unconditionally — it's already useless, so
+ * there's no other-widget reference worth protecting. otherwise, this
+ * widget's own ref is dropped from the blob<->canvas index (`file.ts`'s
+ * `checkLocality`/blobId-write sites are what populate it) and purging
+ * (plus cancelling the transfer) is skipped when any OTHER canvas still
+ * has a ref recorded for the same blob — a fast indexed lookup instead of
+ * scanning every known canvas, per the storage layer's own reference
+ * index (see reliquary/ts's `blobs/db.ts` and reliquary/rust's
+ * `blobz_canvas_refs` table). `canvasDocId` is the canvas this widget
+ * lived on (the narthex itself, or a regular canvas).
+ */
+async function cleanUpFileWidgetBlob(
+  docId: string,
+  repo: Repo,
+  canvasDocId: string
+): Promise<void> {
+  try {
+    const handle = await resolveDocReadyCached<{ blobId?: string; blake3?: string }>(
+      repo,
+      docId as DocumentId
+    );
+    const doc = handle?.doc();
+    const blobId = doc?.blobId;
+    if (!blobId) return;
+    const blake3 = doc?.blake3 || blobId;
+
+    const locality = await checkBlobLocality(blobId, blake3);
+    const isZeroByte = locality.locality === "local" && locality.metadata?.size === 0;
+
+    await removeBlobCanvasRef(blobId, blake3, canvasDocId).catch(() => {
+      // best-effort — index unavailable, fall through to the size check
+    });
+
+    if (!isZeroByte) {
+      const remainingRefs = await getBlobCanvasRefs(blobId, blake3).catch(() => [] as string[]);
+      if (remainingRefs.length > 0) {
+        log.debug(
+          TAG,
+          "skipping blob cleanup — still referenced by another canvas:",
+          blobId.slice(0, 12) + "...",
+          remainingRefs
+        );
+        return;
+      }
+    }
+
+    await pauseSnatchDownload({ blake3 }).catch(() => {
+      // best-effort — no in-flight download to cancel, or not tauri mode
+    });
+    await freeUpLocalBlobCopy(blobId, blake3);
+  } catch (err) {
+    log.warn(TAG, "failed to clean up blob for deleted file widget:", err);
   }
 }
 
@@ -1086,6 +1164,9 @@ class SkeinRouter {
       // when a canvas-card is deleted from the narthex, clean up the linked
       // canvas document and all its per-widget docs from IndexedDB.
       canvas.widgetManager.setBeforeRemoveHook(async (entry, repo) => {
+        if (entry.type === "file" && entry.docId && this.narthexDocId) {
+          await cleanUpFileWidgetBlob(entry.docId, repo, this.narthexDocId);
+        }
         if (entry.type !== "canvas-card" || !entry.docId) return;
         try {
           const cardHandle = await resolveDocReadyCached<Record<string, unknown>>(
@@ -1106,6 +1187,9 @@ class SkeinRouter {
           const canvasDoc = canvasHandle.doc();
           if (canvasDoc?.widgets) {
             for (const w of Object.values(canvasDoc.widgets)) {
+              if (w.type === "file" && w.docId) {
+                await cleanUpFileWidgetBlob(w.docId, repo, canvasDocId);
+              }
               if (w.docId) {
                 try {
                   repo.delete(w.docId as DocumentId);
@@ -1115,6 +1199,14 @@ class SkeinRouter {
               }
             }
           }
+
+          // safety net: cleanUpFileWidgetBlob above already drops each
+          // widget's own ref, but a bulk sweep for the whole canvas doc id
+          // catches anything that failed mid-loop (best-effort try/catch
+          // per widget above) rather than leaving orphaned index rows.
+          await removeAllBlobCanvasRefs(canvasDocId).catch(() => {
+            // best-effort — index unavailable
+          });
 
           // delete the canvas document itself
           repo.delete(canvasDocId as DocumentId);
@@ -2271,6 +2363,18 @@ class SkeinRouter {
         canvas.presenceManager.setLocalNodeId(this.localNodeId);
       }
       canvas.toolbar.refreshRoleGating();
+
+      // clean up a file widget's blob (cancel in-flight snatch, drop the
+      // canvas ref, purge the local copy if nothing else needs it) whenever
+      // one is deleted directly from this (regular, non-narthex) canvas —
+      // mirrors the narthex's own registration above; canvas-card cascade
+      // delete only applies from the narthex, so this only needs the
+      // direct-file-removal case.
+      canvas.widgetManager.setBeforeRemoveHook(async (entry, repo) => {
+        if (entry.type === "file" && entry.docId) {
+          await cleanUpFileWidgetBlob(entry.docId, repo, docId);
+        }
+      });
 
       // update lastVisitedAt on the canvas card
       if (this.narthexDocId) {
