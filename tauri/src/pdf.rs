@@ -356,6 +356,17 @@ async fn render_via_pandoc(
         .arg(&typst_path)
         .arg("--lua-filter")
         .arg(&lua_filter_path)
+        // pandoc's epub media extraction writes images to an absolute path
+        // outside work_dir (e.g. a system-temp `media-xxxx/` dir) and
+        // references them in the generated typst source as absolute paths
+        // (`image("/private/var/.../images/foo.jpg")`). typst resolves
+        // absolute paths against its project root, which defaults to the
+        // .typ file's own directory (work_dir) — silently prefixing that
+        // onto the already-absolute media path and producing a doubled,
+        // nonexistent path. pinning the root to the real filesystem root
+        // makes absolute paths in the typst source resolve as written.
+        .arg("--pdf-engine-opt=--root")
+        .arg("--pdf-engine-opt=/")
         .output()
         .await;
 
