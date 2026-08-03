@@ -18,6 +18,16 @@ export const peedeeeffSchema = z.object({
   pagesPerView: z.number().default(1),
   syncPage: z.boolean().default(true),
   background: z.number().default(0xffffff),
+  // display-only invert filter — not all documents suit this (embedded
+  // photos/covers invert too), so it's a per-widget toggle rather than
+  // something baked into the rendered page images themselves.
+  darkMode: z.boolean().default(false),
+  // contrast boost (0-100, applied as amount/100) to claw back stroke
+  // weight lost when inverting anti-aliased text — see index.ts's
+  // darkModeFilter for why this is needed at all. 0-10 scale (mapped to a
+  // 0-2 contrast amount in index.ts) — pixi's contrast() has no hard
+  // ceiling at 1, so this leaves room to push past it.
+  darkModeContrast: z.number().default(3),
   // best-effort persisted thumbnail (first page) for bin/compact display —
   // bins never mount a child widget's full lifecycle, only read
   // getCompactInfo(), so there's nothing else to lazily fetch a thumbnail

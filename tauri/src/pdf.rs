@@ -309,6 +309,13 @@ async fn render_via_magick_delegate(
     Ok(pages)
 }
 
+/// pandoc lua filter that strips internal same-document link targets —
+/// see the file itself for why (typst hard-fails on unresolved labels that
+/// legacy/messy epub markup produces). embedded in the binary so no extra
+/// resource-bundling config or install step is needed; written out
+/// alongside the rest of a conversion run's temp files.
+const STRIP_INTERNAL_LINKS_LUA: &str = include_str!("pdf_filters/strip_internal_links.lua");
+
 /// convert an epub/docx/odt/rtf/md/html document to pdf via
 /// `pandoc ... --pdf-engine=typst`, then rasterize the resulting pdf through
 /// the existing magick delegate path — no new page-rendering code needed,
@@ -331,6 +338,8 @@ async fn render_via_pandoc(
     let input_path = work_dir.join(format!("input.{input_ext}"));
     tokio::fs::write(&input_path, input_bytes).await?;
     let output_path = work_dir.join("output.pdf");
+    let lua_filter_path = work_dir.join("strip_internal_links.lua");
+    tokio::fs::write(&lua_filter_path, STRIP_INTERNAL_LINKS_LUA).await?;
 
     let status = Command::new(&pandoc_path)
         .env("PATH", magick_delegate_path_env())
@@ -345,6 +354,8 @@ async fn render_via_pandoc(
         .arg(&output_path)
         .arg("--pdf-engine")
         .arg(&typst_path)
+        .arg("--lua-filter")
+        .arg(&lua_filter_path)
         .output()
         .await;
 
@@ -362,7 +373,15 @@ async fn render_via_pandoc(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        warn!(stderr = %stderr, "pandoc failed");
+        // pandoc/typst failures on messy epubs can dump many KB of
+        // duplicate-label warnings — truncate what we log so one bad
+        // document doesn't flood the console, while still keeping the
+        // full text in the returned error for whoever wants it.
+        let logged_stderr = match stderr.char_indices().nth(2000) {
+            Some((idx, _)) => format!("{}... [truncated]", &stderr[..idx]),
+            None => stderr.clone(),
+        };
+        warn!(stderr = %logged_stderr, "pandoc failed");
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
         return Err(PdfRenderError::PandocFailed {
             status: output.status.code().unwrap_or(-1),
