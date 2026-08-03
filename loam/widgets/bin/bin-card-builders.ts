@@ -3,12 +3,9 @@
 
 import { Container, Graphics, Rectangle, Sprite, Text } from "pixi.js";
 import { log } from "@freqhole/reliquary/utils";
-import {
-  checkBlobLocality,
-  revealBlobInFinder,
-  saveBlobToDisk,
-  snatchBlob,
-} from "../../src/widgets/file-utils";
+import { checkBlobLocality } from "../../src/file-utils/blob-locality";
+import { revealBlobInFinder, saveBlobToDisk } from "../../src/file-utils/blob-io";
+import { snatchBlob } from "../../src/file-utils/snatch";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import { drawRevealIcon, drawSaveIcon } from "../../src/widgets/icons";
 import { isTransparent, type CompactInfo } from "../../src/widgets/widget-types";

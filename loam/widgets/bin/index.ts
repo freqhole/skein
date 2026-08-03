@@ -3,17 +3,16 @@ import { resolveDocReady } from "../../src/p2p/doc-ready";
 import { Container, Graphics, Sprite, Text, Texture, Assets } from "pixi.js";
 
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
+import { getThumbnailDataUrl } from "../../src/file-utils/thumbnail-utils";
 import {
-  createPauseGate,
-  getThumbnailDataUrl,
   isDocumentFilename,
   isMarkdownFilename,
   isPlainTextFilename,
   pickFiles,
   readPickedFileText,
   uploadFile,
-  type PauseGate,
-} from "../../src/widgets/file-utils";
+} from "../../src/file-utils/upload";
+import { createPauseGate, type PauseGate } from "../../src/file-utils/snatch";
 import { fileSchema } from "../file";
 import { markdownSchema } from "../markdown";
 import { notepadSchema } from "../notepad";

@@ -1,5 +1,8 @@
 // ---------------------------------------------------------------------------
-// unit tests for file-utils.ts's tauri-mode branches.
+// unit tests for the file-widget subsystem's tauri-mode branches, covering
+// blob-locality.ts, upload.ts, snatch.ts, and thumbnail-utils.ts — kept as
+// one file since every describe block below shares the same top-of-file
+// tauri/identity/blob-store/worker/friendz-bridge mocks.
 //
 // these tests target the isTauriMode() === true branches, mocking the tauri
 // IPC boundary (dispatch) and the blob-store/identity/blob-worker modules
@@ -100,19 +103,18 @@ beforeEach(() => {
   mockIsFriend.mockReturnValue(true);
 });
 
+import { checkBlobLocality } from "./blob-locality";
+import { formatUploadError, uploadFile } from "./upload";
 import {
   canSnatchToDisk,
-  checkBlobLocality,
   discardPausedDownload,
-  formatUploadError,
   isDownloadCancelled,
   pauseSnatchDownload,
   snatchBlob,
   snatchBlobToDisk,
-  getThumbnailDataUrl,
-  uploadFile,
   BlobAccessDeniedError,
-} from "./file-utils";
+} from "./snatch";
+import { getThumbnailDataUrl } from "./thumbnail-utils";
 import { IrohNetworkAdapter } from "@freqhole/reliquary/automerge";
 import { createMockMidden, createMockBiStream } from "@freqhole/reliquary/testing";
 import { DEFAULT_ENSURE_ALPN } from "@freqhole/reliquary/ensure";
@@ -148,7 +150,7 @@ function createMockEnsureBlobProtocol(available: boolean | (() => boolean | Prom
   });
 }
 
-describe("file-utils — tauri-mode branches", () => {
+describe("file-widget subsystem — tauri-mode branches", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -960,7 +962,7 @@ describe("file-utils — tauri-mode branches", () => {
 // ---------------------------------------------------------------------------
 // adversarial tests: concurrent/duplicate snatch races + widget-deletion-
 // mid-snatch safety (see docs/opfs-blob-store-design.md's snatch section
-// and file-utils.ts's `inFlightSnatches` doc comment for the design this
+// and snatch.ts's `inFlightSnatches` doc comment for the design this
 // targets).
 // ---------------------------------------------------------------------------
 

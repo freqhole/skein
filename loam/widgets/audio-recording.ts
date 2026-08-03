@@ -58,15 +58,14 @@ import { z } from "zod";
 import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
 import { getBlobData as getBrowserBlobData, storeBlobFromFile } from "../src/storage/blob-store";
 import { base64Encode, base64Decode } from "@freqhole/reliquary/worker";
+import { checkBlobLocality } from "../src/file-utils/blob-locality";
+import { snatchBlob, BlobAccessDeniedError } from "../src/file-utils/snatch";
 import {
-  checkBlobLocality,
   getLocalNodeId,
-  snatchBlob,
-  BlobAccessDeniedError,
   type BlobLocalityInfo,
   type PeersMap,
   type SnatchOptions,
-} from "../src/widgets/file-utils";
+} from "../src/file-utils/file-shared";
 import { sendFriendRequest } from "../src/p2p/friendz-bridge";
 import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import {

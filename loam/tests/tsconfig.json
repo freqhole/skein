@@ -1,9 +1,10 @@
 {
   "extends": "../tsconfig.json",
   "compilerOptions": {
+    "rootDir": "..",
     "noUnusedLocals": false,
     "noUnusedParameters": false,
-    "types": ["node", "@playwright/test"]
+    "types": ["vite/client", "node", "@playwright/test"]
   },
   "include": ["./**/*.ts", "../src/**/*.ts", "../widgets/**/*.ts"]
 }

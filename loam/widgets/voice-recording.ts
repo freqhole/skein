@@ -28,13 +28,9 @@ import { z } from "zod";
 import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
 import { storeBlobFromFile } from "../src/storage/blob-store";
 import { base64Encode } from "@freqhole/reliquary/worker";
-import {
-  checkBlobLocality,
-  getLocalNodeId,
-  snatchBlob,
-  BlobAccessDeniedError,
-  type PeersMap,
-} from "../src/widgets/file-utils";
+import { snatchBlob, BlobAccessDeniedError } from "../src/file-utils/snatch";
+import { checkBlobLocality } from "../src/file-utils/blob-locality";
+import { getLocalNodeId, type PeersMap } from "../src/file-utils/file-shared";
 import { getLocalAccentColor, sendFriendRequest } from "../src/p2p/friendz-bridge";
 import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import {

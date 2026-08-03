@@ -1,5 +1,5 @@
 import { Assets, Sprite, Texture } from "pixi.js";
-import { getFullBlobDataUrl, getLocalBlobUrl } from "../../src/widgets/file-utils";
+import { getFullBlobDataUrl, getLocalBlobUrl } from "../../src/file-utils/blob-io";
 import type { PageSlot } from "./types";
 
 /**

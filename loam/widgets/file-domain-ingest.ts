@@ -13,7 +13,7 @@
 
 import { log } from "@freqhole/reliquary/utils";
 import type { CanvasStore } from "../src/canvas/canvas-store";
-import { getThumbnailDataUrl } from "../src/widgets/file-utils";
+import { getThumbnailDataUrl } from "../src/file-utils/thumbnail-utils";
 
 const TAG = "file.domain-ingest";
 

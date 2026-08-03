@@ -3,35 +3,23 @@ import { z } from "zod";
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import { getMediaPlaybackUrl } from "../src/media";
 import { isTauriMode } from "../src/p2p/tauri-transport";
+import { getLocalNodeId, type PeersMap, type PickedFile, type ThumbnailOptions } from "../src/file-utils/file-shared";
+import { formatFileSize } from "../src/widgets/format";
+import { addBlobCanvasRef, removeBlobCanvasRef } from "../src/file-utils/blob-canvas-refs";
+import { checkBlobLocality, freeUpLocalBlobCopy, getLocalBlobByteSize } from "../src/file-utils/blob-locality";
+import { getLocalBlobUrl, revealBlobInFinder, saveBlobToDisk } from "../src/file-utils/blob-io";
+import { getDocumentPages } from "../src/file-utils/document-pages";
+import { getThumbnailDataUrl, ensureThumbnailPersisted } from "../src/file-utils/thumbnail-utils";
 import {
-  addBlobCanvasRef,
-  checkBlobLocality,
-  discardPausedDownload,
-  formatFileSize,
-  formatUploadError,
-  freeUpLocalBlobCopy,
-  getDocumentPages,
-  getLocalBlobUrl,
-  getLocalBlobByteSize,
-  getLocalNodeId,
-  getThumbnailDataUrl,
-  ensureThumbnailPersisted,
   isDocumentFilename,
   isMarkdownFilename,
   isPlainTextFilename,
-  pauseSnatchDownload,
+  formatUploadError,
   pickFiles,
   readPickedFileText,
-  removeBlobCanvasRef,
-  revealBlobInFinder,
-  saveBlobToDisk,
-  snatchBlob,
   uploadFile,
-  BlobAccessDeniedError,
-  type PeersMap,
-  type PickedFile,
-  type ThumbnailOptions,
-} from "../src/widgets/file-utils";
+} from "../src/file-utils/upload";
+import { discardPausedDownload, pauseSnatchDownload, snatchBlob, BlobAccessDeniedError } from "../src/file-utils/snatch";
 import { sendFriendRequest } from "../src/p2p/friendz-bridge";
 import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import { createInlinePlayer, type InlinePlayerHandle } from "../src/widgets/inline-media";

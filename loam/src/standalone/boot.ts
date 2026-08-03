@@ -51,15 +51,14 @@ import { createCanvasScopedSharePolicy } from "../p2p/canvas-scoped-share-policy
 import { buildShareUrl, decodeShareString, encodeShareString } from "../p2p/share-string";
 import { resolveFriendDisplay, SqliteSocialDoc } from "../p2p/sqlite-social-doc";
 import { dispatch, isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
+import { setPandocFormatsAvailable } from "../file-utils/upload";
+import { freeUpLocalBlobCopy, checkBlobLocality } from "../file-utils/blob-locality";
+import { pauseSnatchDownload } from "../file-utils/snatch";
 import {
-  setPandocFormatsAvailable,
-  freeUpLocalBlobCopy,
-  pauseSnatchDownload,
-  checkBlobLocality,
   getBlobCanvasRefs,
   removeBlobCanvasRef,
   removeAllBlobCanvasRefs,
-} from "../widgets/file-utils";
+} from "../file-utils/blob-canvas-refs";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
 import { createSkeinHarness, type SkeinHarnessNoStore } from "../harness/skein-harness";
 import { syncCanvasMetadataToCards, watchCanvasDocsForUpdates } from "./canvas-watchers";

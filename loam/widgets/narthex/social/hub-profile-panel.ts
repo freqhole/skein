@@ -19,7 +19,7 @@
 import { Assets, Container, Graphics, Rectangle, Sprite, Text } from "pixi.js";
 import { ScrollBox } from "@pixi/ui";
 import { log } from "@freqhole/reliquary/utils";
-import { formatFileSize } from "../../../src/widgets/file-utils";
+import { formatFileSize } from "../../../src/widgets/format";
 import {
   type HubAdminClient,
   type HubAdminFriendSummary,

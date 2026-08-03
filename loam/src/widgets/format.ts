@@ -53,3 +53,27 @@ export function colorToCss(color: number): string {
   if (color === -1) return "transparent";
   return "#" + color.toString(16).padStart(6, "0");
 }
+
+/**
+ * format a file size in bytes to a human-readable string.
+ * e.g. 1024 -> "1.0 KB", 1048576 -> "1.0 MB"
+ */
+export function formatFileSize(bytes: number): string {
+  if (bytes < 0) return "0 B";
+
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unitIndex = 0;
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex++;
+  }
+
+  // show decimals only for KB and above
+  if (unitIndex === 0) {
+    return `${value} ${units[unitIndex]}`;
+  }
+
+  return `${value.toFixed(1)} ${units[unitIndex]}`;
+}

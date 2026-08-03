@@ -8,14 +8,12 @@ import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { log } from "@freqhole/reliquary/utils";
 import { resolveDocReady } from "../../src/p2p/doc-ready";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
+import { getThumbnailDataUrl } from "../../src/file-utils/thumbnail-utils";
 import {
-  getThumbnailDataUrl,
   snatchBlobBatch,
-  type FileUploadResult,
   type PauseGate,
-  type PeersMap,
-  type SnatchBlobInfo,
-} from "../../src/widgets/file-utils";
+} from "../../src/file-utils/snatch";
+import type { FileUploadResult, PeersMap, SnatchBlobInfo } from "../../src/file-utils/file-shared";
 import { fileSchema, type FileState } from "../file";
 import { binSchema, type BinState } from "./bin-schema";
 

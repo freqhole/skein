@@ -46,7 +46,7 @@ import { log } from "@freqhole/reliquary/utils";
 const TAG = "canvas.blob-acl-sync";
 
 /** coerce a raw automerge field value to a plain string, same as the
- *  `coerceStr` helper in `widgets/file-utils.ts` — automerge Text objects
+ *  `coerceStr` helper in `widgets/file-shared.ts` — automerge Text objects
  *  (which some string fields can end up as) stringify to their real
  *  content via `toString()`, so a plain `String(v)` round-trips correctly. */
 function coerceStr(v: unknown): string {
