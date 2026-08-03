@@ -2451,8 +2451,8 @@ dependencies = [
 
 [[package]]
 name = "haruspex"
-version = "0.2.8"
-source = "git+https://github.com/freqhole/tomb?tag=v0.2.8#207df69a2498e765ebda9343130446fd8cac7267"
+version = "0.2.9"
+source = "git+https://github.com/freqhole/tomb?tag=v0.2.9#d227a1825700488a4d7f30ba593ebe6ba6318c0d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5524,8 +5524,8 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reliquary"
-version = "0.2.8"
-source = "git+https://github.com/freqhole/tomb?tag=v0.2.8#207df69a2498e765ebda9343130446fd8cac7267"
+version = "0.2.9"
+source = "git+https://github.com/freqhole/tomb?tag=v0.2.9#d227a1825700488a4d7f30ba593ebe6ba6318c0d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5536,6 +5536,7 @@ dependencies = [
  "image",
  "iroh",
  "iroh-blobs",
+ "irpc",
  "serde",
  "serde_json",
  "sqlx",
