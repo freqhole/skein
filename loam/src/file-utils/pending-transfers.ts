@@ -295,32 +295,3 @@ export async function pauseTransfer(item: PendingTransferItem): Promise<boolean>
   }
 }
 
-// ---------------------------------------------------------------------------
-// TEMPORARY — scroll-testing helper, remove once the filez flyout's
-// scrolling/clear-completed behavior is confirmed with a long list. injects
-// `count` fake "completed" rows straight into the retained history (capped
-// at MAX_COMPLETED_HISTORY same as real rows) and re-emits immediately.
-// call from the browser devtools console: `window.__filezDebugFill(150)`.
-// ---------------------------------------------------------------------------
-
-function debugFillFakeCompletedTransfers(count: number): void {
-  const now = Date.now();
-  for (let i = 0; i < count; i++) {
-    completedHistory.unshift({
-      id: `debug-fake-${now}-${i}`,
-      direction: i % 2 === 0 ? "upload" : "download",
-      state: "completed",
-      filename: `fake-file-${i}.bin`,
-      completedAt: now - i * 1000,
-      canPause: false,
-      canCancel: false,
-    });
-  }
-  while (completedHistory.length > MAX_COMPLETED_HISTORY) completedHistory.pop();
-  void emit();
-}
-
-if (import.meta.env.DEV && typeof window !== "undefined") {
-  (window as unknown as { __filezDebugFill?: typeof debugFillFakeCompletedTransfers }).__filezDebugFill =
-    debugFillFakeCompletedTransfers;
-}
