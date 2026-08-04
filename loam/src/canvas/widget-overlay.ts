@@ -8,6 +8,8 @@ export const MESSAGES_OVERLAY_W = 560;
 export const MESSAGES_OVERLAY_H = 300;
 export const CANVAS_INFO_OVERLAY_W = 300;
 export const CANVAS_INFO_OVERLAY_H = 360;
+export const FILEZ_OVERLAY_W = 560;
+export const FILEZ_OVERLAY_H = 340;
 
 export class WidgetOverlay {
   private readonly panel: Container;

@@ -78,6 +78,8 @@ import { socialWidget } from "../../widgets/narthex/social/social-widget";
 import { socialSchema } from "../../widgets/narthex/social/schema";
 import { messagezWidget, messagezSchema } from "../../widgets/narthex/messagez-widget";
 import type { MessagezState } from "../../widgets/narthex/messagez-widget";
+import { filezWidget, filezSchema } from "../../widgets/narthex/filez-widget";
+import type { FilezState } from "../../widgets/narthex/filez-widget";
 import { canvasInfoWidget, canvasInfoSchema } from "../../widgets/canvas-info";
 import { peedeeeffWidget } from "../../widgets/peedeeeff/index";
 import {
@@ -88,10 +90,14 @@ import {
   MESSAGES_OVERLAY_H,
   CANVAS_INFO_OVERLAY_W,
   CANVAS_INFO_OVERLAY_H,
+  FILEZ_OVERLAY_W,
+  FILEZ_OVERLAY_H,
 } from "../canvas/widget-overlay";
+import { subscribeToPendingTransfers } from "../file-utils/pending-transfers";
 import type {
   OtherCanvasKnockEntry,
   OtherCanvasKnocksSource,
+  WidgetController,
   WidgetDoc,
   WidgetMountContext,
 } from "../widgets/widget-types";
@@ -376,6 +382,7 @@ class SkeinRouter {
   private currentSocialOverlay: WidgetOverlay | null = null;
   private currentMessagesOverlay: WidgetOverlay | null = null;
   private currentCanvasInfoOverlay: WidgetOverlay | null = null;
+  private currentFilezOverlay: WidgetOverlay | null = null;
   private badgeUnsubs: Array<() => void> = [];
 
   /** adapter connection state source for the ConnectionStatus widget */
@@ -914,6 +921,8 @@ class SkeinRouter {
     this.currentMessagesOverlay = null;
     this.currentCanvasInfoOverlay?.destroy();
     this.currentCanvasInfoOverlay = null;
+    this.currentFilezOverlay?.destroy();
+    this.currentFilezOverlay = null;
     for (const unsub of this.transportPresenceUnsubs) unsub();
     this.transportPresenceUnsubs = [];
     for (const unsub of this.canvasWatcherUnsubs) unsub();
@@ -1095,12 +1104,20 @@ class SkeinRouter {
         onToggleSocial: () => {
           const sw = window.visualViewport?.width ?? window.innerWidth;
           this.currentMessagesOverlay?.close();
+          this.currentFilezOverlay?.close();
           this.currentSocialOverlay?.toggle(sw);
         },
         onToggleMessages: () => {
           const sw = window.visualViewport?.width ?? window.innerWidth;
           this.currentSocialOverlay?.close();
+          this.currentFilezOverlay?.close();
           this.currentMessagesOverlay?.toggle(sw);
+        },
+        onToggleFilez: () => {
+          const sw = window.visualViewport?.width ?? window.innerWidth;
+          this.currentSocialOverlay?.close();
+          this.currentMessagesOverlay?.close();
+          this.currentFilezOverlay?.toggle(sw);
         },
       });
 
@@ -1147,6 +1164,7 @@ class SkeinRouter {
       // mount overlay panels and wire badge counts
       this.currentSocialOverlay = this.mountSocialOverlay(canvas);
       this.currentMessagesOverlay = this.mountMessagesOverlay(canvas);
+      this.currentFilezOverlay = this.mountFilezOverlay(canvas);
       this.wireBadges(canvas);
       canvas.store.setLocalNodeId(this.effectiveLocalNodeId());
       // the narthex is a private, per-install singleton never synced to
@@ -1294,6 +1312,7 @@ class SkeinRouter {
     if (hasOwnedCanvases) return;
     const sw = window.visualViewport?.width ?? window.innerWidth;
     this.currentMessagesOverlay?.close();
+    this.currentFilezOverlay?.close();
     this.currentSocialOverlay.toggle(sw);
   }
 
@@ -2318,12 +2337,20 @@ class SkeinRouter {
         onToggleSocial: () => {
           const sw = window.visualViewport?.width ?? window.innerWidth;
           this.currentMessagesOverlay?.close();
+          this.currentFilezOverlay?.close();
           this.currentSocialOverlay?.toggle(sw);
         },
         onToggleMessages: () => {
           const sw = window.visualViewport?.width ?? window.innerWidth;
           this.currentSocialOverlay?.close();
+          this.currentFilezOverlay?.close();
           this.currentMessagesOverlay?.toggle(sw);
+        },
+        onToggleFilez: () => {
+          const sw = window.visualViewport?.width ?? window.innerWidth;
+          this.currentSocialOverlay?.close();
+          this.currentMessagesOverlay?.close();
+          this.currentFilezOverlay?.toggle(sw);
         },
         onShowCanvasInfo: () => {
           const vv = window.visualViewport;
@@ -2344,6 +2371,7 @@ class SkeinRouter {
       this.currentSocialOverlay = this.mountSocialOverlay(canvas);
       this.currentMessagesOverlay = this.mountMessagesOverlay(canvas);
       this.currentCanvasInfoOverlay = this.mountCanvasInfoOverlay(canvas);
+      this.currentFilezOverlay = this.mountFilezOverlay(canvas);
       this.wireBadges(canvas);
       canvas.store.setLocalNodeId(this.effectiveLocalNodeId());
       // self-heal a canvas this peer created while still anonymous — safe
@@ -3918,6 +3946,62 @@ class SkeinRouter {
     }
   }
 
+  private mountFilezOverlay(canvas: SkeinCanvas): WidgetOverlay | null {
+    // ephemeral in-memory doc, same approach as mountCanvasInfoOverlay above
+    // — pending-transfers state is live/polled, not an automerge doc.
+    let items: FilezState["items"] = [];
+    const listeners = new Set<(state: FilezState) => void>();
+    const doc: WidgetDoc<typeof filezSchema> = {
+      get current(): FilezState {
+        return { items };
+      },
+      change(fn: (draft: FilezState) => void): void {
+        const draft = { items };
+        fn(draft);
+        items = draft.items;
+        listeners.forEach((h) => h({ items }));
+      },
+      on(_event: "change", handler: (state: FilezState) => void): () => void {
+        listeners.add(handler);
+        return () => listeners.delete(handler);
+      },
+    };
+
+    const unsubTransfers = subscribeToPendingTransfers((newItems) => {
+      items = newItems;
+      listeners.forEach((h) => h({ items }));
+    });
+
+    const ctx: WidgetMountContext<typeof filezSchema> = {
+      doc,
+      width: FILEZ_OVERLAY_W,
+      height: FILEZ_OVERLAY_H,
+      keyboard: canvas.keyboard,
+      widgetId: "filez-overlay",
+      canvasElement: canvas.app.canvas as HTMLCanvasElement,
+      canvasStore: canvas.store,
+    };
+
+    try {
+      const ctrl = filezWidget.create(ctx);
+      // subscribeToPendingTransfers's unsubscribe isn't owned by the widget
+      // itself (it's wired up here, not inside create()) — piggyback it on
+      // the controller's own destroy so the overlay's teardown stops it.
+      const wrappedCtrl: WidgetController = {
+        ...ctrl,
+        destroy() {
+          unsubTransfers();
+          ctrl.destroy();
+        },
+      };
+      return new WidgetOverlay(canvas.app, wrappedCtrl, FILEZ_OVERLAY_W, FILEZ_OVERLAY_H, canvas.theme);
+    } catch (err) {
+      unsubTransfers();
+      log.warn(TAG, "failed to mount filez overlay:", err);
+      return null;
+    }
+  }
+
   private wireBadges(canvas: SkeinCanvas): void {
     // social badge: count pending friend requests
     // also update avatar URL whenever the profile changes
@@ -4014,6 +4098,19 @@ class SkeinRouter {
 
       updateMessages();
     }
+
+    // filez arrows: tint up/down independently, no numeric badge (transfers
+    // churn too fast for a count to be meaningful, per design). "serving"
+    // (this node sending bytes to a peer) counts toward the up arrow \u2014
+    // it's an outgoing transfer from this node's perspective, same as an
+    // upload. completed rows never count as active here.
+    const unsubTransfers = subscribeToPendingTransfers((items) => {
+      const live = items.filter((item) => item.state !== "completed");
+      const uploading = live.some((item) => item.direction === "upload" || item.direction === "serving");
+      const downloading = live.some((item) => item.direction === "download");
+      canvas.toolbar.setFilezActivity(uploading, downloading);
+    });
+    this.badgeUnsubs.push(unsubTransfers);
   }
 
   /** tear down the router — destroys canvas, friendz protocol, and bridge. */

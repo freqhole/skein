@@ -348,11 +348,31 @@ export async function uploadFile(
   picked: PickedFile,
   options?: UploadOptions
 ): Promise<FileUploadResult> {
+  // wrap the caller's signal (if any) in our own controller so this
+  // upload stays cancellable via cancelPendingTransfer(id) even when the
+  // caller never passed a signal of its own — see transfer-queue.ts's
+  // controller registry (used by the filez widget's cancel button).
+  const controller = new AbortController();
+  if (options?.signal) {
+    if (options.signal.aborted) {
+      controller.abort(options.signal.reason);
+    } else {
+      const callerSignal = options.signal;
+      callerSignal.addEventListener("abort", () => controller.abort(callerSignal.reason), {
+        once: true,
+      });
+    }
+  }
+  const effectiveOptions: UploadOptions = { ...(options ?? {}), signal: controller.signal };
+
   // every upload call site funnels through here — gating it is enough to
   // cap upload concurrency app-wide without touching every call site.
-  const slotId = await acquireUploadSlot(options?.signal, { filename: picked.filename });
+  const slotId = await acquireUploadSlot(controller.signal, {
+    filename: picked.filename,
+    controller,
+  });
   try {
-    return await uploadFileUnqueued(picked, options);
+    return await uploadFileUnqueued(picked, effectiveOptions);
   } finally {
     releaseUploadSlot(slotId);
   }

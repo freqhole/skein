@@ -40,7 +40,20 @@ export interface TransferProgressEntry {
   fraction: number;
 }
 
+/** one row of the unfiltered, all-blobs feed - for the filez widget's
+ *  aggregation view, which needs to show every outgoing transfer at once
+ *  rather than one widget's single blob. */
+export interface AllTransferProgressEntry {
+  peerId: string;
+  blake3: string;
+  /** 0..1 */
+  fraction: number;
+  bytesSent: number;
+  totalSize: number;
+}
+
 type Listener = (entries: TransferProgressEntry[], truncatedCount: number) => void;
+type WildcardListener = (entries: AllTransferProgressEntry[]) => void;
 
 interface Subscription {
   listener: Listener;
@@ -51,6 +64,7 @@ interface Subscription {
 }
 
 const subscriptionsByBlake3 = new Map<string, Set<Subscription>>();
+const wildcardSubscriptions = new Set<WildcardListener>();
 let pollHandle: ReturnType<typeof setInterval> | null = null;
 
 interface RawTransferRow {
@@ -75,14 +89,18 @@ export function setBrowserTransferSource(source: (() => Promise<RawTransferRow[]
 }
 
 function stopPollingIfIdle(): void {
-  if (subscriptionsByBlake3.size === 0 && pollHandle !== null) {
+  if (
+    subscriptionsByBlake3.size === 0 &&
+    wildcardSubscriptions.size === 0 &&
+    pollHandle !== null
+  ) {
     clearInterval(pollHandle);
     pollHandle = null;
   }
 }
 
 async function pollOnce(): Promise<void> {
-  if (subscriptionsByBlake3.size === 0) {
+  if (subscriptionsByBlake3.size === 0 && wildcardSubscriptions.size === 0) {
     stopPollingIfIdle();
     return;
   }
@@ -112,6 +130,19 @@ async function pollOnce(): Promise<void> {
     const list = entriesByBlake3.get(row.blake3) ?? [];
     list.push({ peerId: row.peerId, fraction });
     entriesByBlake3.set(row.blake3, list);
+  }
+
+  if (wildcardSubscriptions.size > 0) {
+    const allEntries: AllTransferProgressEntry[] = rows.map((row) => ({
+      peerId: row.peerId,
+      blake3: row.blake3,
+      fraction: row.totalSize > 0 ? row.bytesSent / row.totalSize : 0,
+      bytesSent: row.bytesSent,
+      totalSize: row.totalSize,
+    }));
+    for (const listener of wildcardSubscriptions) {
+      listener(allEntries);
+    }
   }
 
   for (const [blake3, subscriptions] of subscriptionsByBlake3) {
@@ -161,6 +192,27 @@ export function subscribeTransferProgress(
     if (set && set.size === 0) {
       subscriptionsByBlake3.delete(blake3);
     }
+    stopPollingIfIdle();
+  };
+}
+
+/** subscribe to ALL outgoing-transfer progress rows regardless of blob -
+ *  for the filez widget's aggregation view, which needs every in-flight
+ *  transfer at once rather than one widget's single blob. reuses the same
+ *  poll loop as `subscribeTransferProgress` above (no second poller).
+ *  returns an unsubscribe function. */
+export function subscribeAllTransferProgress(listener: WildcardListener): () => void {
+  if (!isTauriMode() && !browserSource) {
+    return () => {};
+  }
+
+  wildcardSubscriptions.add(listener);
+  ensurePolling();
+  // catch transfers already in flight without waiting a full interval
+  void pollOnce();
+
+  return () => {
+    wildcardSubscriptions.delete(listener);
     stopPollingIfIdle();
   };
 }

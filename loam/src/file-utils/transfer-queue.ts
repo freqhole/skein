@@ -33,9 +33,28 @@ export interface PendingTransferEntry {
 /** live bookkeeping backing listPendingTransfers() — populated by createSlotQueue()'s acquire/release below. */
 const pendingTransfers = new Map<string, PendingTransferEntry>();
 
+/** AbortController registered per transfer id (when its caller opts in via
+ *  SlotMeta.controller) — lets cancelPendingTransfer() actually stop a
+ *  transfer it didn't start, e.g. from the filez widget's cancel button. */
+const controllers = new Map<string, AbortController>();
+
 /** snapshot of every transfer currently active or queued, across both directions — for a future queue-status UI. */
 export function listPendingTransfers(): PendingTransferEntry[] {
   return Array.from(pendingTransfers.values());
+}
+
+/**
+ * cancel a transfer by its queue id (the same id shown in
+ * listPendingTransfers()) — aborts the AbortController its caller
+ * registered when reserving its slot (SlotMeta.controller). returns false
+ * if no cancellable transfer is registered under that id (already
+ * finished, or its caller opted out of registering a controller).
+ */
+export function cancelPendingTransfer(id: string): boolean {
+  const controller = controllers.get(id);
+  if (!controller) return false;
+  controller.abort(new DOMException("cancelled by user", "AbortError"));
+  return true;
 }
 
 interface SlotWaiter {
@@ -47,6 +66,10 @@ interface SlotWaiter {
 interface SlotMeta {
   blobId?: string;
   filename?: string;
+  /** when provided, registered under this transfer's id so
+   *  cancelPendingTransfer(id) can abort it later — see snatch.ts's/
+   *  upload.ts's callers, which always create one. */
+  controller?: AbortController;
 }
 
 /**
@@ -76,6 +99,7 @@ function createSlotQueue(direction: "upload" | "download", defaultMax: number) {
       startedAt: Date.now(),
     };
     pendingTransfers.set(id, entry);
+    if (meta?.controller) controllers.set(id, meta.controller);
 
     if (activeCount < max) {
       activeCount++;
@@ -94,6 +118,7 @@ function createSlotQueue(direction: "upload" | "download", defaultMax: number) {
           const idx = waiters.indexOf(waiter);
           if (idx !== -1) waiters.splice(idx, 1);
           pendingTransfers.delete(id);
+          controllers.delete(id);
           reject(new DOMException("cancelled", "AbortError"));
         },
       };
@@ -107,6 +132,7 @@ function createSlotQueue(direction: "upload" | "download", defaultMax: number) {
   function release(id: string): void {
     activeCount--;
     pendingTransfers.delete(id);
+    controllers.delete(id);
     const next = waiters.shift();
     next?.release();
   }

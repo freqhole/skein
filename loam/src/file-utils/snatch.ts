@@ -546,15 +546,33 @@ async function snatchFromBrowserPeer(
   peerAddrs: string[],
   options?: SnatchOptions
 ): Promise<FileUploadResult> {
+  // wrap the caller's signal (if any) in our own controller so this
+  // download stays cancellable via cancelPendingTransfer(id) even when
+  // the caller never passed a signal of its own — see transfer-queue.ts's
+  // controller registry (used by the filez widget's cancel button).
+  const controller = new AbortController();
+  if (options?.signal) {
+    if (options.signal.aborted) {
+      controller.abort(options.signal.reason);
+    } else {
+      const callerSignal = options.signal;
+      callerSignal.addEventListener("abort", () => controller.abort(callerSignal.reason), {
+        once: true,
+      });
+    }
+  }
+  const effectiveOptions: SnatchOptions = { ...(options ?? {}), signal: controller.signal };
+
   // every snatch path (single snatchBlob(), and each item of a
   // snatchBlobBatch()) funnels through here — gating it is enough to cap
   // download concurrency app-wide without touching every call site.
-  const slotId = await acquireDownloadSlot(options?.signal, {
+  const slotId = await acquireDownloadSlot(controller.signal, {
     blobId: info.blobId,
     filename: info.filename,
+    controller,
   });
   try {
-    return await snatchFromBrowserPeerUnqueued(info, peerAddrs, options);
+    return await snatchFromBrowserPeerUnqueued(info, peerAddrs, effectiveOptions);
   } finally {
     releaseDownloadSlot(slotId);
   }
@@ -569,17 +587,42 @@ async function snatchFromBrowserPeerUnqueued(
     const peerAddr = peerAddrs[0]!;
     const node = (await getMiddenNode()) as any;
     if (typeof node.download_to_native_store === "function") {
-      const meta = await withPeerTimeout(
-        node.download_to_native_store(
-          peerAddr,
-          info.blake3,
-          info.size || 0,
-          options?.onProgress,
-          info.filename,
-          info.mime
-        ) as Promise<{ size: number; mime: string | null }>,
-        10 * 60_000
-      );
+      // wire real cancellation: `download_to_native_store` itself has no
+      // abort parameter, but rust already exposes `blob_iroh_download_cancel`
+      // (via `cancel_native_download`, the same IPC pauseSnatchDownload()
+      // uses) — flag it the moment the merged signal aborts instead of
+      // waiting for the native call to resolve on its own. mirrors
+      // upload.ts's onAbort/blob_insert_cancel wiring.
+      let onAbort: (() => void) | null = null;
+      if (options?.signal && typeof node.cancel_native_download === "function") {
+        const blake3 = info.blake3;
+        onAbort = () => {
+          log.debug(TAG, `snatch cancel requested for ${blake3.slice(0, 16)}..., flagging native download`);
+          void node.cancel_native_download(blake3).catch((err: unknown) => {
+            log.debug(TAG, "cancel_native_download dispatch failed (non-fatal):", err);
+          });
+        };
+        options.signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      let meta: { size: number; mime: string | null };
+      try {
+        meta = await withPeerTimeout(
+          node.download_to_native_store(
+            peerAddr,
+            info.blake3,
+            info.size || 0,
+            options?.onProgress,
+            info.filename,
+            info.mime
+          ) as Promise<{ size: number; mime: string | null }>,
+          10 * 60_000
+        );
+      } finally {
+        if (onAbort && options?.signal) {
+          options.signal.removeEventListener("abort", onAbort);
+        }
+      }
       if (options?.signal?.aborted) {
         throw new DOMException("snatch cancelled", "AbortError");
       }

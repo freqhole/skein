@@ -27,6 +27,8 @@ export interface ToolbarOptions {
   onToggleSocial?: () => void;
   /** callback for the messages button — shows the messagez overlay */
   onToggleMessages?: () => void;
+  /** callback for the filez button — shows the filez (transfers) overlay */
+  onToggleFilez?: () => void;
   /** if false, the share button is hidden even when onShare is set */
   hasIdentity?: boolean;
   /** pre-seeded avatar URL — if cached, applies immediately (no gradient flash on re-navigation) */
@@ -73,8 +75,12 @@ export class Toolbar {
   private readonly shareBtn: ButtonContainer | null;
   private readonly socialBtn: Container | null;
   private readonly messagesBtn: Container | null;
+  private readonly filezBtn: Container | null;
+  private filezUpArrow: Graphics | null = null;
+  private filezDownArrow: Graphics | null = null;
   private socialBadge: Container | null = null;
   private messagesBadge: Container | null = null;
+
   private avatarSprite: Sprite | null = null;
   private avatarMask: Graphics | null = null;
   private endpointDot: Graphics | null = null;
@@ -171,6 +177,17 @@ export class Toolbar {
       this.root.addChild(this.messagesBtn);
     } else {
       this.messagesBtn = null;
+    }
+
+    // ── filez button ──────────────────────────────────────────────────────────
+    if (this.options.onToggleFilez) {
+      this.filezBtn = this.createFilezButton();
+      this.filezBtn.on("pointertap", () => this.options.onToggleFilez?.());
+      this.filezBtn.eventMode = "static";
+      this.filezBtn.cursor = "pointer";
+      this.root.addChild(this.filezBtn);
+    } else {
+      this.filezBtn = null;
     }
 
     // ── avatar circle button ─────────────────────────────────────────────────
@@ -421,6 +438,53 @@ export class Toolbar {
     icon.lineTo(ix + w, iy);
     icon.stroke({ color: 0xffffff, width: 1.5, alpha: 0.9 });
     c.addChild(icon);
+
+    return c;
+  }
+
+  /** draw the filez button icon — an up arrow (uploads) and a down arrow
+   *  (downloads) side by side, no shaft/tray. each arrow is drawn once in
+   *  white and re-tinted directly (no fade animation) by setFilezActivity()
+   *  whenever that direction has a live transfer. */
+  private createFilezButton(): Container {
+    const BTN_SIZE = 28;
+    const radius = BTN_SIZE / 2;
+
+    const c = new Container();
+
+    const bg = new Graphics();
+    bg.circle(radius, radius, radius);
+    bg.fill({ color: this.theme.frameBorder });
+    c.addChild(bg);
+
+    const pad = 7;
+    const top = pad;
+    const bottom = BTN_SIZE - pad;
+    const headW = 3;
+
+    const upArrow = new Graphics();
+    const upX = radius - 5;
+    upArrow.moveTo(upX, bottom);
+    upArrow.lineTo(upX, top);
+    upArrow.stroke({ color: 0xffffff, width: 1.5, alpha: 0.9 });
+    upArrow.moveTo(upX - headW, top + headW);
+    upArrow.lineTo(upX, top);
+    upArrow.lineTo(upX + headW, top + headW);
+    upArrow.stroke({ color: 0xffffff, width: 1.5, alpha: 0.9 });
+    c.addChild(upArrow);
+    this.filezUpArrow = upArrow;
+
+    const downArrow = new Graphics();
+    const downX = radius + 5;
+    downArrow.moveTo(downX, top);
+    downArrow.lineTo(downX, bottom);
+    downArrow.stroke({ color: 0xffffff, width: 1.5, alpha: 0.9 });
+    downArrow.moveTo(downX - headW, bottom - headW);
+    downArrow.lineTo(downX, bottom);
+    downArrow.lineTo(downX + headW, bottom - headW);
+    downArrow.stroke({ color: 0xffffff, width: 1.5, alpha: 0.9 });
+    c.addChild(downArrow);
+    this.filezDownArrow = downArrow;
 
     return c;
   }
@@ -839,6 +903,13 @@ export class Toolbar {
       x += BTN_SIZE + gap;
     }
 
+    // filez button (circle)
+    if (this.filezBtn) {
+      this.filezBtn.x = x;
+      this.filezBtn.y = circleBtnY;
+      x += BTN_SIZE + gap;
+    }
+
     // avatar circle button
     if (this.socialBtn) {
       this.socialBtn.x = x;
@@ -997,6 +1068,12 @@ export class Toolbar {
       x += BTN_SIZE + gap;
     }
 
+    if (this.filezBtn) {
+      this.filezBtn.x = x;
+      this.filezBtn.y = circleBtnY;
+      x += BTN_SIZE + gap;
+    }
+
     if (this.socialBtn) {
       this.socialBtn.x = x;
       this.socialBtn.y = circleBtnY;
@@ -1107,6 +1184,24 @@ export class Toolbar {
     }
   }
 
+  /**
+   * tint the up/down arrows independently — the "something's happening"
+   * signal for active transfers (no numeric badge, per design — unlike
+   * messages/social, a count here would be noisy since transfers churn
+   * constantly). directly tints each arrow magenta while that direction has
+   * a live transfer (no fade/pulse — a flat color swap is enough of a
+   * signal and is cheaper than an interval-driven animation).
+   */
+  setFilezActivity(uploading: boolean, downloading: boolean): void {
+    const activeTint = 0xff33cc;
+    if (this.filezUpArrow) {
+      this.filezUpArrow.tint = uploading ? activeTint : 0xffffff;
+    }
+    if (this.filezDownArrow) {
+      this.filezDownArrow.tint = downloading ? activeTint : 0xffffff;
+    }
+  }
+
   /** unsubscribe from all listeners and remove the toolbar from the stage. */
   destroy(): void {
     this.closeFlyout();
@@ -1120,6 +1215,7 @@ export class Toolbar {
     this.avatarMask = null;
     this.socialBtn?.destroy({ children: true });
     this.messagesBtn?.destroy({ children: true });
+    this.filezBtn?.destroy({ children: true });
     this.root.destroy({ children: true });
   }
 }
