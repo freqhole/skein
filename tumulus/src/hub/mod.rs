@@ -403,6 +403,12 @@ impl HubPeerService {
             freqhole_reliquary::snatch::SnatchEngineOptions::default(),
         ));
 
+        // hub-side domain-ingest worker: races loam's tauri-peer fallback
+        // path to process a manually-picked file-type domain (thumbnail
+        // only) whenever the hub already has the blob locally — see
+        // `domain_ingest`'s module doc comment.
+        crate::domain_ingest::spawn(hub_repo.clone(), blobz.clone(), node_id_str.clone());
+
         Ok(Self {
             endpoint,
             router,

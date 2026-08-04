@@ -1159,6 +1159,13 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         if (refCanvasDocId) {
           void addBlobCanvasRef(blobId, ctx.doc.current.blake3, refCanvasDocId);
         }
+        // pick up a domain someone else already picked before we had the
+        // blob locally (or before we were even a tauri app) — kickOffDomainIngest
+        // no-ops harmlessly if we're still not actually eligible to help.
+        const domainNow = ctx.doc.current.domain;
+        if (!isDomainEditable(domainNow) && !ctx.doc.current.thumbnailDataUrl) {
+          kickOffDomainIngest(domainNow);
+        }
       } else {
         localByteSize = null;
         actionState = "remote";
@@ -1763,6 +1770,12 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     function kickOffDomainIngest(domain: string) {
       const state = ctx.doc.current;
       if (!state.blobId) return;
+      // only a tauri app (real ffmpeg/magick on this machine) can actually do
+      // this work — a browser tab has nothing to run it with. the tumulus hub
+      // races the same claim independently (it's always on, so in practice it
+      // usually wins first) — this is the tauri-peer fallback path.
+      if (!isTauriMode()) return;
+      if (actionState !== "local" && actionState !== "snatched") return;
       void runDomainIngest(domainIngestDoc, state.blobId, domain, state.mime, ctx.canvasStore, {
         isDestroyed: () => destroyed,
         convertToDocument:
@@ -2171,6 +2184,15 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         snatchDownloadId = null;
         snatchPausedPct = "";
         void refreshLocalByteSize(result.blobId, result.blake3 ?? "");
+
+        // just became capable (blob is now local) — pick up an already-picked
+        // domain nobody has ingested yet.
+        {
+          const domainNow = ctx.doc.current.domain;
+          if (!isDomainEditable(domainNow) && !ctx.doc.current.thumbnailDataUrl) {
+            kickOffDomainIngest(domainNow);
+          }
+        }
 
         if (result.blobId !== state.blobId) {
           ctx.doc.change((draft) => {
