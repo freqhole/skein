@@ -360,7 +360,10 @@ export class BinMediaController {
       audioManager.on("stop", () => this.onAudioStopped()),
       audioManager.on("play", () => this.onAudioPlay()),
       audioManager.on("pause", () => this.onAudioPause()),
-      audioManager.on("loading", (data) => this.onAudioLoading(data.blobId))
+      audioManager.on("loading", (data) => this.onAudioLoading(data.blobId)),
+      audioManager.on("error", (data) => {
+        log.warn("bin-media", `audio playback failed: code=${data.code} message=${data.message}`);
+      })
     );
   }
 

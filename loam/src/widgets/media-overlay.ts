@@ -10,6 +10,10 @@
  * media content.
  */
 
+import { log } from "@freqhole/reliquary/utils";
+
+const TAG = "media-overlay";
+
 export interface MediaOverlayOptions {
   /** type of media to display */
   type: "photo" | "video" | "audio";
@@ -108,6 +112,8 @@ export function createMediaOverlay(options: MediaOverlayOptions): MediaOverlayHa
   // track media elements for teardown
   let videoEl: HTMLVideoElement | null = null;
   let audioEl: HTMLAudioElement | null = null;
+  let videoSourceEl: HTMLSourceElement | null = null;
+  let audioSourceEl: HTMLSourceElement | null = null;
 
   // ---------------------------------------------------------------------------
   // media element
@@ -126,12 +132,15 @@ export function createMediaOverlay(options: MediaOverlayOptions): MediaOverlayHa
     is.borderRadius = "2px";
     contentWrap.appendChild(img);
   } else if (type === "video") {
+    // <video>/<audio> have no real `type` content attribute of their own
+    // (unlike <source>), so an explicit mime hint has to go on a nested
+    // <source> — otherwise the browser falls back to sniffing the src URL,
+    // which fails for asset:// URLs pointing at extensionless blob-files/
+    // paths (no extension for it to guess a Content-Type from).
     const video = document.createElement("video");
-    video.src = src;
     video.controls = true;
     video.autoplay = true;
     video.playsInline = true;
-    if (mime) video.setAttribute("type", mime);
     const vs = video.style;
     vs.maxWidth = "90vw";
     vs.maxHeight = "85vh";
@@ -139,7 +148,12 @@ export function createMediaOverlay(options: MediaOverlayOptions): MediaOverlayHa
     vs.display = "block";
     vs.borderRadius = "2px";
     vs.outline = "none";
+    const videoSource = document.createElement("source");
+    videoSource.src = src;
+    if (mime) videoSource.type = mime;
+    video.appendChild(videoSource);
     videoEl = video;
+    videoSourceEl = videoSource;
     contentWrap.appendChild(video);
   } else if (type === "audio") {
     // optional waveform image above the audio controls
@@ -158,18 +172,33 @@ export function createMediaOverlay(options: MediaOverlayOptions): MediaOverlayHa
     }
 
     const audio = document.createElement("audio");
-    audio.src = src;
     audio.controls = true;
     audio.autoplay = true;
-    if (mime) audio.setAttribute("type", mime);
     const as_ = audio.style;
     as_.display = "block";
     as_.minWidth = "320px";
     as_.maxWidth = "80vw";
     as_.outline = "none";
+    const audioSource = document.createElement("source");
+    audioSource.src = src;
+    if (mime) audioSource.type = mime;
+    audio.appendChild(audioSource);
     audioEl = audio;
+    audioSourceEl = audioSource;
     contentWrap.appendChild(audio);
   }
+
+  // surface playback failures (e.g. an extensionless blob-files/ source with
+  // no/wrong mime -> MEDIA_ERR_SRC_NOT_SUPPORTED) since <video>/<audio> fail
+  // silently otherwise.
+  const playbackEl = videoEl ?? audioEl;
+  playbackEl?.addEventListener("error", () => {
+    const err = playbackEl?.error;
+    log.warn(
+      TAG,
+      `${type} playback failed: code=${err?.code} message=${err?.message || "(none)"} mime=${mime || "(none)"} src=${src.slice(0, 100)}`
+    );
+  });
 
   backdrop.appendChild(contentWrap);
 
@@ -205,12 +234,12 @@ export function createMediaOverlay(options: MediaOverlayOptions): MediaOverlayHa
     // stop playback
     if (videoEl) {
       videoEl.pause();
-      videoEl.removeAttribute("src");
+      videoSourceEl?.removeAttribute("src");
       videoEl.load();
     }
     if (audioEl) {
       audioEl.pause();
-      audioEl.removeAttribute("src");
+      audioSourceEl?.removeAttribute("src");
       audioEl.load();
     }
 
