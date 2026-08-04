@@ -3,15 +3,16 @@ import { resolveDocReady } from "../../src/p2p/doc-ready";
 import { Container, Graphics, Sprite, Text, Texture, Assets } from "pixi.js";
 
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
+import { getThumbnailDataUrl } from "../../src/file-utils/thumbnail-utils";
 import {
-  getThumbnailDataUrl,
   isDocumentFilename,
   isMarkdownFilename,
   isPlainTextFilename,
   pickFiles,
   readPickedFileText,
   uploadFile,
-} from "../../src/widgets/file-utils";
+} from "../../src/file-utils/upload";
+import { createPauseGate, type PauseGate } from "../../src/file-utils/snatch";
 import { fileSchema } from "../file";
 import { markdownSchema } from "../markdown";
 import { notepadSchema } from "../notepad";
@@ -229,8 +230,12 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
     // -- snatch state --------------------------------------------------------
 
     let snatchInProgress = false;
+    let snatchPaused = false;
     let snatchAbortController: AbortController | null = null;
-    let snatchLabel = "snatch all";
+    let snatchPauseGate: PauseGate | null = null;
+    // aggregate progress across the whole batch (0-100), shown in place of
+    // the "snatch all" button while a batch is running.
+    let snatchPercent = 0;
 
     // -- tidy ----------------------------------------------------------------
 
@@ -280,17 +285,37 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
         });
       }
 
-      actions.push({
-        id: "snatch",
-        label: snatchLabel,
-        onClick: () => {
-          if (snatchInProgress) {
-            snatchAbortController?.abort();
-          } else {
-            handleSnatchAll();
-          }
-        },
-      });
+      // while a batch is running, swap the "snatch all" button for an
+      // info% readout plus a pause/resume toggle — snatching all is a
+      // one-shot kickoff, so there's no reason to keep showing that label
+      // once it's underway.
+      if (snatchInProgress) {
+        actions.push({
+          id: "snatch-progress",
+          label: `${snatchPercent}%`,
+          isInfo: true,
+        });
+        actions.push({
+          id: "snatch-pause",
+          label: snatchPaused ? "resume" : "pause",
+          onClick: () => {
+            if (snatchPaused) {
+              snatchPauseGate?.resume();
+              snatchPaused = false;
+            } else {
+              snatchPauseGate?.pause();
+              snatchPaused = true;
+            }
+            ctx.setHeaderActions?.(buildHeaderActions());
+          },
+        });
+      } else {
+        actions.push({
+          id: "snatch",
+          label: "snatch all",
+          onClick: handleSnatchAll,
+        });
+      }
 
       actions.push({
         id: "count",
@@ -620,8 +645,10 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       if (!store || !repo || snatchInProgress) return;
 
       snatchInProgress = true;
+      snatchPaused = false;
+      snatchPercent = 0;
       snatchAbortController = new AbortController();
-      snatchLabel = "cancel";
+      snatchPauseGate = createPauseGate();
       ctx.setHeaderActions?.(buildHeaderActions());
 
       try {
@@ -629,13 +656,11 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
         await snatchAllInBin(ctx.widgetId, store, repo, peers, {
           signal: snatchAbortController.signal,
+          pauseGate: snatchPauseGate,
           onProgress: (progress) => {
-            if (progress.done) {
-              snatchLabel = "snatch all";
-            } else {
-              const done = progress.snatched + progress.failed + progress.alreadyLocal;
-              snatchLabel = `${done}/${progress.total}`;
-            }
+            const done = progress.snatched + progress.failed + progress.alreadyLocal;
+            const fraction = progress.total > 0 ? (done + progress.currentProgress) / progress.total : 1;
+            snatchPercent = Math.round(Math.min(1, fraction) * 100);
             ctx.setHeaderActions?.(buildHeaderActions());
           },
         });
@@ -643,8 +668,9 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
         log.warn("bin", "snatch all failed:", err);
       } finally {
         snatchInProgress = false;
+        snatchPaused = false;
         snatchAbortController = null;
-        snatchLabel = "snatch all";
+        snatchPauseGate = null;
         ctx.setHeaderActions?.(buildHeaderActions());
       }
     }
@@ -917,6 +943,9 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       destroy() {
         destroyed = true;
         unsub();
+        // unblocks a paused snatch-all batch (and cancels an in-flight one)
+        // rather than leaving it awaiting a resume/abort that never comes.
+        snatchAbortController?.abort();
         mediaController?.destroy();
         mediaController = null;
         renderer?.destroy();

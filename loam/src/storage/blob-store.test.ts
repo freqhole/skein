@@ -2,7 +2,7 @@
 // createBlobStore() from @freqhole/reliquary/blobs (metadata layer + bytes
 // layer), the domain-into-metadata translation, and the getBlobDomain
 // read-back path - the exact flow the file widget's upload handler uses
-// (see widgets/file-utils.ts's uploadFile()). the worker (hashing + the
+// (see widgets/upload.ts's uploadFile()). the worker (hashing + the
 // OPFS write path) is mocked, matching the pattern reliquary's own
 // blobs/store.test.ts uses - no real Worker or bundled midden module
 // exists in this test environment.
@@ -126,7 +126,7 @@ describe("blob-store domain classification", () => {
     const domain = classifyDomain(file.type);
     expect(domain).toBe("photo");
 
-    // exactly the call shape widgets/file-utils.ts's uploadFile() uses in
+    // exactly the call shape widgets/upload.ts's uploadFile() uses in
     // browser mode: only `metadata.domain` is passed, filename/mime are
     // inferred from the File object itself.
     const record = await storeBlobFromFile(file, { metadata: { domain } });

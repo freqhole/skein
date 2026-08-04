@@ -7,16 +7,13 @@
  * letting the caller handle UI updates.
  */
 
+import { checkBlobLocality } from "../../src/file-utils/blob-locality";
+import { revealBlobInFinder, saveBlobToDisk } from "../../src/file-utils/blob-io";
 import {
-  checkBlobLocality,
-  revealBlobInFinder,
-  saveBlobToDisk,
   snatchBlobBatch,
   type BatchSnatchOptions,
-  type FileUploadResult,
-  type PeersMap,
-  type SnatchBlobInfo,
-} from "../../src/widgets/file-utils";
+} from "../../src/file-utils/snatch";
+import type { FileUploadResult, PeersMap, SnatchBlobInfo } from "../../src/file-utils/file-shared";
 import { log } from "@freqhole/reliquary/utils";
 import type { ActionState, PeedeeeffState } from "./types";
 

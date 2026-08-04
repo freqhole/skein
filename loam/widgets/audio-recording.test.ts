@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { SnatchOptions } from "../src/widgets/file-utils";
+import type { SnatchOptions } from "../src/file-utils/file-shared";
 import {
   addSnatcher,
   audioRecordingSchema,

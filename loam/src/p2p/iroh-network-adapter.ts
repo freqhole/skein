@@ -20,9 +20,6 @@ import {
 } from "@freqhole/reliquary/automerge";
 
 import { getStoredIdentity, onIdentityChange } from "./identity";
-import { log } from "@freqhole/reliquary/utils";
-
-const TAG = "p2p.iroh-network-adapter";
 
 export { IrohNetworkAdapter, SYNC_ALPN };
 export type { BiStreamLike, ConnectionSummary, EndpointState, MiddenStreamNode };

@@ -14,7 +14,8 @@
 
 import { log } from "@freqhole/reliquary/utils";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
-import { getDocumentPages, getThumbnailDataUrl } from "../../src/widgets/file-utils";
+import { getDocumentPages } from "../../src/file-utils/document-pages";
+import { getThumbnailDataUrl } from "../../src/file-utils/thumbnail-utils";
 import { PROCESSING_CLAIM_STALE_MS, type PeedeeeffState } from "./types";
 
 const TAG = "peedeeeff.render-client";
