@@ -52,9 +52,9 @@ static DOWNLOAD_CANCELS: LazyLock<StdMutex<HashMap<String, Arc<AtomicBool>>>> =
 /// canonical path — which `register_ingested` then happily recorded as a
 /// real blob, since it only re-derives size from disk the first time a row
 /// is created. see docs on the 0-byte blob bug this caused.
-static DOWNLOAD_INFLIGHT: LazyLock<
-    StdMutex<HashMap<String, broadcast::Sender<Result<Value, String>>>>,
-> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+type DownloadInflightMap = StdMutex<HashMap<String, broadcast::Sender<Result<Value, String>>>>;
+static DOWNLOAD_INFLIGHT: LazyLock<DownloadInflightMap> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 /// RAII guard that removes the cancel flag for `blake3` from `DOWNLOAD_CANCELS`
 /// when dropped, so the registry never accumulates stale entries.
@@ -1391,7 +1391,7 @@ async fn blob_purge_local(args: BlobGetArgs, state: &AppState) -> Result<Value, 
         return Err(DispatchError::NotFound);
     }
     blobz
-        .soft_delete(&[args.blake3.clone()], "purge_local")
+        .soft_delete(std::slice::from_ref(&args.blake3), "purge_local")
         .await?;
     blobz.hard_delete_soft_deleted(Some(&[args.blake3])).await?;
     Ok(Value::Null)
