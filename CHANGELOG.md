@@ -1,5 +1,12 @@
 # skein
 
+## 0.1.7
+
+### Patch Changes
+
+- 0322606: stub out file canvas refz data; let user specify domain for unknown filez;
+- d61cb04: file transfer ui;
+
 ## 0.1.6
 
 ### Patch Changes
