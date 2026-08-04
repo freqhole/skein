@@ -15,7 +15,7 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use freqhole_reliquary::blobz::{BlobRecord, NewBlobMeta};
+use freqhole_reliquary::blobz::{BlobRecord, BlobSortField, NewBlobMeta, SortDirection};
 use freqhole_reliquary::identity;
 use iroh::Endpoint;
 use serde::{Deserialize, Serialize};
@@ -692,6 +692,7 @@ struct BlobDto {
     mime: Option<String>,
     size: u64,
     created_at: i64,
+    external: bool,
 }
 
 impl From<BlobRecord> for BlobDto {
@@ -703,6 +704,7 @@ impl From<BlobRecord> for BlobDto {
             mime: b.mime,
             size: b.size,
             created_at: b.created_at,
+            external: b.external,
         }
     }
 }
@@ -1232,16 +1234,43 @@ async fn social_update_settings(
 struct BlobListArgs {
     limit: Option<i64>,
     offset: Option<i64>,
+    /// "size" | "filename" | "created_at" (default).
+    sort: Option<String>,
+    /// "asc" | "desc" (default).
+    direction: Option<String>,
+    /// filename substring filter (case-sensitive `LIKE '%...%'`).
+    search: Option<String>,
 }
 
 async fn blob_list(args: BlobListArgs, state: &AppState) -> Result<Value, DispatchError> {
-    let (blobs, _total) = state
+    let sort = match args.sort.as_deref() {
+        Some("size") => BlobSortField::Size,
+        Some("filename") => BlobSortField::Filename,
+        _ => BlobSortField::CreatedAt,
+    };
+    let direction = match args.direction.as_deref() {
+        Some("asc") => SortDirection::Asc,
+        _ => SortDirection::Desc,
+    };
+    let search = args.search.as_deref().filter(|s| !s.is_empty());
+
+    let (blobs, total_count, total_size) = state
         .storage
         .blobz
-        .list(args.limit.unwrap_or(200), args.offset.unwrap_or(0))
+        .list_filtered(
+            args.limit.unwrap_or(200),
+            args.offset.unwrap_or(0),
+            sort,
+            direction,
+            search,
+        )
         .await?;
     let dtos: Vec<BlobDto> = blobs.into_iter().map(Into::into).collect();
-    Ok(serde_json::to_value(dtos).expect("blob list serialize"))
+    Ok(json!({
+        "items": dtos,
+        "totalCount": total_count,
+        "totalSize": total_size,
+    }))
 }
 
 /// snapshot of every outgoing (this node serving a peer) blob transfer
@@ -2524,13 +2553,67 @@ mod tests {
         let listed = blob_list(BlobListArgs::default(), &state)
             .await
             .expect("blob_list");
-        let listed = listed.as_array().expect("list is array");
+        let listed = listed["items"].as_array().expect("items is array");
         let blake3s: Vec<&str> = listed
             .iter()
             .map(|v| v["blake3"].as_str().unwrap())
             .collect();
         assert!(blake3s.contains(&a["blake3"].as_str().unwrap()));
         assert!(blake3s.contains(&b["blake3"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn blob_list_sorts_and_searches() {
+        let (state, _tmp) = make_test_state().await;
+        blob_insert(
+            BlobInsertArgs {
+                filename: Some("apple.txt".into()),
+                mime: None,
+                data: B64.encode(b"a"),
+            },
+            &state,
+        )
+        .await
+        .expect("insert apple");
+        let banana = blob_insert(
+            BlobInsertArgs {
+                filename: Some("banana.txt".into()),
+                mime: None,
+                data: B64.encode(b"bbbbb"),
+            },
+            &state,
+        )
+        .await
+        .expect("insert banana");
+
+        let by_size = blob_list(
+            BlobListArgs {
+                sort: Some("size".into()),
+                direction: Some("asc".into()),
+                ..Default::default()
+            },
+            &state,
+        )
+        .await
+        .expect("blob_list sorted");
+        assert_eq!(by_size["totalCount"], 2);
+        assert_eq!(by_size["totalSize"], 6);
+        let items = by_size["items"].as_array().expect("items is array");
+        assert_eq!(items[0]["size"], 1);
+        assert_eq!(items[1]["size"], 5);
+
+        let searched = blob_list(
+            BlobListArgs {
+                search: Some("ban".into()),
+                ..Default::default()
+            },
+            &state,
+        )
+        .await
+        .expect("blob_list searched");
+        let items = searched["items"].as_array().expect("items is array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["blake3"], banana["blake3"]);
     }
 
     #[tokio::test]

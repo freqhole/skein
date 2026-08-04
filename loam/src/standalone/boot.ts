@@ -8,6 +8,7 @@ import type { SocialDoc } from "../../widgets/narthex/social/types";
 import type { CanvasDocument, InvitableRole } from "../canvas/canvas-doc";
 import { registerPeerName } from "../canvas/peer-names";
 import { CanvasStore } from "../canvas/canvas-store";
+import { setupOsFileDrop } from "../canvas/os-file-drop";
 import type { ConnectionStateSource } from "../canvas/connection-status";
 import { initCanvas, type SkeinCanvas } from "../canvas/init";
 import type { BreadcrumbItem } from "../canvas/toolbar";
@@ -805,6 +806,14 @@ class SkeinRouter {
       }
       // canvas update flush is best-effort — peer may not receive before close
       this.flushCanvasUpdates?.();
+    });
+
+    // OS-level file drag-and-drop onto whichever canvas is currently open
+    // (see os-file-drop.ts) — wired once, independent of canvas navigation.
+    setupOsFileDrop({
+      repo: this.repo,
+      getCurrentCanvas: () => this.currentCanvas,
+      getNarthexDocId: () => this.narthexDocId,
     });
 
     // initial navigation based on current hash
@@ -3980,6 +3989,10 @@ class SkeinRouter {
       widgetId: "filez-overlay",
       canvasElement: canvas.app.canvas as HTMLCanvasElement,
       canvasStore: canvas.store,
+      // lets the "local files" tab support dragging a row onto the canvas —
+      // see filez-widget.ts's drag-out handling.
+      world: canvas.world,
+      narthexDocId: this.narthexDocId ?? undefined,
     };
 
     try {

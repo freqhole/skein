@@ -14,6 +14,7 @@ pub mod blob_acl;
 pub mod dashboard;
 pub mod db;
 pub mod documents;
+pub mod domain_ingest;
 pub mod friendz;
 pub mod groupz;
 pub mod hub;

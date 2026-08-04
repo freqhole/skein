@@ -71,6 +71,16 @@ pub struct FileWidgetState {
     /// used to target blob downloads — only probe peers in this list.
     #[serde(default)]
     pub snatched_by: Vec<String>,
+    /// domain-ingest status for a manually-picked (not auto-detected)
+    /// domain: "" idle, "processing". see `crate::domain_ingest`.
+    #[serde(default)]
+    pub domain_ingest_state: String,
+    /// best-effort claim so only one peer (or the hub) attempts domain
+    /// ingest at a time.
+    #[serde(default)]
+    pub domain_ingest_claimed_by: String,
+    #[serde(default)]
+    pub domain_ingest_claimed_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +173,9 @@ mod tests {
             blake3: "abc123def456".to_string(),
             thumbnail_data_url: String::new(),
             snatched_by: vec!["node-a".to_string(), "node-b".to_string()],
+            domain_ingest_state: String::new(),
+            domain_ingest_claimed_by: String::new(),
+            domain_ingest_claimed_at: 0,
         };
 
         let json = serde_json::to_string(&state).unwrap();

@@ -1,4 +1,5 @@
-import { Container, Graphics, Rectangle, Text } from "pixi.js";
+import { Container, Graphics, Rectangle, Text, type FederatedPointerEvent } from "pixi.js";
+import { ScrollBox } from "@pixi/ui";
 import { z } from "zod";
 import type { DocumentId } from "@automerge/automerge-repo";
 import { log } from "@freqhole/reliquary/utils";
@@ -10,6 +11,18 @@ import {
   clearCompletedTransfers,
   pauseTransfer,
 } from "../../src/file-utils/pending-transfers";
+import { subscribeToLocalFiles, type LocalFilesResult } from "../../src/file-utils/local-files";
+import type { LocalBlobItem } from "../../src/file-utils/local-blobs";
+import { getBlobCanvasRefs } from "../../src/file-utils/blob-canvas-refs";
+import { freeUpLocalBlobCopy } from "../../src/file-utils/blob-locality";
+import { unregisterBlobFromAllCanvases } from "../../src/file-utils/unregister-blob";
+import {
+  createFileWidgetFromBlob,
+  CREATE_FILE_WIDGET_DEFAULT_WIDTH,
+  CREATE_FILE_WIDGET_DEFAULT_HEIGHT,
+} from "../../src/file-utils/create-file-widget";
+import { createSkeinInput } from "../../src/widgets/skein-input";
+import { formatFileSize, formatRelativeTime } from "../../src/widgets/format";
 
 const TAG = "widgets.filez";
 
@@ -53,7 +66,7 @@ const BG = 0x1a1a24;
 const BORDER = 0x2a2a3e;
 const TEXT_COLOR = 0xf0f0ff;
 const MUTED_TEXT = 0x666678;
-const ACCENT_COLOR = 0x3b82f6;
+const ACCENT_COLOR = 0xd946ef;
 const CARD_RADIUS = 6;
 const PADDING_X = 16;
 const PADDING_Y = 14;
@@ -65,12 +78,32 @@ const TITLE_FONT_SIZE = 12;
 const ROW_NAME_SIZE = 11;
 const ROW_SUB_SIZE = 9;
 const ROW_ALT_BG = 0x1f1f2c;
-const SCROLL_SPEED = 30;
 const CTRL_BTN_W = 44;
 const CTRL_BTN_H = 16;
 const CTRL_BTN_GAP = 6;
 const FONT = "system-ui, sans-serif";
 const RESOLUTION = 3;
+const TAB_GAP = 16;
+const FILTER_ROW_HEIGHT = 26;
+const FILTER_GAP = 12;
+const LOCAL_ROW_HEIGHT = 62;
+const LOCAL_PAGE_SIZE = 50;
+const LOAD_MORE_ROW_HEIGHT = 24;
+const CONFIRM_TIMEOUT_MS = 5000;
+const SEARCH_DEBOUNCE_MS = 300;
+
+// drag-out-to-canvas (local files tab only) — mirrors bin-drag.ts's ghost
+// drag pattern, since both convert a global pointer position to world-space
+// coordinates via `world.toLocal()` on a container that shares the same
+// PixiJS stage as the widget frames.
+const DRAG_THRESHOLD = 5;
+const GHOST_WIDTH = 140;
+const GHOST_HEIGHT = 28;
+const GHOST_RADIUS = 4;
+const GHOST_BG = 0x2a2a2a;
+const GHOST_TEXT_COLOR = 0xe0e0e0;
+const GHOST_ALPHA = 0.85;
+const GHOST_FONT_SIZE = 10;
 
 const DIRECTION_INFO: Record<FilezItem["direction"], { label: string; color: number }> = {
   upload: { label: "upload", color: 0x3b82f6 },
@@ -86,6 +119,10 @@ function truncate(value: string, maxChars: number): string {
 
 function truncateId(id: string, len = 10): string {
   return id.length > len ? `${id.slice(0, len)}\u2026` : id;
+}
+
+function sortFieldLabel(field: "created_at" | "size" | "filename"): string {
+  return field === "created_at" ? "date" : field === "size" ? "size" : "name";
 }
 
 /** relative-time label for a completed row's completedAt timestamp. */
@@ -127,10 +164,20 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
     let currentHeight = ctx.height;
     let destroyed = false;
 
+    // which of the two tabs is currently shown. not persisted — resets to
+    // "pending" every time the overlay is (re)mounted, same as scroll
+    // position.
+    let activeTab: "pending" | "local" = "pending";
+
+    // -------------------------------------------------------------------
+    // tab 1 ("pending transfers") state
+    // -------------------------------------------------------------------
+
     // canvas title lookups are best-effort/async (repo.find always returns
     // a Promise) — cache resolved titles and re-layout once they arrive,
     // rather than blocking row rendering on them. undefined = not yet
-    // attempted, null = attempted and unresolvable.
+    // attempted, null = attempted and unresolvable. shared with tab 2's
+    // canvas-refs subtitle line below.
     const canvasTitleCache = new Map<string, string | null>();
     const resolvingCanvasIds = new Set<string>();
 
@@ -160,9 +207,231 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
       return null;
     }
 
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // tab 2 ("local files") state
+    // -------------------------------------------------------------------
+
+    let localItems: LocalBlobItem[] = [];
+    let localTotalCount = 0;
+    let localTotalSize = 0;
+    let localLoading = false;
+    let localError: string | null = null;
+    let localSort: "created_at" | "size" | "filename" = "created_at";
+    let localDirection: "asc" | "desc" = "desc";
+    let localSearch = "";
+    let localOrphansOnly = false;
+    let localAppendMode = false;
+    let localHasMore = true;
+    let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // blob -> referencing-canvas-ids, resolved best-effort/async (same
+    // cache-then-relayout shape as resolveCanvasTitle above) so the orphan
+    // filter and per-row canvas-refs line don't block row rendering on it.
+    // null once resolved with zero refs (orphan); undefined-equivalent
+    // (absent from map) = not yet resolved.
+    const blobRefsCache = new Map<string, string[]>();
+    const resolvingBlobRefs = new Set<string>();
+
+    const pendingPurges = new Set<string>();
+    let confirmPurgeId: string | null = null;
+    let confirmPurgeTimer: ReturnType<typeof setTimeout> | null = null;
+    let confirmBulkPurge = false;
+    let confirmBulkPurgeTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // "add to canvas" — a click-driven alternative to dragging a row onto
+    // the canvas (see startRowDrag below), for the same drop target.
+    const addingToCanvas = new Set<string>();
+
+    /** returns cached canvas-refs for a blob, kicking off (and caching) an
+     *  async lookup on a cache miss. returns `null` while unresolved so
+     *  callers can render a neutral state until the real answer arrives. */
+    function resolveBlobRefs(blobId: string, blake3: string | undefined): string[] | null {
+      const key = blake3 || blobId;
+      if (blobRefsCache.has(key)) return blobRefsCache.get(key)!;
+      if (resolvingBlobRefs.has(key)) return null;
+      resolvingBlobRefs.add(key);
+      getBlobCanvasRefs(blobId, blake3)
+        .then((refs) => {
+          resolvingBlobRefs.delete(key);
+          blobRefsCache.set(key, refs);
+          if (!destroyed) layout(currentWidth, currentHeight);
+        })
+        .catch(() => {
+          resolvingBlobRefs.delete(key);
+          blobRefsCache.set(key, []);
+        });
+      return null;
+    }
+
+    function isOrphan(item: LocalBlobItem): boolean | null {
+      const refs = resolveBlobRefs(item.blobId, item.blake3);
+      if (refs === null) return null; // not resolved yet — don't count either way
+      return refs.length === 0;
+    }
+
+    const localFilesSub = subscribeToLocalFiles((result: LocalFilesResult) => {
+      localLoading = false;
+      if (result.ok) {
+        localItems = localAppendMode ? [...localItems, ...result.items] : result.items;
+        localTotalCount = result.totalCount;
+        localTotalSize = result.totalSize;
+        localHasMore = localItems.length < result.totalCount;
+        localError = null;
+      } else {
+        localError = result.error;
+      }
+      if (!destroyed) layout(currentWidth, currentHeight);
+    });
+
+    /** (re)query tab 2's data. `append: true` fetches the next page and
+     *  keeps what's already loaded; `append: false` (a fresh search/sort/
+     *  tab-switch) replaces the list from offset 0. */
+    function queryLocalFiles(opts: { append: boolean }): void {
+      localAppendMode = opts.append;
+      localLoading = true;
+      if (!opts.append && !destroyed) layout(currentWidth, currentHeight);
+      void localFilesSub.query({
+        sort: localSort,
+        direction: localDirection,
+        search: localSearch || undefined,
+        limit: LOCAL_PAGE_SIZE,
+        offset: opts.append ? localItems.length : 0,
+      });
+    }
+
+    function switchTab(tab: "pending" | "local"): void {
+      if (activeTab === tab) return;
+      activeTab = tab;
+      if (tab === "local" && localItems.length === 0 && !localLoading) {
+        queryLocalFiles({ append: false });
+      }
+      scrollBox.scrollTop();
+      layout(currentWidth, currentHeight);
+    }
+
+    function handleSortClick(field: "created_at" | "size" | "filename"): void {
+      if (localSort === field) {
+        localDirection = localDirection === "asc" ? "desc" : "asc";
+      } else {
+        localSort = field;
+        localDirection = field === "filename" ? "asc" : "desc";
+      }
+      scrollBox.scrollTop();
+      queryLocalFiles({ append: false });
+    }
+
+    function handleOrphanToggle(): void {
+      localOrphansOnly = !localOrphansOnly;
+      layout(currentWidth, currentHeight);
+    }
+
+    /** free a blob's local bytes, after cross-canvas snatchedBy cleanup
+     *  (phase 3) so peers stop targeting us for downloads of a blob we no
+     *  longer have. optimistic on success: removes the row locally instead
+     *  of re-querying the whole page (cheaper, avoids reshuffling offsets
+     *  mid-scroll). external files (tauri-only, user-picked outside
+     *  skein's managed dir) are only ever "forgotten" here — the actual
+     *  file on disk is never touched, `freeUpLocalBlobCopy` already knows
+     *  the difference. */
+    async function executePurge(item: LocalBlobItem): Promise<void> {
+      pendingPurges.add(item.blobId);
+      layout(currentWidth, currentHeight);
+      try {
+        if (ctx.canvasStore) {
+          await unregisterBlobFromAllCanvases(ctx.canvasStore.repo, item.blobId, item.blake3).catch(
+            (err) => log.debug(TAG, "unregisterBlobFromAllCanvases failed (non-fatal):", err)
+          );
+        }
+        await freeUpLocalBlobCopy(item.blobId, item.blake3);
+        localItems = localItems.filter((i) => i.blobId !== item.blobId);
+        localTotalCount = Math.max(0, localTotalCount - 1);
+        localTotalSize = Math.max(0, localTotalSize - item.size);
+        blobRefsCache.delete(item.blake3 || item.blobId);
+      } catch (err) {
+        log.warn(TAG, `purge failed for ${item.blobId.slice(0, 12)}...:`, err);
+      } finally {
+        pendingPurges.delete(item.blobId);
+        if (!destroyed) layout(currentWidth, currentHeight);
+      }
+    }
+
+    function handlePurgeClick(item: LocalBlobItem): void {
+      if (pendingPurges.has(item.blobId)) return;
+      if (confirmPurgeId === item.blobId) {
+        if (confirmPurgeTimer !== null) clearTimeout(confirmPurgeTimer);
+        confirmPurgeTimer = null;
+        confirmPurgeId = null;
+        void executePurge(item);
+        return;
+      }
+      confirmPurgeId = item.blobId;
+      if (confirmPurgeTimer !== null) clearTimeout(confirmPurgeTimer);
+      confirmPurgeTimer = setTimeout(() => {
+        confirmPurgeId = null;
+        confirmPurgeTimer = null;
+        if (!destroyed) layout(currentWidth, currentHeight);
+      }, CONFIRM_TIMEOUT_MS);
+      layout(currentWidth, currentHeight);
+    }
+
+    function cancelPurgeClick(): void {
+      if (confirmPurgeTimer !== null) clearTimeout(confirmPurgeTimer);
+      confirmPurgeTimer = null;
+      confirmPurgeId = null;
+      layout(currentWidth, currentHeight);
+    }
+
+    /** create a `file` widget from an already-local blob on the currently
+     *  open canvas, at the default drop position — see create-file-widget.ts.
+     *  hidden entirely when `canDragOut()` is false (narthex / viewer /
+     *  overlay not wired with `world`/`canvasStore`, see below). */
+    function handleAddToCanvas(item: LocalBlobItem): void {
+      if (addingToCanvas.has(item.blobId) || !ctx.canvasStore) return;
+      const store = ctx.canvasStore;
+      addingToCanvas.add(item.blobId);
+      layout(currentWidth, currentHeight);
+      createFileWidgetFromBlob(store.repo, store, {
+        blobId: item.blobId,
+        filename: item.filename,
+        mime: item.mime,
+        size: item.size,
+        blake3: item.blake3,
+      })
+        .catch((err) => {
+          log.warn(TAG, `add-to-canvas: failed to create file widget from blob ${item.blobId}:`, err);
+        })
+        .finally(() => {
+          addingToCanvas.delete(item.blobId);
+          if (!destroyed) layout(currentWidth, currentHeight);
+        });
+    }
+
+    /** purge every currently-*loaded* orphaned row in one go (bounded to
+     *  what's actually fetched so far — the orphan filter only ever
+     *  filters the loaded page(s) client-side, see renderLocalRows). */
+    function handleBulkPurgeClick(): void {
+      const orphans = localItems.filter((i) => isOrphan(i) === true);
+      if (orphans.length === 0) return;
+      if (confirmBulkPurge) {
+        if (confirmBulkPurgeTimer !== null) clearTimeout(confirmBulkPurgeTimer);
+        confirmBulkPurgeTimer = null;
+        confirmBulkPurge = false;
+        void Promise.allSettled(orphans.map((item) => executePurge(item)));
+        return;
+      }
+      confirmBulkPurge = true;
+      if (confirmBulkPurgeTimer !== null) clearTimeout(confirmBulkPurgeTimer);
+      confirmBulkPurgeTimer = setTimeout(() => {
+        confirmBulkPurge = false;
+        confirmBulkPurgeTimer = null;
+        if (!destroyed) layout(currentWidth, currentHeight);
+      }, CONFIRM_TIMEOUT_MS);
+      layout(currentWidth, currentHeight);
+    }
+
+    // -------------------------------------------------------------------
     // background card
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
 
     const cardBg = new Graphics();
     container.addChild(cardBg);
@@ -174,17 +443,31 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
       cardBg.stroke({ color: BORDER, width: 1 });
     };
 
-    // -----------------------------------------------------------------------
-    // header
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // header: tab switch (left) + tab-specific summary/actions (right)
+    // -------------------------------------------------------------------
 
-    const titleText = new Text({
-      text: "transfers",
-      style: { fontFamily: FONT, fontSize: TITLE_FONT_SIZE, fill: TEXT_COLOR },
-      resolution: RESOLUTION,
-    });
-    titleText.eventMode = "none";
-    container.addChild(titleText);
+    function buildTabLabel(label: string, tab: "pending" | "local"): Text {
+      const text = new Text({
+        text: label,
+        style: { fontFamily: FONT, fontSize: TITLE_FONT_SIZE, fill: TEXT_COLOR },
+        resolution: RESOLUTION,
+      });
+      text.eventMode = "static";
+      text.cursor = "pointer";
+      text.on("pointertap", (e) => {
+        e.stopPropagation();
+        switchTab(tab);
+      });
+      return text;
+    }
+
+    const pendingTabText = buildTabLabel("pending", "pending");
+    container.addChild(pendingTabText);
+    const localTabText = buildTabLabel("local", "local");
+    container.addChild(localTabText);
+    const tabUnderline = new Graphics();
+    container.addChild(tabUnderline);
 
     const countText = new Text({
       text: "",
@@ -194,7 +477,7 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
     countText.eventMode = "none";
     container.addChild(countText);
 
-    // only visible once there's at least one completed row to clear.
+    // tab 1 only — visible while there's at least one completed row to clear.
     const clearCompletedBtn = new Text({
       text: "clear completed",
       style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
@@ -202,35 +485,144 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
     });
     clearCompletedBtn.eventMode = "static";
     clearCompletedBtn.cursor = "pointer";
-    clearCompletedBtn.on("pointertap", () => clearCompletedTransfers());
+    clearCompletedBtn.on("pointertap", (e) => {
+      e.stopPropagation();
+      clearCompletedTransfers();
+    });
     container.addChild(clearCompletedBtn);
 
-    const headerDivider = new Graphics();
-    container.addChild(headerDivider);
+    // tab 2 only — visible while the orphan filter is on and at least one
+    // loaded row qualifies.
+    const bulkPurgeBtn = new Text({
+      text: "purge orphans",
+      style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+      resolution: RESOLUTION,
+    });
+    bulkPurgeBtn.eventMode = "static";
+    bulkPurgeBtn.cursor = "pointer";
+    bulkPurgeBtn.on("pointertap", (e) => {
+      e.stopPropagation();
+      handleBulkPurgeClick();
+    });
+    container.addChild(bulkPurgeBtn);
 
-    // -----------------------------------------------------------------------
-    // list area (scrollable, masked) — single tab only right now; a "local
-    // files" tab is deferred, see this widget's plan doc. rows are built by
-    // renderRows() below so a future tab can reuse it for a different item
-    // source without a rewrite.
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // tab 2 filter row: search box, sort buttons, orphan-only toggle
+    // -------------------------------------------------------------------
 
-    let scrollY = 0;
+    const searchInputHandle = createSkeinInput({
+      canvasElement: ctx.canvasElement,
+      width: 140,
+      height: 20,
+      placeholder: "search filename\u2026",
+      onChange: (value) => {
+        if (searchDebounceTimer !== null) clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = setTimeout(() => {
+          searchDebounceTimer = null;
+          localSearch = value;
+          scrollBox.scrollTop();
+          queryLocalFiles({ append: false });
+        }, SEARCH_DEBOUNCE_MS);
+      },
+    });
+    container.addChild(searchInputHandle.input);
+
+    function buildSortLabel(field: "created_at" | "size" | "filename"): Text {
+      const text = new Text({
+        text: sortFieldLabel(field),
+        style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+        resolution: RESOLUTION,
+      });
+      text.eventMode = "static";
+      text.cursor = "pointer";
+      text.on("pointertap", (e) => {
+        e.stopPropagation();
+        handleSortClick(field);
+      });
+      return text;
+    }
+
+    const sortLabels: Array<{ field: "created_at" | "size" | "filename"; text: Text }> = [
+      { field: "created_at", text: buildSortLabel("created_at") },
+      { field: "size", text: buildSortLabel("size") },
+      { field: "filename", text: buildSortLabel("filename") },
+    ];
+    for (const { text } of sortLabels) container.addChild(text);
+
+    const orphanToggle = new Text({
+      text: "\u25a1 orphans only",
+      style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+      resolution: RESOLUTION,
+    });
+    orphanToggle.eventMode = "static";
+    orphanToggle.cursor = "pointer";
+    orphanToggle.on("pointertap", (e) => {
+      e.stopPropagation();
+      handleOrphanToggle();
+    });
+    container.addChild(orphanToggle);
+
+    // -------------------------------------------------------------------
+    // list area (scrollable) — shared by both tabs via @pixi/ui's
+    // ScrollBox (see hub-profile-panel.ts for why: three earlier
+    // hand-rolled wheel/hitArea attempts across this codebase didn't
+    // scroll reliably in production; ScrollBox's document-capture wheel
+    // listener + isOver gating solves the whole class of problem). only
+    // one tab's rows are ever in `inner` at a time — rebuilt on every
+    // layout() call.
+    // -------------------------------------------------------------------
+
     let listAreaY = 0;
     let listAreaHeight = 0;
-    let totalListHeight = 0;
+    let scrollBoxW = 0;
+    let scrollBoxH = 0;
+    // ScrollBox.setSize() always calls its own scrollTop() internally, so
+    // it must only be called when the size actually changes — otherwise
+    // every content-only re-layout (an async canvas-title/blob-ref
+    // resolution, a doc change, a purge settling) would silently reset the
+    // user's scroll position to the top.
+    let lastScrollBoxW = -1;
+    let lastScrollBoxH = -1;
 
-    const listContainer = new Container();
-    listContainer.eventMode = "static";
-    container.addChild(listContainer);
+    // ScrollBox needs a document-level capture-phase wheel listener
+    // registered BEFORE construction: the canvas viewport's own pan
+    // handler lives on the canvas element and was registered at app boot,
+    // so a same-target listener can't jump that queue — only a
+    // document-level ancestor capture-phase listener runs first. this also
+    // primes ScrollBox's `isOver` state for the common case where the
+    // pointer is already over the panel when it mounts (ScrollBox only
+    // flips `isOver` on a pointerover crossing).
+    const onNativeWheel = (e: WheelEvent) => {
+      if (destroyed) return;
+      if (!scrollBox.visible) return;
+      const rect = ctx.canvasElement.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+      const g = scrollBox.getGlobalPosition();
+      const inside = px >= g.x && px <= g.x + scrollBoxW && py >= g.y && py <= g.y + scrollBoxH;
+      (scrollBox as unknown as { isOver: boolean }).isOver = inside;
+      if (inside) {
+        (e as WheelEvent & { _skeinWidgetScroll?: boolean })._skeinWidgetScroll = true;
+      }
+    };
+    document.addEventListener("wheel", onNativeWheel, { capture: true, passive: true });
 
-    const listMask = new Graphics();
-    container.addChild(listMask);
-    listContainer.mask = listMask;
+    const scrollBox = new ScrollBox({
+      width: 10,
+      height: 10,
+      background: BG,
+      globalScroll: false,
+      disableEasing: true,
+    });
+    container.addChild(scrollBox);
 
-    const listInner = new Container();
-    listInner.eventMode = "static";
-    listContainer.addChild(listInner);
+    const inner = new Container();
+    inner.eventMode = "static";
+    const innerSizingRect = new Graphics();
+    innerSizingRect.rect(0, 0, 1, 1);
+    innerSizingRect.fill({ color: 0x000000, alpha: 0.0001 });
+    inner.addChild(innerSizingRect);
+    scrollBox.addItem(inner);
 
     const emptyText = new Text({
       text: "no transfers",
@@ -240,29 +632,20 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
     emptyText.eventMode = "none";
     container.addChild(emptyText);
 
-    const clampListScroll = () => {
-      const maxScroll = Math.max(0, totalListHeight - listAreaHeight);
-      scrollY = Math.max(0, Math.min(scrollY, maxScroll));
-    };
+    function finishInnerLayout(contentHeight: number): void {
+      innerSizingRect.clear();
+      innerSizingRect.rect(0, 0, Math.max(1, scrollBoxW), Math.max(1, contentHeight));
+      innerSizingRect.fill({ color: 0x000000, alpha: 0.0001 });
+      scrollBox.resize(true);
+    }
 
-    listContainer.on("wheel", (e: WheelEvent) => {
-      const canScroll = totalListHeight > listAreaHeight;
-      if (!canScroll) return; // let the event pass through to the canvas viewport
+    // -------------------------------------------------------------------
+    // tab 1 row rendering — pending transfers
+    // -------------------------------------------------------------------
 
-      e.stopPropagation();
-      if ((e as any).nativeEvent) (e as any).nativeEvent._skeinWidgetScroll = true;
-      scrollY += e.deltaY > 0 ? SCROLL_SPEED : -SCROLL_SPEED;
-      clampListScroll();
-      listInner.y = -scrollY;
-    });
-
-    // -----------------------------------------------------------------------
-    // row rendering
-    // -----------------------------------------------------------------------
-
-    function renderRows(items: FilezItem[], contentW: number): void {
-      while (listInner.children.length > 0) {
-        listInner.removeChildAt(0).destroy({ children: true });
+    function renderPendingRows(items: FilezItem[], contentW: number): void {
+      while (inner.children.length > 1) {
+        inner.removeChildAt(1).destroy({ children: true }); // keep innerSizingRect (index 0)
       }
 
       for (let i = 0; i < items.length; i++) {
@@ -273,7 +656,7 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
         const rowContainer = new Container();
         rowContainer.eventMode = "static";
         rowContainer.y = rowY;
-        listInner.addChild(rowContainer);
+        inner.addChild(rowContainer);
 
         // alternating row background
         const rowBg = new Graphics();
@@ -412,7 +795,7 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
         rowContainer.alpha = item.state === "completed" ? 0.55 : 1;
       }
 
-      totalListHeight = items.length * ROW_HEIGHT;
+      finishInnerLayout(items.length * ROW_HEIGHT);
     }
 
     /**
@@ -450,7 +833,8 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
       x: number,
       y: number,
       disabled: boolean,
-      onClick: () => void
+      onClick: () => void,
+      width: number = CTRL_BTN_W
     ): Container {
       const btn = new Container();
       btn.x = x;
@@ -459,7 +843,7 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
       btn.cursor = disabled ? "default" : "pointer";
 
       const bg = new Graphics();
-      bg.roundRect(0, 0, CTRL_BTN_W, CTRL_BTN_H, 4);
+      bg.roundRect(0, 0, width, CTRL_BTN_H, 4);
       bg.fill({ color: disabled ? 0x14141c : BORDER });
       btn.addChild(bg);
 
@@ -473,7 +857,7 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
         resolution: RESOLUTION,
       });
       text.anchor.set(0.5, 0.5);
-      text.x = CTRL_BTN_W / 2;
+      text.x = width / 2;
       text.y = CTRL_BTN_H / 2;
       btn.addChild(text);
 
@@ -487,55 +871,438 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
       return btn;
     }
 
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // tab 2 row rendering — local files
+    // -------------------------------------------------------------------
+
+    const LOCAL_CTRL_RESERVED = CTRL_BTN_W * 2 + CTRL_BTN_GAP; // sized for the widest (2-button confirm) state so text doesn't reflow when clicked
+
+    // drag-out-to-canvas: dragging a local-files row onto the canvas creates
+    // a new `file` widget bound to the already-local blob at the drop point
+    // (see create-file-widget.ts). only available when the overlay was
+    // wired with `world`/`canvasStore` (boot.ts's mountFilezOverlay) and the
+    // current canvas isn't the narthex — the narthex is a private per-user
+    // index of canvas cards and intentionally never shows file widgets.
+    function canDragOut(): boolean {
+      return (
+        !!ctx.world &&
+        !!ctx.canvasStore &&
+        !ctx.canvasStore.isLocalViewer() &&
+        ctx.canvasStore.handle.documentId !== ctx.narthexDocId
+      );
+    }
+
+    // cleanup for whichever row-drag is currently in flight, if any — let
+    // destroy() abandon it cleanly if the overlay closes mid-drag.
+    let activeDragCleanup: (() => void) | null = null;
+
+    function createDragGhost(label: string): Container {
+      const c = new Container();
+      c.alpha = GHOST_ALPHA;
+      c.label = "filez-drag-ghost";
+
+      const bg = new Graphics();
+      bg.roundRect(0, 0, GHOST_WIDTH, GHOST_HEIGHT, GHOST_RADIUS).fill({ color: GHOST_BG });
+      c.addChild(bg);
+
+      const text = new Text({
+        text: label,
+        style: { fontFamily: FONT, fontSize: GHOST_FONT_SIZE, fill: GHOST_TEXT_COLOR },
+        resolution: RESOLUTION,
+      });
+      text.x = 6;
+      text.y = Math.round((GHOST_HEIGHT - GHOST_FONT_SIZE) / 2);
+      c.addChild(text);
+
+      return c;
+    }
+
+    function startRowDrag(pe: FederatedPointerEvent, item: LocalBlobItem): void {
+      if (!canDragOut()) return;
+      const world = ctx.world!;
+      const store = ctx.canvasStore!;
+
+      // track via native window pointer events, not pixi's own target-
+      // bound pointerup/pointerupoutside — the row is a pixi Container that
+      // can be destroyed mid-drag by an unrelated relayout (e.g. the
+      // pending-transfers doc's "change" firing while the local tab is
+      // active, or an async blob-refs/canvas-title resolve completing —
+      // both call layout() unconditionally, which rebuilds every row).
+      // pixi never fires pointerup/pointerupoutside for a target that's
+      // been destroyed, so the drag would silently end early — dropping a
+      // widget wherever the pointer happened to be at that moment instead
+      // of where the user actually released the mouse. native window
+      // events don't care about pixi's scene graph at all.
+      const rectOf = () => ctx.canvasElement.getBoundingClientRect();
+      const startX = pe.global.x;
+      const startY = pe.global.y;
+      let dragging = false;
+      let ghost: Container | null = null;
+
+      const cleanup = () => {
+        window.removeEventListener("pointermove", moveHandler);
+        window.removeEventListener("pointerup", upHandler);
+        window.removeEventListener("pointercancel", cancelHandler);
+        if (ghost) {
+          ghost.parent?.removeChild(ghost);
+          ghost.destroy({ children: true });
+          ghost = null;
+        }
+      };
+
+      const globalFromClient = (clientX: number, clientY: number) => {
+        const rect = rectOf();
+        return { x: clientX - rect.left, y: clientY - rect.top };
+      };
+
+      const moveHandler = (moveEvent: PointerEvent) => {
+        const g = globalFromClient(moveEvent.clientX, moveEvent.clientY);
+        const dx = g.x - startX;
+        const dy = g.y - startY;
+
+        if (!dragging && Math.sqrt(dx * dx + dy * dy) > DRAG_THRESHOLD) {
+          dragging = true;
+          ghost = createDragGhost(truncate(item.filename || truncateId(item.blobId), 24));
+          world.addChild(ghost);
+        }
+
+        if (dragging && ghost) {
+          const local = world.toLocal(g);
+          ghost.x = local.x;
+          ghost.y = local.y;
+        }
+      };
+
+      const upHandler = (upEvent: PointerEvent) => {
+        if (dragging) {
+          const g = globalFromClient(upEvent.clientX, upEvent.clientY);
+          const local = world.toLocal(g);
+          createFileWidgetFromBlob(store.repo, store, {
+            blobId: item.blobId,
+            filename: item.filename,
+            mime: item.mime,
+            size: item.size,
+            blake3: item.blake3,
+            x: local.x - CREATE_FILE_WIDGET_DEFAULT_WIDTH / 2,
+            y: local.y - CREATE_FILE_WIDGET_DEFAULT_HEIGHT / 2,
+          }).catch((err) => {
+            log.warn(TAG, `drag-out: failed to create file widget from blob ${item.blobId}:`, err);
+          });
+        }
+        cleanup();
+        activeDragCleanup = null;
+      };
+
+      // interrupted (e.g. alt-tab, touch cancel) — abandon, no widget.
+      const cancelHandler = () => {
+        cleanup();
+        activeDragCleanup = null;
+      };
+
+      activeDragCleanup?.(); // safety: abandon any still-active drag first
+      activeDragCleanup = cleanup;
+      window.addEventListener("pointermove", moveHandler);
+      window.addEventListener("pointerup", upHandler);
+      window.addEventListener("pointercancel", cancelHandler);
+    }
+
+    /** @returns the number of rows actually rendered (after the client-side
+     *  orphan filter, if on), so layout() can decide whether to show the
+     *  empty-state message. */
+    function renderLocalRows(contentW: number): number {
+      while (inner.children.length > 1) {
+        inner.removeChildAt(1).destroy({ children: true });
+      }
+
+      // the orphan filter can only ever be applied to the currently-loaded
+      // page(s) — phase 2's list options have no server-side orphan flag,
+      // and blob-canvas-refs is a separate app-level index the storage
+      // backends don't know about. totals shown in the header therefore
+      // reflect ALL local files, not just orphans, while this filter is on.
+      const visible = localOrphansOnly ? localItems.filter((i) => isOrphan(i) === true) : localItems;
+
+      for (let i = 0; i < visible.length; i++) {
+        const item = visible[i];
+        const rowY = i * LOCAL_ROW_HEIGHT;
+
+        const rowContainer = new Container();
+        rowContainer.eventMode = "static";
+        rowContainer.hitArea = new Rectangle(0, 0, contentW, LOCAL_ROW_HEIGHT);
+        rowContainer.y = rowY;
+        if (canDragOut()) {
+          rowContainer.cursor = "grab";
+          rowContainer.on("pointerdown", (e: FederatedPointerEvent) => {
+            // desktop: a row drag starts a file-drag-out gesture instead of
+            // panning the list — touch keeps its native drag-to-scroll.
+            if (e.pointerType !== "mouse") return;
+            e.stopPropagation();
+            startRowDrag(e, item);
+          });
+        }
+        inner.addChild(rowContainer);
+
+        const rowBg = new Graphics();
+        rowBg.eventMode = "none";
+        if (i % 2 === 1) {
+          rowBg.rect(0, 0, contentW, LOCAL_ROW_HEIGHT);
+          rowBg.fill({ color: ROW_ALT_BG, alpha: 0.5 });
+        }
+        rowContainer.addChild(rowBg);
+
+        const textLeft = ROW_PADDING_X;
+        const textW = Math.max(20, contentW - textLeft - ROW_PADDING_X - LOCAL_CTRL_RESERVED - CTRL_BTN_GAP);
+
+        // line 1: filename + size
+        const filename = item.filename || truncateId(item.blobId);
+        const filenameMaxChars = Math.max(4, Math.floor((textW * 0.6) / (ROW_NAME_SIZE * 0.55)));
+        const filenameText = new Text({
+          text: truncate(filename, filenameMaxChars),
+          style: { fontFamily: FONT, fontSize: ROW_NAME_SIZE, fill: TEXT_COLOR },
+          resolution: RESOLUTION,
+        });
+        filenameText.eventMode = "none";
+        filenameText.x = textLeft;
+        filenameText.y = 7;
+        rowContainer.addChild(filenameText);
+
+        const sizeText = new Text({
+          text: formatFileSize(item.size),
+          style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+          resolution: RESOLUTION,
+        });
+        sizeText.eventMode = "none";
+        sizeText.x = textLeft + textW - sizeText.width;
+        sizeText.y = 9;
+        rowContainer.addChild(sizeText);
+
+        // line 2: created date + canvas refs / orphan badge
+        const refs = resolveBlobRefs(item.blobId, item.blake3);
+        let subtitle = `created ${formatRelativeTime(item.createdAt)}`;
+        if (item.external) subtitle += " \u2022 external (kept on disk)";
+        if (refs !== null) {
+          if (refs.length === 0) {
+            subtitle += " \u2022 orphaned";
+          } else {
+            const names = refs.map((id) => resolveCanvasTitle(id)).filter((n): n is string => !!n);
+            if (names.length > 0) subtitle += ` \u2022 in: ${names.join(", ")}`;
+          }
+        }
+        const subtitleMaxChars = Math.max(4, Math.floor(textW / (ROW_SUB_SIZE * 0.55)));
+        const subtitleText = new Text({
+          text: truncate(subtitle, subtitleMaxChars),
+          style: {
+            fontFamily: FONT,
+            fontSize: ROW_SUB_SIZE,
+            fill: refs !== null && refs.length === 0 ? ACCENT_COLOR : MUTED_TEXT,
+          },
+          resolution: RESOLUTION,
+        });
+        subtitleText.eventMode = "none";
+        subtitleText.x = textLeft;
+        subtitleText.y = 26;
+        rowContainer.addChild(subtitleText);
+
+        // remove/purge — confirm-then-execute (mirrors hub-profile-panel.ts's
+        // handleHardDeleteAllClick), one active confirmation at a time. an
+        // "add to canvas" button stacks underneath in the idle state only
+        // (hidden during pendingPurges/confirm, and whenever canDragOut()
+        // is false — narthex / viewer / no drop target wired).
+        const ctrlX = contentW - ROW_PADDING_X - LOCAL_CTRL_RESERVED;
+        const showAddToCanvas =
+          canDragOut() && !pendingPurges.has(item.blobId) && confirmPurgeId !== item.blobId;
+        const ctrlGapY = 4;
+        const ctrlStackH = showAddToCanvas ? CTRL_BTN_H * 2 + ctrlGapY : CTRL_BTN_H;
+        const ctrlTopY = (LOCAL_ROW_HEIGHT - ctrlStackH) / 2;
+        if (pendingPurges.has(item.blobId)) {
+          const removingText = new Text({
+            text: "removing\u2026",
+            style: { fontFamily: FONT, fontSize: 8, fill: MUTED_TEXT },
+            resolution: RESOLUTION,
+          });
+          removingText.x = ctrlX;
+          removingText.y = ctrlTopY + 2;
+          rowContainer.addChild(removingText);
+        } else if (confirmPurgeId === item.blobId) {
+          rowContainer.addChild(buildActionButton("confirm", ctrlX, ctrlTopY, false, () => handlePurgeClick(item)));
+          rowContainer.addChild(
+            buildActionButton("cancel", ctrlX + CTRL_BTN_W + CTRL_BTN_GAP, ctrlTopY, false, cancelPurgeClick)
+          );
+        } else {
+          rowContainer.addChild(
+            buildActionButton(
+              item.external ? "remove" : "purge",
+              ctrlX + CTRL_BTN_W + CTRL_BTN_GAP,
+              ctrlTopY,
+              false,
+              () => handlePurgeClick(item)
+            )
+          );
+          if (showAddToCanvas) {
+            rowContainer.addChild(
+              buildActionButton(
+                addingToCanvas.has(item.blobId) ? "adding\u2026" : "add to canvas",
+                ctrlX,
+                ctrlTopY + CTRL_BTN_H + ctrlGapY,
+                addingToCanvas.has(item.blobId),
+                () => handleAddToCanvas(item),
+                LOCAL_CTRL_RESERVED
+              )
+            );
+          }
+        }
+      }
+
+      let contentHeight = visible.length * LOCAL_ROW_HEIGHT;
+
+      // "load more" footer — scoped to the raw (unfiltered) list so paging
+      // still works while the orphan filter is on (more orphans may exist
+      // on later pages).
+      if (localItems.length > 0 && localHasMore) {
+        const loadMoreText = new Text({
+          text: localLoading ? "loading\u2026" : "load more",
+          style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: ACCENT_COLOR },
+          resolution: RESOLUTION,
+        });
+        loadMoreText.y = contentHeight + 8;
+        if (!localLoading) {
+          loadMoreText.eventMode = "static";
+          loadMoreText.cursor = "pointer";
+          loadMoreText.on("pointertap", (e) => {
+            e.stopPropagation();
+            queryLocalFiles({ append: true });
+          });
+        }
+        loadMoreText.x = (contentW - loadMoreText.width) / 2;
+        inner.addChild(loadMoreText);
+        contentHeight += LOAD_MORE_ROW_HEIGHT;
+      }
+
+      finishInnerLayout(contentHeight);
+      return visible.length;
+    }
+
+    // -------------------------------------------------------------------
     // layout
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
 
     const layout = (w: number, h: number) => {
-      const items = ctx.doc.current.items;
-      const completedCount = items.filter((i) => i.state === "completed").length;
-      const liveCount = items.length - completedCount;
-
+      currentWidth = w;
+      currentHeight = h;
       drawCard(w, h);
 
-      titleText.x = PADDING_X;
-      titleText.y = PADDING_Y - 2;
+      // -- header: tab switch --
+      pendingTabText.x = PADDING_X;
+      pendingTabText.y = PADDING_Y - 2;
+      pendingTabText.style.fill = activeTab === "pending" ? TEXT_COLOR : MUTED_TEXT;
 
-      countText.text = liveCount > 0 ? `${liveCount} active` : "";
+      localTabText.x = pendingTabText.x + pendingTabText.width + TAB_GAP;
+      localTabText.y = PADDING_Y - 2;
+      localTabText.style.fill = activeTab === "local" ? TEXT_COLOR : MUTED_TEXT;
+
+      const activeTabText = activeTab === "pending" ? pendingTabText : localTabText;
+      tabUnderline.clear();
+      tabUnderline.moveTo(activeTabText.x, activeTabText.y + activeTabText.height + 2);
+      tabUnderline.lineTo(activeTabText.x + activeTabText.width, activeTabText.y + activeTabText.height + 2);
+      tabUnderline.stroke({ color: ACCENT_COLOR, width: 2 });
+
+      const pendingItems = ctx.doc.current.items;
+      const completedCount = pendingItems.filter((i) => i.state === "completed").length;
+      const liveCount = pendingItems.length - completedCount;
+
+      countText.visible = true;
+      countText.text =
+        activeTab === "pending"
+          ? liveCount > 0
+            ? `${liveCount} active`
+            : ""
+          : localTotalCount > 0
+            ? `${localTotalCount} files \u00b7 ${formatFileSize(localTotalSize)}`
+            : "";
       countText.x = w - PADDING_X - countText.width;
       countText.y = PADDING_Y + 1;
 
-      clearCompletedBtn.visible = completedCount > 0;
+      clearCompletedBtn.visible = activeTab === "pending" && completedCount > 0;
       if (clearCompletedBtn.visible) {
         clearCompletedBtn.x = countText.x - clearCompletedBtn.width - 12;
         clearCompletedBtn.y = PADDING_Y + 1;
       }
 
-      headerDivider.clear();
-      headerDivider.moveTo(PADDING_X, HEADER_HEIGHT);
-      headerDivider.lineTo(w - PADDING_X, HEADER_HEIGHT);
-      headerDivider.stroke({ color: BORDER, width: 1 });
+      bulkPurgeBtn.visible =
+        activeTab === "local" && localOrphansOnly && localItems.some((i) => isOrphan(i) === true);
+      if (bulkPurgeBtn.visible) {
+        bulkPurgeBtn.text = confirmBulkPurge ? "confirm purge?" : "purge orphans";
+        bulkPurgeBtn.style.fill = confirmBulkPurge ? ACCENT_COLOR : MUTED_TEXT;
+        bulkPurgeBtn.x = countText.x - bulkPurgeBtn.width - 12;
+        bulkPurgeBtn.y = PADDING_Y + 1;
+      }
 
-      listAreaY = HEADER_HEIGHT + 6;
-      listAreaHeight = Math.max(0, h - listAreaY - PADDING_Y);
       const contentW = Math.max(0, w - PADDING_X * 2);
 
-      listContainer.x = PADDING_X;
-      listContainer.y = listAreaY;
-      // explicit hitArea (rather than relying on child bounds) so wheel/
-      // pointer events register anywhere in the visible list box, even over
-      // gaps between rows or an even row's undrawn background.
-      listContainer.hitArea = new Rectangle(0, 0, contentW, listAreaHeight);
+      // -- filter row (tab 2 only) --
+      const showFilterRow = activeTab === "local";
+      searchInputHandle.input.visible = showFilterRow;
+      for (const { text } of sortLabels) text.visible = showFilterRow;
+      orphanToggle.visible = showFilterRow;
 
-      listMask.clear();
-      listMask.rect(PADDING_X, listAreaY, contentW, listAreaHeight);
-      listMask.fill({ color: 0xffffff });
+      let listTop = HEADER_HEIGHT + 6;
+      if (showFilterRow) {
+        const filterY = listTop;
+        const searchWidth = Math.min(140, Math.max(60, contentW * 0.35));
+        searchInputHandle.setWidth(searchWidth);
+        searchInputHandle.input.x = PADDING_X;
+        searchInputHandle.input.y = filterY;
 
-      renderRows(items, contentW);
-      clampListScroll();
-      listInner.y = -scrollY;
+        let sortX = PADDING_X + searchWidth + FILTER_GAP;
+        for (const { field, text } of sortLabels) {
+          const active = localSort === field;
+          text.style.fill = active ? ACCENT_COLOR : MUTED_TEXT;
+          text.text = active
+            ? `${sortFieldLabel(field)} ${localDirection === "asc" ? "\u25b2" : "\u25bc"}`
+            : sortFieldLabel(field);
+          text.x = sortX;
+          text.y = filterY + 3;
+          sortX += text.width + FILTER_GAP;
+        }
 
-      emptyText.visible = items.length === 0;
+        orphanToggle.text = localOrphansOnly ? "\u25a0 orphans only" : "\u25a1 orphans only";
+        orphanToggle.style.fill = localOrphansOnly ? ACCENT_COLOR : MUTED_TEXT;
+        orphanToggle.x = w - PADDING_X - orphanToggle.width;
+        orphanToggle.y = filterY + 3;
+
+        listTop += FILTER_ROW_HEIGHT;
+      }
+
+      listAreaY = listTop;
+      listAreaHeight = Math.max(0, h - listAreaY - PADDING_Y);
+      scrollBoxW = contentW;
+      scrollBoxH = listAreaHeight;
+
+      scrollBox.x = PADDING_X;
+      scrollBox.y = listAreaY;
+      if (scrollBoxW !== lastScrollBoxW || scrollBoxH !== lastScrollBoxH) {
+        scrollBox.setSize(scrollBoxW, scrollBoxH);
+        lastScrollBoxW = scrollBoxW;
+        lastScrollBoxH = scrollBoxH;
+      }
+
+      const visibleCount =
+        activeTab === "pending"
+          ? (renderPendingRows(pendingItems, contentW), pendingItems.length)
+          : renderLocalRows(contentW);
+
+      if (activeTab === "pending") {
+        emptyText.visible = visibleCount === 0;
+        emptyText.text = "no transfers";
+      } else {
+        emptyText.visible = visibleCount === 0;
+        emptyText.text = localError
+          ? localError
+          : localLoading && localItems.length === 0
+            ? "loading\u2026"
+            : localOrphansOnly
+              ? "no orphaned files loaded"
+              : "no local files";
+      }
       if (emptyText.visible) {
         emptyText.x = PADDING_X + (contentW - emptyText.width) / 2;
         emptyText.y = listAreaY + (listAreaHeight - emptyText.height) / 2;
@@ -552,6 +1319,13 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
       destroy() {
         destroyed = true;
         unsub();
+        activeDragCleanup?.();
+        document.removeEventListener("wheel", onNativeWheel, { capture: true } as EventListenerOptions);
+        if (confirmPurgeTimer !== null) clearTimeout(confirmPurgeTimer);
+        if (confirmBulkPurgeTimer !== null) clearTimeout(confirmBulkPurgeTimer);
+        if (searchDebounceTimer !== null) clearTimeout(searchDebounceTimer);
+        localFilesSub.unsubscribe();
+        searchInputHandle.destroy();
         container.destroy({ children: true });
       },
 

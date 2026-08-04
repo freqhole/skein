@@ -14,7 +14,7 @@ import path from "path";
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(dirname, "..");
 
-const GIT_TAG = "v0.2.10";
+const GIT_TAG = "v0.2.11";
 const GIT_SOURCE = `git = "https://github.com/freqhole/tomb", tag = "${GIT_TAG}"`;
 
 function escapeRegExp(str) {

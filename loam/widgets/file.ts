@@ -1157,7 +1157,16 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         // not just the ones that write blobId themselves.
         const refCanvasDocId = ctx.canvasStore?.handle.documentId;
         if (refCanvasDocId) {
-          void addBlobCanvasRef(blobId, ctx.doc.current.blake3, refCanvasDocId);
+          addBlobCanvasRef(blobId, ctx.doc.current.blake3, refCanvasDocId).catch((err) => {
+            log.warn("file-widget", "addBlobCanvasRef failed (non-fatal):", err);
+          });
+        }
+        // pick up a domain someone else already picked before we had the
+        // blob locally (or before we were even a tauri app) — kickOffDomainIngest
+        // no-ops harmlessly if we're still not actually eligible to help.
+        const domainNow = ctx.doc.current.domain;
+        if (!isDomainEditable(domainNow) && !ctx.doc.current.thumbnailDataUrl) {
+          kickOffDomainIngest(domainNow);
         }
       } else {
         localByteSize = null;
@@ -1565,7 +1574,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
               });
               const refCanvasDocId = store.handle.documentId;
               if (refCanvasDocId) {
-                void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+                addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId).catch((err) => {
+                  log.warn("file-widget", "addBlobCanvasRef failed (non-fatal):", err);
+                });
               }
 
               // best-effort persisted thumbnail — see peedeeeff's
@@ -1625,7 +1636,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             });
             const refCanvasDocId = store.handle.documentId;
             if (refCanvasDocId) {
-              void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+              addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId).catch((err) => {
+                log.warn("file-widget", "addBlobCanvasRef failed (non-fatal):", err);
+              });
             }
 
             // video/audio/pdf thumbnails need ffmpeg/magick, so they're never
@@ -1763,6 +1776,12 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     function kickOffDomainIngest(domain: string) {
       const state = ctx.doc.current;
       if (!state.blobId) return;
+      // only a tauri app (real ffmpeg/magick on this machine) can actually do
+      // this work — a browser tab has nothing to run it with. the tumulus hub
+      // races the same claim independently (it's always on, so in practice it
+      // usually wins first) — this is the tauri-peer fallback path.
+      if (!isTauriMode()) return;
+      if (actionState !== "local" && actionState !== "snatched") return;
       void runDomainIngest(domainIngestDoc, state.blobId, domain, state.mime, ctx.canvasStore, {
         isDestroyed: () => destroyed,
         convertToDocument:
@@ -1949,7 +1968,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           {
             const refCanvasDocId = ctx.canvasStore?.handle.documentId;
             if (refCanvasDocId) {
-              void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+              addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId).catch((err) => {
+                log.warn("file-widget", "addBlobCanvasRef failed (non-fatal):", err);
+              });
             }
           }
 
@@ -2172,6 +2193,15 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         snatchPausedPct = "";
         void refreshLocalByteSize(result.blobId, result.blake3 ?? "");
 
+        // just became capable (blob is now local) — pick up an already-picked
+        // domain nobody has ingested yet.
+        {
+          const domainNow = ctx.doc.current.domain;
+          if (!isDomainEditable(domainNow) && !ctx.doc.current.thumbnailDataUrl) {
+            kickOffDomainIngest(domainNow);
+          }
+        }
+
         if (result.blobId !== state.blobId) {
           ctx.doc.change((draft) => {
             draft.blobId = result.blobId;
@@ -2183,9 +2213,13 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           const refCanvasDocId = ctx.canvasStore?.handle.documentId;
           if (refCanvasDocId) {
             if (state.blobId) {
-              void removeBlobCanvasRef(state.blobId, state.blake3, refCanvasDocId);
+              removeBlobCanvasRef(state.blobId, state.blake3, refCanvasDocId).catch((err) => {
+                log.warn("file-widget", "removeBlobCanvasRef failed (non-fatal):", err);
+              });
             }
-            void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+            addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId).catch((err) => {
+              log.warn("file-widget", "addBlobCanvasRef failed (non-fatal):", err);
+            });
           }
         }
         if (!state.title || !state.title.trim()) {
@@ -2601,7 +2635,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         if (prevBlobId) {
           const refCanvasDocId = ctx.canvasStore?.handle.documentId;
           if (refCanvasDocId) {
-            void removeBlobCanvasRef(prevBlobId, prevBlake3, refCanvasDocId);
+            removeBlobCanvasRef(prevBlobId, prevBlake3, refCanvasDocId).catch((err) => {
+              log.warn("file-widget", "removeBlobCanvasRef failed (non-fatal):", err);
+            });
           }
         }
 

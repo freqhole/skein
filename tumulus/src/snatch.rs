@@ -730,7 +730,7 @@ pub(crate) fn read_widget_state(
 
 /// helper: read a string field from an automerge object.
 /// handles both scalar strings and Text objects (JS automerge stores strings as Text).
-fn read_str(doc: &automerge::Automerge, obj: &automerge::ObjId, key: &str) -> String {
+pub(crate) fn read_str(doc: &automerge::Automerge, obj: &automerge::ObjId, key: &str) -> String {
     use automerge::ReadDoc;
     match doc.get(obj, key) {
         Ok(Some((automerge::Value::Object(automerge::ObjType::Text), text_id))) => {
@@ -742,7 +742,7 @@ fn read_str(doc: &automerge::Automerge, obj: &automerge::ObjId, key: &str) -> St
 }
 
 /// helper: read a u64 field from an automerge object.
-fn read_u64(doc: &automerge::Automerge, obj: &automerge::ObjId, key: &str) -> u64 {
+pub(crate) fn read_u64(doc: &automerge::Automerge, obj: &automerge::ObjId, key: &str) -> u64 {
     use automerge::ReadDoc;
     doc.get(obj, key)
         .ok()

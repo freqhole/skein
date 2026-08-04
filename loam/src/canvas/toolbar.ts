@@ -557,8 +557,21 @@ export class Toolbar {
     const itemPadH = 10;
     const itemPadV = 6;
     const itemGap = 2;
+    const flyoutPad = 4;
     let maxItemWidth = 0;
     let y = itemPadV;
+
+    // cap item text width so the flyout fits within a narrow (mobile)
+    // viewport — some widget descriptions (e.g. peedeeeff's) are long
+    // enough to blow past the visible viewport entirely if left unwrapped.
+    // matches the `margin` used by positionFlyout()/positionFlyoutAtScreen().
+    const flyoutMargin = 8;
+    const vv = window.visualViewport;
+    const viewportW = vv ? vv.width : window.innerWidth;
+    const maxTextWidth = Math.max(
+      120,
+      viewportW - flyoutMargin * 2 - flyoutPad * 2 - itemPadH * 2
+    );
 
     const items: Container[] = [];
 
@@ -574,6 +587,9 @@ export class Toolbar {
           fontFamily: this.theme.fontFamily,
           fontSize: this.theme.fontSizeSmall,
           fill: 0xffffff,
+          wordWrap: true,
+          wordWrapWidth: maxTextWidth,
+          breakWords: true,
         },
         resolution: this.theme.textResolution,
       });
@@ -593,6 +609,9 @@ export class Toolbar {
             fontFamily: this.theme.fontFamily,
             fontSize: this.theme.fontSizeSmall - 1,
             fill: 0x808080,
+            wordWrap: true,
+            wordWrapWidth: maxTextWidth,
+            breakWords: true,
           },
           resolution: this.theme.textResolution,
         });
@@ -648,7 +667,6 @@ export class Toolbar {
     }
 
     // now draw all hover backgrounds at the correct max width and draw the flyout bg
-    const flyoutPad = 4;
     const flyoutWidth = maxItemWidth + flyoutPad * 2;
     const flyoutHeight = y - itemGap + itemPadV + flyoutPad;
 
@@ -716,25 +734,31 @@ export class Toolbar {
     let x = screenX + 8 - this.root.x;
     let y = screenY - 4 - this.root.y;
 
-    // clamp right edge
-    if (this.root.x + x + flyoutW > screenW - margin) {
-      x = screenW - margin - this.root.x - flyoutW;
-    }
-    // clamp left edge
-    if (this.root.x + x < margin) {
-      x = margin - this.root.x;
-    }
-    // clamp bottom edge
-    if (this.root.y + y + flyoutH > screenH - margin) {
-      y = screenH - margin - this.root.y - flyoutH;
-    }
-    // clamp top edge
-    if (this.root.y + y < margin) {
-      y = margin - this.root.y;
-    }
+    x = this.clampFlyoutAxis(x, flyoutW, screenW, this.root.x, margin);
+    y = this.clampFlyoutAxis(y, flyoutH, screenH, this.root.y, margin);
 
     this.flyout.x = Math.round(x);
     this.flyout.y = Math.round(y);
+  }
+
+  /** clamp `pos` (root-local coordinate) along one axis so the flyout stays
+   *  within the viewport. prefers keeping `margin` clearance on both edges,
+   *  but falls back to the hard viewport edges (no margin) when the flyout
+   *  is itself wider/taller than the viewport minus both margins — the
+   *  naive margin-only clamp would otherwise anchor one edge while letting
+   *  the opposite edge run off-screen entirely (e.g. a flyout with several
+   *  long widget descriptions on a narrow mobile viewport). */
+  private clampFlyoutAxis(
+    pos: number,
+    size: number,
+    screenSize: number,
+    rootOffset: number,
+    margin: number
+  ): number {
+    const effMargin = size + margin * 2 <= screenSize ? margin : 0;
+    const min = effMargin - rootOffset;
+    const max = screenSize - effMargin - rootOffset - size;
+    return Math.max(min, Math.min(max, pos));
   }
 
   /** position the flyout so it stays fully within the visible viewport. */
@@ -754,12 +778,7 @@ export class Toolbar {
     // clamp so the flyout stays within screen bounds.
     // convert local coords to screen coords, clamp, convert back.
     // screen position = root position + local position.
-
-    // right edge: root.x + x + flyoutW <= screenW - margin
-    const maxX = screenW - margin - this.root.x - flyoutW;
-    // left edge: root.x + x >= margin
-    const minX = margin - this.root.x;
-    x = Math.max(minX, Math.min(maxX, x));
+    x = this.clampFlyoutAxis(x, flyoutW, screenW, this.root.x, margin);
 
     // bottom edge: root.y + y + flyoutH <= screenH - margin
     const maxY = screenH - margin - this.root.y - flyoutH;

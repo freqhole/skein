@@ -10,7 +10,7 @@ import type { CompactInfo } from "../../src/widgets/widget-types";
 import { buildCard } from "./bin-card-builders";
 import { SLOT_BORDER_COLOR } from "./bin-constants";
 import type { BinMode, SlotPosition, SlotSizeOptions } from "./bin-layout";
-import { computeCellBorderLines, contentDimensions, slotRect } from "./bin-layout";
+import { computeCellBorderLines, contentDimensions, modeBorderInset, slotRect } from "./bin-layout";
 import type { BinMediaController } from "./bin-media";
 import type {
   CardBuildContext,
@@ -311,7 +311,12 @@ export class BinRenderer {
 
     const opts: SlotSizeOptions = { scale: this.scale, cellBorderWidth: this.effectiveCellBorderWidth };
     const color = this.cellBorderColor !== -1 ? this.cellBorderColor : SLOT_BORDER_COLOR;
-    const width = this.cellBorderWidth;
+    // use the capped inset (same value slotGap/slotSize used to make room
+    // for this border) rather than the raw configured width — otherwise a
+    // border wider than the gap it created overlaps into neighboring cells
+    // instead of sitting cleanly between them.
+    const width = modeBorderInset(this.mode, opts) * 2;
+    if (width <= 0) return;
     const half = width / 2;
     const { lines, outer } = computeCellBorderLines(this.mode, cols, rows, this.contentWidth, opts);
 

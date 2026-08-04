@@ -10,6 +10,9 @@
  */
 
 import type { Container } from "pixi.js";
+import { log } from "@freqhole/reliquary/utils";
+
+const TAG = "inline-media";
 
 export interface InlinePlayerOptions {
   /** type of media to play */
@@ -72,6 +75,7 @@ export function createInlinePlayer(options: InlinePlayerOptions): InlinePlayerHa
 
   // track media element for teardown
   let mediaEl: HTMLVideoElement | HTMLAudioElement | null = null;
+  let sourceEl: HTMLSourceElement | null = null;
 
   // ---------------------------------------------------------------------------
   // wrapper — position: fixed container for the player
@@ -115,13 +119,16 @@ export function createInlinePlayer(options: InlinePlayerOptions): InlinePlayerHa
   // media element
   // ---------------------------------------------------------------------------
 
+  // <video>/<audio> elements have no real `type` content attribute of their
+  // own (unlike <source>), so an explicit mime hint has to go on a nested
+  // <source> — otherwise the browser falls back to sniffing the src URL,
+  // which fails for asset:// URLs pointing at extensionless blob-files/
+  // paths (no extension for it to guess a Content-Type from).
   if (type === "video") {
     const video = document.createElement("video");
-    video.src = src;
     video.controls = true;
     video.autoplay = true;
     video.playsInline = true;
-    if (mime) video.setAttribute("type", mime);
     const vs = video.style;
     vs.width = "100%";
     vs.height = "100%";
@@ -129,21 +136,40 @@ export function createInlinePlayer(options: InlinePlayerOptions): InlinePlayerHa
     vs.display = "block";
     vs.borderRadius = "2px";
     vs.outline = "none";
+    const source = document.createElement("source");
+    source.src = src;
+    if (mime) source.type = mime;
+    video.appendChild(source);
     mediaEl = video;
+    sourceEl = source;
     wrapper.appendChild(video);
   } else if (type === "audio") {
     const audio = document.createElement("audio");
-    audio.src = src;
     audio.controls = true;
     audio.autoplay = true;
-    if (mime) audio.setAttribute("type", mime);
     const as_ = audio.style;
     as_.display = "block";
     as_.maxWidth = "100%";
     as_.outline = "none";
+    const source = document.createElement("source");
+    source.src = src;
+    if (mime) source.type = mime;
+    audio.appendChild(source);
     mediaEl = audio;
+    sourceEl = source;
     wrapper.appendChild(audio);
   }
+
+  // surface playback failures (e.g. an extensionless blob-files/ source with
+  // no/wrong mime -> MEDIA_ERR_SRC_NOT_SUPPORTED) since <video>/<audio> fail
+  // silently otherwise.
+  mediaEl?.addEventListener("error", () => {
+    const err = mediaEl?.error;
+    log.warn(
+      TAG,
+      `${type} playback failed: code=${err?.code} message=${err?.message || "(none)"} mime=${mime || "(none)"} src=${src.slice(0, 100)}`
+    );
+  });
 
   // ---------------------------------------------------------------------------
   // rAF tracking loop — keeps the wrapper in sync with the PixiJS container
@@ -213,7 +239,7 @@ export function createInlinePlayer(options: InlinePlayerOptions): InlinePlayerHa
     // stop playback and unload
     if (mediaEl) {
       mediaEl.pause();
-      mediaEl.removeAttribute("src");
+      sourceEl?.removeAttribute("src");
       mediaEl.load();
     }
 
