@@ -6,7 +6,7 @@
 // real, mirroring unregister-blob.test.ts's approach.
 // ---------------------------------------------------------------------------
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestRepo } from "../test-helpers/automerge-helpers";
 import { CanvasStore } from "../canvas/canvas-store";
 

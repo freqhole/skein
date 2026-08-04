@@ -7,7 +7,7 @@
 // preference for a real repo over mocking automerge-repo itself.
 // ---------------------------------------------------------------------------
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DocumentId } from "@automerge/automerge-repo";
 import { createTestRepo } from "../test-helpers/automerge-helpers";
 import { CanvasStore } from "../canvas/canvas-store";

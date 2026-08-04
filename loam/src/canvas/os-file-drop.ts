@@ -26,6 +26,7 @@
 
 import type { Repo, DocumentId } from "@automerge/automerge-repo";
 import { log } from "@freqhole/reliquary/utils";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { SkeinCanvas } from "./init";
 import { CanvasStore } from "./canvas-store";
 import { isTauriMode } from "../p2p/tauri-transport";
@@ -183,7 +184,6 @@ async function setupTauriDragDrop(
   hideOverlay: () => void
 ): Promise<void> {
   try {
-    const { getCurrentWebview } = await import("@tauri-apps/api/webview");
     await getCurrentWebview().onDragDropEvent((event) => {
       const payload = event.payload;
       if (payload.type === "enter" || payload.type === "over") {
