@@ -63,14 +63,36 @@ let nextSessionId = 1;
 // can flip it, and is freed when the download settles.
 const cancelTokens = new Map<string, CancelToken>();
 
-function registerCancelToken(downloadId: string): CancelToken {
+// secondary index so a caller that only knows the blake3 (not the
+// per-attempt downloadId — e.g. cleaning up a widget that's already been
+// torn down) can still cancel the transfer. usually one downloadId per
+// hash, but a Set handles the same blob being fetched by more than one
+// caller at once.
+const downloadIdsByBlake3 = new Map<string, Set<string>>();
+
+function registerCancelToken(downloadId: string, blake3Hash?: string): CancelToken {
   const token = new CancelToken();
   cancelTokens.set(downloadId, token);
+  if (blake3Hash) {
+    let ids = downloadIdsByBlake3.get(blake3Hash);
+    if (!ids) {
+      ids = new Set();
+      downloadIdsByBlake3.set(blake3Hash, ids);
+    }
+    ids.add(downloadId);
+  }
   return token;
 }
 
-function releaseCancelToken(downloadId: string, token: CancelToken): void {
+function releaseCancelToken(downloadId: string, token: CancelToken, blake3Hash?: string): void {
   cancelTokens.delete(downloadId);
+  if (blake3Hash) {
+    const ids = downloadIdsByBlake3.get(blake3Hash);
+    if (ids) {
+      ids.delete(downloadId);
+      if (ids.size === 0) downloadIdsByBlake3.delete(blake3Hash);
+    }
+  }
   token.free();
 }
 
@@ -303,7 +325,7 @@ async function downloadVerifiedWithEnsureProgress(
   onProgress: (fraction: number) => void,
   downloadId?: string
 ): Promise<Uint8Array> {
-  const token = downloadId ? registerCancelToken(downloadId) : null;
+  const token = downloadId ? registerCancelToken(downloadId, blake3Hash) : null;
   try {
     const result = await requireNode().download_verified_with_ensure_progress(
       peerAddr,
@@ -314,7 +336,7 @@ async function downloadVerifiedWithEnsureProgress(
     );
     return Comlink.transfer(result, [result.buffer as ArrayBuffer]);
   } finally {
-    if (downloadId && token) releaseCancelToken(downloadId, token);
+    if (downloadId && token) releaseCancelToken(downloadId, token, blake3Hash);
   }
 }
 
@@ -351,7 +373,7 @@ async function downloadVerifiedStreamingWithEnsure(
   onProgress: (fraction: number) => void,
   downloadId?: string
 ): Promise<number> {
-  const token = downloadId ? registerCancelToken(downloadId) : null;
+  const token = downloadId ? registerCancelToken(downloadId, blake3Hash) : null;
   try {
     return await requireNode().download_verified_streaming_with_ensure(
       peerAddr,
@@ -362,7 +384,7 @@ async function downloadVerifiedStreamingWithEnsure(
       token ? token.clone_token() : undefined
     );
   } finally {
-    if (downloadId && token) releaseCancelToken(downloadId, token);
+    if (downloadId && token) releaseCancelToken(downloadId, token, blake3Hash);
   }
 }
 
@@ -374,6 +396,20 @@ function downloadCancel(downloadId: string): boolean {
   if (!token) return false;
   token.cancel();
   return true;
+}
+
+/** cancel every in-flight download currently transferring this blake3 hash
+ *  (normally at most one, but a shared blob can have more than one caller
+ *  downloading it at once). returns how many were flagged — 0 means none
+ *  were in flight. */
+function downloadCancelByBlake3(blake3Hash: string): number {
+  const ids = downloadIdsByBlake3.get(blake3Hash);
+  if (!ids || ids.size === 0) return 0;
+  let count = 0;
+  for (const id of [...ids]) {
+    if (downloadCancel(id)) count++;
+  }
+  return count;
 }
 
 /** pin a hash against gc (e.g. keep a paused partial alive). */
@@ -432,6 +468,7 @@ const api = {
   downloadVerifiedByIdProgress,
   downloadVerifiedStreamingWithEnsure,
   downloadCancel,
+  downloadCancelByBlake3,
   protectBlob,
   unprotectBlob,
   proxyRequest,

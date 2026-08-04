@@ -258,7 +258,12 @@ async fn handle_thumbnail_data(
         Err(e) => return err_response(id, 404, format!("blob data not found on disk: {e}")),
     };
 
-    let mime = record.mime.as_deref().unwrap_or("application/octet-stream");
+    // a manually-picked domain override wins over the (possibly wrong)
+    // stored mime - retrying with the same mime that already failed
+    // classification would fail identically.
+    let mime_override = body.get("mime_override").and_then(Value::as_str);
+    let mime = mime_override
+        .unwrap_or_else(|| record.mime.as_deref().unwrap_or("application/octet-stream"));
     let size = 200u32;
     match crate::thumbnail::generate_thumbnail(&bytes, mime, record.filename.as_deref(), size).await
     {

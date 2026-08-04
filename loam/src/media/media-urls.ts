@@ -23,7 +23,7 @@ import { dispatch as tauriDispatch, isTauriMode } from "../p2p/tauri-transport";
 import { log } from "@freqhole/reliquary/utils";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { resolveBlob, getBlobData } from "../storage/blob-store";
-import { getFullBlobDataUrl } from "../widgets/file-utils";
+import { getFullBlobDataUrl } from "../file-utils/blob-io";
 
 const TAG = "media-urls";
 

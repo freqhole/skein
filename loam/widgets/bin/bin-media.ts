@@ -13,7 +13,7 @@
 
 import { Container, Graphics } from "pixi.js";
 import { audioManager, getMediaPlaybackUrl } from "../../src/media";
-import { getFullBlobDataUrl } from "../../src/widgets/file-utils";
+import { getFullBlobDataUrl } from "../../src/file-utils/blob-io";
 import { createMediaOverlay as createFullscreenOverlay } from "../../src/widgets/media-overlay";
 import { log } from "@freqhole/reliquary/utils";
 import type { RenderedCard } from "./bin-types";

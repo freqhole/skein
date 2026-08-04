@@ -52,6 +52,8 @@ export interface InitCanvasOptions {
   onToggleSocial?: () => void;
   /** callback to toggle the messages overlay panel — toolbar shows messages button when set */
   onToggleMessages?: () => void;
+  /** callback to toggle the filez (transfers) overlay panel — toolbar shows filez button when set */
+  onToggleFilez?: () => void;
   /** whether the user has a configured identity — controls share button visibility */
   hasIdentity?: boolean;
   /** pre-seeded avatar URL — shown immediately if cached, avoiding the gradient flash */
@@ -290,6 +292,7 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     onShare: options.onShare,
     onToggleSocial: options.onToggleSocial,
     onToggleMessages: options.onToggleMessages,
+    onToggleFilez: options.onToggleFilez,
     hasIdentity: options.hasIdentity,
     avatarUrl: options.avatarUrl,
     endpointStateSource: options.endpointStateSource,

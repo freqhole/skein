@@ -37,6 +37,12 @@ const FIELD_HEIGHT = 24;
 const LABEL_FIELD_GAP = 3;
 const RESIZE_HANDLE_WIDTH = 6;
 
+/** `visibleWhen.value` matches either a single value, or (if an array) any
+ *  value in the list. */
+function matchesVisibleWhen(currentVal: unknown, expected: unknown): boolean {
+  return Array.isArray(expected) ? expected.includes(currentVal) : currentVal === expected;
+}
+
 // preset color palette for the color picker
 const COLOR_PALETTE = [
   // transparent + neutrals
@@ -369,7 +375,7 @@ export class PropertyTray {
         if (prop.visibleWhen) {
           this.controlVisibility.set(i, prop.visibleWhen);
           const currentVal = doc.current[prop.visibleWhen.key];
-          if (currentVal !== prop.visibleWhen.value) {
+          if (!matchesVisibleWhen(currentVal, prop.visibleWhen.value)) {
             control.container.visible = false;
           }
         }
@@ -390,7 +396,7 @@ export class PropertyTray {
 
           const vis = this.controlVisibility.get(i);
           if (vis) {
-            const shouldBeVisible = state[vis.key] === vis.value;
+            const shouldBeVisible = matchesVisibleWhen(state[vis.key], vis.value);
             if (control.container.visible !== shouldBeVisible) {
               control.container.visible = shouldBeVisible;
               needsRelayout = true;

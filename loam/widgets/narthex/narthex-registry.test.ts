@@ -11,9 +11,9 @@ describe("createNarthexRegistry", () => {
     expect(registry.has("join-canvas")).toBe(true);
   });
 
-  it("has exactly 10 widget types", () => {
+  it("has exactly 11 widget types", () => {
     const registry = createNarthexRegistry();
-    expect(registry.types().length).toBe(10);
+    expect(registry.types().length).toBe(11);
   });
 
   it("canvas-card is hidden", () => {

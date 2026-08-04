@@ -42,6 +42,10 @@ export const {
   hasBlobBytes,
   checkBlobLocality,
   clearAll,
+  addCanvasRef,
+  removeCanvasRef,
+  getCanvasRefs,
+  removeAllCanvasRefsForCanvas,
 } = store;
 
 /** classify a MIME type into a domain string used for widget rendering

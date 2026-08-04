@@ -17,12 +17,8 @@
 import { ColorMatrixFilter, Container, Graphics, Text } from "pixi.js";
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
-import {
-  getLocalNodeId,
-  pickDocumentFile,
-  uploadFile,
-  type PeersMap,
-} from "../../src/widgets/file-utils";
+import { getLocalNodeId, type PeersMap } from "../../src/file-utils/file-shared";
+import { pickDocumentFile, uploadFile } from "../../src/file-utils/upload";
 import type {
   CompactInfo,
   HeaderAction,

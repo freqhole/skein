@@ -119,7 +119,7 @@ export interface SkeinP2PBridge {
   /**
    * fetch a blob's bytes directly from another peer by node id + blake3
    * hash, using midden's `download_verified_with_ensure` (the same
-   * verified iroh-blobs transfer `widgets/file-utils.ts` uses for full
+   * verified iroh-blobs transfer `widgets/snatch.ts` uses for full
    * blob downloads). this talks straight to the peer's raw iroh endpoint —
    * it does not go through the canvas doc or `AclFilteringNetworkAdapter`
    * at all, which is exactly what makes it useful for testing whether blob
@@ -742,7 +742,7 @@ export function buildP2PBridge(adapter: IrohNetworkAdapter): SkeinP2PBridge {
         );
         // comlink proxy chunk messages ride a different channel than the
         // RPC return — wait until every byte has actually arrived (same
-        // race as downloadBlobToWritableFromPeer in file-utils.ts)
+        // race as downloadBlobToWritableFromPeer in snatch.ts)
         const deadline = Date.now() + 30_000;
         while (bytesReceived < total && Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, 25));

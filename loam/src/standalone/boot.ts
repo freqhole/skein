@@ -51,7 +51,14 @@ import { createCanvasScopedSharePolicy } from "../p2p/canvas-scoped-share-policy
 import { buildShareUrl, decodeShareString, encodeShareString } from "../p2p/share-string";
 import { resolveFriendDisplay, SqliteSocialDoc } from "../p2p/sqlite-social-doc";
 import { dispatch, isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
-import { setPandocFormatsAvailable } from "../widgets/file-utils";
+import { setPandocFormatsAvailable } from "../file-utils/upload";
+import { freeUpLocalBlobCopy, checkBlobLocality } from "../file-utils/blob-locality";
+import { pauseSnatchDownload } from "../file-utils/snatch";
+import {
+  getBlobCanvasRefs,
+  removeBlobCanvasRef,
+  removeAllBlobCanvasRefs,
+} from "../file-utils/blob-canvas-refs";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
 import { createSkeinHarness, type SkeinHarnessNoStore } from "../harness/skein-harness";
 import { syncCanvasMetadataToCards, watchCanvasDocsForUpdates } from "./canvas-watchers";
@@ -71,6 +78,8 @@ import { socialWidget } from "../../widgets/narthex/social/social-widget";
 import { socialSchema } from "../../widgets/narthex/social/schema";
 import { messagezWidget, messagezSchema } from "../../widgets/narthex/messagez-widget";
 import type { MessagezState } from "../../widgets/narthex/messagez-widget";
+import { filezWidget, filezSchema } from "../../widgets/narthex/filez-widget";
+import type { FilezState } from "../../widgets/narthex/filez-widget";
 import { canvasInfoWidget, canvasInfoSchema } from "../../widgets/canvas-info";
 import { peedeeeffWidget } from "../../widgets/peedeeeff/index";
 import {
@@ -81,10 +90,14 @@ import {
   MESSAGES_OVERLAY_H,
   CANVAS_INFO_OVERLAY_W,
   CANVAS_INFO_OVERLAY_H,
+  FILEZ_OVERLAY_W,
+  FILEZ_OVERLAY_H,
 } from "../canvas/widget-overlay";
+import { subscribeToPendingTransfers } from "../file-utils/pending-transfers";
 import type {
   OtherCanvasKnockEntry,
   OtherCanvasKnocksSource,
+  WidgetController,
   WidgetDoc,
   WidgetMountContext,
 } from "../widgets/widget-types";
@@ -157,6 +170,76 @@ function getDismissedKnockIds(canvasDocId: string): Set<string> {
     return new Set(Array.isArray(parsed) ? parsed : []);
   } catch {
     return new Set();
+  }
+}
+
+/**
+ * best-effort cleanup for a file widget that's being permanently removed
+ * (either directly, or as part of a whole canvas-card cascade delete) —
+ * stops any in-flight snatch for its blob and purges the local copy, so a
+ * deleted widget doesn't leave a download running in the background or a
+ * local copy sitting on disk with nothing left referencing it.
+ *
+ * called from `beforeRemoveHook`, so the widget's own doc still exists
+ * (its blobId/blake3 are readable) even though the widget instance itself
+ * has already been torn down (`WidgetController.destroy()` already ran —
+ * see widget-manager.ts's `unmountWidget`) and its in-memory
+ * `activeSnatchBlake3`/`snatchDownloadId` closure state is gone. re-reads
+ * blake3 straight from the persisted doc instead.
+ *
+ * a 0-byte local copy (the concurrent-download corruption bug this fixes
+ * elsewhere) is always purged unconditionally — it's already useless, so
+ * there's no other-widget reference worth protecting. otherwise, this
+ * widget's own ref is dropped from the blob<->canvas index (`file.ts`'s
+ * `checkLocality`/blobId-write sites are what populate it) and purging
+ * (plus cancelling the transfer) is skipped when any OTHER canvas still
+ * has a ref recorded for the same blob — a fast indexed lookup instead of
+ * scanning every known canvas, per the storage layer's own reference
+ * index (see reliquary/ts's `blobs/db.ts` and reliquary/rust's
+ * `blobz_canvas_refs` table). `canvasDocId` is the canvas this widget
+ * lived on (the narthex itself, or a regular canvas).
+ */
+async function cleanUpFileWidgetBlob(
+  docId: string,
+  repo: Repo,
+  canvasDocId: string
+): Promise<void> {
+  try {
+    const handle = await resolveDocReadyCached<{ blobId?: string; blake3?: string }>(
+      repo,
+      docId as DocumentId
+    );
+    const doc = handle?.doc();
+    const blobId = doc?.blobId;
+    if (!blobId) return;
+    const blake3 = doc?.blake3 || blobId;
+
+    const locality = await checkBlobLocality(blobId, blake3);
+    const isZeroByte = locality.locality === "local" && locality.metadata?.size === 0;
+
+    await removeBlobCanvasRef(blobId, blake3, canvasDocId).catch(() => {
+      // best-effort — index unavailable, fall through to the size check
+    });
+
+    if (!isZeroByte) {
+      const remainingRefs = await getBlobCanvasRefs(blobId, blake3).catch(() => [] as string[]);
+      if (remainingRefs.length > 0) {
+        log.debug(
+          TAG,
+          "skipping blob cleanup — still referenced by another canvas:",
+          blobId.slice(0, 12) + "...",
+          remainingRefs
+        );
+        return;
+      }
+    }
+
+    await pauseSnatchDownload({ blake3 }).catch(() => {
+      // best-effort — no in-flight download to cancel, or not tauri mode
+    });
+    await freeUpLocalBlobCopy(blobId, blake3);
+  } catch (err) {
+    log.warn(TAG, "failed to clean up blob for deleted file widget:", err);
   }
 }
 
@@ -299,6 +382,7 @@ class SkeinRouter {
   private currentSocialOverlay: WidgetOverlay | null = null;
   private currentMessagesOverlay: WidgetOverlay | null = null;
   private currentCanvasInfoOverlay: WidgetOverlay | null = null;
+  private currentFilezOverlay: WidgetOverlay | null = null;
   private badgeUnsubs: Array<() => void> = [];
 
   /** adapter connection state source for the ConnectionStatus widget */
@@ -837,6 +921,8 @@ class SkeinRouter {
     this.currentMessagesOverlay = null;
     this.currentCanvasInfoOverlay?.destroy();
     this.currentCanvasInfoOverlay = null;
+    this.currentFilezOverlay?.destroy();
+    this.currentFilezOverlay = null;
     for (const unsub of this.transportPresenceUnsubs) unsub();
     this.transportPresenceUnsubs = [];
     for (const unsub of this.canvasWatcherUnsubs) unsub();
@@ -1018,12 +1104,20 @@ class SkeinRouter {
         onToggleSocial: () => {
           const sw = window.visualViewport?.width ?? window.innerWidth;
           this.currentMessagesOverlay?.close();
+          this.currentFilezOverlay?.close();
           this.currentSocialOverlay?.toggle(sw);
         },
         onToggleMessages: () => {
           const sw = window.visualViewport?.width ?? window.innerWidth;
           this.currentSocialOverlay?.close();
+          this.currentFilezOverlay?.close();
           this.currentMessagesOverlay?.toggle(sw);
+        },
+        onToggleFilez: () => {
+          const sw = window.visualViewport?.width ?? window.innerWidth;
+          this.currentSocialOverlay?.close();
+          this.currentMessagesOverlay?.close();
+          this.currentFilezOverlay?.toggle(sw);
         },
       });
 
@@ -1070,6 +1164,7 @@ class SkeinRouter {
       // mount overlay panels and wire badge counts
       this.currentSocialOverlay = this.mountSocialOverlay(canvas);
       this.currentMessagesOverlay = this.mountMessagesOverlay(canvas);
+      this.currentFilezOverlay = this.mountFilezOverlay(canvas);
       this.wireBadges(canvas);
       canvas.store.setLocalNodeId(this.effectiveLocalNodeId());
       // the narthex is a private, per-install singleton never synced to
@@ -1086,6 +1181,9 @@ class SkeinRouter {
       // when a canvas-card is deleted from the narthex, clean up the linked
       // canvas document and all its per-widget docs from IndexedDB.
       canvas.widgetManager.setBeforeRemoveHook(async (entry, repo) => {
+        if (entry.type === "file" && entry.docId && this.narthexDocId) {
+          await cleanUpFileWidgetBlob(entry.docId, repo, this.narthexDocId);
+        }
         if (entry.type !== "canvas-card" || !entry.docId) return;
         try {
           const cardHandle = await resolveDocReadyCached<Record<string, unknown>>(
@@ -1106,6 +1204,9 @@ class SkeinRouter {
           const canvasDoc = canvasHandle.doc();
           if (canvasDoc?.widgets) {
             for (const w of Object.values(canvasDoc.widgets)) {
+              if (w.type === "file" && w.docId) {
+                await cleanUpFileWidgetBlob(w.docId, repo, canvasDocId);
+              }
               if (w.docId) {
                 try {
                   repo.delete(w.docId as DocumentId);
@@ -1115,6 +1216,14 @@ class SkeinRouter {
               }
             }
           }
+
+          // safety net: cleanUpFileWidgetBlob above already drops each
+          // widget's own ref, but a bulk sweep for the whole canvas doc id
+          // catches anything that failed mid-loop (best-effort try/catch
+          // per widget above) rather than leaving orphaned index rows.
+          await removeAllBlobCanvasRefs(canvasDocId).catch(() => {
+            // best-effort — index unavailable
+          });
 
           // delete the canvas document itself
           repo.delete(canvasDocId as DocumentId);
@@ -1203,6 +1312,7 @@ class SkeinRouter {
     if (hasOwnedCanvases) return;
     const sw = window.visualViewport?.width ?? window.innerWidth;
     this.currentMessagesOverlay?.close();
+    this.currentFilezOverlay?.close();
     this.currentSocialOverlay.toggle(sw);
   }
 
@@ -2227,12 +2337,20 @@ class SkeinRouter {
         onToggleSocial: () => {
           const sw = window.visualViewport?.width ?? window.innerWidth;
           this.currentMessagesOverlay?.close();
+          this.currentFilezOverlay?.close();
           this.currentSocialOverlay?.toggle(sw);
         },
         onToggleMessages: () => {
           const sw = window.visualViewport?.width ?? window.innerWidth;
           this.currentSocialOverlay?.close();
+          this.currentFilezOverlay?.close();
           this.currentMessagesOverlay?.toggle(sw);
+        },
+        onToggleFilez: () => {
+          const sw = window.visualViewport?.width ?? window.innerWidth;
+          this.currentSocialOverlay?.close();
+          this.currentMessagesOverlay?.close();
+          this.currentFilezOverlay?.toggle(sw);
         },
         onShowCanvasInfo: () => {
           const vv = window.visualViewport;
@@ -2253,6 +2371,7 @@ class SkeinRouter {
       this.currentSocialOverlay = this.mountSocialOverlay(canvas);
       this.currentMessagesOverlay = this.mountMessagesOverlay(canvas);
       this.currentCanvasInfoOverlay = this.mountCanvasInfoOverlay(canvas);
+      this.currentFilezOverlay = this.mountFilezOverlay(canvas);
       this.wireBadges(canvas);
       canvas.store.setLocalNodeId(this.effectiveLocalNodeId());
       // self-heal a canvas this peer created while still anonymous — safe
@@ -2271,6 +2390,18 @@ class SkeinRouter {
         canvas.presenceManager.setLocalNodeId(this.localNodeId);
       }
       canvas.toolbar.refreshRoleGating();
+
+      // clean up a file widget's blob (cancel in-flight snatch, drop the
+      // canvas ref, purge the local copy if nothing else needs it) whenever
+      // one is deleted directly from this (regular, non-narthex) canvas —
+      // mirrors the narthex's own registration above; canvas-card cascade
+      // delete only applies from the narthex, so this only needs the
+      // direct-file-removal case.
+      canvas.widgetManager.setBeforeRemoveHook(async (entry, repo) => {
+        if (entry.type === "file" && entry.docId) {
+          await cleanUpFileWidgetBlob(entry.docId, repo, docId);
+        }
+      });
 
       // update lastVisitedAt on the canvas card
       if (this.narthexDocId) {
@@ -3815,6 +3946,62 @@ class SkeinRouter {
     }
   }
 
+  private mountFilezOverlay(canvas: SkeinCanvas): WidgetOverlay | null {
+    // ephemeral in-memory doc, same approach as mountCanvasInfoOverlay above
+    // — pending-transfers state is live/polled, not an automerge doc.
+    let items: FilezState["items"] = [];
+    const listeners = new Set<(state: FilezState) => void>();
+    const doc: WidgetDoc<typeof filezSchema> = {
+      get current(): FilezState {
+        return { items };
+      },
+      change(fn: (draft: FilezState) => void): void {
+        const draft = { items };
+        fn(draft);
+        items = draft.items;
+        listeners.forEach((h) => h({ items }));
+      },
+      on(_event: "change", handler: (state: FilezState) => void): () => void {
+        listeners.add(handler);
+        return () => listeners.delete(handler);
+      },
+    };
+
+    const unsubTransfers = subscribeToPendingTransfers((newItems) => {
+      items = newItems;
+      listeners.forEach((h) => h({ items }));
+    });
+
+    const ctx: WidgetMountContext<typeof filezSchema> = {
+      doc,
+      width: FILEZ_OVERLAY_W,
+      height: FILEZ_OVERLAY_H,
+      keyboard: canvas.keyboard,
+      widgetId: "filez-overlay",
+      canvasElement: canvas.app.canvas as HTMLCanvasElement,
+      canvasStore: canvas.store,
+    };
+
+    try {
+      const ctrl = filezWidget.create(ctx);
+      // subscribeToPendingTransfers's unsubscribe isn't owned by the widget
+      // itself (it's wired up here, not inside create()) — piggyback it on
+      // the controller's own destroy so the overlay's teardown stops it.
+      const wrappedCtrl: WidgetController = {
+        ...ctrl,
+        destroy() {
+          unsubTransfers();
+          ctrl.destroy();
+        },
+      };
+      return new WidgetOverlay(canvas.app, wrappedCtrl, FILEZ_OVERLAY_W, FILEZ_OVERLAY_H, canvas.theme);
+    } catch (err) {
+      unsubTransfers();
+      log.warn(TAG, "failed to mount filez overlay:", err);
+      return null;
+    }
+  }
+
   private wireBadges(canvas: SkeinCanvas): void {
     // social badge: count pending friend requests
     // also update avatar URL whenever the profile changes
@@ -3911,6 +4098,19 @@ class SkeinRouter {
 
       updateMessages();
     }
+
+    // filez arrows: tint up/down independently, no numeric badge (transfers
+    // churn too fast for a count to be meaningful, per design). "serving"
+    // (this node sending bytes to a peer) counts toward the up arrow \u2014
+    // it's an outgoing transfer from this node's perspective, same as an
+    // upload. completed rows never count as active here.
+    const unsubTransfers = subscribeToPendingTransfers((items) => {
+      const live = items.filter((item) => item.state !== "completed");
+      const uploading = live.some((item) => item.direction === "upload" || item.direction === "serving");
+      const downloading = live.some((item) => item.direction === "download");
+      canvas.toolbar.setFilezActivity(uploading, downloading);
+    });
+    this.badgeUnsubs.push(unsubTransfers);
   }
 
   /** tear down the router — destroys canvas, friendz protocol, and bridge. */

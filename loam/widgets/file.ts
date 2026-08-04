@@ -3,31 +3,23 @@ import { z } from "zod";
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import { getMediaPlaybackUrl } from "../src/media";
 import { isTauriMode } from "../src/p2p/tauri-transport";
+import { getLocalNodeId, type PeersMap, type PickedFile, type ThumbnailOptions } from "../src/file-utils/file-shared";
+import { formatFileSize } from "../src/widgets/format";
+import { addBlobCanvasRef, removeBlobCanvasRef } from "../src/file-utils/blob-canvas-refs";
+import { checkBlobLocality, freeUpLocalBlobCopy, getLocalBlobByteSize } from "../src/file-utils/blob-locality";
+import { getLocalBlobUrl, revealBlobInFinder, saveBlobToDisk } from "../src/file-utils/blob-io";
+import { getDocumentPages } from "../src/file-utils/document-pages";
+import { getThumbnailDataUrl, ensureThumbnailPersisted } from "../src/file-utils/thumbnail-utils";
 import {
-  checkBlobLocality,
-  discardPausedDownload,
-  formatFileSize,
-  formatUploadError,
-  freeUpLocalBlobCopy,
-  getDocumentPages,
-  getLocalBlobUrl,
-  getLocalNodeId,
-  getThumbnailDataUrl,
   isDocumentFilename,
   isMarkdownFilename,
   isPlainTextFilename,
-  pauseSnatchDownload,
+  formatUploadError,
   pickFiles,
   readPickedFileText,
-  revealBlobInFinder,
-  saveBlobToDisk,
-  snatchBlob,
   uploadFile,
-  BlobAccessDeniedError,
-  type PeersMap,
-  type PickedFile,
-  type ThumbnailOptions,
-} from "../src/widgets/file-utils";
+} from "../src/file-utils/upload";
+import { discardPausedDownload, pauseSnatchDownload, snatchBlob, BlobAccessDeniedError } from "../src/file-utils/snatch";
 import { sendFriendRequest } from "../src/p2p/friendz-bridge";
 import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
 import { createInlinePlayer, type InlinePlayerHandle } from "../src/widgets/inline-media";
@@ -35,6 +27,11 @@ import { createMediaOverlay, type MediaOverlayHandle } from "../src/widgets/medi
 import { createGifHoverOverlay, type GifHoverOverlayHandle } from "../src/widgets/gif-hover-overlay";
 import { peerNameFor } from "../src/canvas/peer-names";
 import { subscribeTransferProgress } from "../src/p2p/transfer-progress";
+import {
+  cancelDomainIngest,
+  runDomainIngest,
+  type DomainIngestDoc,
+} from "./file-domain-ingest";
 import { kickOffDocumentProcessing } from "./peedeeeff/render-client";
 import { peedeeeffSchema, type PeedeeeffState } from "./peedeeeff/types";
 import { markdownSchema } from "./markdown";
@@ -45,6 +42,7 @@ import type {
   WidgetController,
   WidgetFactory,
   WidgetMountContext,
+  WidgetPropDef,
 } from "../src/widgets/widget-types";
 
 export const fileSchema = z.object({
@@ -76,9 +74,51 @@ export const fileSchema = z.object({
   /** ms epoch of the last uploadingBy/uploadingProgress write — locks older
    *  than the staleness window are ignored (crashed uploader recovery) */
   uploadingAt: z.number().default(0),
+  /** domain-ingest status for a manually-picked (not auto-detected) domain:
+   *  "" idle, "processing", or "failed" (transient — cleared back to "" the
+   *  same tick `domain` reverts to ""). see file-domain-ingest.ts. */
+  domainIngestState: z.string().default(""),
+  /** best-effort claim so only one peer attempts domain ingest at a time —
+   *  same pattern as peedeeeff's processingClaimedBy/processingClaimedAt. */
+  domainIngestClaimedBy: z.string().default(""),
+  domainIngestClaimedAt: z.number().default(0),
 });
 
 export type FileState = z.infer<typeof fileSchema>;
+
+/** `classifyDomain()` (src/storage/blob-store.ts) never returns "" — it
+ *  falls back to the generic "file" bucket for anything it can't
+ *  recognize, so `domain` is realistically never actually empty. "file" is
+ *  that fallback/unclassified state, same as truly unset. */
+function isDomainEditable(domain: string): boolean {
+  return !domain || domain === "file";
+}
+
+/** instance-level editable props: the "file type" select only appears while
+ *  the domain is still the generic/unclassified "file" bucket (or, for
+ *  legacy widgets predating this field, truly unset) — it's a fill-in-the-
+ *  blank control, not a general override for a domain that auto-detection
+ *  already pinned down to something more specific. */
+function fileEditableProps(domain: string): WidgetPropDef[] {
+  const props: WidgetPropDef[] = [{ key: "title", label: "title", type: "string", default: "" }];
+  if (isDomainEditable(domain)) {
+    props.push({
+      key: "domain",
+      label: "file type",
+      type: "select",
+      options: ["file", "photo", "video", "audio", "document"],
+      default: "file",
+      // the property tray only rebuilds this control list when the widget
+      // *selection* changes, not on every doc write — so a pick that lands
+      // while the tray stays open needs this live, reactive check to hide
+      // the select immediately (rather than leaving a stale control
+      // showing through the whole processing run, and after a failure
+      // reverts `domain` back to "" - though it re-appearing then is correct).
+      visibleWhen: { key: "domain", value: ["", "file"] },
+    });
+  }
+  return props;
+}
 
 type LoadState = "empty" | "loading" | "loaded" | "error";
 
@@ -263,6 +303,14 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     let snatchCancelled = false;
     let snatchProgressText = "";
     let snatchHovered = false;
+    // the blake3 the in-flight/paused snatch actually targets — captured at
+    // handleSnatch's start, NOT re-read from ctx.doc.current, because
+    // cancelSnatch/pauseSnatch/discardPausedSnatch can be invoked from the
+    // doc-change subscriber's blobId-change branch, where ctx.doc.current
+    // already reflects the NEW state by the time they run. reading the doc
+    // there would tell rust/the worker to cancel the wrong (new) blake3,
+    // leaving the real in-flight download for the OLD blake3 orphaned.
+    let activeSnatchBlake3: string | null = null;
     // pause/resume: paused downloads keep their partial in the persistent
     // store (pinned against gc) — resume re-dispatches the snatch and only
     // the missing ranges transfer. downloadId keys the worker-side cancel
@@ -295,6 +343,17 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     // flag: true when the user uploaded the file through this widget instance.
     // prevents showing "save to disk" for files the user just uploaded.
     let uploadedLocally = false;
+
+    // actual on-disk byte size of the local copy (null = no local copy known
+    // yet, or the check hasn't resolved). shown in the property tray so users
+    // can spot a 0-byte/corrupt local copy left behind by an interrupted
+    // snatch — see refreshLocalByteSize().
+    let localByteSize: number | null = null;
+
+    // instance-level editable props (see fileEditableProps) — recomputed
+    // whenever `domain` changes so the "file type" select appears/disappears
+    // as soon as auto-detection fills it in.
+    let currentEditableProps: WidgetPropDef[] = fileEditableProps(ctx.doc.current.domain);
 
     // set when the widget is destroyed; async handlers check this to bail out
     let destroyed = false;
@@ -666,6 +725,32 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     let hasThumbnail = false;
 
+    // -- domain-ingest status overlay ------------------------------------------
+    // shown while file-domain-ingest.ts's runDomainIngest() is processing a
+    // manually-picked domain (thumbnail generation / document conversion), so
+    // the user isn't left staring at a static fallback icon with no feedback —
+    // mirrors peedeeeff/index.ts's statusText pattern, plus a cancel
+    // affordance peedeeeff doesn't have (explicitly wanted for this UX).
+    const ingestStatusText = new Text({
+      text: "",
+      style: {
+        fontFamily: "system-ui, sans-serif",
+        fontSize: 11,
+        fill: 0x999999,
+        align: "center",
+      },
+      resolution: 2,
+    });
+    ingestStatusText.anchor.set(0.5);
+    ingestStatusText.visible = false;
+    container.addChild(ingestStatusText);
+
+    const ingestCancelBtn = createPillButton("cancel", 0x5a2727, () => {
+      cancelDomainIngest(domainIngestDoc);
+    });
+    ingestCancelBtn.container.visible = false;
+    container.addChild(ingestCancelBtn.container);
+
     // -- action state helpers -------------------------------------------------
 
     /** check whether any action buttons should be visible */
@@ -752,6 +837,24 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         (actionState === "local" || actionState === "snatched");
     }
 
+    /** reflect `domainIngestState`/`domainIngestClaimedBy` as a status
+     *  overlay + cancel button on top of the thumb area — called from the
+     *  doc-change subscription whenever either field changes. */
+    function syncIngestStatusUI() {
+      if (destroyed) return;
+      const state = ctx.doc.current;
+      const processing = state.domainIngestState === "processing";
+      ingestStatusText.visible = processing;
+      ingestCancelBtn.container.visible = processing;
+      if (processing) {
+        const claimant = state.domainIngestClaimedBy;
+        const localId = ctx.canvasStore?.localNodeId ?? "";
+        const who = !claimant || claimant === localId ? "this device" : (peerNameFor(claimant) ?? "a peer");
+        ingestStatusText.text = `processing ${state.domain || "file"}... (${who})`;
+      }
+      positionFallbackIcon(currentWidth, currentHeight);
+    }
+
     // -- layout helpers -------------------------------------------------------
 
     const positionInfoBar = (w: number, h: number) => {
@@ -826,6 +929,17 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       fallbackText.text = (state.domain || "file").toUpperCase();
       fallbackText.x = w / 2;
       fallbackText.y = thumbAreaH / 2;
+
+      // domain-ingest status overlay shares the thumb area — position it
+      // regardless of current visibility, cheap and keeps it correct the
+      // instant syncIngestStatusUI() shows it.
+      ingestStatusText.x = w / 2;
+      ingestStatusText.y = Math.max(16, thumbAreaH / 2 - 14);
+      ingestCancelBtn.container.x = Math.round((w - ingestCancelBtn.getWidth()) / 2);
+      ingestCancelBtn.container.y = Math.min(
+        Math.max(0, thumbAreaH - BUTTON_H - 4),
+        thumbAreaH / 2 + 10
+      );
     };
 
     // -- sprite management ----------------------------------------------------
@@ -999,6 +1113,16 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     // -- blob locality checking -----------------------------------------------
 
+    /** re-fetch the local copy's actual on-disk byte size (not the doc's
+     *  possibly-stale `size` field). no-op if the widget has moved on to a
+     *  different blob or been destroyed by the time it resolves. */
+    const refreshLocalByteSize = async (blobId: string, blake3: string) => {
+      const bytes = await getLocalBlobByteSize(blobId, blake3);
+      if (destroyed || ctx.doc.current.blobId !== blobId) return;
+      localByteSize = bytes;
+      positionInfoBar(currentWidth, currentHeight);
+    };
+
     const checkLocality = async (blobId: string) => {
       if (!blobId) {
         actionState = "checking";
@@ -1025,7 +1149,18 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       // blob is local, so offering snatch is the safe fallback.
       if (info.locality === "local") {
         actionState = "local";
+        void refreshLocalByteSize(blobId, ctx.doc.current.blake3);
+        // record that this canvas references the blob whenever we confirm
+        // it's actually present locally — covers every path that can land
+        // a blobId here (upload, snatch, or a widget that arrived via
+        // automerge sync already pointing at a blob this device also has),
+        // not just the ones that write blobId themselves.
+        const refCanvasDocId = ctx.canvasStore?.handle.documentId;
+        if (refCanvasDocId) {
+          void addBlobCanvasRef(blobId, ctx.doc.current.blake3, refCanvasDocId);
+        }
       } else {
+        localByteSize = null;
         actionState = "remote";
         // blob is not local — remove ourselves from snatchedBy so peers
         // don't try to download from us
@@ -1428,20 +1563,24 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
                 draft.blake3 = result.blake3 ?? "";
                 draft.size = result.size;
               });
+              const refCanvasDocId = store.handle.documentId;
+              if (refCanvasDocId) {
+                void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+              }
 
               // best-effort persisted thumbnail — see peedeeeff's
               // thumbnailDataUrl doc comment for why this is needed at all
-              // (bins never mount a child's full widget lifecycle).
-              try {
-                const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200, square: true });
-                if (thumbDataUrl) {
-                  childDocHandle.change((draft: any) => {
-                    draft.thumbnailDataUrl = thumbDataUrl;
-                  });
-                }
-              } catch {
-                log.debug("file-widget", "auto-bin doc thumbnail generation failed for", result.blobId);
-              }
+              // (bins never mount a child's full widget lifecycle). cast:
+              // childDocHandle's declared type is a union across all bin
+              // child widget types, but we're inside the isDoc branch here
+              // (a file being uploaded, ahead of a possible peedeeeff
+              // conversion below) so it's always file-shaped at runtime.
+              const fileDocHandle = childDocHandle as unknown as DocHandle<FileState>;
+              await ensureThumbnailPersisted(
+                { current: () => fileDocHandle.doc(), change: (fn) => fileDocHandle.change(fn) },
+                result.blobId,
+                { size: 200, square: true }
+              );
 
               // kick off page rendering (hub/peer proxy in browser mode,
               // local dispatch in tauri mode) — nobody will ever mount this
@@ -1484,24 +1623,24 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
                 }
               }
             });
+            const refCanvasDocId = store.handle.documentId;
+            if (refCanvasDocId) {
+              void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+            }
 
             // video/audio/pdf thumbnails need ffmpeg/magick, so they're never
             // ready synchronously at upload time. a bin never mounts its
             // children's full widget lifecycle (it only reads the persisted
             // doc via getCompactInfo), so nothing else will ever generate and
-            // persist one later - fetch and write it now, best-effort.
-            if (!result.thumbnailDataUrl) {
-              try {
-                const thumbDataUrl = await getThumbnailDataUrl(result.blobId, { size: 200 });
-                if (thumbDataUrl) {
-                  childDocHandle.change((draft: any) => {
-                    draft.thumbnailDataUrl = thumbDataUrl;
-                  });
-                }
-              } catch {
-                log.debug("file-widget", "auto-bin thumbnail generation failed for", result.blobId);
-              }
-            }
+            // persist one later - fetch and write it now, best-effort. cast:
+            // this branch always creates a plain file child, so childDocHandle
+            // is always file-shaped at runtime (see cast comment above).
+            const fileDocHandle = childDocHandle as unknown as DocHandle<FileState>;
+            await ensureThumbnailPersisted(
+              { current: () => fileDocHandle.doc(), change: (fn) => fileDocHandle.change(fn) },
+              result.blobId,
+              { size: 200 }
+            );
           })
           .catch((err) => {
             log.warn("file-widget", `auto-bin upload failed for ${file.filename}:`, err);
@@ -1522,6 +1661,116 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       // remove this file widget — the bin replaces it
       store.removeWidget(ctx.widgetId);
     };
+
+    /**
+     * tauri-only: poll for a pdf's rendered pages, then replace this file
+     * widget with a peedeeeff widget holding them. shared by the upload
+     * flow (called unconditionally once a pdf finishes uploading) and the
+     * manual domain-pick ingest path (see runDomainIngest / kickOffDomainIngest
+     * below) — used to be duplicated inline at the upload call site.
+     * returns false on failure/timeout instead of throwing.
+     */
+    async function convertToDocumentWidget(
+      blobId: string,
+      filename: string,
+      mime: string,
+      blake3: string,
+      size: number
+    ): Promise<boolean> {
+      if (!ctx.canvasStore || !isTauriMode()) return false;
+      const store = ctx.canvasStore;
+
+      const maxAttempts = 120; // poll for up to ~2 minutes
+      const pollIntervalMs = 1000;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (destroyed) return false;
+        await new Promise((r) => setTimeout(r, pollIntervalMs));
+
+        const pages = await getDocumentPages(blobId);
+        if (pages.length > 0) {
+          if (destroyed) return false;
+          const selfEntry = store.getWidget(ctx.widgetId);
+          if (!selfEntry) return false;
+
+          const blobIds = pages.map((p) => p.page_blob_id);
+          const totalPages = pages[0]?.total_pages ?? pages.length;
+
+          // best-effort thumbnail from the first page — bins never mount a
+          // peedeeeff widget's full lifecycle, so this needs to be
+          // persisted at creation time (see peedeeeff's thumbnailDataUrl
+          // doc comment).
+          let firstPageThumb = "";
+          try {
+            firstPageThumb = (await getThumbnailDataUrl(blobIds[0], { size: 200, square: true })) ?? "";
+          } catch {
+            log.debug(
+              "file-widget",
+              "peedeeeff first-page thumbnail generation failed for",
+              blobIds[0]?.slice(0, 8)
+            );
+          }
+
+          const pdfId = crypto.randomUUID();
+          store.addWidget({
+            id: pdfId,
+            type: "peedeeeff",
+            x: selfEntry.x,
+            y: selfEntry.y,
+            width: Math.max(selfEntry.width, 480),
+            height: Math.max(selfEntry.height, 640),
+            zIndex: selfEntry.zIndex,
+            title: filename.replace(/\.pdf$/i, ""),
+            props: {
+              blobId,
+              filename,
+              mime,
+              blake3,
+              size,
+              pageCount: totalPages,
+              pageBlobIds: blobIds,
+              pageBlake3s: pages.map((p) => p.blake3 || ""),
+              thumbnailDataUrl: firstPageThumb,
+            },
+            collapsed: false,
+            docId: null,
+            parentId: null,
+          });
+
+          // remove this file widget — the peedeeeff widget replaces it
+          store.removeWidget(ctx.widgetId);
+          return true;
+        }
+      }
+      // timed out — pages may still be rendering, leave file widget in place
+      log.warn("file-widget", "PDF page rendering timed out for", blobId.slice(0, 8));
+      return false;
+    }
+
+    /** minimal doc-access wrapper for file-domain-ingest.ts's claim/release
+     *  helpers — adapts `ctx.doc`'s property-getter `current` into the
+     *  method shape those helpers expect (mirrors peedeeeff's RenderableDoc
+     *  wrapper around a DocHandle). */
+    const domainIngestDoc: DomainIngestDoc = {
+      current: () => ctx.doc.current,
+      change: (fn) => ctx.doc.change(fn),
+    };
+
+    /** triggered when a user fills in a previously-unset `domain` via the
+     *  property tray (see the `state.domain !== prevDomain` handling in the
+     *  doc-change subscription below). no-op if a fresh upload/snatch set
+     *  domain+blobId together instead — see `domainJustFilledIn`'s guard. */
+    function kickOffDomainIngest(domain: string) {
+      const state = ctx.doc.current;
+      if (!state.blobId) return;
+      void runDomainIngest(domainIngestDoc, state.blobId, domain, state.mime, ctx.canvasStore, {
+        isDestroyed: () => destroyed,
+        convertToDocument:
+          domain === "document" && state.mime === "application/pdf"
+            ? (blobId) => convertToDocumentWidget(blobId, state.filename, state.mime, state.blake3, state.size)
+            : undefined,
+      });
+    }
 
     const handleUpload = async () => {
       if (loadState !== "empty") return;
@@ -1657,81 +1906,14 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           // populated. the file widget stays visible as a normal file in the
           // meantime (with thumbnail, filename, actions, etc.)
           if (result.mime === "application/pdf" && ctx.canvasStore && isTauriMode()) {
-            const store = ctx.canvasStore;
-            const uploadBlobId = result.blobId;
-            const uploadFilename = file.filename;
-            const uploadMime = result.mime;
-            const uploadBlake3 = result.blake3 ?? "";
-            const uploadSize = result.size;
-
             // fire-and-forget: poll for pages without blocking the upload flow
-            (async () => {
-              const maxAttempts = 120; // poll for up to ~2 minutes
-              const pollIntervalMs = 1000;
-
-              for (let attempt = 0; attempt < maxAttempts; attempt++) {
-                if (destroyed) return;
-                await new Promise((r) => setTimeout(r, pollIntervalMs));
-
-                const pages = await getDocumentPages(uploadBlobId);
-                if (pages.length > 0) {
-                  if (destroyed) return;
-                  const selfEntry = store.getWidget(ctx.widgetId);
-                  if (!selfEntry) return;
-
-                  const blobIds = pages.map((p) => p.page_blob_id);
-                  const totalPages = pages[0]?.total_pages ?? pages.length;
-
-                  // best-effort thumbnail from the first page — bins never
-                  // mount a peedeeeff widget's full lifecycle, so this needs
-                  // to be persisted at creation time (see peedeeeff's
-                  // thumbnailDataUrl doc comment).
-                  let firstPageThumb = "";
-                  try {
-                    firstPageThumb =
-                      (await getThumbnailDataUrl(blobIds[0], { size: 200, square: true })) ?? "";
-                  } catch {
-                    log.debug(
-                      "file-widget",
-                      "peedeeeff first-page thumbnail generation failed for",
-                      blobIds[0]?.slice(0, 8)
-                    );
-                  }
-
-                  const pdfId = crypto.randomUUID();
-                  store.addWidget({
-                    id: pdfId,
-                    type: "peedeeeff",
-                    x: selfEntry.x,
-                    y: selfEntry.y,
-                    width: Math.max(selfEntry.width, 480),
-                    height: Math.max(selfEntry.height, 640),
-                    zIndex: selfEntry.zIndex,
-                    title: uploadFilename.replace(/\.pdf$/i, ""),
-                    props: {
-                      blobId: uploadBlobId,
-                      filename: uploadFilename,
-                      mime: uploadMime,
-                      blake3: uploadBlake3,
-                      size: uploadSize,
-                      pageCount: totalPages,
-                      pageBlobIds: blobIds,
-                      pageBlake3s: pages.map((p) => p.blake3 || ""),
-                      thumbnailDataUrl: firstPageThumb,
-                    },
-                    collapsed: false,
-                    docId: null,
-                    parentId: null,
-                  });
-
-                  // remove this file widget — the peedeeeff widget replaces it
-                  store.removeWidget(ctx.widgetId);
-                  return;
-                }
-              }
-              // timed out — pages may still be rendering, leave file widget in place
-              log.warn("file-widget", "PDF page rendering timed out for", uploadBlobId.slice(0, 8));
-            })();
+            void convertToDocumentWidget(
+              result.blobId,
+              file.filename,
+              result.mime,
+              result.blake3 ?? "",
+              result.size
+            );
           }
 
           // mark as locally uploaded so we don't show "save to disk".
@@ -1764,6 +1946,12 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
               }
             }
           });
+          {
+            const refCanvasDocId = ctx.canvasStore?.handle.documentId;
+            if (refCanvasDocId) {
+              void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+            }
+          }
 
           // use the embedded thumbnail if the upload produced one, otherwise
           // fall back to the async thumbnail fetch from grimoire/peers
@@ -1804,11 +1992,12 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       // best-effort: also flag the in-flight wasm transfer so it stops at
       // the next chunk boundary instead of running to completion in the
       // background, then release the gc pin the cancel left behind.
-      const blake3 = String(ctx.doc.current.blake3 || "");
+      const blake3 = activeSnatchBlake3 ?? String(ctx.doc.current.blake3 || "");
       void pauseSnatchDownload({
         downloadId: snatchDownloadId ?? undefined,
         blake3: blake3 || null,
       }).then(() => discardPausedDownload(blake3));
+      activeSnatchBlake3 = null;
       snatchDownloadId = null;
       snatchHovered = false;
       snatchProgressText = "";
@@ -1833,10 +2022,10 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         snatchAbort.abort();
         snatchAbort = null;
       }
-      const state = ctx.doc.current;
+      const blake3 = activeSnatchBlake3 ?? String(ctx.doc.current.blake3 || "");
       await pauseSnatchDownload({
         downloadId: snatchDownloadId ?? undefined,
-        blake3: String(state.blake3 || "") || null,
+        blake3: blake3 || null,
       });
       log.debug("file-widget", "snatch paused by user");
     }
@@ -1845,7 +2034,8 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
      *  back to plain "remote". */
     function discardPausedSnatch() {
       if (actionState !== "paused") return;
-      void discardPausedDownload(String(ctx.doc.current.blake3 || ""));
+      void discardPausedDownload(activeSnatchBlake3 ?? String(ctx.doc.current.blake3 || ""));
+      activeSnatchBlake3 = null;
       snatchPaused = false;
       snatchPausedPct = "";
       snatchProgressText = "";
@@ -1888,6 +2078,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       snatchPaused = false;
       snatchDownloadId = crypto.randomUUID();
       snatchAbort = new AbortController();
+      activeSnatchBlake3 = String(state.blake3 || "") || null;
 
       actionState = "snatching";
       snatchBtn.setLabel("snatching...");
@@ -1973,11 +2164,13 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         // "snatched" with a re-check that resolves to "local"
         prevBlobId = result.blobId;
         actionState = "snatched";
+        activeSnatchBlake3 = null;
         // release any gc pin left behind by an earlier pause of this blob —
         // the content is now safely persisted outside the midden store
         void discardPausedDownload(String(state.blake3 || ""));
         snatchDownloadId = null;
         snatchPausedPct = "";
+        void refreshLocalByteSize(result.blobId, result.blake3 ?? "");
 
         if (result.blobId !== state.blobId) {
           ctx.doc.change((draft) => {
@@ -1987,6 +2180,13 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             draft.size = result.size;
             draft.blake3 = result.blake3 ?? "";
           });
+          const refCanvasDocId = ctx.canvasStore?.handle.documentId;
+          if (refCanvasDocId) {
+            if (state.blobId) {
+              void removeBlobCanvasRef(state.blobId, state.blake3, refCanvasDocId);
+            }
+            void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+          }
         }
         if (!state.title || !state.title.trim()) {
           ctx.doc.change((draft) => {
@@ -2068,12 +2268,14 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           log.debug("file-widget", "snatch denied — no friend has this blob yet:", err.message);
           deniedPeerNodeId = err.peerNodeId;
           actionState = "needs-friend";
+          activeSnatchBlake3 = null;
           syncActionButtons();
           positionInfoBar(currentWidth, currentHeight);
           return;
         }
         log.error("file-widget", "snatch failed:", err);
         actionState = "remote";
+        activeSnatchBlake3 = null;
         syncActionButtons();
       } finally {
         snatchAbort = null;
@@ -2332,10 +2534,35 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
     // into `entry.title` here so the toolbar stays in sync the same way it
     // does for every other widget type.
     let prevTitle = ctx.doc.current.title;
+    let prevDomain = ctx.doc.current.domain;
+    let prevDomainIngestState = ctx.doc.current.domainIngestState;
+    let prevDomainIngestClaimedBy = ctx.doc.current.domainIngestClaimedBy;
     const unsub = ctx.doc.on("change", (state) => {
       if (state.title !== prevTitle) {
         prevTitle = state.title;
         ctx.canvasStore?.setWidgetTitle(ctx.widgetId, state.title);
+      }
+
+      // a domain picked away from the generic/unclassified "file" bucket
+      // while the file was already loaded (blobId unchanged) means the user
+      // just chose one via the property tray's fill-in-the-blank select —
+      // kick off ingest for it below. a domain that arrives bundled with a
+      // brand-new blobId (upload/snatch completion) is auto-detected and
+      // handled by that flow already, not here — see the
+      // `state.blobId !== prevBlobId` branch further down.
+      const domainJustPicked = isDomainEditable(prevDomain) && !isDomainEditable(state.domain);
+      if (state.domain !== prevDomain) {
+        prevDomain = state.domain;
+        currentEditableProps = fileEditableProps(state.domain);
+      }
+
+      if (
+        state.domainIngestState !== prevDomainIngestState ||
+        state.domainIngestClaimedBy !== prevDomainIngestClaimedBy
+      ) {
+        prevDomainIngestState = state.domainIngestState;
+        prevDomainIngestClaimedBy = state.domainIngestClaimedBy;
+        syncIngestStatusUI();
       }
 
       drawBg(currentWidth, currentHeight);
@@ -2368,6 +2595,28 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       }
 
       if (state.blobId !== prevBlobId) {
+        // the OLD blobId is no longer referenced by this widget doc — drop
+        // its canvas ref (if this device ever recorded one) so the index
+        // doesn't keep protecting bytes nothing here points at anymore.
+        if (prevBlobId) {
+          const refCanvasDocId = ctx.canvasStore?.handle.documentId;
+          if (refCanvasDocId) {
+            void removeBlobCanvasRef(prevBlobId, prevBlake3, refCanvasDocId);
+          }
+        }
+
+        // an in-flight/paused snatch targets the OLD blobId — if it's left
+        // running, checkLocality() below resets actionState out from under
+        // it (hiding the pause button), but the snatch promise's onProgress
+        // callback only checks `snatchCancelled`, not actionState, so it
+        // keeps clobbering the snatch button's label with stale progress
+        // forever. cancel/discard it first so it stops cleanly.
+        if (actionState === "snatching") {
+          cancelSnatch();
+        } else if (actionState === "paused") {
+          discardPausedSnatch();
+        }
+
         prevBlobId = state.blobId;
         prevBlake3 = state.blake3;
         prevThumbDataUrl = state.thumbnailDataUrl;
@@ -2396,9 +2645,16 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         prevThumbDataUrl = state.thumbnailDataUrl;
         loadEmbeddedThumbnail(state.thumbnailDataUrl);
       } else if (loadState === "loaded") {
-        // metadata changed — refresh info bar
+        // metadata changed (e.g. title, or a user-picked domain override) —
+        // refresh info bar + anything else keyed off domain
         syncActionButtons();
         positionInfoBar(currentWidth, currentHeight);
+        drawHoverOverlay(currentWidth, currentHeight);
+        drawThumbHitArea(currentWidth, currentHeight);
+
+        if (domainJustPicked) {
+          kickOffDomainIngest(state.domain);
+        }
       }
     });
 
@@ -2416,6 +2672,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       syncVisibility();
       positionInfoBar(currentWidth, currentHeight);
       positionFallbackIcon(currentWidth, currentHeight);
+      syncIngestStatusUI();
 
       // if we have an embedded thumbnail, load it (fast — it's a data URL, already local)
       if (ctx.doc.current.thumbnailDataUrl) {
@@ -2462,7 +2719,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     /** delete the LOCAL copy of the blob to reclaim disk space — the widget
      *  stays on the canvas and the blob flips back to "remote" (snatchable
-     *  from whoever still has it, e.g. a hub peer). browser-only. */
+     *  from whoever still has it, e.g. a hub peer). */
     async function handleFreeUpSpace() {
       const state = ctx.doc.current;
       if (!state.blobId) return;
@@ -2489,6 +2746,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       }
       if (destroyed) return;
       uploadedLocally = false;
+      localByteSize = null;
       actionState = "remote";
       syncActionButtons();
       positionInfoBar(currentWidth, currentHeight);
@@ -2538,9 +2796,15 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
     return {
       container,
+      // "file type" select only appears while `domain` is unset (fill-in-
+      // the-blank for auto-detection misses) — see fileEditableProps().
+      get editableProps() {
+        return currentEditableProps;
+      },
       // property-tray extras: thumbnail override actions (all file types —
-      // audio/video/pdf/whatever), "purge local copy" (browser only — tauri
-      // blob storage is the durable native store), and who-has-this-file info rows
+      // audio/video/pdf/whatever), "purge local copy" (frees the local
+      // OPFS/blobz copy — e.g. to retry a snatch that left a corrupt/0-byte
+      // file — without disturbing the widget doc), and who-has-this-file info rows
       widgetActions: [
         { id: "choose-thumbnail", label: "choose thumbnail", onClick: () => void handleChooseThumbnail() },
         { id: "remove-thumbnail", label: "remove thumbnail", onClick: handleRemoveThumbnail },
@@ -2553,32 +2817,41 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
               },
             ]
           : []),
-        ...(isTauriMode()
-          ? []
-          : [
-              {
-                id: "purge-local-copy",
-                label: "purge local copy",
-                onClick: () => {
-                  void handleFreeUpSpace();
-                },
-              },
-            ]),
+        {
+          id: "purge-local-copy",
+          label: "purge local copy",
+          onClick: () => {
+            void handleFreeUpSpace();
+          },
+        },
       ],
       widgetInfoRows: () => {
         const state = ctx.doc.current;
         if (!state.blobId) return [];
+        const rows: { label: string; value: string }[] = [];
+        // local-only stat (not tracked in the automerge doc) — lets a user
+        // spot a 0-byte/corrupt local copy left behind by an interrupted
+        // snatch, which "purge local copy" + re-snatch repairs.
+        if (localByteSize !== null) {
+          rows.push({
+            label: "local size",
+            value:
+              localByteSize === 0
+                ? "0 B — looks corrupt, try purge local copy"
+                : formatFileSize(localByteSize),
+          });
+        }
         // dedupe: concurrent CRDT inserts of the same node id (e.g. two
         // racing "record myself as a snatcher" writes) can leave the same
         // id in `snatchedBy` more than once.
         const holders = [...new Set((state.snatchedBy ?? []).map(String))];
         if (holders.length === 0) {
-          return [{ label: "have it", value: "nobody yet" }];
+          rows.push({ label: "have it", value: "nobody yet" });
+          return rows;
         }
         // one row per holder, by username where known (session peer-name
         // registry, fed from the social doc) — node ids only as fallback.
         // hubs are labeled; any number of hubs may have synced it.
-        const rows: { label: string; value: string }[] = [];
         for (const id of holders) {
           const isHub = ctx.canvasStore?.isHubNode(id) ?? false;
           const you = id === localNodeIdCached;
