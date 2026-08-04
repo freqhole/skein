@@ -34,13 +34,32 @@ export interface SlotSizeOptions {
 }
 
 /** inset (px) subtracted from a cell's own footprint per side when cell
- *  borders are enabled — capped so a very thick border still leaves a
- *  usable cell. `maxInset` scales the cap to the mode's own (much smaller,
- *  for shelf/crate/drawer) base slot size, so the same border width
- *  doesn't shrink a 28px-tall row as aggressively as an 84px grid cell. */
-export function cellBorderInset(cellBorderWidth?: number, maxInset = 16): number {
+ *  borders are enabled — capped to a fraction of the cell's own (already
+ *  scaled) size so a very thick border still leaves a usable cell, but a
+ *  thicker border keeps shrinking the cell right up to that cap instead of
+ *  hitting a fixed ceiling regardless of how large the cell actually is. */
+export function cellBorderInset(cellBorderWidth: number | undefined, referenceSize: number): number {
   if (!cellBorderWidth || cellBorderWidth <= 0) return 0;
+  const maxInset = Math.floor(referenceSize * 0.3);
   return Math.min(cellBorderWidth, maxInset);
+}
+
+/** per-mode border inset, using each mode's own scaled reference dimension —
+ *  shared by `slotSize` (cell shrink) and `slotGap` (spacing growth) so the
+ *  border stroke drawn by BinRenderer always fits in the gap it creates,
+ *  instead of overlapping into the (now smaller) neighboring cells. */
+export function modeBorderInset(mode: BinMode, options?: SlotSizeOptions): number {
+  const s = options?.scale ?? 1.0;
+  switch (mode) {
+    case "grid":
+      return cellBorderInset(options?.cellBorderWidth, Math.round(GRID_CELL_SIZE * s));
+    case "shelf":
+      return cellBorderInset(options?.cellBorderWidth, Math.round(SHELF_SLOT_W * s));
+    case "crate":
+      return cellBorderInset(options?.cellBorderWidth, Math.round(CRATE_SLOT_H * s));
+    case "drawer":
+      return cellBorderInset(options?.cellBorderWidth, Math.round(DRAWER_ROW_H * s));
+  }
 }
 
 /** resolve the effective cell-border width to use for layout — 0 unless
@@ -66,47 +85,64 @@ export function slotSize(
   options?: SlotSizeOptions
 ): { width: number; height: number } {
   const s = options?.scale ?? 1.0;
+  const inset = modeBorderInset(mode, options) * 2;
   switch (mode) {
     case "grid": {
-      const inset = cellBorderInset(options?.cellBorderWidth, 16) * 2;
+      const cellSize = Math.round(GRID_CELL_SIZE * s);
       return {
-        width: Math.round(GRID_CELL_SIZE * s) - inset,
-        height: Math.round(GRID_CELL_SIZE * s) - inset + GRID_LABEL_HEIGHT,
+        width: cellSize - inset,
+        height: cellSize - inset + GRID_LABEL_HEIGHT,
       };
     }
     case "shelf": {
-      const inset = cellBorderInset(options?.cellBorderWidth, Math.floor(SHELF_SLOT_W * 0.3)) * 2;
+      const w = Math.round(SHELF_SLOT_W * s);
+      const h = Math.round(SHELF_SLOT_H * s);
       return {
-        width: Math.round(SHELF_SLOT_W * s) - inset,
-        height: Math.round(SHELF_SLOT_H * s) - inset,
+        width: w - inset,
+        height: h - inset,
       };
     }
     case "crate": {
-      const inset = cellBorderInset(options?.cellBorderWidth, Math.floor(CRATE_SLOT_H * 0.3)) * 2;
+      const w = Math.round(CRATE_SLOT_W * s);
+      const h = Math.round(CRATE_SLOT_H * s);
       return {
-        width: Math.round(CRATE_SLOT_W * s) - inset,
-        height: Math.round(CRATE_SLOT_H * s) - inset,
+        width: w - inset,
+        height: h - inset,
       };
     }
     case "drawer": {
-      const inset = cellBorderInset(options?.cellBorderWidth, Math.floor(DRAWER_ROW_H * 0.3)) * 2;
-      return { width: 0, height: Math.round(DRAWER_ROW_H * s) - inset };
+      const h = Math.round(DRAWER_ROW_H * s);
+      return { width: 0, height: h - inset };
     }
   }
 }
 
-/** get the gap between slots for a given mode */
-export function slotGap(mode: BinMode): number {
-  switch (mode) {
-    case "grid":
-      return GRID_GAP;
-    case "shelf":
-      return SHELF_GAP;
-    case "crate":
-      return CRATE_GAP;
-    case "drawer":
-      return DRAWER_GAP;
-  }
+/** get the gap between slots for a given mode — grown by the same (capped)
+ *  border inset `slotSize` shrinks cells by, so a cell-border stroke of
+ *  that width fits cleanly in the gap instead of overlapping the cells
+ *  on either side of it. */
+export function slotGap(mode: BinMode, options?: SlotSizeOptions): number {
+  const base = (() => {
+    switch (mode) {
+      case "grid":
+        return GRID_GAP;
+      case "shelf":
+        return SHELF_GAP;
+      case "crate":
+        return CRATE_GAP;
+      case "drawer":
+        return DRAWER_GAP;
+    }
+  })();
+  return base + modeBorderInset(mode, options) * 2;
+}
+
+/** leading/trailing margin reserved before the first and after the last
+ *  cell along the tiled axes — half of `slotGap`, so the perimeter border
+ *  gets the same clearance internal dividers get instead of sitting flush
+ *  against the first/last row or column. */
+export function outerMargin(mode: BinMode, options?: SlotSizeOptions): number {
+  return slotGap(mode, options) / 2;
 }
 
 /** compute the number of rows needed for the given item count and column count */
@@ -139,7 +175,7 @@ export function computePageSize(
 ): PageSize {
   const cols = autoFitCols(mode, contentWidth, options);
   const size = slotSize(mode, options);
-  const gap = slotGap(mode);
+  const gap = slotGap(mode, options);
   const rowHeight = size.height + gap;
   const rowsPerPage = rowHeight > 0 ? Math.max(1, Math.floor((viewportHeight + gap) / rowHeight)) : 1;
   return { cols, rowsPerPage, itemsPerPage: cols * rowsPerPage };
@@ -180,10 +216,12 @@ export function autoFitCols(
   if (mode === "drawer") return 1;
 
   const size = slotSize(mode, options);
-  const gap = slotGap(mode);
+  const gap = slotGap(mode, options);
 
   if (size.width <= 0) return 1;
-  return Math.max(1, Math.floor((contentWidth + gap) / (size.width + gap)));
+  // margin (gap / 2) reserved on both sides means cols columns need exactly
+  // cols * (size.width + gap) of contentWidth — see slotRect/contentDimensions.
+  return Math.max(1, Math.floor(contentWidth / (size.width + gap)));
 }
 
 /**
@@ -197,22 +235,25 @@ export function slotRect(
   options?: SlotSizeOptions
 ): SlotRect {
   const size = slotSize(mode, options);
-  const gap = slotGap(mode);
+  const gap = slotGap(mode, options);
+  const margin = outerMargin(mode, options);
 
   if (mode === "drawer") {
-    // drawer: full width rows stacked vertically
-    const inset = cellBorderInset(options?.cellBorderWidth, Math.floor(DRAWER_ROW_H * 0.3)) * 2;
+    // drawer: full width rows stacked vertically — inset applied evenly to
+    // both left and right so the row is centered, matching the leading/
+    // trailing margin used on the row-stacking axis below.
+    const inset = modeBorderInset(mode, options);
     return {
-      x: 0,
-      y: slot.row * (size.height + gap),
-      width: contentWidth - inset,
+      x: inset,
+      y: margin + slot.row * (size.height + gap),
+      width: contentWidth - inset * 2,
       height: size.height,
     };
   }
 
   return {
-    x: slot.col * (size.width + gap),
-    y: slot.row * (size.height + gap),
+    x: margin + slot.col * (size.width + gap),
+    y: margin + slot.row * (size.height + gap),
     width: size.width,
     height: size.height,
   };
@@ -252,17 +293,18 @@ export function hitTestSlot(
   options?: SlotSizeOptions
 ): SlotPosition | null {
   const size = slotSize(mode, options);
-  const gap = slotGap(mode);
+  const gap = slotGap(mode, options);
+  const margin = outerMargin(mode, options);
 
   if (mode === "drawer") {
-    const row = Math.floor(py / (size.height + gap));
+    const row = Math.floor((py - margin) / (size.height + gap));
     if (row < 0 || row >= rows) return null;
     if (px < 0 || px > contentWidth) return null;
     return { col: 0, row };
   }
 
-  const col = Math.floor(px / (size.width + gap));
-  const row = Math.floor(py / (size.height + gap));
+  const col = Math.floor((px - margin) / (size.width + gap));
+  const row = Math.floor((py - margin) / (size.height + gap));
 
   if (col < 0 || col >= cols || row < 0 || row >= rows) return null;
 
@@ -270,8 +312,8 @@ export function hitTestSlot(
   // this makes drop targeting more forgiving — instead of returning null
   // (which causes the highlight to jump to the first empty slot), we
   // keep the highlight on the nearest cell.
-  const cellX = px - col * (size.width + gap);
-  const cellY = py - row * (size.height + gap);
+  const cellX = px - margin - col * (size.width + gap);
+  const cellY = py - margin - row * (size.height + gap);
 
   // if we're past the cell in X, try the next column
   if (cellX > size.width && col + 1 < cols) {
@@ -297,18 +339,21 @@ export function contentDimensions(
   options?: SlotSizeOptions
 ): { width: number; height: number } {
   const size = slotSize(mode, options);
-  const gap = slotGap(mode);
+  const gap = slotGap(mode, options);
 
+  // the leading + trailing margins (outerMargin on each side) add up to
+  // exactly one `gap`, which cancels the "no trailing gap" subtraction that
+  // used to apply here — so total size is simply count * (size + gap).
   if (mode === "drawer") {
     return {
       width: contentWidth,
-      height: rows * (size.height + gap) - (rows > 0 ? gap : 0),
+      height: rows * (size.height + gap),
     };
   }
 
   return {
-    width: cols * (size.width + gap) - (cols > 0 ? gap : 0),
-    height: rows * (size.height + gap) - (rows > 0 ? gap : 0),
+    width: cols * (size.width + gap),
+    height: rows * (size.height + gap),
   };
 }
 
@@ -344,22 +389,25 @@ export function computeCellBorderLines(
   options?: SlotSizeOptions
 ): { lines: CellBorderLine[]; outer: SlotRect } {
   const size = slotSize(mode, options);
-  const gap = slotGap(mode);
+  const gap = slotGap(mode, options);
   const effCols = mode === "drawer" ? 1 : Math.max(1, cols);
   const effRows = Math.max(1, rows);
   const cellW = mode === "drawer" ? contentWidth : size.width;
   const cellH = size.height;
 
-  const totalW = mode === "drawer" ? contentWidth : effCols * (cellW + gap) - gap;
-  const totalH = effRows * (cellH + gap) - gap;
+  const totalW = mode === "drawer" ? contentWidth : effCols * (cellW + gap);
+  const totalH = effRows * (cellH + gap);
 
+  // dividers land exactly on each cell's pitch boundary — the leading
+  // margin (gap / 2) folded into slotRect already centers each cell's own
+  // half-gap clearance around these points, so no extra offset is needed.
   const lines: CellBorderLine[] = [];
   for (let c = 1; c < effCols; c++) {
-    const x = c * (cellW + gap) - gap / 2;
+    const x = c * (cellW + gap);
     lines.push({ x1: x, y1: 0, x2: x, y2: totalH });
   }
   for (let r = 1; r < effRows; r++) {
-    const y = r * (cellH + gap) - gap / 2;
+    const y = r * (cellH + gap);
     lines.push({ x1: 0, y1: y, x2: totalW, y2: y });
   }
 
