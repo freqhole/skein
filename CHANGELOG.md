@@ -1,5 +1,15 @@
 # skein
 
+## 0.1.8
+
+### Patch Changes
+
+- f492d8e: handle playing audio + video filez better
+- 670a98b: add drag'n drop handlerz for droppin' external filez
+- 3390ce1: filez widget showz local filez
+- 9af1d29: peerz that have file should re-process on file type domain changez
+- 5214d8e: scale up bin sizes and improve cell size calculationz to better handle cell borderz
+
 ## 0.1.7
 
 ### Patch Changes
