@@ -3980,6 +3980,10 @@ class SkeinRouter {
       widgetId: "filez-overlay",
       canvasElement: canvas.app.canvas as HTMLCanvasElement,
       canvasStore: canvas.store,
+      // lets the "local files" tab support dragging a row onto the canvas —
+      // see filez-widget.ts's drag-out handling.
+      world: canvas.world,
+      narthexDocId: this.narthexDocId ?? undefined,
     };
 
     try {

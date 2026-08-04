@@ -268,6 +268,16 @@ export interface WidgetMountContext<S extends z.ZodType = z.ZodType> {
    *  messagez widget's overlay mount (boot.ts); undefined for other
    *  widgets and for headless/test contexts. */
   otherCanvasKnocks?: OtherCanvasKnocksSource;
+  /** the pan/zoom-affected world container that hosts every widget frame on
+   *  the currently open canvas. an overlay widget (rendered as a stage
+   *  sibling of `world`, not a descendant — see `widget-overlay.ts`) can
+   *  still convert a drag gesture's global pointer position into world-space
+   *  coordinates via `world.toLocal(event.global)`, the same conversion
+   *  `bin-drag.ts` uses for in-canvas widget drags, since both live under
+   *  the same PixiJS stage. only wired in for the filez widget's overlay
+   *  mount (boot.ts), to support dragging a local-files row onto the
+   *  canvas; undefined for other widgets and for headless/test contexts. */
+  world?: Container;
 }
 
 /**

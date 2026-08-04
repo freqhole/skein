@@ -13,7 +13,7 @@
 import { createBlobStore, type BlobRecord } from "@freqhole/reliquary/blobs";
 import { BLOB_OPFS_DIR } from "@freqhole/reliquary/worker";
 
-export type { BlobRecord } from "@freqhole/reliquary/blobs";
+export type { BlobRecord, ListBlobsOptions, ListBlobsPage } from "@freqhole/reliquary/blobs";
 
 /** IndexedDB database name — matches the name skein has always used, so
  *  existing browser data keeps resolving after adopting the shared store. */
@@ -46,6 +46,7 @@ export const {
   removeCanvasRef,
   getCanvasRefs,
   removeAllCanvasRefsForCanvas,
+  listBlobs,
 } = store;
 
 /** classify a MIME type into a domain string used for widget rendering

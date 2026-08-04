@@ -1157,7 +1157,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         // not just the ones that write blobId themselves.
         const refCanvasDocId = ctx.canvasStore?.handle.documentId;
         if (refCanvasDocId) {
-          void addBlobCanvasRef(blobId, ctx.doc.current.blake3, refCanvasDocId);
+          addBlobCanvasRef(blobId, ctx.doc.current.blake3, refCanvasDocId).catch((err) => {
+            log.warn("file-widget", "addBlobCanvasRef failed (non-fatal):", err);
+          });
         }
         // pick up a domain someone else already picked before we had the
         // blob locally (or before we were even a tauri app) — kickOffDomainIngest
@@ -1572,7 +1574,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
               });
               const refCanvasDocId = store.handle.documentId;
               if (refCanvasDocId) {
-                void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+                addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId).catch((err) => {
+                  log.warn("file-widget", "addBlobCanvasRef failed (non-fatal):", err);
+                });
               }
 
               // best-effort persisted thumbnail — see peedeeeff's
@@ -1632,7 +1636,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             });
             const refCanvasDocId = store.handle.documentId;
             if (refCanvasDocId) {
-              void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+              addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId).catch((err) => {
+                log.warn("file-widget", "addBlobCanvasRef failed (non-fatal):", err);
+              });
             }
 
             // video/audio/pdf thumbnails need ffmpeg/magick, so they're never
@@ -1962,7 +1968,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           {
             const refCanvasDocId = ctx.canvasStore?.handle.documentId;
             if (refCanvasDocId) {
-              void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+              addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId).catch((err) => {
+                log.warn("file-widget", "addBlobCanvasRef failed (non-fatal):", err);
+              });
             }
           }
 
@@ -2205,9 +2213,13 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           const refCanvasDocId = ctx.canvasStore?.handle.documentId;
           if (refCanvasDocId) {
             if (state.blobId) {
-              void removeBlobCanvasRef(state.blobId, state.blake3, refCanvasDocId);
+              removeBlobCanvasRef(state.blobId, state.blake3, refCanvasDocId).catch((err) => {
+                log.warn("file-widget", "removeBlobCanvasRef failed (non-fatal):", err);
+              });
             }
-            void addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId);
+            addBlobCanvasRef(result.blobId, result.blake3, refCanvasDocId).catch((err) => {
+              log.warn("file-widget", "addBlobCanvasRef failed (non-fatal):", err);
+            });
           }
         }
         if (!state.title || !state.title.trim()) {
@@ -2623,7 +2635,9 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         if (prevBlobId) {
           const refCanvasDocId = ctx.canvasStore?.handle.documentId;
           if (refCanvasDocId) {
-            void removeBlobCanvasRef(prevBlobId, prevBlake3, refCanvasDocId);
+            removeBlobCanvasRef(prevBlobId, prevBlake3, refCanvasDocId).catch((err) => {
+              log.warn("file-widget", "removeBlobCanvasRef failed (non-fatal):", err);
+            });
           }
         }
 
