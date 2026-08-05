@@ -1,5 +1,13 @@
 # skein
 
+## 0.1.9
+
+### Patch Changes
+
+- 29991a2: improve local filez widget: add type labelz + filter, add thumbnail imagez, fix date formatting, improve pagination
+- 6e86eba: add xs and xxl SLOT_SCALE_MULTIPLIERS
+- 956c969: re-work bin size scale; improve widget resize handle so easier to use zoomed out; fix bin cell label text; try to improve snatch all ui/ux;
+
 ## 0.1.8
 
 ### Patch Changes
