@@ -30,11 +30,12 @@ all three share:
 ## 1. web-only mode
 
 the skein browser app drives its own iroh endpoint via webtransport through
-a compiled-to-wasm helper crate (`midden`). no reliquary required.
+`@freqhole/midden`, a compiled-to-wasm node package that lives under
+`tomb/lib/midden`. no reliquary required.
 
 ```sh
-# build the midden wasm bundle (first time + whenever rust source changes)
-cd skein/midden
+# build the midden wasm bundle (first time + whenever its rust source changes)
+cd midden
 make
 
 ## optionally, instead of make, run wasm-pack like:
@@ -43,7 +44,7 @@ make
 # rm -f pkg/.gitignore
 
 # run the dev server
-cd ../loam
+cd ../skein/loam
 npm install
 npm run dev
 ```
@@ -59,23 +60,24 @@ peers are added by pasting invites (see below).
 
 ---
 
-## 2. web + reliquary hub
+## 2. web + tumulus hub
 
-running a reliquary peer alongside gives you a stable always-on node id,
+running a tumulus peer alongside gives you a stable always-on node id,
 durable blob storage, and lets you bridge canvases between browsers that
 aren't both online at the same time.
 
 ```sh
 cd skein
-cargo build --release -p reliquary
+cargo build --release -p tumulus
 
 # generate a keypair (idempotent — remembers its node id across restarts)
-./target/release/reliquary --data-dir ~/.skein-hub init
-./target/release/reliquary --data-dir ~/.skein-hub node-id
+cargo run --bin tumulus
+./target/release/tumulus --data-dir ~/.skein-hub init
+./target/release/tumulus --data-dir ~/.skein-hub node-id
 # -> prints the node id you'll paste into a browser invite
 
 # run the hub (ctrl-c to stop; graceful shutdown on signal)
-./target/release/reliquary --data-dir ~/.skein-hub serve
+./target/release/tumulus --data-dir ~/.skein-hub serve
 ```
 
 environment:
@@ -98,7 +100,7 @@ identity.secret     # iroh ed25519 secret key (chmod 600)
 
 ## 3. desktop (tauri)
 
-the tauri app runs a full reliquary peer in-process and shares its iroh
+the tauri app runs a full tumulus peer in-process and shares its iroh
 endpoint with the webview. **not yet bundle-ready** — icons are placeholders
 copied from tomb/charnel; frontend wiring (`beforeDevCommand`/`frontendDist`)
 still needs a `npm run build:tauri` target in `skein/loam/`.
@@ -121,9 +123,6 @@ the IPC surface exposed to the webview (see
 | `skein_friend_list` | —                     | `Friend[]`                            |
 | `blob_list`         | `{ limit?, offset? }` | `Blob[]`                              |
 
-full `cargo tauri dev` workflow will arrive once real icons + the skein
-vite-tauri build target land (phase-1 backlog item).
-
 ---
 
 ## invite format
@@ -140,17 +139,3 @@ other through iroh's n0 relay discovery — no explicit multiaddr gymnastics.
 
 one peer adds the other via `skein_friend_add` (tauri/reliquary) or the
 equivalent browser helper; the other side auto-accepts on first contact for
-the phase-1 prototype. proper ACL and invite round-tripping come in phase-2.
-
----
-
-## what's in phase-2
-
-- canvas invite orchestration (ported from `hub/` + `canvas.rs`)
-- blob snatcher (ported from `snatch.rs`)
-- gossip digests for cross-canvas peer discovery
-- tauri frontend wiring + real icons + bundler targets
-- typed `skein-api-client` (zod schemas from rust types, like tomb's
-  `client-codegen`)
-
-see [PLAN.md](PLAN.md) for the full multi-phase roadmap.
