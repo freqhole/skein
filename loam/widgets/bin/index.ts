@@ -79,7 +79,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       key: "slotScale",
       label: "slot size",
       type: "select",
-      options: ["s", "m", "l", "xl"],
+      options: ["xs", "s", "m", "l", "xl", "xxl"],
       default: "m",
     },
     {      key: "bgColor",

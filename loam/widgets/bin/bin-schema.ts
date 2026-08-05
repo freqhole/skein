@@ -24,7 +24,7 @@ export const binSchema = z.object({
   /** shelf text direction — top = text reads top-to-bottom, bottom = bottom-to-top */
   shelfTextOrigin: z.enum(["top", "bottom"]).default("top"),
   /** slot size preset — controls density of the grid */
-  slotScale: z.enum(["s", "m", "l", "xl"]).default("m"),
+  slotScale: z.enum(["xs", "s", "m", "l", "xl", "xxl"]).default("m"),
   /** background color for the bin itself, as a 0xRRGGBB number — -1 means
    *  transparent/none, matching the -1 convention used elsewhere */
   bgColor: z.number().default(-1),
