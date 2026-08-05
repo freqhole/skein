@@ -4,10 +4,12 @@
 #
 # triggers (no PAT needed):
 #   - push to changeset-release/main (you pushing a commit to the version PR)
-#   - the version PR reopened or synchronized (close+reopen it, or push to it)
+#   - the version PR opened, reopened, or synchronized (or close+reopen it, or push to it)
 #   - workflow_dispatch (rebuild a version on demand, e.g. after a flaky job)
-# the changesets bot's own push uses GITHUB_TOKEN, which github's recursion
-# guard stops from auto-triggering workflows - hence the user-driven levers above.
+# the changesets bot's own push/PR-open uses GITHUB_TOKEN, which github's
+# recursion guard stops from auto-starting the run - but the run still queues
+# and shows an "approve workflow run" button, so `opened` is worth keeping
+# even though closing+reopening the PR remains a fallback lever.
 #
 # builds run on the PR so problems get worked out before merge. when the version
 # PR merges, changesets.yml just publishes this already-built draft (it does not
@@ -39,7 +41,7 @@ on:
     branches:
       - "changeset-release/main"
   pull_request:
-    types: [reopened, synchronize]
+    types: [opened, reopened, synchronize]
     branches:
       - main
   workflow_dispatch:

@@ -493,9 +493,14 @@ function buildGridCard(state: CardRenderState, ctx: CardBuildContext): RenderedC
   if (gridFits) {
     gridDisplayText = info.label;
   } else {
-    const maxChars = Math.max(
+    // GRID_LABEL_MAX_CHARS is a cap, not a floor (unlike the small minimums
+    // used by the shelf/crate/drawer variants below) — cells smaller than
+    // that cap must clamp DOWN to what actually fits, or the label
+    // overflows the cell. Math.max here would force the cap even when
+    // less than that fits, which is exactly what caused the overflow.
+    const maxChars = Math.min(
       GRID_LABEL_MAX_CHARS,
-      Math.floor(cellSize / (gridFontSize * 0.55))
+      Math.max(4, Math.floor(cellSize / (gridFontSize * 0.55)))
     );
     gridDisplayText = truncateLabel(info.label, maxChars);
   }

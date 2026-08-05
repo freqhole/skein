@@ -139,6 +139,11 @@ export class WidgetFrame {
   private resizeStartSize = { w: 0, h: 0 };
   private resizeStartPos = { x: 0, y: 0 };
 
+  // current viewport zoom, kept in sync via setZoom() so resize handles can
+  // grow in world space to hold a constant on-screen (and hit-test) size
+  // when zoomed out, instead of shrinking to unclickably small.
+  private currentZoom = 1;
+
   constructor(
     entry: WidgetEntry,
     widgetName: string,
@@ -389,6 +394,14 @@ export class WidgetFrame {
   /** update z-index */
   setZIndex(zIndex: number): void {
     this.root.zIndex = zIndex;
+  }
+
+  /** sync the current viewport zoom so resize handles can compensate their
+   *  world-space size to stay easily clickable at any zoom level. */
+  setZoom(zoom: number): void {
+    if (this.currentZoom === zoom) return;
+    this.currentZoom = zoom;
+    this.positionResizeHandles();
   }
 
   /** set collapsed state */
@@ -751,7 +764,10 @@ export class WidgetFrame {
   }
 
   private positionResizeHandles(): void {
-    const s = this.theme.resizeHandleSize;
+    // grow (never shrink below the base size) as zoom decreases, so the
+    // handles keep a roughly constant on-screen size instead of becoming
+    // tiny, hard-to-click targets when the canvas is zoomed out.
+    const s = Math.max(this.theme.resizeHandleSize, this.theme.resizeHandleSize / this.currentZoom);
     const w = this._width;
     const hdr = this.theme.frameHeaderHeight;
     const totalH = this._collapsed ? hdr : hdr + this._height;
@@ -1075,6 +1091,7 @@ export class WidgetFrame {
   private createActionButton(action: HeaderAction): Container {
     const btnHeight = this.theme.frameHeaderHeight - 8;
     const container = new Container();
+    if (action.disabled) container.alpha = 0.5;
 
     if (action.renderIcon) {
       // icon button: fixed square size, icon drawn via callback
@@ -1085,8 +1102,8 @@ export class WidgetFrame {
       const bg = new Graphics();
       bg.roundRect(0, 0, totalWidth, btnHeight, 3);
       bg.fill({ color: action.active ? this.theme.accent : this.theme.frameBorder });
-      bg.eventMode = "static";
-      bg.cursor = "pointer";
+      bg.eventMode = action.disabled ? "none" : "static";
+      bg.cursor = action.disabled ? "default" : "pointer";
       bg.on("pointertap", (e: FederatedPointerEvent) => {
         e.stopPropagation();
         action.onClick?.({ x: e.globalX, y: e.globalY });
@@ -1131,8 +1148,8 @@ export class WidgetFrame {
       const bg = new Graphics();
       bg.roundRect(0, 0, totalWidth, btnHeight, 3);
       bg.fill({ color: action.active ? this.theme.accent : this.theme.frameBorder });
-      bg.eventMode = "static";
-      bg.cursor = action.onDrag ? "ew-resize" : "pointer";
+      bg.eventMode = action.disabled ? "none" : "static";
+      bg.cursor = action.disabled ? "default" : action.onDrag ? "ew-resize" : "pointer";
       bg.on("pointertap", (e: FederatedPointerEvent) => {
         e.stopPropagation();
         action.onClick?.({ x: e.globalX, y: e.globalY });

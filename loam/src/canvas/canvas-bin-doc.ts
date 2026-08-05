@@ -46,7 +46,7 @@ export const canvasBinModeSchema = z.enum(["grid", "shelf", "crate", "drawer"]);
 export type CanvasBinMode = z.infer<typeof canvasBinModeSchema>;
 
 /** slot size preset — same options `widgets/bin/bin-constants.ts` defines. */
-export const canvasBinSlotScaleSchema = z.enum(["s", "m", "l", "xl"]);
+export const canvasBinSlotScaleSchema = z.enum(["xs", "s", "m", "l", "xl", "xxl"]);
 export type CanvasBinSlotScale = z.infer<typeof canvasBinSlotScaleSchema>;
 
 export interface CanvasBinFolderNode {

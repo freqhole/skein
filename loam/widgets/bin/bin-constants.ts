@@ -4,16 +4,18 @@
 // -- slot scale --------------------------------------------------------------
 
 /** named slot size presets */
-export type SlotScale = "s" | "m" | "l" | "xl";
+export type SlotScale = "xs" | "s" | "m" | "l" | "xl" | "xxl";
 
 /** multiplier applied to base slot dimensions for each scale preset. s is
  *  left alone; m/l/xl each double the previous tier so the jump between
  *  sizes reads clearly. */
 export const SLOT_SCALE_MULTIPLIERS: Record<SlotScale, number> = {
-  s: 0.6,
-  m: 5,
-  l: 10,
-  xl: 20,
+  xs: 0.5,
+  s: 1,
+  m: 2.5,
+  l: 5,
+  xl: 10,
+  xxl: 20,
 };
 
 // -- grid mode (square tiles) ------------------------------------------------

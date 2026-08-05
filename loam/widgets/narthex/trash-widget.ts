@@ -63,7 +63,7 @@ export const trashSchema = z.object({
   /** number of rows — auto-computed from items.length / cols */
   rows: z.number().default(1),
   /** slot size preset */
-  slotScale: z.enum(["s", "m", "l", "xl"]).default("m"),
+  slotScale: z.enum(["xs", "s", "m", "l", "xl", "xxl"]).default("m"),
 });
 
 export type TrashState = z.infer<typeof trashSchema>;
@@ -100,7 +100,7 @@ export const trashWidget: WidgetFactory<typeof trashSchema> = {
       key: "slotScale",
       label: "density",
       type: "select",
-      options: ["s", "m", "l", "xl"],
+      options: ["xs", "s", "m", "l", "xl", "xxl"],
       default: "m",
     },
   ],

@@ -1,4 +1,13 @@
-import { Container, Graphics, Rectangle, Text, type FederatedPointerEvent } from "pixi.js";
+import {
+  Assets,
+  Container,
+  Graphics,
+  Rectangle,
+  Sprite,
+  Text,
+  Texture,
+  type FederatedPointerEvent,
+} from "pixi.js";
 import { ScrollBox } from "@pixi/ui";
 import { z } from "zod";
 import type { DocumentId } from "@automerge/automerge-repo";
@@ -23,6 +32,8 @@ import {
 } from "../../src/file-utils/create-file-widget";
 import { createSkeinInput } from "../../src/widgets/skein-input";
 import { formatFileSize, formatRelativeTime } from "../../src/widgets/format";
+import { classifyDomain } from "../../src/storage/blob-store";
+import { getThumbnailDataUrl } from "../../src/file-utils/thumbnail-utils";
 
 const TAG = "widgets.filez";
 
@@ -92,6 +103,22 @@ const LOAD_MORE_ROW_HEIGHT = 24;
 const CONFIRM_TIMEOUT_MS = 5000;
 const SEARCH_DEBOUNCE_MS = 300;
 
+// local-files row thumbnail (image/video-frame/audio-waveform preview, or a
+// domain icon fallback when no preview is available)
+const LOCAL_THUMB_SIZE = 42;
+const LOCAL_THUMB_GAP = 10;
+
+// domain filter (multi-select) dropdown, tab 2 filter row
+const DOMAIN_FILTER_OPTIONS: Array<{ key: string; label: string }> = [
+  { key: "photo", label: "photo" },
+  { key: "video", label: "video" },
+  { key: "audio", label: "audio" },
+  { key: "document", label: "document" },
+  { key: "file", label: "other" },
+];
+const DOMAIN_FILTER_ROW_H = 20;
+const DOMAIN_FILTER_POPUP_W = 120;
+
 // drag-out-to-canvas (local files tab only) — mirrors bin-drag.ts's ghost
 // drag pattern, since both convert a global pointer position to world-space
 // coordinates via `world.toLocal()` on a container that shares the same
@@ -111,6 +138,26 @@ const DIRECTION_INFO: Record<FilezItem["direction"], { label: string; color: num
   serving: { label: "serving", color: 0x8b5cf6 },
 };
 
+// domain icon fallback (shown until/unless a real thumbnail loads) — glyph
+// left blank for "file" so the caller falls back to the filename's first
+// letter, matching the bin widget's existing generic-file fallback.
+const DOMAIN_ICON_INFO: Record<string, { glyph: string; color: number }> = {
+  photo: { glyph: "\u25a7", color: 0x22c55e },
+  video: { glyph: "\u25b6", color: 0x06b6d4 },
+  audio: { glyph: "\u266a", color: 0x8b5cf6 },
+  document: { glyph: "\u25a4", color: 0xf59e0b },
+  file: { glyph: "", color: MUTED_TEXT },
+};
+
+function domainIconGlyph(domain: string, filename: string): string {
+  const glyph = DOMAIN_ICON_INFO[domain]?.glyph;
+  return glyph || (filename.charAt(0) || "?").toUpperCase();
+}
+
+function domainIconColor(domain: string): number {
+  return DOMAIN_ICON_INFO[domain]?.color ?? MUTED_TEXT;
+}
+
 /** truncate a string so it fits within a rough character budget. */
 function truncate(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
@@ -120,6 +167,7 @@ function truncate(value: string, maxChars: number): string {
 function truncateId(id: string, len = 10): string {
   return id.length > len ? `${id.slice(0, len)}\u2026` : id;
 }
+
 
 function sortFieldLabel(field: "created_at" | "size" | "filename"): string {
   return field === "created_at" ? "date" : field === "size" ? "size" : "name";
@@ -220,9 +268,19 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
     let localDirection: "asc" | "desc" = "desc";
     let localSearch = "";
     let localOrphansOnly = false;
+    let localDomainFilter = new Set<string>();
+    let domainFilterOpen = false;
     let localAppendMode = false;
     let localHasMore = true;
     let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // resolved thumbnail textures for local-files rows, keyed by blake3 (or
+    // blobId when blake3 is absent) — same cache-then-relayout shape as
+    // blobRefsCache/resolveBlobRefs below. `null` means "resolved, no
+    // preview available" (non-previewable domain, or the fetch/decode
+    // failed) — falls back to the domain icon.
+    const localThumbCache = new Map<string, Texture | null>();
+    const resolvingLocalThumbs = new Set<string>();
 
     // blob -> referencing-canvas-ids, resolved best-effort/async (same
     // cache-then-relayout shape as resolveCanvasTitle above) so the orphan
@@ -269,6 +327,46 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
       return refs.length === 0;
     }
 
+    /** returns a cached thumbnail texture for a local-files row, kicking off
+     *  (and caching) an async fetch+decode on a cache miss. returns `null`
+     *  while unresolved OR once resolved-with-no-preview — either way the
+     *  caller falls back to the domain icon until a real texture arrives. */
+    function resolveLocalThumbTexture(item: LocalBlobItem): Texture | null {
+      const key = item.blake3 || item.blobId;
+      if (localThumbCache.has(key)) return localThumbCache.get(key)!;
+      if (resolvingLocalThumbs.has(key)) return null;
+
+      const domain = classifyDomain(item.mime ?? "");
+      if (domain !== "photo" && domain !== "video" && domain !== "audio") {
+        // not a previewable domain — resolve immediately, no fetch needed
+        localThumbCache.set(key, null);
+        return null;
+      }
+
+      resolvingLocalThumbs.add(key);
+      (async () => {
+        try {
+          const dataUrl = await getThumbnailDataUrl(item.blobId, {
+            size: LOCAL_THUMB_SIZE * 2,
+            square: true,
+          });
+          if (!dataUrl) {
+            localThumbCache.set(key, null);
+            return;
+          }
+          const tex = await Assets.load<Texture>(dataUrl);
+          localThumbCache.set(key, tex && tex.source?.style ? tex : null);
+        } catch (err) {
+          log.debug(TAG, `resolveLocalThumbTexture: failed for ${key.slice(0, 12)}...`, err);
+          localThumbCache.set(key, null);
+        } finally {
+          resolvingLocalThumbs.delete(key);
+          if (!destroyed) layout(currentWidth, currentHeight);
+        }
+      })();
+      return null;
+    }
+
     const localFilesSub = subscribeToLocalFiles((result: LocalFilesResult) => {
       localLoading = false;
       if (result.ok) {
@@ -277,6 +375,7 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
         localTotalSize = result.totalSize;
         localHasMore = localItems.length < result.totalCount;
         localError = null;
+        maybeAutoLoadForFilter();
       } else {
         localError = result.error;
       }
@@ -297,6 +396,18 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
         limit: LOCAL_PAGE_SIZE,
         offset: opts.append ? localItems.length : 0,
       });
+    }
+
+    /** the orphan/domain filters only ever match within already-loaded
+     *  pages (see renderLocalRows) — while either is active, keep fetching
+     *  subsequent pages automatically so the filtered view (and the
+     *  "load more" footer's visibility) reflects the FULL local library
+     *  instead of stopping partway through it. */
+    function maybeAutoLoadForFilter(): void {
+      const filterActive = localOrphansOnly || localDomainFilter.size > 0;
+      if (filterActive && localHasMore && !localLoading) {
+        queryLocalFiles({ append: true });
+      }
     }
 
     function switchTab(tab: "pending" | "local"): void {
@@ -322,6 +433,7 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
 
     function handleOrphanToggle(): void {
       localOrphansOnly = !localOrphansOnly;
+      maybeAutoLoadForFilter();
       layout(currentWidth, currentHeight);
     }
 
@@ -562,6 +674,23 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
     });
     container.addChild(orphanToggle);
 
+    // domain-type multi-select filter — the clickable label lives in the
+    // filter row; the popup + backdrop are added further below (after the
+    // scroll list) so they render on top of it.
+    const domainFilterLabel = new Text({
+      text: "type \u25be",
+      style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+      resolution: RESOLUTION,
+    });
+    domainFilterLabel.eventMode = "static";
+    domainFilterLabel.cursor = "pointer";
+    domainFilterLabel.on("pointertap", (e) => {
+      e.stopPropagation();
+      domainFilterOpen = !domainFilterOpen;
+      layout(currentWidth, currentHeight);
+    });
+    container.addChild(domainFilterLabel);
+
     // -------------------------------------------------------------------
     // list area (scrollable) — shared by both tabs via @pixi/ui's
     // ScrollBox (see hub-profile-panel.ts for why: three earlier
@@ -631,6 +760,74 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
     });
     emptyText.eventMode = "none";
     container.addChild(emptyText);
+
+    // domain filter popup — added after the scroll list so it renders on
+    // top of it (pixi z-order follows child order; no sortableChildren
+    // needed here since these two are the last children added).
+    const domainFilterBackdrop = new Graphics();
+    domainFilterBackdrop.eventMode = "static";
+    domainFilterBackdrop.visible = false;
+    domainFilterBackdrop.on("pointerdown", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      domainFilterOpen = false;
+      layout(currentWidth, currentHeight);
+    });
+    container.addChild(domainFilterBackdrop);
+
+    const domainFilterPopup = new Container();
+    domainFilterPopup.eventMode = "static";
+    domainFilterPopup.visible = false;
+    domainFilterPopup.on("pointerdown", (e: FederatedPointerEvent) => e.stopPropagation());
+    container.addChild(domainFilterPopup);
+
+    const domainFilterPopupH = DOMAIN_FILTER_OPTIONS.length * DOMAIN_FILTER_ROW_H + 8;
+    const domainFilterPopupBg = new Graphics();
+    domainFilterPopupBg.roundRect(0, 0, DOMAIN_FILTER_POPUP_W, domainFilterPopupH, 4);
+    domainFilterPopupBg.fill({ color: BG, alpha: 0.98 });
+    domainFilterPopupBg.stroke({ color: ROW_ALT_BG, width: 1 });
+    domainFilterPopup.addChild(domainFilterPopupBg);
+
+    const domainFilterRows = DOMAIN_FILTER_OPTIONS.map((opt, idx) => {
+      const rowY = 4 + idx * DOMAIN_FILTER_ROW_H;
+      const bg = new Graphics();
+      bg.eventMode = "static";
+      bg.cursor = "pointer";
+      domainFilterPopup.addChild(bg);
+
+      const check = new Text({
+        text: "\u2610",
+        style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+        resolution: RESOLUTION,
+      });
+      check.eventMode = "none";
+      check.x = 8;
+      check.y = rowY + 3;
+      domainFilterPopup.addChild(check);
+
+      const label = new Text({
+        text: opt.label,
+        style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: MUTED_TEXT },
+        resolution: RESOLUTION,
+      });
+      label.eventMode = "none";
+      label.x = 22;
+      label.y = rowY + 3;
+      domainFilterPopup.addChild(label);
+
+      bg.on("pointertap", (e: FederatedPointerEvent) => {
+        e.stopPropagation();
+        if (localDomainFilter.has(opt.key)) {
+          localDomainFilter.delete(opt.key);
+        } else {
+          localDomainFilter.add(opt.key);
+        }
+        scrollBox.scrollTop();
+        maybeAutoLoadForFilter();
+        layout(currentWidth, currentHeight);
+      });
+
+      return { key: opt.key, rowY, bg, check, label };
+    });
 
     function finishInnerLayout(contentHeight: number): void {
       innerSizingRect.clear();
@@ -1019,7 +1216,13 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
       // and blob-canvas-refs is a separate app-level index the storage
       // backends don't know about. totals shown in the header therefore
       // reflect ALL local files, not just orphans, while this filter is on.
-      const visible = localOrphansOnly ? localItems.filter((i) => isOrphan(i) === true) : localItems;
+      // the domain filter is likewise purely client-side, over whatever
+      // pages are already loaded.
+      const visible = localItems.filter((i) => {
+        if (localOrphansOnly && isOrphan(i) !== true) return false;
+        if (localDomainFilter.size > 0 && !localDomainFilter.has(classifyDomain(i.mime ?? ""))) return false;
+        return true;
+      });
 
       for (let i = 0; i < visible.length; i++) {
         const item = visible[i];
@@ -1049,11 +1252,47 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
         }
         rowContainer.addChild(rowBg);
 
-        const textLeft = ROW_PADDING_X;
+        // thumbnail (image / video-frame / audio-waveform preview) or a
+        // domain-icon fallback when no preview is available yet/at all.
+        const domain = classifyDomain(item.mime ?? "");
+        const filename = item.filename || truncateId(item.blobId);
+        const thumbBox = new Container();
+        thumbBox.eventMode = "none";
+        thumbBox.x = ROW_PADDING_X;
+        thumbBox.y = Math.round((LOCAL_ROW_HEIGHT - LOCAL_THUMB_SIZE) / 2);
+        rowContainer.addChild(thumbBox);
+
+        const thumbTex = resolveLocalThumbTexture(item);
+        if (thumbTex) {
+          const thumbMask = new Graphics();
+          thumbMask.roundRect(0, 0, LOCAL_THUMB_SIZE, LOCAL_THUMB_SIZE, 4).fill({ color: 0xffffff });
+          thumbBox.addChild(thumbMask);
+          const sprite = new Sprite(thumbTex);
+          sprite.width = LOCAL_THUMB_SIZE;
+          sprite.height = LOCAL_THUMB_SIZE;
+          sprite.mask = thumbMask;
+          thumbBox.addChild(sprite);
+        } else {
+          const iconBg = new Graphics();
+          iconBg
+            .roundRect(0, 0, LOCAL_THUMB_SIZE, LOCAL_THUMB_SIZE, 4)
+            .fill({ color: domainIconColor(domain), alpha: 0.18 });
+          thumbBox.addChild(iconBg);
+          const iconText = new Text({
+            text: domainIconGlyph(domain, filename),
+            style: { fontFamily: FONT, fontSize: Math.round(LOCAL_THUMB_SIZE * 0.42), fill: domainIconColor(domain) },
+            resolution: RESOLUTION,
+          });
+          iconText.anchor.set(0.5);
+          iconText.x = LOCAL_THUMB_SIZE / 2;
+          iconText.y = LOCAL_THUMB_SIZE / 2;
+          thumbBox.addChild(iconText);
+        }
+
+        const textLeft = ROW_PADDING_X + LOCAL_THUMB_SIZE + LOCAL_THUMB_GAP;
         const textW = Math.max(20, contentW - textLeft - ROW_PADDING_X - LOCAL_CTRL_RESERVED - CTRL_BTN_GAP);
 
         // line 1: filename + size
-        const filename = item.filename || truncateId(item.blobId);
         const filenameMaxChars = Math.max(4, Math.floor((textW * 0.6) / (ROW_NAME_SIZE * 0.55)));
         const filenameText = new Text({
           text: truncate(filename, filenameMaxChars),
@@ -1078,7 +1317,7 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
         // line 2: created date + canvas refs / orphan badge
         const refs = resolveBlobRefs(item.blobId, item.blake3);
         let subtitle = `created ${formatRelativeTime(item.createdAt)}`;
-        if (item.external) subtitle += " \u2022 external (kept on disk)";
+        if (item.external) subtitle += " \u2022 external";
         if (refs !== null) {
           if (refs.length === 0) {
             subtitle += " \u2022 orphaned";
@@ -1101,6 +1340,18 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
         subtitleText.x = textLeft;
         subtitleText.y = 26;
         rowContainer.addChild(subtitleText);
+
+        // line 3: domain classification — surfaced mainly so the "type"
+        // filter dropdown above is easy to sanity-check against.
+        const typeText = new Text({
+          text: domain,
+          style: { fontFamily: FONT, fontSize: ROW_SUB_SIZE, fill: domainIconColor(domain) },
+          resolution: RESOLUTION,
+        });
+        typeText.eventMode = "none";
+        typeText.x = textLeft;
+        typeText.y = 41;
+        rowContainer.addChild(typeText);
 
         // remove/purge — confirm-then-execute (mirrors hub-profile-panel.ts's
         // handleHardDeleteAllClick), one active confirmation at a time. an
@@ -1243,6 +1494,10 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
       searchInputHandle.input.visible = showFilterRow;
       for (const { text } of sortLabels) text.visible = showFilterRow;
       orphanToggle.visible = showFilterRow;
+      domainFilterLabel.visible = showFilterRow;
+      if (!showFilterRow) domainFilterOpen = false;
+      domainFilterBackdrop.visible = showFilterRow && domainFilterOpen;
+      domainFilterPopup.visible = showFilterRow && domainFilterOpen;
 
       let listTop = HEADER_HEIGHT + 6;
       if (showFilterRow) {
@@ -1268,6 +1523,40 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
         orphanToggle.style.fill = localOrphansOnly ? ACCENT_COLOR : MUTED_TEXT;
         orphanToggle.x = w - PADDING_X - orphanToggle.width;
         orphanToggle.y = filterY + 3;
+
+        domainFilterLabel.text =
+          localDomainFilter.size > 0
+            ? truncate(
+                `type: ${DOMAIN_FILTER_OPTIONS.filter((o) => localDomainFilter.has(o.key))
+                  .map((o) => o.label)
+                  .join(", ")} \u25be`,
+                20
+              )
+            : "type \u25be";
+        domainFilterLabel.style.fill = localDomainFilter.size > 0 ? ACCENT_COLOR : MUTED_TEXT;
+        domainFilterLabel.x = orphanToggle.x - FILTER_GAP - domainFilterLabel.width;
+        domainFilterLabel.y = filterY + 3;
+
+        if (domainFilterOpen) {
+          domainFilterBackdrop.clear();
+          domainFilterBackdrop.rect(0, 0, w, h).fill({ color: 0x000000, alpha: 0.0001 });
+
+          domainFilterPopup.x = Math.max(
+            PADDING_X,
+            Math.min(domainFilterLabel.x, w - PADDING_X - DOMAIN_FILTER_POPUP_W)
+          );
+          domainFilterPopup.y = filterY + FILTER_ROW_HEIGHT + 2;
+
+          for (const row of domainFilterRows) {
+            const active = localDomainFilter.has(row.key);
+            row.bg.clear();
+            row.bg.roundRect(4, row.rowY, DOMAIN_FILTER_POPUP_W - 8, DOMAIN_FILTER_ROW_H, 3);
+            row.bg.fill({ color: active ? ACCENT_COLOR : 0x000000, alpha: active ? 0.15 : 0 });
+            row.check.text = active ? "\u2611" : "\u2610";
+            row.check.style.fill = active ? ACCENT_COLOR : MUTED_TEXT;
+            row.label.style.fill = active ? ACCENT_COLOR : MUTED_TEXT;
+          }
+        }
 
         listTop += FILTER_ROW_HEIGHT;
       }

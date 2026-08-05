@@ -37,6 +37,10 @@ export interface SnatchAllProgress {
   failed: number;
   /** currently downloading item index (0-based across all items) */
   currentIndex: number;
+  /** widgetId of the item currently downloading (or that just completed),
+   *  or null when no download is in flight (e.g. before start / after done).
+   *  use this (not currentIndex) to target UI updates at a specific card. */
+  currentWidgetId: string | null;
   /** download progress of current item (0.0 to 1.0; 0 between items) */
   currentProgress: number;
   /** whether the operation is complete */
@@ -207,6 +211,7 @@ export async function snatchAllInBin(
     snatched: 0,
     failed: 0,
     currentIndex: 0,
+    currentWidgetId: null,
     currentProgress: 0,
     done: false,
   };
@@ -259,8 +264,6 @@ export async function snatchAllInBin(
   // already-local and successfully-downloaded blobs (distinguished by
   // result.existing). per-blob failures show up as `null` entries in the
   // returned array.
-  let lastDownloadIndex = 0;
-
   try {
     const results = await snatchBlobBatch(blobInfos, peers, {
       signal,
@@ -277,15 +280,16 @@ export async function snatchAllInBin(
           void applySnatchResult(allFiles[index], result, repo);
         }
         progress.currentIndex = index;
+        progress.currentWidgetId = allFiles[index]?.widgetId ?? null;
         progress.currentProgress = 1;
-        lastDownloadIndex = index;
         emit();
       },
-      onProgress: (_completed, _total, blobProgress) => {
+      onProgress: (_completed, _total, blobProgress, currentIndex) => {
         // blobProgress is -1 between downloads, 0..1 during one. only
         // emit fractional updates so we don't spam the renderer.
         if (blobProgress >= 0) {
-          progress.currentIndex = lastDownloadIndex;
+          progress.currentIndex = currentIndex;
+          progress.currentWidgetId = allFiles[currentIndex]?.widgetId ?? null;
           progress.currentProgress = blobProgress;
           emit();
         }
@@ -312,6 +316,7 @@ export async function snatchAllInBin(
 
   progress.done = true;
   progress.currentProgress = 0;
+  progress.currentWidgetId = null;
   emit();
   return progress;
 }

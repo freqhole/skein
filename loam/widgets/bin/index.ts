@@ -79,7 +79,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       key: "slotScale",
       label: "slot size",
       type: "select",
-      options: ["s", "m", "l", "xl"],
+      options: ["xs", "s", "m", "l", "xl", "xxl"],
       default: "m",
     },
     {      key: "bgColor",
@@ -236,6 +236,20 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
     // aggregate progress across the whole batch (0-100), shown in place of
     // the "snatch all" button while a batch is running.
     let snatchPercent = 0;
+    // set once a completed "snatch all" pass leaves nothing outstanding (no
+    // failures) — disables the button until a new item shows up, so the user
+    // isn't tempted to click it again on an already-fully-local bin. cheap to
+    // maintain incrementally (see the doc.on("change") item-count check below)
+    // rather than precomputing locality for every item up front.
+    let snatchAllExhausted = false;
+    // widgetId whose card currently has a snatch-progress overlay showing, so
+    // handleSnatchAll can clear the previous card's overlay when progress
+    // moves on to the next item.
+    let progressOverlayWidgetId: string | null = null;
+    // tracks item count so the doc-change subscription can tell "an item was
+    // added" (which invalidates snatchAllExhausted) apart from other changes
+    // (reorder, cover image, etc).
+    let lastItemCount = ctx.doc.current.items.length;
 
     // -- tidy ----------------------------------------------------------------
 
@@ -313,6 +327,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
         actions.push({
           id: "snatch",
           label: "snatch all",
+          disabled: snatchAllExhausted,
           onClick: handleSnatchAll,
         });
       }
@@ -642,7 +657,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
     // -- snatch all flow -----------------------------------------------------
 
     async function handleSnatchAll() {
-      if (!store || !repo || snatchInProgress) return;
+      if (!store || !repo || snatchInProgress || snatchAllExhausted) return;
 
       snatchInProgress = true;
       snatchPaused = false;
@@ -654,7 +669,7 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
       try {
         const peers = store.peers();
 
-        await snatchAllInBin(ctx.widgetId, store, repo, peers, {
+        const finalProgress = await snatchAllInBin(ctx.widgetId, store, repo, peers, {
           signal: snatchAbortController.signal,
           pauseGate: snatchPauseGate,
           onProgress: (progress) => {
@@ -662,11 +677,30 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
             const fraction = progress.total > 0 ? (done + progress.currentProgress) / progress.total : 1;
             snatchPercent = Math.round(Math.min(1, fraction) * 100);
             ctx.setHeaderActions?.(buildHeaderActions());
+
+            // move the per-slot progress overlay to whichever card is
+            // currently downloading, clearing the previous one first.
+            if (progressOverlayWidgetId && progressOverlayWidgetId !== progress.currentWidgetId) {
+              renderer?.setCardProgress(progressOverlayWidgetId, null);
+            }
+            progressOverlayWidgetId = progress.currentWidgetId;
+            if (progress.currentWidgetId) {
+              renderer?.setCardProgress(progress.currentWidgetId, progress.currentProgress);
+            }
           },
         });
+
+        // nothing left to snatch (no failures) — disable the button until a
+        // new item is added. leave it enabled after a partial failure so the
+        // user can retry.
+        snatchAllExhausted = finalProgress.failed === 0;
       } catch (err) {
         log.warn("bin", "snatch all failed:", err);
       } finally {
+        if (progressOverlayWidgetId) {
+          renderer?.setCardProgress(progressOverlayWidgetId, null);
+          progressOverlayWidgetId = null;
+        }
         snatchInProgress = false;
         snatchPaused = false;
         snatchAbortController = null;
@@ -917,6 +951,16 @@ export const binWidget: WidgetFactory<typeof binSchema> = {
 
     // subscribe to doc changes
     const unsub = ctx.doc.on("change", () => {
+      // a new item showing up (upload, drag-drop into the bin, etc.) means
+      // the bin may no longer be fully local — re-enable "snatch all".
+      // removals/reorders don't increase the count, so they leave the
+      // exhausted flag as-is.
+      const newItemCount = ctx.doc.current.items.length;
+      if (newItemCount > lastItemCount) {
+        snatchAllExhausted = false;
+      }
+      lastItemCount = newItemCount;
+
       layout(currentWidth, currentHeight);
       ctx.setHeaderActions?.(buildHeaderActions());
     });

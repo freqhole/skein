@@ -74,7 +74,11 @@ export async function listLocalBlobs(options: ListLocalBlobsOptions = {}): Promi
         filename: b.filename ?? undefined,
         mime: b.mime ?? undefined,
         size: b.size,
-        createdAt: b.created_at,
+        // reliquary's rust side stores created_at in unix seconds
+        // (now_secs()), but LocalBlobItem.createdAt is milliseconds
+        // everywhere else (matching the browser build's Date.now() and
+        // formatRelativeTime/formatShortDate's documented input unit).
+        createdAt: b.created_at * 1000,
         external: b.external,
       })),
       totalCount: res.totalCount,

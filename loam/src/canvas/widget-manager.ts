@@ -135,6 +135,10 @@ export class WidgetManager {
   /** viewport reference for saving/restoring camera state during maximize */
   private viewport: Viewport | null = null;
 
+  /** current viewport zoom, kept in sync so newly-mounted frames start with
+   *  the right resize-handle scale (see WidgetFrame.setZoom()). */
+  private currentZoom = 1;
+
   /** toolbar reference for pushing breadcrumb updates */
   private toolbar: Toolbar | null = null;
 
@@ -192,6 +196,13 @@ export class WidgetManager {
   /** set the viewport reference so maximize/restore can save and restore camera state */
   setViewport(viewport: Viewport): void {
     this.viewport = viewport;
+    this.currentZoom = viewport.zoom;
+    viewport.onZoomChange((zoom) => {
+      this.currentZoom = zoom;
+      for (const live of this.liveWidgets.values()) {
+        live.frame.setZoom(zoom);
+      }
+    });
   }
 
   /** set the toolbar reference so breadcrumbs can be updated on maximize/restore */
@@ -608,6 +619,7 @@ export class WidgetManager {
     // create the pixi frame
     const frame = new WidgetFrame(entry, widgetName, this.theme, callbacks);
     frame.setClosable(factory.metadata.closable === true);
+    frame.setZoom(this.currentZoom);
 
     // if this widget is the currently selected one, mark it
     if (this.inputRouter.selectedWidgetId === entry.id) {
@@ -674,6 +686,7 @@ export class WidgetManager {
   private mountCrashed(entry: WidgetEntry, reason: string): void {
     const callbacks = this.createFrameCallbacks(entry.id, entry.type);
     const frame = new WidgetFrame(entry, "crashed", this.theme, callbacks);
+    frame.setZoom(this.currentZoom);
     const ctrl = createCrashedPlaceholder(entry.width, entry.height, reason, this.theme);
 
     frame.contentContainer.addChild(ctrl.container);
