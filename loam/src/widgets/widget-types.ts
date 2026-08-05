@@ -57,6 +57,10 @@ export interface HeaderAction {
   isInfo?: boolean;
   /** when true, the button background is filled with the accent (magenta) color */
   active?: boolean;
+  /** when true, the button is dimmed and clicks are ignored (e.g. "snatch
+   *  all" once everything in a bin is already local). unlike `isInfo`, the
+   *  button still looks/behaves like an action button, just inert. */
+  disabled?: boolean;
   /**
    * optional compact label used in the header button when space is tight.
    * the full `label` is still shown in the hamburger overflow flyout.

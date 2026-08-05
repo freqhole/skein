@@ -10,10 +10,10 @@ export type SlotScale = "s" | "m" | "l" | "xl";
  *  left alone; m/l/xl each double the previous tier so the jump between
  *  sizes reads clearly. */
 export const SLOT_SCALE_MULTIPLIERS: Record<SlotScale, number> = {
-  s: 0.6,
-  m: 5,
-  l: 10,
-  xl: 20,
+  s: 0.5,
+  m: 1,
+  l: 5,
+  xl: 10,
 };
 
 // -- grid mode (square tiles) ------------------------------------------------

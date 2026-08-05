@@ -65,6 +65,14 @@ export class BinRenderer {
   private slotHighlight: Graphics;
   private highlightedSlot: SlotPosition | null = null;
 
+  /** per-widgetId snatch-download progress overlay (dim scrim + progress
+   *  bar) shown while a "snatch all" batch is downloading that item. kept
+   *  outside RenderedCard (rather than as a field on it) so it survives
+   *  updateCard()'s full container rebuild — e.g. when the child file's own
+   *  doc changes mid-batch (thumbnail write) — instead of silently
+   *  disappearing along with the old container. */
+  private progressOverlays = new Map<string, { graphic: Graphics; fraction: number }>();
+
   /** shared table-like border lines drawn across all occupied cells */
   private cellBordersOverlay: Graphics;
 
@@ -368,6 +376,72 @@ export class BinRenderer {
   }
 
   /**
+   * show or update a snatch-download progress indicator on a card (a dim
+   * scrim plus a progress bar drawn across the bottom of the cell). pass
+   * `fraction: null` to clear it once the download finishes, fails, or the
+   * batch stops.
+   */
+  setCardProgress(widgetId: string, fraction: number | null): void {
+    if (fraction === null) {
+      const entry = this.progressOverlays.get(widgetId);
+      if (entry) {
+        entry.graphic.destroy();
+        this.progressOverlays.delete(widgetId);
+      }
+      return;
+    }
+
+    const clamped = Math.max(0, Math.min(1, fraction));
+    let entry = this.progressOverlays.get(widgetId);
+    if (!entry) {
+      const graphic = new Graphics();
+      graphic.label = "snatch-progress";
+      graphic.zIndex = 50; // above action buttons (zIndex 11) and card content
+      graphic.eventMode = "none";
+      entry = { graphic, fraction: clamped };
+      this.progressOverlays.set(widgetId, entry);
+    } else {
+      entry.fraction = clamped;
+    }
+
+    const card = this.cards.get(widgetId);
+    if (card && entry.graphic.parent !== card.container) {
+      card.container.addChild(entry.graphic);
+    }
+    this.drawProgressOverlay(widgetId);
+  }
+
+  /** redraw a card's progress overlay at its current fraction — called both
+   *  from setCardProgress() and after a card's container is rebuilt, so the
+   *  overlay tracks the cell's current rect even across layout changes. */
+  private drawProgressOverlay(widgetId: string): void {
+    const entry = this.progressOverlays.get(widgetId);
+    const card = this.cards.get(widgetId);
+    if (!entry || !card) return;
+
+    const opts: SlotSizeOptions = { scale: this.scale, cellBorderWidth: this.effectiveCellBorderWidth };
+    const rect = slotRect(this.mode, card.slot, this.contentWidth, opts);
+    const barH = Math.max(2, Math.round(rect.height * 0.05));
+
+    entry.graphic.clear();
+    entry.graphic.rect(0, 0, rect.width, rect.height).fill({ color: 0x000000, alpha: 0.4 });
+    entry.graphic
+      .rect(0, rect.height - barH, rect.width * entry.fraction, barH)
+      .fill({ color: 0xff1a9e, alpha: 0.95 });
+  }
+
+  /** re-parent an existing progress overlay onto a card's (possibly just
+   *  rebuilt) container, if one is active for that widgetId. no-op otherwise. */
+  private restoreProgressOverlay(widgetId: string): void {
+    if (!this.progressOverlays.has(widgetId)) return;
+    const card = this.cards.get(widgetId);
+    if (!card) return;
+    const entry = this.progressOverlays.get(widgetId)!;
+    card.container.addChild(entry.graphic);
+    this.drawProgressOverlay(widgetId);
+  }
+
+  /**
    * clean up all cards, textures, and doc subscriptions.
    */
   destroy(): void {
@@ -393,6 +467,7 @@ export class BinRenderer {
     this.cards.set(state.widgetId, card);
     this.cardParent.addChild(card.container);
     this.mediaController?.attachToCard(card);
+    this.restoreProgressOverlay(state.widgetId);
   }
 
   private updateCard(existing: RenderedCard, state: CardRenderState): void {
@@ -405,6 +480,7 @@ export class BinRenderer {
     this.cards.set(state.widgetId, card);
     this.cardParent.addChild(card.container);
     this.mediaController?.attachToCard(card);
+    this.restoreProgressOverlay(state.widgetId);
   }
 
   private removeCard(widgetId: string): void {
@@ -415,6 +491,13 @@ export class BinRenderer {
     this.cardParent.removeChild(card.container);
     this.cleanupCardResources(card);
     this.cards.delete(widgetId);
+
+    // the card is gone for good — drop any snatch-progress overlay for it too
+    const progressEntry = this.progressOverlays.get(widgetId);
+    if (progressEntry) {
+      progressEntry.graphic.destroy();
+      this.progressOverlays.delete(widgetId);
+    }
 
     // unsubscribe from doc changes
     const unsub = this.docUnsubs.get(widgetId);

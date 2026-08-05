@@ -878,8 +878,16 @@ export interface BatchSnatchOptions {
    *  use for progressive rendering — display each blob as it becomes available. */
   onBlobComplete?: (index: number, result: FileUploadResult) => void;
   /** called with overall progress. completedCount includes already-local blobs.
-   *  blobProgress is 0-1 for the current download, or -1 between downloads. */
-  onProgress?: (completedCount: number, totalCount: number, blobProgress: number) => void;
+   *  blobProgress is 0-1 for the current download, or -1 between downloads.
+   *  currentIndex is the index (into the array passed to snatchBlobBatch) of
+   *  the blob this update is for — use it to target UI updates (e.g. a
+   *  per-item progress indicator) at exactly the right item. */
+  onProgress?: (
+    completedCount: number,
+    totalCount: number,
+    blobProgress: number,
+    currentIndex: number
+  ) => void;
   /** abort signal */
   signal?: AbortSignal;
   /** check if a peer is currently connected */
@@ -954,7 +962,7 @@ export async function snatchBlobBatch(
       results[i] = result;
       completedCount++;
       options?.onBlobComplete?.(i, result);
-      options?.onProgress?.(completedCount, totalCount, -1);
+      options?.onProgress?.(completedCount, totalCount, -1, i);
       continue;
     }
 
@@ -985,7 +993,7 @@ export async function snatchBlobBatch(
           results[i] = result;
           completedCount++;
           options?.onBlobComplete?.(i, result);
-          options?.onProgress?.(completedCount, totalCount, -1);
+          options?.onProgress?.(completedCount, totalCount, -1, i);
           continue;
         }
       } catch (err) {
@@ -1016,7 +1024,7 @@ export async function snatchBlobBatch(
           results[i] = result;
           completedCount++;
           options?.onBlobComplete?.(i, result);
-          options?.onProgress?.(completedCount, totalCount, -1);
+          options?.onProgress?.(completedCount, totalCount, -1, i);
           continue;
         }
       } catch (err) {
@@ -1083,7 +1091,7 @@ export async function snatchBlobBatch(
         signal: options?.signal,
         isPeerOnline: options?.isPeerOnline,
         onProgress: (fraction) => {
-          options?.onProgress?.(completedCount, totalCount, fraction);
+          options?.onProgress?.(completedCount, totalCount, fraction, idx);
         },
       };
 
@@ -1092,7 +1100,7 @@ export async function snatchBlobBatch(
         results[idx] = result;
         completedCount++;
         options?.onBlobComplete?.(idx, result);
-        options?.onProgress?.(completedCount, totalCount, -1);
+        options?.onProgress?.(completedCount, totalCount, -1, idx);
       } catch (err) {
         log.debug(
           TAG,
