@@ -14,6 +14,8 @@ import { getLocalNodeId, guessMimeFromFilename, type PeersMap } from "../../src/
 import { pickFiles, uploadFile } from "../../src/file-utils/upload";
 import { getMediaPlaybackUrl } from "../../src/media";
 import { createMediaDomOverlay, type MediaDomOverlayHandle } from "../../src/widgets/media-dom-overlay";
+import { createCutSegmentsTrack, type CutSegmentsTrackHandle, type EditableSegment } from "./cut-segments-track";
+import { createVideoTimeline, TIMELINE_SHELL_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
 import type {
   CompactInfo,
   WidgetController,
@@ -24,6 +26,7 @@ import { stfuSchema, type StfuState } from "./types";
 
 const PADDING = 8;
 const HEADER_HEIGHT = 20;
+const TIMELINE_INSET = 6;
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 
 // a fresh upload lock claim older than this is presumed abandoned (crashed
@@ -74,6 +77,9 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     let progressText = "";
     let loadedVideoKey = "";
     let mediaOverlay: MediaDomOverlayHandle | null = null;
+    let timeline: VideoTimelineHandle | null = null;
+    let cutTrack: CutSegmentsTrackHandle | null = null;
+    let timeUpdateHandler: (() => void) | null = null;
 
     // -- background ------------------------------------------------------------
 
@@ -102,6 +108,14 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     headerText.x = PADDING;
     headerText.y = PADDING;
     container.addChild(headerText);
+
+    // dedicated child container whose local (0,0) is the video area's own
+    // top-left (below the header row) — createMediaDomOverlay tracks *this*
+    // container's bounds, so the DOM video element is positioned correctly
+    // without needing a CSS margin hack on the video itself.
+    const videoArea = new Container();
+    videoArea.y = HEADER_HEIGHT;
+    container.addChild(videoArea);
 
     // -- placeholder (empty/loading state) --------------------------------------
 
@@ -162,9 +176,40 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     }
 
     function teardownMediaOverlay(): void {
+      if (mediaOverlay && timeUpdateHandler) {
+        mediaOverlay.video.removeEventListener("timeupdate", timeUpdateHandler);
+      }
+      timeUpdateHandler = null;
       mediaOverlay?.close();
       mediaOverlay = null;
       loadedVideoKey = "";
+    }
+
+    function teardownTimeline(): void {
+      cutTrack?.destroy();
+      cutTrack = null;
+      timeline?.destroy();
+      timeline = null;
+    }
+
+    function ensureTimeline(): VideoTimelineHandle {
+      if (timeline) return timeline;
+      timeline = createVideoTimeline(Math.max(0, currentWidth - TIMELINE_INSET * 2));
+      timeline.container.x = TIMELINE_INSET;
+      timeline.container.y = currentHeight - TIMELINE_SHELL_HEIGHT - PADDING;
+      timeline.setDuration(ctx.doc.current.videoDurationSec);
+      container.addChild(timeline.container);
+      cutTrack = createCutSegmentsTrack({
+        timeline,
+        getSegments: () => ctx.doc.current.editableSegments,
+        onChange: (next: EditableSegment[]) => {
+          ctx.doc.change((d) => {
+            d.editableSegments = next;
+          });
+        },
+        getDuration: () => ctx.doc.current.videoDurationSec,
+      });
+      return timeline;
     }
 
     async function mountMediaOverlay(): Promise<void> {
@@ -194,18 +239,19 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       mediaOverlay = createMediaDomOverlay({
         src,
         mime: state.videoMime || undefined,
-        container,
+        container: videoArea,
         canvasElement: ctx.canvasElement,
         getSize: () => ({
           width: currentWidth,
-          height: Math.max(0, currentHeight - HEADER_HEIGHT),
+          height: Math.max(0, currentHeight - HEADER_HEIGHT - TIMELINE_SHELL_HEIGHT - PADDING),
         }),
         muted: false,
         loop: false,
         controls: true,
         objectFit: "contain",
       });
-      mediaOverlay.video.style.marginTop = `${HEADER_HEIGHT}px`;
+
+      const tl = ensureTimeline();
 
       // best-effort duration — populated from the browser's own metadata
       // probe rather than a backend probe pipeline (not built yet).
@@ -214,14 +260,22 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         () => {
           if (destroyed) return;
           const dur = mediaOverlay?.video.duration;
-          if (dur && Number.isFinite(dur) && Math.abs(dur - ctx.doc.current.videoDurationSec) > 0.5) {
-            ctx.doc.change((d) => {
-              d.videoDurationSec = dur;
-            });
+          if (dur && Number.isFinite(dur)) {
+            tl.setDuration(dur);
+            if (Math.abs(dur - ctx.doc.current.videoDurationSec) > 0.5) {
+              ctx.doc.change((d) => {
+                d.videoDurationSec = dur;
+              });
+            }
           }
         },
         { once: true }
       );
+
+      timeUpdateHandler = () => {
+        if (mediaOverlay) tl.setCurrentTime(mediaOverlay.video.currentTime);
+      };
+      mediaOverlay.video.addEventListener("timeupdate", timeUpdateHandler);
     }
 
     function applyDocState(): void {
@@ -231,10 +285,17 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
 
       if (loadState === "ready") {
         void mountMediaOverlay();
+        refreshTimelineFromDoc();
       } else {
         teardownMediaOverlay();
+        teardownTimeline();
       }
       refresh();
+    }
+
+    function refreshTimelineFromDoc(): void {
+      timeline?.setDuration(ctx.doc.current.videoDurationSec);
+      cutTrack?.refresh();
     }
 
     applyDocState();
@@ -338,6 +399,10 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         drawPlaceholderBorder(w, h);
         placeholderText.x = w / 2;
         placeholderText.y = h / 2;
+        if (timeline) {
+          timeline.container.y = h - TIMELINE_SHELL_HEIGHT - PADDING;
+          timeline.resize(Math.max(0, w - TIMELINE_INSET * 2));
+        }
       },
 
       destroy() {
@@ -346,6 +411,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         uploadAbort?.abort();
         unsubscribe();
         teardownMediaOverlay();
+        teardownTimeline();
       },
     };
   },
