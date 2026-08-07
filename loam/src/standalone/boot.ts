@@ -53,6 +53,7 @@ import { buildShareUrl, decodeShareString, encodeShareString } from "../p2p/shar
 import { resolveFriendDisplay, SqliteSocialDoc } from "../p2p/sqlite-social-doc";
 import { dispatch, isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
 import { setPandocFormatsAvailable } from "../file-utils/upload";
+import { checkSayAvailable } from "../../widgets/tts/voices";
 import { freeUpLocalBlobCopy, checkBlobLocality } from "../file-utils/blob-locality";
 import { pauseSnatchDownload } from "../file-utils/snatch";
 import {
@@ -538,6 +539,15 @@ class SkeinRouter {
         setPandocFormatsAvailable(!!result?.available);
       } catch (err) {
         log.debug(TAG, "pandoc_check_available dispatch failed (non-fatal):", err);
+      }
+
+      // say (tts) capability — never gates the standalone tts widget's
+      // visibility, only its "generate audio" action (checked per-peer at
+      // render time, see widgets/tts/voices.ts).
+      try {
+        await checkSayAvailable();
+      } catch (err) {
+        log.debug(TAG, "say_check_available dispatch failed (non-fatal):", err);
       }
     }
 

@@ -481,6 +481,10 @@ export interface WidgetPropDef {
   min?: number;
   /** for number props: maximum allowed value (defaults to 100 if omitted) */
   max?: number;
+  /** for number props: increment applied by the +/- buttons and used to snap
+   *  typed values (defaults to 1 if omitted). use a fractional value (e.g.
+   *  0.1) for props like a speech rate multiplier. */
+  step?: number;
   /** for image props: maximum output width in pixels */
   imageMaxWidth?: number;
   /** for image props: maximum output height in pixels */

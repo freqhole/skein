@@ -947,7 +947,17 @@ export class PropertyTray {
 
     const lo = prop.min ?? 1;
     const hi = prop.max ?? 100;
-    const clamp = (n: number) => Math.max(lo, Math.min(hi, Math.round(n) || lo));
+    const step = prop.step ?? 1;
+    const stepDecimals = (() => {
+      const s = String(step);
+      const dot = s.indexOf(".");
+      return dot === -1 ? 0 : s.length - dot - 1;
+    })();
+    const clamp = (n: number) => {
+      const snapped = Number.isFinite(n) ? Math.round(n / step) * step : lo;
+      const rounded = Number(snapped.toFixed(stepDecimals));
+      return Math.max(lo, Math.min(hi, rounded));
+    };
 
     // minus button
     const minusBtn = this.createNumberButton("\u2212");
@@ -1062,8 +1072,8 @@ export class PropertyTray {
       btn.on("pointerleave", stopRepeat);
     };
 
-    wireHoldRepeat(minusBtn.container, -1);
-    wireHoldRepeat(plusBtn.container, 1);
+    wireHoldRepeat(minusBtn.container, -step);
+    wireHoldRepeat(plusBtn.container, step);
 
     const totalHeight = fieldY + FIELD_HEIGHT;
 

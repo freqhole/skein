@@ -313,6 +313,8 @@ pub(crate) enum DispatchError {
     Identity(String),
     #[error("fetch: {0}")]
     Fetch(String),
+    #[error("tts: {0}")]
+    Tts(String),
 }
 
 /// read the current node id without any side effects — never generates a
@@ -568,6 +570,28 @@ async fn dispatch(
             Ok(json!({ "available": crate::pdf::pandoc_backend_available().await }))
         }
 
+        // capability probe for the standalone tts widget's (and later
+        // stfu's) "generate audio" action — reports whether `say` was found
+        // on this machine, and if so, its full voice list (see `tts.rs`'s
+        // `say_check_available`). checked per-peer, live, every time —
+        // never cached in any doc — since it only ever gates a single
+        // action, never a whole widget's visibility (unlike
+        // `pdf_check_available` above): a doc authored on a say-less
+        // machine is still fully usable everywhere, and any tauri+`say`
+        // peer who later opens it gets a working "generate" button (see
+        // docs/stfu-widget-plan.md's tts scope note).
+        "say_check_available" => {
+            let voices = crate::tts::say_check_available().await;
+            Ok(json!({
+                "available": voices.is_some(),
+                "voices": voices.unwrap_or_default(),
+            }))
+        }
+
+        // generates real speech audio via `say` and adopts it into managed
+        // blob storage — see `tts::tts_generate`.
+        "tts_generate" => crate::tts::tts_generate(decode("tts_generate", payload)?, state).await,
+
         // read a small local text file (.txt/.text/.log) as utf-8 — used to
         // seed a notepad widget's initial text when one of these files is
         // picked/dropped, instead of routing it through the pdf/imagemagick
@@ -685,7 +709,7 @@ impl From<friendz::Friend> for FriendDto {
 }
 
 #[derive(Debug, Serialize)]
-struct BlobDto {
+pub(crate) struct BlobDto {
     blake3: String,
     iroh_hash: String,
     filename: Option<String>,
@@ -1433,7 +1457,7 @@ async fn blob_purge_local(args: BlobGetArgs, state: &AppState) -> Result<Value, 
 /// handler — easily blowing past the browser's 30 s strategy-1 timeout
 /// for video files. errors are logged and swallowed: the lazy
 /// `blob_iroh_ensure` path will still work as a fallback.
-async fn prewarm_fs_store(state: &AppState, blob: &BlobRecord) {
+pub(crate) async fn prewarm_fs_store(state: &AppState, blob: &BlobRecord) {
     prewarm_fs_store_for(&state.storage, blob).await;
 }
 
@@ -1597,7 +1621,7 @@ struct BlobInsertFromPathArgs {
 /// app on large files. widgets already handle "blob only reachable via
 /// tauri dispatch" gracefully (see `getBlobData()`'s tauri fallback), so a
 /// large file simply staying rust-only is fine.
-const MIRROR_DATA_MAX_BYTES: u64 = 25 * 1024 * 1024;
+pub(crate) const MIRROR_DATA_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
 /// thin tauri-facing wrapper around [`blob_insert_from_path_impl`]: its only
 /// job is turning `app`/`upload_id` into an `on_progress` closure that emits
