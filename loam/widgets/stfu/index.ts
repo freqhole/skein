@@ -19,7 +19,6 @@ import { getMediaPlaybackUrl } from "../../src/media";
 import { createMediaDomOverlay, type MediaDomOverlayHandle } from "../../src/widgets/media-dom-overlay";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import { createAudioClipsTrack, type AudioClipsTrackHandle } from "./audio-clips-track";
-import { createClipEditorPanel, type ClipEditorPanelHandle } from "./clip-editor-panel";
 import { createCutModeControl, CUT_MODE_CONTROL_RESERVED_WIDTH, type CutModeControlHandle } from "./cut-mode-control";
 import { createCutSegmentsTrack, type CutSegmentsTrackHandle, type EditableSegment } from "./cut-segments-track";
 import { createKeyboardShortcutsControl, type KeyboardShortcutsControlHandle } from "./keyboard-shortcuts-control";
@@ -114,7 +113,6 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     let timeline: VideoTimelineHandle | null = null;
     let cutTrack: CutSegmentsTrackHandle | null = null;
     let audioClipsTrack: AudioClipsTrackHandle | null = null;
-    let clipEditorPanel: ClipEditorPanelHandle | null = null;
     let cutModeControl: CutModeControlHandle | null = null;
     let referenceTrack: ReferenceTrackHandle | null = null;
     let segmentsPanel: SegmentsPanelHandle | null = null;
@@ -220,6 +218,13 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         videoActionState = "local";
         videoSnatchProgressText = "";
         updateVideoHeaderActions();
+        // the blob is now locally available but nothing else changed
+        // (blobId/blake3 are unchanged, so mountMediaOverlay()'s own
+        // dedup guard wouldn't otherwise retry) — force a fresh attempt so
+        // the video renders right away instead of only after the widget is
+        // unmounted/remounted (e.g. by leaving and returning to the canvas).
+        loadedVideoKey = "";
+        void mountMediaOverlay();
       } catch (err) {
         if (videoSnatchCancelled || destroyed) return;
         console.error("stfu widget: video snatch failed:", err);
@@ -642,8 +647,6 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       keyboardShortcutsControl = null;
       cutTrack?.destroy();
       cutTrack = null;
-      clipEditorPanel?.destroy();
-      clipEditorPanel = null;
       audioClipsTrack?.destroy();
       audioClipsTrack = null;
       referenceTrack?.destroy();
@@ -713,30 +716,11 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         ],
         getWorldContainer: () => findWorldContainer(),
         onDragOut: (clip, worldX, worldY) => void handleAudioClipDragOut(clip, worldX, worldY),
-        onClipTap: (clip, screenX, screenY) => {
-          if (!timeline) return;
-          const local = timeline.container.toLocal({ x: screenX, y: screenY });
-          clipEditorPanel?.open(clip, local.x, local.y);
-        },
-      });
-      clipEditorPanel = createClipEditorPanel({
-        overlayParent: timeline.container,
-        canvasElement: ctx.canvasElement,
-        onGenerated: (clip, text, result, voiceName, voiceLang, rate) => {
-          ctx.doc.change((d) => {
-            const idx = d.audioClips.findIndex((c) => c.id === clip.id);
-            if (idx === -1) return;
-            const target = d.audioClips[idx];
-            target.audioBlobId = result.blobId;
-            target.audioBlake3 = result.blake3;
-            target.audioMime = result.mime;
-            target.durationSec = result.duration;
-            target.ttsText = text;
-            target.ttsVoiceName = voiceName;
-            target.ttsVoiceLang = voiceLang;
-            target.ttsRate = rate;
-            if (!target.label) target.label = text.slice(0, 40);
-          });
+        // tapping a clip just selects + scrolls its row in the segments
+        // panel into view — authoring its tts text happens inline there,
+        // not in a popup (see segments-panel.ts's inline audio-clip rows).
+        onClipTap: (clip) => {
+          segmentsPanel?.setSelectedClip(clip.id);
         },
       });
       timeline.reserveToolbarStart(CUT_MODE_CONTROL_RESERVED_WIDTH);
@@ -790,8 +774,32 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         getEditableSegments: () => ctx.doc.current.editableSegments,
         getTranscriptSegments: () => ctx.doc.current.transcriptSegments,
         getReferenceSpeakers: () => ctx.doc.current.referenceSpeakers,
+        getAudioClips: () => ctx.doc.current.audioClips,
         onSeek: (t: number) => {
           if (mediaOverlay) mediaOverlay.video.currentTime = t;
+        },
+        onClipTextCommit: (clip, text) => {
+          ctx.doc.change((d) => {
+            const idx = d.audioClips.findIndex((c) => c.id === clip.id);
+            if (idx === -1) return;
+            d.audioClips[idx].ttsText = text;
+          });
+        },
+        onClipGenerate: (clip, text, result, voiceName, voiceLang, rate) => {
+          ctx.doc.change((d) => {
+            const idx = d.audioClips.findIndex((c) => c.id === clip.id);
+            if (idx === -1) return;
+            const target = d.audioClips[idx];
+            target.audioBlobId = result.blobId;
+            target.audioBlake3 = result.blake3;
+            target.audioMime = result.mime;
+            target.durationSec = result.duration;
+            target.ttsText = text;
+            target.ttsVoiceName = voiceName;
+            target.ttsVoiceLang = voiceLang;
+            target.ttsRate = rate;
+            if (!target.label) target.label = text.slice(0, 40);
+          });
         },
         storageKey: `skein.stfu.${ctx.widgetId}.segmentsPanel`,
       });
@@ -828,6 +836,12 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
 
       if (destroyed || loadedVideoKey !== key) return;
       if (!src) {
+        // don't keep `loadedVideoKey` claimed on failure — otherwise a later
+        // retry for this exact blob (e.g. right after a successful snatch
+        // makes it locally available) silently no-ops at the guard above,
+        // and the video only ever mounts after a full widget remount (the
+        // "had to leave the canvas and come back" bug).
+        loadedVideoKey = "";
         statusMessage = "could not load video";
         refresh();
         return;

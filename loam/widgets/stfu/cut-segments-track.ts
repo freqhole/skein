@@ -67,6 +67,20 @@ export interface CutSegmentsTrackHandle {
    *  for any reason (this track's own `onChange`, or a remote peer's edit
    *  landing via the doc's change subscription). */
   refresh(): void;
+  /** the currently-selected segment (whichever was last clicked/dragged),
+   *  or null if nothing is selected — drives keyboard shortcuts like
+   *  delete/trim-to-playhead. */
+  getSelectedSegment(): EditableSegment | null;
+  /** delete the currently-selected segment, if any — no-op otherwise. */
+  deleteSelected(): void;
+  /** trim the selected segment's start edge to `time` (clamped so it stays
+   *  at least `MIN_SEGMENT_SEC` before the end edge) — no-op if nothing is
+   *  selected. */
+  trimSelectedStartTo(time: number): boolean;
+  /** trim the selected segment's end edge to `time` (clamped so it stays
+   *  at least `MIN_SEGMENT_SEC` after the start edge) — no-op if nothing is
+   *  selected. */
+  trimSelectedEndTo(time: number): boolean;
   destroy(): void;
 }
 
@@ -442,6 +456,37 @@ export function createCutSegmentsTrack(options: CutSegmentsTrackOptions): CutSeg
 
   return {
     refresh,
+    getSelectedSegment() {
+      return selectedIndex !== null ? (getSegments()[selectedIndex] ?? null) : null;
+    },
+    deleteSelected() {
+      if (selectedIndex === null) return;
+      const index = selectedIndex;
+      commit(getSegments().filter((_, idx) => idx !== index));
+      setSelectedIndex(null);
+    },
+    trimSelectedStartTo(time: number): boolean {
+      if (selectedIndex === null) return false;
+      const segments = [...getSegments()];
+      const seg = segments[selectedIndex];
+      if (!seg) return false;
+      const newStart = Math.max(0, Math.min(time, seg[1] - MIN_SEGMENT_SEC));
+      segments[selectedIndex] = [newStart, seg[1]];
+      commit(segments);
+      return true;
+    },
+    trimSelectedEndTo(time: number): boolean {
+      if (selectedIndex === null) return false;
+      const segments = [...getSegments()];
+      const seg = segments[selectedIndex];
+      if (!seg) return false;
+      const duration = getDuration();
+      const maxEnd = duration > 0 ? duration : time;
+      const newEnd = Math.min(maxEnd, Math.max(time, seg[0] + MIN_SEGMENT_SEC));
+      segments[selectedIndex] = [seg[0], newEnd];
+      commit(segments);
+      return true;
+    },
     destroy() {
       offViewChange();
       timeline.trackHitArea.off("pointerdown", onTrackPointerDown);

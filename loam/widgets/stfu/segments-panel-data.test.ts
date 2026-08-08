@@ -32,7 +32,7 @@ describe("buildPanelSegments", () => {
 
   it("cutlist mode maps editableSegments and matches transcript text", () => {
     const transcriptSegments: TranscriptSegment[] = [{ start: 0, end: 2, speaker: "SPEAKER_00", text: "hello" }];
-    const result = buildPanelSegments("cutlist", [[5, 7], [0, 2]], transcriptSegments, referenceSpeakers);
+    const result = buildPanelSegments(new Set(["cutlist"]), [[5, 7], [0, 2]], transcriptSegments, referenceSpeakers);
     expect(result).toEqual([
       { start: 0, end: 2, speakerName: "", source: "cut list", text: "hello" },
       { start: 5, end: 7, speakerName: "", source: "cut list", text: "" },
@@ -44,7 +44,7 @@ describe("buildPanelSegments", () => {
       { start: 5, end: 7, speaker: "SPEAKER_01", text: "there" },
       { start: 0, end: 2, speaker: "SPEAKER_00", text: "hello" },
     ];
-    const result = buildPanelSegments("reference", [], transcriptSegments, referenceSpeakers);
+    const result = buildPanelSegments(new Set(["reference"]), [], transcriptSegments, referenceSpeakers);
     expect(result).toEqual([
       { start: 0, end: 2, speakerName: "Janeway", speakerColor: 0x123456, source: "reference", text: "hello" },
       { start: 5, end: 7, speakerName: "SPEAKER_01", speakerColor: undefined, source: "reference", text: "there" },
@@ -53,7 +53,7 @@ describe("buildPanelSegments", () => {
 
   it("reference mode falls back to the raw label when no speaker name is set, and leaves unlabeled segments blank", () => {
     const transcriptSegments: TranscriptSegment[] = [{ start: 0, end: 2, speaker: "", text: "hi" }];
-    const result = buildPanelSegments("reference", [], transcriptSegments, referenceSpeakers);
+    const result = buildPanelSegments(new Set(["reference"]), [], transcriptSegments, referenceSpeakers);
     expect(result).toEqual([
       { start: 0, end: 2, speakerName: "", speakerColor: undefined, source: "reference", text: "hi" },
     ]);
@@ -62,12 +62,12 @@ describe("buildPanelSegments", () => {
 
 describe("findActiveSegmentIndex", () => {
   it("finds the segment containing the current time", () => {
-    const segments = buildPanelSegments("cutlist", [[0, 2], [5, 7]], [], {});
+    const segments = buildPanelSegments(new Set(["cutlist"]), [[0, 2], [5, 7]], [], {});
     expect(findActiveSegmentIndex(segments, 6)).toBe(1);
   });
 
   it("returns -1 when no segment contains the current time", () => {
-    const segments = buildPanelSegments("cutlist", [[0, 2]], [], {});
+    const segments = buildPanelSegments(new Set(["cutlist"]), [[0, 2]], [], {});
     expect(findActiveSegmentIndex(segments, 10)).toBe(-1);
   });
 });

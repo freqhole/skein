@@ -86,8 +86,9 @@ export interface AudioClipsTrackOptions {
    *  is responsible for turning it into a standalone widget at the given
    *  world coordinates (see stfu/index.ts). */
   onDragOut?: (clip: AudioClip, worldX: number, worldY: number) => void;
-  /** called on a plain click (no drag) of an existing clip — opens the
-   *  per-clip "author this clip" popover (see clip-editor-panel.ts). */
+  /** called on a plain click (no drag) of an existing clip — the caller
+   *  typically selects + scrolls the clip's row into view in
+   *  segments-panel.ts, where its tts text is authored inline. */
   onClipTap?: (clip: AudioClip, screenX: number, screenY: number) => void;
 }
 
@@ -251,9 +252,6 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
   }
 
   function modeForLocalX(clip: AudioClip, localX: number): DragMode {
-    // a clip with no known real duration yet has nothing meaningful to
-    // trim — only moving/deleting applies until it has real audio.
-    if (clip.durationSec <= 0) return "move";
     const dur = displayDuration(clip);
     const x1 = timeline.timeToScreenX(clip.start);
     const x2 = timeline.timeToScreenX(clip.start + dur);
@@ -335,7 +333,10 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
         index: hit.index,
         startClientX: e.global.x,
         startStart: clip.start,
-        startDuration: clip.durationSec,
+        // a not-yet-authored clip has no real duration yet — use its
+        // nominal displayed width (see `displayDuration()`) as the resize
+        // basis so trimming it moves/shrinks the box the user actually sees.
+        startDuration: displayDuration(clip),
         pendingStart: clip.start,
         moved: false,
         draggingOut: false,

@@ -1,14 +1,15 @@
 /**
- * stfu's "SEGMENTS" panel — a below-timeline scrollable list of rows (time
- * range + matched transcript text), switchable between the editable cut
- * list and read-only reference data via a hover-pill flyout (same visual
- * language as `reference-track.ts`'s speaker popover), with an
+ * stfu's "SEGMENTS" panel — a below-timeline scrollable list of rows,
+ * switchable (multi-select) between the editable cut list, the read-only
+ * reference data, and the audio-clips track via a hover-pill flyout (same
+ * visual language as `reference-track.ts`'s speaker popover), with an
  * "autoscroll" toggle that follows the playhead. design-ports editor.js's
  * dub panel (`createDubRowContainer()`/`layoutDubRow()`/
- * `createSegmentsViewControl()`/`maybeSyncPanelScroll()`) — MINUS its
- * tts-editing/voice-preview machinery, which belongs to a future dubbing
- * feature, not this checklist item ("time range + matched transcript
- * text", a view toggle, and autoscroll only).
+ * `createSegmentsViewControl()`/`maybeSyncPanelScroll()`), including its
+ * inline tts-text authoring (`openDubEditOverlay()`'s reusable DOM
+ * `<textarea>`-over-a-pixi-box technique) directly in each audio-clip row
+ * — deliberately NOT a separate popup/dialog, so authoring a clip's text
+ * reads as part of scanning the list rather than a context switch.
  *
  * unlike `reference-track.ts` (nested inside `video-timeline.ts`'s layered
  * containers, so its popover needs an externally-supplied `overlayParent`
@@ -20,6 +21,7 @@
 import { Container, Graphics, Rectangle, Text, type FederatedPointerEvent } from "pixi.js";
 import { createExpandingPanel, type ExpandingPanelHandle } from "../../src/widgets/expanding-panel";
 import { createScrollableContent, type ScrollableContent } from "../../src/widgets/scrollable-content";
+import { createSkeinInput, type SkeinInputHandle } from "../../src/widgets/skein-input";
 import type { EditableSegment } from "./cut-segments-track";
 import { contrastTextColor } from "./reference-data";
 import {
@@ -29,7 +31,12 @@ import {
   type PanelSegment,
   type SegmentsViewMode,
 } from "./segments-panel-data";
-import type { ReferenceSpeaker, TranscriptSegment } from "./types";
+import { generateTtsAudio, type TtsGenerateResult } from "../tts/generate";
+import { cancelPreview, isGenerateAvailable, listVoiceNames, speakPreview, VOICE_DEFAULT } from "../tts/voices";
+import type { AudioClip, ReferenceSpeaker, TranscriptSegment } from "./types";
+import { log } from "@freqhole/reliquary/utils";
+
+const TAG = "stfu.segments-panel";
 
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2;
@@ -40,10 +47,16 @@ const MAGENTA_HOVER = 0xff33c9;
 
 export const SEGMENTS_TOOLBAR_HEIGHT = 20;
 const ROW_HEIGHT = 60;
+/** taller row for an audio clip — room for the time/meta line plus the
+ *  inline tts-text box and voice/rate/generate controls below it. */
+const AUDIO_ROW_HEIGHT = 150;
 const ROW_GAP = 6;
 const ROW_PAD_X = 8;
 const PAD_X = 8;
 const TOOLBAR_GAP = 4;
+const RATE_MIN = 0.5;
+const RATE_MAX = 2;
+const RATE_STEP = 0.25;
 /** how many rows' worth of vertical space the scrollable list reserves below the toolbar */
 const VISIBLE_ROWS = 2;
 export const SEGMENTS_PANEL_HEIGHT =
@@ -54,14 +67,28 @@ export interface SegmentsPanelOptions {
   getEditableSegments: () => EditableSegment[];
   getTranscriptSegments: () => TranscriptSegment[];
   getReferenceSpeakers: () => Record<string, ReferenceSpeaker>;
+  getAudioClips: () => AudioClip[];
   onSeek: (t: number) => void;
-  /** localStorage key for the view-mode + autoscroll prefs (browser-local UI state) */
+  /** commits an audio clip's edited tts text (fires on blur/Enter, same as
+   *  every other skein-input-backed text field in this codebase). */
+  onClipTextCommit: (clip: AudioClip, text: string) => void;
+  /** fires once tts generation succeeds for a clip's inline "generate"
+   *  button — caller writes the result onto the clip's doc fields. */
+  onClipGenerate: (
+    clip: AudioClip,
+    text: string,
+    result: TtsGenerateResult,
+    voiceName: string,
+    voiceLang: string,
+    rate: number
+  ) => void;
+  /** localStorage key for the view-modes + autoscroll prefs (browser-local UI state) */
   storageKey: string;
 }
 
 export interface SegmentsPanelHandle {
   container: Container;
-  /** re-draw rows — call after editableSegments/transcriptSegments/referenceSpeakers change. */
+  /** re-draw rows — call after editableSegments/transcriptSegments/referenceSpeakers/audioClips change. */
   refresh(): void;
   resize(width: number): void;
   /** call on every video timeupdate with the current playhead time — advances autoscroll. */
@@ -69,30 +96,42 @@ export interface SegmentsPanelHandle {
   /**
    * highlight the cut-list row matching `seg` (by [start, end], the same
    * identity `cut-segments-track.ts` reports its selection with) and
-   * scroll it into view; pass `null` to clear the highlight. a no-op while
-   * the panel is showing "reference" mode, since selection only applies to
-   * cut-list segments.
+   * scroll it into view; pass `null` to clear the highlight. a no-op
+   * while the cut list isn't currently a visible source.
    */
   setSelectedSegment(seg: EditableSegment | null): void;
+  /** highlight the audio-clip row matching `clipId` and scroll it into
+   *  view; pass `null` to clear. a no-op while audio clips aren't
+   *  currently a visible source. */
+  setSelectedClip(clipId: string | null): void;
   destroy(): void;
 }
 
 interface PanelPrefs {
-  viewMode: SegmentsViewMode;
+  viewModes: SegmentsViewMode[];
   autoscroll: boolean;
+}
+
+const ALL_MODE_IDS = SEGMENTS_VIEW_MODES.map((m) => m.id);
+
+function sanitizeModes(raw: unknown): SegmentsViewMode[] {
+  const valid = Array.isArray(raw) ? raw.filter((m): m is SegmentsViewMode => ALL_MODE_IDS.includes(m)) : [];
+  return valid.length > 0 ? valid : ["cutlist"];
 }
 
 function loadPrefs(storageKey: string): PanelPrefs {
   try {
     const raw = localStorage.getItem(storageKey);
-    if (!raw) return { viewMode: "cutlist", autoscroll: false };
+    if (!raw) return { viewModes: ["cutlist"], autoscroll: false };
     const parsed = JSON.parse(raw);
+    // migrate the old single-`viewMode` shape transparently
+    const modesSource = Array.isArray(parsed.viewModes) ? parsed.viewModes : [parsed.viewMode];
     return {
-      viewMode: parsed.viewMode === "reference" ? "reference" : "cutlist",
+      viewModes: sanitizeModes(modesSource),
       autoscroll: Boolean(parsed.autoscroll),
     };
   } catch {
-    return { viewMode: "cutlist", autoscroll: false };
+    return { viewModes: ["cutlist"], autoscroll: false };
   }
 }
 
@@ -163,15 +202,351 @@ function createToggleButton(
   return self;
 }
 
+interface AudioRowExtras {
+  root: Container;
+  input: SkeinInputHandle;
+  bind(clip: AudioClip, width: number, y: number): void;
+  destroy(): void;
+}
+
+/**
+ * inline tts-authoring controls for one audio-clip row: a `createSkeinInput()`
+ * text box (commits via `onEnter`, same convention `hub-profile-panel.ts`
+ * uses) plus a voice-cycle button, rate +/- steppers, and a "generate"
+ * button — ported from clip-editor-panel.ts's popover, but always visible
+ * as part of the row rather than behind a popup. one instance is created
+ * lazily per pooled row slot and re-`bind()`-ed to whichever clip currently
+ * occupies that slot.
+ */
+function createAudioRowExtras(
+  canvasElement: HTMLCanvasElement,
+  onClipTextCommit: SegmentsPanelOptions["onClipTextCommit"],
+  onClipGenerate: SegmentsPanelOptions["onClipGenerate"]
+): AudioRowExtras {
+  let currentClip: AudioClip | null = null;
+  let voiceName = VOICE_DEFAULT;
+  let rate = 1;
+  let generating = false;
+  let previewing = false;
+  let errorMessage = "";
+  let lastWidth = 0;
+
+  const root = new Container();
+
+  function drawButton(g: Graphics, w: number, h: number, hovered: boolean, disabled: boolean): void {
+    g.clear();
+    const color = disabled ? 0x2a2a2a : hovered ? 0x3a3a52 : 0x2a2a3e;
+    g.roundRect(0, 0, w, h, 4).fill({ color });
+  }
+
+  const input = createSkeinInput({
+    canvasElement,
+    width: 100,
+    height: 40,
+    placeholder: "what should this clip say?",
+    fontSize: 11,
+    onEnter: (value) => {
+      if (currentClip) onClipTextCommit(currentClip, value);
+    },
+  });
+  root.addChild(input.input);
+
+  const voiceButton = new Container();
+  voiceButton.eventMode = "static";
+  voiceButton.cursor = "pointer";
+  const voiceBg = new Graphics();
+  const voiceLabel = new Text({
+    text: "",
+    style: { fontFamily: FONT_FAMILY, fontSize: 10, fill: 0xe2e2e2 },
+    resolution: TEXT_RESOLUTION,
+  });
+  voiceBg.eventMode = "static";
+  voiceBg.cursor = "pointer";
+  voiceButton.addChild(voiceBg, voiceLabel);
+  root.addChild(voiceButton);
+
+  function layoutVoiceButton(): void {
+    voiceLabel.text = `voice: ${voiceName}`;
+    voiceLabel.x = 6;
+    voiceLabel.y = 4;
+    drawButton(voiceBg, Math.max(70, voiceLabel.width + 12), 20, false, false);
+  }
+  layoutVoiceButton();
+  voiceButton.on("pointerover", () => drawButton(voiceBg, Math.max(70, voiceLabel.width + 12), 20, true, false));
+  voiceButton.on("pointerout", () => drawButton(voiceBg, Math.max(70, voiceLabel.width + 12), 20, false, false));
+  voiceButton.on("pointertap", (e: FederatedPointerEvent) => {
+    e.stopPropagation();
+    const names = listVoiceNames();
+    const idx = names.indexOf(voiceName);
+    voiceName = names[(idx + 1) % names.length] ?? VOICE_DEFAULT;
+    layoutVoiceButton();
+  });
+
+  // preview (speechSynthesis) works everywhere, unlike `generate` below —
+  // never gated on `isGenerateAvailable()`, matches the tts widget's own
+  // "preview text aloud" action.
+  const previewButton = new Container();
+  previewButton.eventMode = "static";
+  previewButton.cursor = "pointer";
+  const previewBg = new Graphics();
+  const previewLabel = new Text({
+    text: "\u25b6 preview",
+    style: { fontFamily: FONT_FAMILY, fontSize: 10, fill: 0xe2e2e2 },
+    resolution: TEXT_RESOLUTION,
+  });
+  previewBg.eventMode = "static";
+  previewBg.cursor = "pointer";
+  previewButton.addChild(previewBg, previewLabel);
+  root.addChild(previewButton);
+
+  function layoutPreviewButton(hovered = false): void {
+    previewLabel.text = previewing ? "\u25a0 stop" : "\u25b6 preview";
+    previewLabel.x = 6;
+    previewLabel.y = 4;
+    drawButton(previewBg, Math.max(70, previewLabel.width + 12), 20, hovered, false);
+  }
+  layoutPreviewButton();
+  previewButton.on("pointerover", () => layoutPreviewButton(true));
+  previewButton.on("pointerout", () => layoutPreviewButton(false));
+  previewButton.on("pointertap", (e: FederatedPointerEvent) => {
+    e.stopPropagation();
+    if (previewing) {
+      cancelPreview();
+      previewing = false;
+      layoutPreviewButton();
+      return;
+    }
+    const text = input.value.trim();
+    if (!text) {
+      errorMessage = "enter some text first";
+      layout();
+      return;
+    }
+    previewing = true;
+    errorMessage = "";
+    layoutPreviewButton();
+    log.debug(TAG, `previewing clip ${currentClip?.id ?? "?"} via speechSynthesis (voice=${voiceName}, rate=${rate})`);
+    speakPreview(text, voiceName === VOICE_DEFAULT ? "" : voiceName, rate, () => {
+      previewing = false;
+      layoutPreviewButton();
+    });
+  });
+
+  const rateMinusButton = new Container();
+  rateMinusButton.eventMode = "static";
+  rateMinusButton.cursor = "pointer";
+  const rateMinusBg = new Graphics();
+  const rateMinusLabel = new Text({
+    text: "\u2212",
+    style: { fontFamily: FONT_FAMILY, fontSize: 11, fill: 0xe2e2e2 },
+    resolution: TEXT_RESOLUTION,
+  });
+  rateMinusLabel.position.set(7, 3);
+  rateMinusBg.eventMode = "static";
+  rateMinusBg.cursor = "pointer";
+  drawButton(rateMinusBg, 20, 20, false, false);
+  rateMinusButton.addChild(rateMinusBg, rateMinusLabel);
+  root.addChild(rateMinusButton);
+  rateMinusButton.on("pointerover", () => drawButton(rateMinusBg, 20, 20, true, false));
+  rateMinusButton.on("pointerout", () => drawButton(rateMinusBg, 20, 20, false, false));
+  rateMinusButton.on("pointertap", (e: FederatedPointerEvent) => {
+    e.stopPropagation();
+    rate = Math.max(RATE_MIN, Math.round((rate - RATE_STEP) * 100) / 100);
+    rateLabel.text = `${rate.toFixed(2)}x`;
+  });
+
+  const rateLabel = new Text({
+    text: "",
+    style: { fontFamily: FONT_FAMILY, fontSize: 10, fill: 0xe2e2e2 },
+    resolution: TEXT_RESOLUTION,
+  });
+  root.addChild(rateLabel);
+
+  const ratePlusButton = new Container();
+  ratePlusButton.eventMode = "static";
+  ratePlusButton.cursor = "pointer";
+  const ratePlusBg = new Graphics();
+  const ratePlusLabel = new Text({
+    text: "+",
+    style: { fontFamily: FONT_FAMILY, fontSize: 11, fill: 0xe2e2e2 },
+    resolution: TEXT_RESOLUTION,
+  });
+  ratePlusLabel.position.set(6, 3);
+  ratePlusBg.eventMode = "static";
+  ratePlusBg.cursor = "pointer";
+  drawButton(ratePlusBg, 20, 20, false, false);
+  ratePlusButton.addChild(ratePlusBg, ratePlusLabel);
+  root.addChild(ratePlusButton);
+  ratePlusButton.on("pointerover", () => drawButton(ratePlusBg, 20, 20, true, false));
+  ratePlusButton.on("pointerout", () => drawButton(ratePlusBg, 20, 20, false, false));
+  ratePlusButton.on("pointertap", (e: FederatedPointerEvent) => {
+    e.stopPropagation();
+    rate = Math.min(RATE_MAX, Math.round((rate + RATE_STEP) * 100) / 100);
+    rateLabel.text = `${rate.toFixed(2)}x`;
+  });
+
+  const generateButton = new Container();
+  generateButton.eventMode = "static";
+  generateButton.cursor = "pointer";
+  const generateBg = new Graphics();
+  const generateLabel = new Text({
+    text: "generate",
+    style: { fontFamily: FONT_FAMILY, fontSize: 11, fill: 0xffffff },
+    resolution: TEXT_RESOLUTION,
+  });
+  generateLabel.position.set(10, 5);
+  generateBg.eventMode = "static";
+  generateBg.cursor = "pointer";
+  generateButton.addChild(generateBg, generateLabel);
+  root.addChild(generateButton);
+  generateButton.on("pointerover", () => drawButton(generateBg, Math.max(70, generateLabel.width + 20), 24, true, generating));
+  generateButton.on("pointerout", () => drawButton(generateBg, Math.max(70, generateLabel.width + 20), 24, false, generating));
+  generateButton.on("pointertap", (e: FederatedPointerEvent) => {
+    e.stopPropagation();
+    void handleGenerate();
+  });
+
+  const errorText = new Text({
+    text: "",
+    style: { fontFamily: FONT_FAMILY, fontSize: 9, fill: 0xef4444, wordWrap: true },
+    resolution: TEXT_RESOLUTION,
+  });
+  root.addChild(errorText);
+
+  async function handleGenerate(): Promise<void> {
+    if (generating || !currentClip) {
+      log.debug(TAG, `handleGenerate ignored (generating=${generating}, hasClip=${!!currentClip})`);
+      return;
+    }
+    const text = input.value.trim();
+    if (!text) {
+      errorMessage = "enter some text first";
+      layout();
+      return;
+    }
+    const clipId = currentClip.id;
+    generating = true;
+    errorMessage = "";
+    layout();
+    log.debug(TAG, `generating tts for clip ${clipId} (voice=${voiceName}, rate=${rate}, chars=${text.length})`);
+    try {
+      const result = await generateTtsAudio(text, voiceName === VOICE_DEFAULT ? "" : voiceName, rate);
+      log.debug(TAG, `generated ok for clip ${clipId}: blobId=${result.blobId || "(empty)"} duration=${result.duration}`);
+      if (!result.blobId) {
+        errorMessage = "generation returned no audio — is the tauri app up to date?";
+        return;
+      }
+      const names = listVoiceNames();
+      const lang = names.includes(voiceName) ? voiceName : "";
+      onClipGenerate(currentClip, text, result, voiceName === VOICE_DEFAULT ? "" : voiceName, lang, rate);
+    } catch (err) {
+      log.error(TAG, `generate failed for clip ${clipId}: ${err instanceof Error ? err.message : String(err)}`);
+      errorMessage = err instanceof Error ? err.message : "generation failed";
+    } finally {
+      generating = false;
+      layout();
+    }
+  }
+
+  function layout(): void {
+    const w = lastWidth;
+    input.setWidth(Math.max(40, w));
+    input.input.x = 0;
+    input.input.y = 0;
+
+    let by = 44;
+
+    // preview (speechSynthesis) is always available, unlike `generate` below
+    previewButton.x = 0;
+    previewButton.y = by;
+    by += 20 + 4;
+
+    const generateAvailable = isGenerateAvailable();
+    voiceButton.visible = generateAvailable;
+    rateMinusButton.visible = generateAvailable;
+    rateLabel.visible = generateAvailable;
+    ratePlusButton.visible = generateAvailable;
+    generateButton.visible = generateAvailable;
+
+    if (generateAvailable) {
+      voiceButton.x = 0;
+      voiceButton.y = by;
+      const voiceW = Math.max(70, voiceLabel.width + 12);
+      rateMinusButton.x = voiceW + 6;
+      rateMinusButton.y = by;
+      rateLabel.text = `${rate.toFixed(2)}x`;
+      rateLabel.x = rateMinusButton.x + 24;
+      rateLabel.y = by + 4;
+      ratePlusButton.x = rateLabel.x + rateLabel.width + 8;
+      ratePlusButton.y = by;
+
+      generateLabel.text = generating ? "generating\u2026" : "generate";
+      const genW = Math.max(70, generateLabel.width + 20);
+      drawButton(generateBg, genW, 24, false, generating);
+      generateButton.x = Math.max(0, w - genW);
+      generateButton.y = by;
+      generateButton.eventMode = generating ? "none" : "static";
+      by += 24 + 4;
+    }
+
+    errorText.text = errorMessage;
+    errorText.style.wordWrapWidth = Math.max(1, w);
+    errorText.x = 0;
+    errorText.y = by;
+  }
+
+  return {
+    root,
+    input,
+    bind(clip: AudioClip, width: number, y: number) {
+      root.y = y;
+      lastWidth = width;
+      const isSameClip = currentClip?.id === clip.id;
+      currentClip = clip;
+      if (!isSameClip) {
+        voiceName = clip.ttsVoiceName || VOICE_DEFAULT;
+        rate = clip.ttsRate ?? 1;
+        errorMessage = "";
+        generating = false;
+        if (previewing) {
+          cancelPreview();
+          previewing = false;
+        }
+        layoutVoiceButton();
+        layoutPreviewButton();
+      }
+      if (!input.isEditing && input.value !== (clip.ttsText ?? "")) {
+        input.value = clip.ttsText ?? "";
+      }
+      layout();
+    },
+    destroy() {
+      if (previewing) cancelPreview();
+      input.destroy();
+    },
+  };
+}
+
 export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPanelHandle {
-  const { canvasElement, getEditableSegments, getTranscriptSegments, getReferenceSpeakers, onSeek, storageKey } =
-    options;
+  const {
+    canvasElement,
+    getEditableSegments,
+    getTranscriptSegments,
+    getReferenceSpeakers,
+    getAudioClips,
+    onSeek,
+    onClipTextCommit,
+    onClipGenerate,
+    storageKey,
+  } = options;
 
   let prefs = loadPrefs(storageKey);
   let contentWidth = 0;
   let currentSegments: PanelSegment[] = [];
+  let rowTops: number[] = [];
   let lastAutoScrolledIndex = -1;
   let selectedSegment: EditableSegment | null = null;
+  let selectedClipId: string | null = null;
 
   const container = new Container();
 
@@ -198,8 +573,10 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
   toolbar.addChild(viewModeLabel);
 
   function drawViewModeLabel(hover: boolean): void {
-    const mode = SEGMENTS_VIEW_MODES.find((m) => m.id === prefs.viewMode) ?? SEGMENTS_VIEW_MODES[0];
-    viewModeLabelText.text = mode.label.toUpperCase();
+    const label = SEGMENTS_VIEW_MODES.filter((m) => prefs.viewModes.includes(m.id))
+      .map((m) => m.label.toUpperCase())
+      .join(" + ");
+    viewModeLabelText.text = label || SEGMENTS_VIEW_MODES[0].label.toUpperCase();
     const caretW = 6;
     const caretH = 4;
     const gap = 6;
@@ -229,7 +606,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     viewModeFlyoutPanel.toggle();
   });
 
-  // -- view-mode flyout (2 chips: "cut list" / "reference") --------------------
+  // -- view-mode flyout (3 toggle chips: "cut list" / "reference" / "audio clips") --
 
   const viewModeFlyout = new Container();
   interface Chip {
@@ -253,11 +630,26 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     viewModeFlyout.addChild(chipContainer);
     chipContainer.on("pointertap", (e: FederatedPointerEvent) => {
       e.stopPropagation();
-      setViewMode(mode.id);
-      viewModeFlyoutPanel.close();
+      toggleMode(mode.id);
     });
     return { container: chipContainer, bg: chipBg, label: chipLabel, mode: mode.id };
   });
+
+  function toggleMode(mode: SegmentsViewMode): void {
+    const active = new Set(prefs.viewModes);
+    if (active.has(mode)) {
+      if (active.size === 1) return; // keep at least one source visible
+      active.delete(mode);
+    } else {
+      active.add(mode);
+    }
+    prefs = { ...prefs, viewModes: ALL_MODE_IDS.filter((id) => active.has(id)) };
+    savePrefs(storageKey, prefs);
+    lastAutoScrolledIndex = -1;
+    drawViewModeLabel(false);
+    layoutChips();
+    redraw();
+  }
 
   function layoutChips(): void {
     const chipHeight = 20;
@@ -268,7 +660,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
       const w = Math.ceil(chip.label.width) + chipPadX * 2;
       chip.label.x = w / 2;
       chip.label.y = chipHeight / 2;
-      const active = chip.mode === prefs.viewMode;
+      const active = prefs.viewModes.includes(chip.mode);
       chip.bg.clear().roundRect(0, 0, w, chipHeight, 4).fill({ color: active ? MAGENTA : 0x3a3a3a });
       chip.container.hitArea = new Rectangle(0, 0, w, chipHeight);
       chip.container.x = x;
@@ -334,6 +726,8 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     refText: Text;
     pillBg: Graphics;
     pillText: Text;
+    /** lazily-created inline authoring controls, only for audio-clip rows */
+    audio: AudioRowExtras | null;
   }
   const rowPool: Row[] = [];
 
@@ -343,6 +737,13 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
       rowContainer.eventMode = "static";
       rowContainer.cursor = "pointer";
       const rowBg = new Graphics();
+      // the seek-on-tap gesture lives on `rowBg` itself, not `rowContainer` — a
+      // container-wide `hitArea` (used by the plain cutlist/reference rows,
+      // see `layoutRow()`) makes pixi hit-test that rectangle directly and
+      // skip recursing into children entirely, which would swallow clicks
+      // meant for an audio-clip row's inline buttons/input underneath it.
+      rowBg.eventMode = "static";
+      rowBg.cursor = "pointer";
       const timeText = new Text({
         text: "",
         style: { fontFamily: FONT_FAMILY, fontSize: 10, fill: 0x999999 },
@@ -368,25 +769,44 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
       pillText.anchor.set(0.5);
       rowContainer.addChild(rowBg, timeText, metaText, refText, pillBg, pillText);
       scrollable.content.addChild(rowContainer);
-      const row: Row = { container: rowContainer, bg: rowBg, timeText, metaText, refText, pillBg, pillText };
+      const row: Row = { container: rowContainer, bg: rowBg, timeText, metaText, refText, pillBg, pillText, audio: null };
       rowPool.push(row);
     }
     return rowPool[i];
   }
 
-  function layoutRow(row: Row, seg: PanelSegment, index: number): void {
+  function ensureAudioExtras(row: Row): AudioRowExtras {
+    if (!row.audio) {
+      const extras = createAudioRowExtras(canvasElement, onClipTextCommit, onClipGenerate);
+      row.container.addChild(extras.root);
+      row.audio = extras;
+    }
+    return row.audio;
+  }
+
+  function layoutRow(row: Row, seg: PanelSegment, y: number): void {
     const w = Math.max(1, contentWidth);
-    row.container.y = index * (ROW_HEIGHT + ROW_GAP);
+    row.container.y = y;
     row.container.visible = true;
     row.container.hitArea = new Rectangle(0, 0, w, ROW_HEIGHT);
-    row.container.off("pointertap").on("pointertap", () => onSeek(seg.start));
+    row.container.off("pointertap").on("pointertap", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      onSeek(seg.start);
+    });
+    // clear any seek listener a prior audio-clip-row layout put directly on
+    // `bg` (see `layoutAudioClipRow`) — harmless no-op if never registered,
+    // but avoids a stale handler lingering on a reused pooled row.
+    row.bg.off("pointertap");
+    row.refText.visible = true;
+    if (row.audio) row.audio.root.visible = false;
 
     row.bg.clear();
     const isSelected =
-      prefs.viewMode === "cutlist" &&
+      prefs.viewModes.includes("cutlist") &&
       selectedSegment !== null &&
       selectedSegment[0] === seg.start &&
-      selectedSegment[1] === seg.end;
+      selectedSegment[1] === seg.end &&
+      seg.source === "cut list";
     row.bg
       .roundRect(0, 0, w, ROW_HEIGHT, 6)
       .fill({ color: isSelected ? 0x2a2233 : 0x222222 })
@@ -431,42 +851,95 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     row.refText.y = 22;
   }
 
-  function setViewMode(mode: SegmentsViewMode): void {
-    if (prefs.viewMode === mode) return;
-    prefs = { ...prefs, viewMode: mode };
-    savePrefs(storageKey, prefs);
-    lastAutoScrolledIndex = -1;
-    drawViewModeLabel(false);
-    redraw();
+  function layoutAudioClipRow(row: Row, seg: PanelSegment, y: number): void {
+    const w = Math.max(1, contentWidth);
+    const clip = seg.clip;
+    if (!clip) return;
+    row.container.y = y;
+    row.container.visible = true;
+    // no container-wide hitArea here (see the `rowBg` comment in `rowAt()`) —
+    // the seek gesture lives on the background graphic instead, so the
+    // inline audio-authoring buttons/input on top of it stay clickable.
+    row.container.hitArea = null;
+    row.container.off("pointertap");
+    row.bg.off("pointertap").on("pointertap", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      onSeek(seg.start);
+    });
+    row.pillBg.visible = false;
+    row.pillText.visible = false;
+    row.refText.visible = false;
+
+    row.bg.clear();
+    const isSelected = selectedClipId !== null && selectedClipId === clip.id;
+    row.bg
+      .roundRect(0, 0, w, AUDIO_ROW_HEIGHT, 6)
+      .fill({ color: isSelected ? 0x2a2233 : 0x222222 })
+      .stroke({ width: isSelected ? 2 : 1, color: isSelected ? MAGENTA : 0x333333 });
+
+    row.timeText.text = `${formatTime(seg.start)} \u2013 ${formatTime(seg.end)}`;
+    row.timeText.x = ROW_PAD_X;
+    row.timeText.y = 6;
+
+    row.metaText.anchor.set(1, 0);
+    row.metaText.text = clip.audioBlobId ? "audio clip \u00b7 recorded" : "audio clip \u00b7 pending";
+    row.metaText.x = w - ROW_PAD_X;
+    row.metaText.y = 6;
+
+    const extras = ensureAudioExtras(row);
+    extras.root.visible = true;
+    extras.root.x = ROW_PAD_X;
+    extras.bind(clip, Math.max(1, w - ROW_PAD_X * 2), 24);
+  }
+
+  function rowHeightFor(seg: PanelSegment): number {
+    return seg.source === "audio clip" ? AUDIO_ROW_HEIGHT : ROW_HEIGHT;
   }
 
   function redraw(): void {
+    const modes = new Set(prefs.viewModes);
     currentSegments = buildPanelSegments(
-      prefs.viewMode,
+      modes,
       getEditableSegments(),
       getTranscriptSegments(),
-      getReferenceSpeakers()
+      getReferenceSpeakers(),
+      getAudioClips()
     );
 
     emptyText.visible = currentSegments.length === 0;
-    emptyText.text =
-      prefs.viewMode === "reference" ? "no reference data loaded yet" : "no cut segments yet";
+    emptyText.text = modes.has("cutlist")
+      ? "no cut segments yet"
+      : modes.has("audioclips")
+        ? "no audio clips yet"
+        : "no reference data loaded yet";
     emptyText.x = ROW_PAD_X;
     emptyText.y = 8;
 
-    currentSegments.forEach((seg, i) => layoutRow(rowAt(i), seg, i));
-    for (let i = currentSegments.length; i < rowPool.length; i++) rowPool[i].container.visible = false;
+    let y = 0;
+    rowTops = [];
+    currentSegments.forEach((seg, i) => {
+      rowTops.push(y);
+      const row = rowAt(i);
+      if (seg.source === "audio clip") layoutAudioClipRow(row, seg, y);
+      else layoutRow(row, seg, y);
+      y += rowHeightFor(seg) + ROW_GAP;
+    });
+    for (let i = currentSegments.length; i < rowPool.length; i++) {
+      rowPool[i].container.visible = false;
+      if (rowPool[i].audio) rowPool[i].audio!.root.visible = false;
+    }
 
-    const totalHeight =
-      currentSegments.length > 0 ? currentSegments.length * (ROW_HEIGHT + ROW_GAP) - ROW_GAP : emptyText.height;
+    const totalHeight = currentSegments.length > 0 ? y - ROW_GAP : emptyText.height;
     scrollable.reflow(Math.max(1, contentWidth), Math.max(1, totalHeight));
 
     if (viewModeFlyoutPanel.isOpen) layoutChips();
   }
 
   function scrollRowIntoView(index: number): void {
-    const rowTop = index * (ROW_HEIGHT + ROW_GAP);
-    const rowBottom = rowTop + ROW_HEIGHT;
+    const seg = currentSegments[index];
+    if (!seg) return;
+    const rowTop = rowTops[index] ?? 0;
+    const rowBottom = rowTop + rowHeightFor(seg);
     const current = scrollable.getScrollY();
     let target = current;
     if (rowTop < current) target = rowTop;
@@ -507,8 +980,19 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     setSelectedSegment(seg: EditableSegment | null) {
       selectedSegment = seg;
       redraw();
-      if (seg && prefs.viewMode === "cutlist") {
-        const index = currentSegments.findIndex((s) => s.start === seg[0] && s.end === seg[1]);
+      if (seg && prefs.viewModes.includes("cutlist")) {
+        const index = currentSegments.findIndex(
+          (s) => s.source === "cut list" && s.start === seg[0] && s.end === seg[1]
+        );
+        if (index !== -1) scrollRowIntoView(index);
+      }
+    },
+
+    setSelectedClip(clipId: string | null) {
+      selectedClipId = clipId;
+      redraw();
+      if (clipId && prefs.viewModes.includes("audioclips")) {
+        const index = currentSegments.findIndex((s) => s.source === "audio clip" && s.clip?.id === clipId);
         if (index !== -1) scrollRowIntoView(index);
       }
     },
@@ -518,6 +1002,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
       // not covered by pixi's own destroy cascade below. everything else
       // (rows, chips, the flyout's backdrop/panel, the scrollBox itself) is
       // a descendant of `container`, so one recursive destroy handles it.
+      for (const row of rowPool) row.audio?.destroy();
       scrollable.destroy();
       container.destroy({ children: true });
     },

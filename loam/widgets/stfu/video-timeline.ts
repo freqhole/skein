@@ -239,6 +239,9 @@ export interface VideoTimelineHandle {
    *  this before snapping a drag/create/resize to a nearby edge (mirrors
    *  editor.js's `snapEnabled` gating `maybeSnap()`). */
   isSnapEnabled(): boolean;
+  /** flip the "snap" toolbar toggle — same effect as clicking it, for the
+   *  `s` keyboard shortcut. */
+  toggleSnap(): void;
   timeToScreenX(t: number): number;
   screenXToTime(x: number): number;
   /** fires after any pan/zoom/resize — track rows re-draw their content here. */
@@ -800,6 +803,9 @@ export function createVideoTimeline(
     zoomFit,
     isSnapEnabled() {
       return snapEnabled;
+    },
+    toggleSnap() {
+      setSnapEnabled(!snapEnabled);
     },
     timeToScreenX,
     screenXToTime,

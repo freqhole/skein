@@ -27,14 +27,22 @@ const ROW_GAP = 6;
 const KEY_COLUMN_WIDTH = 108;
 
 /** [key label, description] — mirrors trek-minus-paris's own `SHORTCUTS_LIST`,
- *  trimmed to what stfu's `handleKeyDown` (index.ts) actually implements
- *  today (playback/view only — no selection/undo stack yet). */
+ *  kept in sync with what stfu's `handleKeyDown` (index.ts) actually
+ *  implements today. no undo/redo yet (no undo stack exists in stfu). */
 const SHORTCUTS_LIST: Array<[string, string]> = [
   ["space", "play / pause"],
+  ["i", "mark in point"],
+  ["o", "mark out point (adds a cut segment)"],
+  ["delete / backspace", "remove selected segment"],
   ["\u2190 / \u2192", "seek 1s"],
   ["shift + \u2190 / \u2192", "seek 10s"],
+  [", / .", "step 1 frame back / forward"],
+  ["[", "trim selected segment's start to playhead"],
+  ["]", "trim selected segment's end to playhead"],
   ["+ / -", "zoom timeline in / out"],
   ["0", "fit timeline to view"],
+  ["s", "toggle snapping"],
+  ["/ or ?", "toggle this help"],
 ];
 
 /** mirrors trek-minus-paris's `MOUSE_INTERACTIONS_LIST`, trimmed/updated to
@@ -64,6 +72,8 @@ export interface KeyboardShortcutsControlOptions {
 export interface KeyboardShortcutsControlHandle {
   /** call whenever the timeline shell's own width changes. */
   resize(contentWidth: number): void;
+  /** toggle the panel open/closed — wired to the `/`/`?` keyboard shortcut. */
+  toggle(): void;
   destroy(): void;
 }
 
@@ -201,12 +211,25 @@ export function createKeyboardShortcutsControl(
       collapsed.visible = !open;
     },
   });
-  panel.x = 0;
-  panel.y = 0;
+
+  /** center the panel within the timeline shell's own bounds — previously
+   *  pinned at (0,0), which jammed it into the toolbar's top-left corner
+   *  instead of reading as a centered dialog. */
+  let lastContentWidth = 0;
+  function centerPanel(): void {
+    panel.x = Math.max(0, (lastContentWidth - PANEL_WIDTH) / 2);
+    panel.y = Math.max(0, (TIMELINE_SHELL_HEIGHT - panelHeight) / 2);
+  }
+  centerPanel();
 
   return {
     resize(contentWidth: number) {
+      lastContentWidth = contentWidth;
+      centerPanel();
       expandingPanel.resize(Math.max(0, contentWidth), TIMELINE_SHELL_HEIGHT);
+    },
+    toggle() {
+      expandingPanel.toggle();
     },
     destroy() {
       expandingPanel.destroy();
