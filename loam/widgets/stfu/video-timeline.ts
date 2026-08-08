@@ -103,6 +103,11 @@ const RULER_LABEL_POOL_SIZE = 16;
 /** fixed width reserved at the toolbar row's trailing (right) edge for an
  *  externally-mounted control — see `toolbarTrailingSlot`. */
 export const TOOLBAR_TRAILING_SLOT_WIDTH = 24;
+/** wider gap used to visually separate distinct button *groups* in the
+ *  toolbar row (three-way toggle→zoom out, fit→undo, redo→snap,
+ *  autoscroll→"?") — bigger than the plain 4-8px gap used *within* a
+ *  group (e.g. zoom out→zoom in→fit, undo→redo). */
+export const TOOLBAR_GROUP_GAP = 24;
 
 /** total fixed height of the whole shell (toolbar + reference + cut track +
  *  audio-clips track + ruler + scrollbar rows) — only the width is
@@ -197,6 +202,46 @@ function makeToggleButton(label: string, isOn: () => boolean, onClick: () => voi
     e.stopPropagation();
     onClick();
     draw(false);
+  });
+  (c as Container & { buttonWidth: number; redraw: () => void }).buttonWidth = w;
+  (c as Container & { redraw: () => void }).redraw = () => draw(false);
+  return c;
+}
+
+/** like `makeTextButton()`, but can be disabled (dimmed, non-interactive) —
+ *  used for "undo"/"redo", which are only actionable some of the time.
+ *  exposes a `redraw()` escape hatch so external state changes (the undo
+ *  history gaining/losing entries) can refresh the dimmed look without
+ *  waiting for a hover event. */
+function makeActionButton(label: string, onClick: () => void, isDisabled: () => boolean): Container {
+  const c = new Container();
+  const bg = new Graphics();
+  const text = new Text({
+    text: label,
+    style: { fontFamily: FONT_FAMILY, fontSize: 11, fill: 0xe2e2e2 },
+    resolution: TEXT_RESOLUTION,
+  });
+  const w = Math.max(22, text.width + 12);
+  const h = TOOLBAR_HEIGHT;
+  const draw = (hover: boolean) => {
+    const disabled = isDisabled();
+    bg.clear();
+    bg.roundRect(0, 0, w, h, 4).fill({ color: hover && !disabled ? 0x3a3a52 : 0x2a2a3e });
+    text.alpha = disabled ? 0.35 : 1;
+    c.cursor = disabled ? "default" : "pointer";
+  };
+  draw(false);
+  text.anchor.set(0.5);
+  text.x = w / 2;
+  text.y = h / 2;
+  c.addChild(bg, text);
+  c.eventMode = "static";
+  c.on("pointerover", () => draw(true));
+  c.on("pointerout", () => draw(false));
+  c.on("pointertap", (e) => {
+    e.stopPropagation();
+    if (isDisabled()) return;
+    onClick();
   });
   (c as Container & { buttonWidth: number; redraw: () => void }).buttonWidth = w;
   (c as Container & { redraw: () => void }).redraw = () => draw(false);
@@ -318,6 +363,11 @@ export interface VideoTimelineHandle {
   /** flip the "snap" toolbar toggle — same effect as clicking it, for the
    *  `s` keyboard shortcut. */
   toggleSnap(): void;
+  /** re-reads `canUndo()`/`canRedo()` and refreshes the undo/redo buttons'
+   *  dimmed look — call after any action that could change either (a push,
+   *  an undo, or a redo), since the buttons only otherwise redraw on
+   *  hover. */
+  refreshUndoRedo(): void;
   /** whether the "autoscroll" toolbar toggle is on — gates both this
    *  timeline's own scroll-to-playhead behavior (`setCurrentTime()`'s
    *  `scrollTimeIntoView()`) and, via `segments-panel.ts`'s
@@ -351,6 +401,16 @@ export interface VideoTimelineTrackLabelOptions {
   /** whether audio clips are currently a visible segments-panel source —
    *  drives the "AUDIO CLIPS" label's highlight. */
   isAudioClipsVisible?: () => boolean;
+  /** fires on "undo" button click (or the `cmd/ctrl+z` shortcut). */
+  onUndo?: () => void;
+  /** fires on "redo" button click (or the `cmd/ctrl+shift+z` shortcut). */
+  onRedo?: () => void;
+  /** whether there's anything to undo — dims/disables the "undo" button
+   *  when false. */
+  canUndo?: () => boolean;
+  /** whether there's anything to redo — dims/disables the "redo" button
+   *  when false. */
+  canRedo?: () => boolean;
 }
 
 export function createVideoTimeline(
@@ -399,7 +459,7 @@ export function createVideoTimeline(
     toolbarTrailingSlot.x = Math.max(0, contentWidth - TOOLBAR_TRAILING_SLOT_WIDTH);
     autoscrollBtn.x = Math.max(
       0,
-      toolbarTrailingSlot.x - 8 - (autoscrollBtn as Container & { buttonWidth: number }).buttonWidth
+      toolbarTrailingSlot.x - TOOLBAR_GROUP_GAP - (autoscrollBtn as Container & { buttonWidth: number }).buttonWidth
     );
   }
   layoutTrailing();
@@ -425,12 +485,22 @@ export function createVideoTimeline(
   const zoomOutBtn = makeTextButton("\u2212", () => zoomOut());
   const zoomInBtn = makeTextButton("+", () => zoomIn());
   const fitBtn = makeTextButton("fit", () => zoomFit());
+  const undoBtn = makeActionButton(
+    "undo",
+    () => trackLabelOptions?.onUndo?.(),
+    () => !(trackLabelOptions?.canUndo?.() ?? false)
+  );
+  const redoBtn = makeActionButton(
+    "redo",
+    () => trackLabelOptions?.onRedo?.(),
+    () => !(trackLabelOptions?.canRedo?.() ?? false)
+  );
   const snapBtn = makeToggleButton(
     "snap",
     () => snapEnabled,
     () => setSnapEnabled(!snapEnabled)
   );
-  toolbarRow.addChild(zoomOutBtn, zoomLabelText, zoomLevelText, zoomInBtn, fitBtn, snapBtn);
+  toolbarRow.addChild(zoomOutBtn, zoomLabelText, zoomLevelText, zoomInBtn, fitBtn, undoBtn, redoBtn, snapBtn);
 
   // reserved space at the row's start for an externally-mounted control
   // (stfu's cut-mode-control sits leftmost, matching editor.js's own
@@ -447,7 +517,11 @@ export function createVideoTimeline(
     zoomInBtn.x = x;
     x += (zoomInBtn as any).buttonWidth + 8;
     fitBtn.x = x;
-    x += (fitBtn as any).buttonWidth + 8;
+    x += (fitBtn as any).buttonWidth + TOOLBAR_GROUP_GAP;
+    undoBtn.x = x;
+    x += (undoBtn as any).buttonWidth + 6;
+    redoBtn.x = x;
+    x += (redoBtn as any).buttonWidth + TOOLBAR_GROUP_GAP;
     snapBtn.x = x;
   }
   layoutToolbar();
@@ -934,6 +1008,10 @@ export function createVideoTimeline(
     },
     toggleSnap() {
       setSnapEnabled(!snapEnabled);
+    },
+    refreshUndoRedo() {
+      (undoBtn as Container & { redraw: () => void }).redraw();
+      (redoBtn as Container & { redraw: () => void }).redraw();
     },
     isAutoScrollEnabled() {
       return autoScrollEnabled;

@@ -12,7 +12,6 @@
  * keydown handler in index.ts, so keep the two in sync by hand whenever a
  * shortcut is added/changed/removed.
  */
-
 import { Container, Graphics, Text } from "pixi.js";
 import { createExpandingPanel, type ExpandingPanelHandle } from "../../src/widgets/expanding-panel";
 
@@ -27,7 +26,7 @@ const KEY_COLUMN_WIDTH = 108;
 
 /** [key label, description] — mirrors trek-minus-paris's own `SHORTCUTS_LIST`,
  *  kept in sync with what stfu's `handleKeyDown` (index.ts) actually
- *  implements today. no undo/redo yet (no undo stack exists in stfu). */
+ *  implements today. */
 const SHORTCUTS_LIST: Array<[string, string]> = [
   ["space", "play / pause"],
   ["i", "mark in point"],
@@ -41,6 +40,8 @@ const SHORTCUTS_LIST: Array<[string, string]> = [
   ["+ / -", "zoom timeline in / out"],
   ["0", "fit timeline to view"],
   ["s", "toggle snapping"],
+  ["cmd/ctrl+z", "undo"],
+  ["cmd/ctrl+shift+z", "redo"],
   ["/ or ?", "toggle this help"],
 ];
 

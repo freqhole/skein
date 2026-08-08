@@ -85,6 +85,13 @@ export interface CutSegmentsTrackHandle {
    *  "only one timeline segment selected at once" when the audio-clips
    *  track selects something instead. */
   clearSelection(): void;
+  /** show/update a not-yet-committed mark-in/mark-out preview segment
+   *  spanning `range` (order-independent, pass the same value twice for a
+   *  zero-width just-marked-in point) — driven by the `i`/`o` keyboard
+   *  shortcuts in index.ts so the in-progress segment is visible from the
+   *  moment `i` is pressed, not just once `o` commits it. pass `null` to
+   *  hide it (on commit or a fresh `i` overwriting a stale one). */
+  setPendingSegment(range: EditableSegment | null): void;
   destroy(): void;
 }
 
@@ -93,6 +100,12 @@ export function createCutSegmentsTrack(options: CutSegmentsTrackOptions): CutSeg
 
   const rows: Graphics[] = []; // parallel to getSegments(), rebuilt each refresh()
   let createPreviewRow: Graphics | null = null;
+  /** current mark-in/mark-out preview range, or null when none is pending —
+   *  redrawn on every `refresh()` too (e.g. after a pan/zoom) since its
+   *  screen position depends on the camera, not just the committed
+   *  segments array. */
+  let pendingRange: EditableSegment | null = null;
+  let pendingRow: Graphics | null = null;
   let drag: DragState | null = null;
   /** index of the segment currently hovered (no active drag) — drives the
    *  delete-glyph/highlight visibility and cursor, matching editor.js's
@@ -454,6 +467,14 @@ export function createCutSegmentsTrack(options: CutSegmentsTrackOptions): CutSeg
     segments.forEach((seg, i) =>
       drawSegment(rows[i], seg, i === hoveredIndex, i === hoveredIndex ? hoveredRegion : null, i === selectedIndex)
     );
+    if (pendingRange) {
+      if (!pendingRow) {
+        pendingRow = new Graphics();
+        pendingRow.eventMode = "none";
+        timeline.trackContentLayer.addChild(pendingRow);
+      }
+      drawSegment(pendingRow, clampSegment(pendingRange), false, null, false);
+    }
   }
 
   refresh();
@@ -494,6 +515,20 @@ export function createCutSegmentsTrack(options: CutSegmentsTrackOptions): CutSeg
     clearSelection() {
       setSelectedIndex(null);
     },
+    setPendingSegment(range: EditableSegment | null): void {
+      pendingRange = range;
+      if (!range) {
+        pendingRow?.destroy();
+        pendingRow = null;
+        return;
+      }
+      if (!pendingRow) {
+        pendingRow = new Graphics();
+        pendingRow.eventMode = "none";
+        timeline.trackContentLayer.addChild(pendingRow);
+      }
+      drawSegment(pendingRow, clampSegment(range), false, null, false);
+    },
     destroy() {
       offViewChange();
       timeline.trackHitArea.off("pointerdown", onTrackPointerDown);
@@ -504,6 +539,8 @@ export function createCutSegmentsTrack(options: CutSegmentsTrackOptions): CutSeg
       timeline.trackHitArea.off("pointerout", onTrackPointerOut);
       createPreviewRow?.destroy();
       createPreviewRow = null;
+      pendingRow?.destroy();
+      pendingRow = null;
       rows.forEach((g) => g.destroy());
       rows.length = 0;
     },

@@ -27,6 +27,7 @@ import { createReferenceTrack, type ReferenceTrackHandle } from "./reference-tra
 import { createSegmentsPanel, SEGMENTS_PANEL_HEIGHT, type SegmentsPanelHandle } from "./segments-panel";
 import { cancelPreview, speakPreview } from "../tts/voices";
 import { AUDIO_CLIP_TRACK_HEIGHT, createVideoTimeline, TIMELINE_SHELL_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
+import { createUndoHistory, type UndoHistory } from "./undo-history";
 import { createVoicePickerDialog, type VoicePickerDialogHandle } from "./voice-picker-dialog";
 import type {
   CompactInfo,
@@ -413,6 +414,90 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     }
 
     let segmentsPanelHeight = loadSegmentsPanelHeight();
+
+    // -- undo/redo (local session only — does not undo peers' concurrent edits;
+    // same accepted tradeoff as doodle.ts's own local-only undo stack) ----------
+    //
+    // direct port of trek-minus-paris's editor.js `pushHistory()`/`undo()`/
+    // `redo()`, widened from editor.js's single `editableSegments` array to
+    // cover `audioClips` too (a feature editor.js never had). snapshots the
+    // whole pair of arrays together rather than tracking per-entry diffs:
+    // `editableSegments` has no stable id (plain `[start, end]` tuples), so
+    // there's no reliable way to target "this one entry" the way doodle.ts
+    // does for its id-keyed strokes — a full-array snapshot is what
+    // `cut-segments-track.ts`/`audio-clips-track.ts` already commit through
+    // their own `onChange` anyway (see their shared `commit()` helpers), so
+    // this matches the codebase's existing "whole array replace" convention
+    // rather than introducing a second, different mutation style.
+    interface HistorySnapshot {
+      editableSegments: EditableSegment[];
+      audioClips: AudioClip[];
+    }
+
+    function snapshotHistoryState(): HistorySnapshot {
+      return {
+        editableSegments: ctx.doc.current.editableSegments.map((s) => [s[0], s[1]] as EditableSegment),
+        audioClips: ctx.doc.current.audioClips.map((c) => ({ ...c })),
+      };
+    }
+
+    const history: UndoHistory<HistorySnapshot> = createUndoHistory(
+      200,
+      (a, b) => JSON.stringify(a) === JSON.stringify(b)
+    );
+    let historyInitialized = false;
+
+    /** call once, right after `ctx.doc.current.editableSegments`/`audioClips`
+     *  are known to reflect the real starting state (inside `ensureTimeline()`,
+     *  same as editor.js's own one-time `history = [snapshotSegments()]`
+     *  init) — safe to call more than once, only the first call does anything. */
+    function initHistory(): void {
+      if (historyInitialized) return;
+      historyInitialized = true;
+      history.reset(snapshotHistoryState());
+      timeline?.refreshUndoRedo();
+    }
+
+    /** record the current doc state as a new undoable entry — call after
+     *  any local edit to `editableSegments`/`audioClips` completes (mirrors
+     *  every `pushHistory()` call site in editor.js). never call this from
+     *  the doc's own "change" subscription (`applyDocState`), which also
+     *  fires for remote peers' edits — that would let a peer's edit sneak
+     *  into this session's own undo stack. */
+    function pushHistory(): void {
+      history.push(snapshotHistoryState());
+      timeline?.refreshUndoRedo();
+    }
+
+    /** applies a history snapshot back to the doc — used by both `undo()`
+     *  and `redo()`. mutates the existing doc arrays in place (splice)
+     *  rather than reassigning them outright: reassigning a doc array to a
+     *  new array built from that array's own (proxied) elements throws in
+     *  automerge, but splicing in plain-value copies from a snapshot is
+     *  safe (see automerge-gotchas memory notes). */
+    function applyHistorySnapshot(snap: HistorySnapshot): void {
+      ctx.doc.change((d) => {
+        d.editableSegments.splice(0, d.editableSegments.length, ...snap.editableSegments.map((s) => [...s] as [number, number]));
+        d.audioClips.splice(0, d.audioClips.length, ...snap.audioClips.map((c) => ({ ...c })));
+      });
+      cutTrack?.refresh();
+      audioClipsTrack?.refresh();
+      segmentsPanel?.refresh();
+    }
+
+    function undo(): void {
+      const snap = history.undo();
+      if (!snap) return;
+      applyHistorySnapshot(snap);
+      timeline?.refreshUndoRedo();
+    }
+
+    function redo(): void {
+      const snap = history.redo();
+      if (!snap) return;
+      applyHistorySnapshot(snap);
+      timeline?.refreshUndoRedo();
+    }
 
     // -- cut-overlay DOM element (the "overlay cuts" playback effect) ------------
     // a red-tinted fade-in indicator over the video while the playhead is
@@ -893,6 +978,10 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           onToggleAudioClipsVisible: () => segmentsPanel?.toggleViewMode("audioclips"),
           isCutListVisible: () => segmentsPanel?.isViewModeActive("cutlist") ?? false,
           isAudioClipsVisible: () => segmentsPanel?.isViewModeActive("audioclips") ?? false,
+          onUndo: undo,
+          onRedo: redo,
+          canUndo: () => history.canUndo(),
+          canRedo: () => history.canRedo(),
         }
       );
       timeline.container.x = TIMELINE_INSET;
@@ -906,6 +995,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           ctx.doc.change((d) => {
             d.editableSegments = next;
           });
+          pushHistory();
         },
         getDuration: () => ctx.doc.current.videoDurationSec,
         // snap to the reference/diarization track's own segment edges and
@@ -933,6 +1023,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           ctx.doc.change((d) => {
             d.audioClips = next;
           });
+          pushHistory();
         },
         getDuration: () => ctx.doc.current.videoDurationSec,
         // snap clip placement to the cut list's own edges, the reference
@@ -996,6 +1087,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           // in this file (`handleToggleSkip` etc) — otherwise the new
           // segment doesn't visually appear until some unrelated redraw.
           cutTrack?.refresh();
+          pushHistory();
         },
         // same drag gesture, but dropped onto the audio-clips row instead —
         // snap a new clip to the same [start, end].
@@ -1010,6 +1102,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
             });
           });
           audioClipsTrack?.refresh();
+          pushHistory();
         },
         // matches editor.js's own reference-track click behavior — a plain
         // click (no drag) on a segment seeks the video to its start.
@@ -1147,10 +1240,13 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         onOpenChange: handleFullWidgetDialogOpenChange,
       });
       voicePickerDialog.resize(currentWidth, currentHeight);
-      // draws/positions the two splitter handles for the first time (their
+      // draws/positions the splitter handle for the first time (its
       // Graphics start out empty with no hitArea until `applyLayout()` runs
       // at least once) and re-confirms every other piece's layout too.
       applyLayout(currentWidth, currentHeight);
+      // seed the undo/redo baseline once, now that `ctx.doc.current`'s
+      // `editableSegments`/`audioClips` reflect the real starting state.
+      initHistory();
       return timeline;
     }
 
@@ -1234,6 +1330,9 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         applyCutPlaybackEffects();
         applyAudioClipPlayback();
         if (mediaOverlay) segmentsPanel?.onTimeUpdate(mediaOverlay.video.currentTime);
+        if (mediaOverlay && pendingInTime !== null) {
+          cutTrack?.setPendingSegment([pendingInTime, mediaOverlay.video.currentTime]);
+        }
       };
       mediaOverlay.video.addEventListener("timeupdate", timeUpdateHandler);
       // "timeupdate" stops firing once paused, so a clip mid-playback needs
@@ -1390,6 +1489,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         d.editableSegments.push([s, eTime]);
       });
       cutTrack?.refresh();
+      pushHistory();
     }
 
     function handleKeyDown(e: KeyboardEvent): void {
@@ -1426,12 +1526,14 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         case "i":
         case "I":
           pendingInTime = video.currentTime;
+          cutTrack?.setPendingSegment([pendingInTime, pendingInTime]);
           break;
         case "o":
         case "O":
           if (pendingInTime !== null) {
             createCutSegment(pendingInTime, video.currentTime);
             pendingInTime = null;
+            cutTrack?.setPendingSegment(null);
           }
           break;
         case "Delete":
@@ -1462,6 +1564,12 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         case "/":
         case "?":
           keyboardShortcutsControl?.toggle();
+          break;
+        case "z":
+        case "Z":
+          if (!(e.metaKey || e.ctrlKey)) return;
+          if (e.shiftKey) redo();
+          else undo();
           break;
         default:
           return;
@@ -1665,6 +1773,11 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
               ctx.doc.change((d) => {
                 d.audioClips.push(clip);
               });
+              // matches every other local mutation handler in this file —
+              // the doc-change subscription alone doesn't reliably redraw
+              // our own local edit in the same tick.
+              audioClipsTrack?.refresh();
+              pushHistory();
 
               store.removeWidget(draggedWidgetId);
               return true;

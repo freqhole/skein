@@ -1,8 +1,8 @@
 /**
  * stfu's cut-playback-mode picker — skip / overlay / mute toggles for how
  * playback treats a cut segment. direct port of trek-minus-paris's
- * `editor.js` `createCutModeControl()`: a small collapsed icon button, sat
- * leftmost in the toolbar row (matching `layoutToolbar()`'s own ordering),
+ * `editor.js` `createCutModeControl()`: a small collapsed icon button,
+ * right-aligned above the track label column (see `CUT_MODE_CONTROL_RESERVED_WIDTH`),
  * that expands *in place* into a row of 3 icon+label+hint option chips plus
  * a click-away backdrop. "skip" is mutually exclusive with the other two
  * (turning it on forces "overlay"/"mute" off, since there's nothing left to
@@ -11,8 +11,9 @@
  * `drawMuteCutsIcon`/`drawNoCutModeIcon`) rather than redrawn here.
  *
  * the collapsed button mounts into `video-timeline.ts`'s `toolbarRow`
- * (leftmost, after reserving space via `reserveToolbarStart()`); the
- * expanded panel mounts into `overlayParent` (pass `timeline.container`,
+ * (leftmost slot, after reserving space via `reserveToolbarStart()`, though
+ * its own `x` sits further right — see `CUT_MODE_CONTROL_RESERVED_WIDTH`);
+ * the expanded panel mounts into `overlayParent` (pass `timeline.container`,
  * already the topmost sibling in stfu's own widget z-order) via the generic
  * `expanding-panel.ts` helper, so it draws above the track/ruler/scrollbar
  * rows without editor.js's `app.stage`-reparenting trick.
@@ -26,7 +27,7 @@ import {
   drawSkipCutsIcon,
 } from "../../src/widgets/icons";
 import { createExpandingPanel, type ExpandingPanelHandle } from "../../src/widgets/expanding-panel";
-import { TIMELINE_SHELL_HEIGHT } from "./video-timeline";
+import { TIMELINE_SHELL_HEIGHT, TOOLBAR_GROUP_GAP, TRACK_LABEL_COLUMN_WIDTH } from "./video-timeline";
 
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2;
@@ -36,10 +37,14 @@ const MAGENTA = 0xe619b3;
 const MAGENTA_HOVER = 0xff33c9;
 
 const COLLAPSED_SIZE = 20;
-const COLLAPSED_GAP = 10;
 /** total leading width the collapsed button reserves in the toolbar row —
- *  pass to `timeline.reserveToolbarStart()`. */
-export const CUT_MODE_CONTROL_RESERVED_WIDTH = COLLAPSED_SIZE + COLLAPSED_GAP;
+ *  pass to `timeline.reserveToolbarStart()`. the button itself sits with
+ *  its right edge flush against `TRACK_LABEL_COLUMN_WIDTH` (aligned with the
+ *  track rows' own REFERENCE/CUT LIST/AUDIO CLIPS label column) rather than
+ *  flush against the toolbar's left edge, then a `TOOLBAR_GROUP_GAP` gap
+ *  before the zoom-out button — same gap used between every other button
+ *  *group* in the toolbar row. */
+export const CUT_MODE_CONTROL_RESERVED_WIDTH = TRACK_LABEL_COLUMN_WIDTH + TOOLBAR_GROUP_GAP;
 
 const CHIP_WIDTH = 138;
 const CHIP_HEIGHT = 92;
@@ -183,6 +188,7 @@ export function createCutModeControl(options: CutModeControlOptions): CutModeCon
   collapsed.addChild(collapsedBg, collapsedIconA, collapsedIconB);
   collapsed.eventMode = "static";
   collapsed.cursor = "pointer";
+  collapsed.x = TRACK_LABEL_COLUMN_WIDTH - COLLAPSED_SIZE;
   toolbar.addChild(collapsed);
 
   let collapsedHover = false;
