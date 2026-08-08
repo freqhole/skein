@@ -24,10 +24,19 @@ export const audioClipSchema = z.object({
   start: z.number(),
   durationSec: z.number().default(0),
   label: z.string().default(""),
+  /** which authoring source this clip is committed to, once one has been
+   *  picked — undefined means "not yet decided" (a brand-new placeholder
+   *  clip with neither tts text nor a recording). switching a clip to
+   *  "recording" clears any tts* fields below (mutually exclusive); there's
+   *  no UI to switch back to "tts" on the same clip — delete it and create
+   *  a fresh one instead. */
+  kind: z.enum(["tts", "recording"]).optional(),
   // -- recorded/uploaded audio source (mutually exclusive with tts* below) --
   audioBlobId: z.string().optional(),
   audioBlake3: z.string().optional(),
   audioMime: z.string().optional(),
+  audioFilename: z.string().optional(),
+  audioSize: z.number().optional(),
   // -- tts source (mutually exclusive with audioBlobId above) --------------
   ttsText: z.string().optional(),
   ttsVoiceName: z.string().optional(),

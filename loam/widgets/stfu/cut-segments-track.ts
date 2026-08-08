@@ -85,6 +85,11 @@ export interface CutSegmentsTrackHandle {
    *  "only one timeline segment selected at once" when the audio-clips
    *  track selects something instead. */
   clearSelection(): void;
+  /** select the segment matching `[start, end]` exactly, if one exists —
+   *  used by segments-panel.ts's row click so selecting a row there also
+   *  highlights it here (mirrors the timeline→panel direction the
+   *  `onSelectionChange` option already covers). no-op if no exact match. */
+  selectSegment(seg: EditableSegment): void;
   /** show/update a not-yet-committed mark-in/mark-out preview segment
    *  spanning `range` (order-independent, pass the same value twice for a
    *  zero-width just-marked-in point) — driven by the `i`/`o` keyboard
@@ -514,6 +519,10 @@ export function createCutSegmentsTrack(options: CutSegmentsTrackOptions): CutSeg
     },
     clearSelection() {
       setSelectedIndex(null);
+    },
+    selectSegment(seg: EditableSegment): void {
+      const index = getSegments().findIndex((s) => s[0] === seg[0] && s[1] === seg[1]);
+      if (index !== -1) setSelectedIndex(index);
     },
     setPendingSegment(range: EditableSegment | null): void {
       pendingRange = range;

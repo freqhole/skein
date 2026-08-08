@@ -23,9 +23,11 @@
  */
 
 import type { FederatedPointerEvent } from "pixi.js";
-import { Container, Graphics, Text } from "pixi.js";
+import { Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import { AUDIO_CLIP_TRACK_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
 import type { AudioClip } from "./types";
+import { getThumbnailDataUrl } from "../../src/file-utils/thumbnail-utils";
+import type { PeersMap } from "../../src/file-utils/file-shared";
 
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2;
@@ -101,6 +103,16 @@ export interface AudioClipsTrackOptions {
    *  at most one timeline segment selected across both this track and the
    *  cut-segments track (see stfu/index.ts). */
   onSelectionChange?: (clip: AudioClip | null) => void;
+  /** called when a clip is genuinely deleted (delete-glyph click or the
+   *  delete/backspace keyboard shortcut) — NOT fired for a drag-out (that's
+   *  a move, not a delete; see `onDragOut` above). the caller uses this to
+   *  purge the clip's underlying blob, if it has one (see stfu/index.ts). */
+  onClipDelete?: (clip: AudioClip) => void;
+  /** connected canvas peers, for the P2P thumbnail-fetch fallback used by
+   *  the waveform image (see `ensureWaveformTexture` below) — omit to skip
+   *  the P2P fallback (waveform simply won't render for a blob this node
+   *  doesn't have locally and can't generate itself). */
+  getPeers?: () => PeersMap | undefined;
 }
 
 export interface AudioClipsTrackHandle {
@@ -118,6 +130,18 @@ export interface AudioClipsTrackHandle {
    *  "only one timeline segment selected at once" when the cut-segments
    *  track selects something instead. */
   clearSelection(): void;
+  /** select the clip with this id, if it exists — used by segments-panel.ts's
+   *  row click so selecting a row there also highlights it here (mirrors the
+   *  timeline→panel direction `onSelectionChange` already covers). no-op
+   *  if no clip with that id exists. */
+  selectClip(clipId: string): void;
+  /** show a clip's box growing live as a mic recording proceeds (analogous
+   *  to cut-segments-track.ts's `setPendingSegment` for `i`/`o` preview) —
+   *  the clip's real `durationSec` in the doc doesn't change until the
+   *  recording actually finishes and commits, but the drawn box (and its
+   *  hit-test bounds) grows with `elapsedSec` in the meantime. pass `null`
+   *  to clear it (on stop/cancel). */
+  setRecordingPreview(clipId: string | null, elapsedSec?: number): void;
   destroy(): void;
 }
 
@@ -133,9 +157,23 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
     onDragOut,
     onClipTap,
     onSelectionChange,
+    onClipDelete,
+    getPeers,
   } = options;
 
   const rows: Graphics[] = []; // parallel to getClips(), rebuilt each refresh()
+  /** one waveform-image `Sprite` per row, kept as a child of that row's own
+   *  `Graphics` (which is itself a `Container`, so this is legal) — texture
+   *  and visibility/position are updated in `drawClip()` on every redraw,
+   *  the sprite object itself is created once and reused for that row. */
+  const waveSpriteByRow = new WeakMap<Graphics, Sprite>();
+  /** waveform PNG (ffmpeg `showwavespic`, via the existing thumbnail
+   *  pipeline — see `thumbnail-utils.ts`/`tauri/src/thumbnail.rs`'s
+   *  `thumbnail_audio()`) keyed by blobId. `null` means "tried and failed
+   *  or unavailable" (e.g. browser mode, no ffmpeg) — don't retry every
+   *  redraw. */
+  const waveTextureCache = new Map<string, Texture | null>();
+  const wavePending = new Set<string>();
   let createPreviewRow: Graphics | null = null;
   let drag: DragState | null = null;
   let ghost: Container | null = null;
@@ -151,6 +189,8 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
    *  drives the delete/backspace keyboard shortcut and cross-track
    *  "only one segment selected" exclusivity (see stfu/index.ts). */
   let selectedIndex: number | null = null;
+  /** see `setRecordingPreview()` on the returned handle. */
+  let recordingPreview: { clipId: string; elapsedSec: number } | null = null;
 
   function buildGhost(clip: AudioClip): Container {
     const c = new Container();
@@ -189,7 +229,31 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
   }
 
   function displayDuration(clip: AudioClip): number {
+    if (recordingPreview && clip.id === recordingPreview.clipId) {
+      return Math.max(clip.durationSec, recordingPreview.elapsedSec, MIN_CLIP_SEC);
+    }
     return clip.durationSec > 0 ? clip.durationSec : PENDING_DISPLAY_SEC;
+  }
+
+  /** kick off (once, if not already cached/in flight) a waveform-image fetch
+   *  for a clip with real audio \u2014 reuses the existing ffmpeg-backed
+   *  thumbnail pipeline (`showwavespic`, generalized from the file-preview
+   *  thumbnail feature) rather than adding a new one. calls `refresh()` once
+   *  the image lands so the box redraws with it. */
+  function ensureWaveformTexture(blobId: string): void {
+    if (waveTextureCache.has(blobId) || wavePending.has(blobId)) return;
+    wavePending.add(blobId);
+    void getThumbnailDataUrl(blobId, { size: 100, peers: getPeers?.() })
+      .then((url) => {
+        waveTextureCache.set(blobId, url ? Texture.from(url) : null);
+      })
+      .catch(() => {
+        waveTextureCache.set(blobId, null);
+      })
+      .finally(() => {
+        wavePending.delete(blobId);
+        refresh();
+      });
   }
 
   /** a clip is only manually trimmable while it's truly empty (no tts text,
@@ -276,8 +340,12 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
     const top = MARGIN_Y;
     const height = AUDIO_CLIP_TRACK_HEIGHT - MARGIN_Y * 2;
     const pending = !clip.audioBlobId;
+    const isRecording = recordingPreview?.clipId === clip.id;
 
-    if (pending) {
+    if (isRecording) {
+      g.roundRect(left, top, width, height, 3).fill({ color: hovered ? 0x5a2a2a : 0x3a1f1f });
+      g.roundRect(left, top, width, height, 3).stroke({ color: 0xef4444, width: 1.5 });
+    } else if (pending) {
       g.roundRect(left, top, width, height, 3).fill({ color: hovered ? 0x2a3242 : 0x222836 });
       // diagonal hatch, clamped to the clip's own rect
       const step = 6;
@@ -292,6 +360,35 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
     } else {
       g.roundRect(left, top, width, height, 3).fill({ color: hovered ? 0x2a4a6a : 0x1a3a5a });
       g.roundRect(left, top, width, height, 3).stroke({ color: 0x60a5fa, width: 1 });
+    }
+
+    // waveform image, once the clip has real audio \u2014 inset a few px inside
+    // the box so the border (and, if selected, the white selection ring
+    // drawn just outside the box below) both stay visible around it.
+    let wave = waveSpriteByRow.get(g);
+    if (!pending && clip.audioBlobId) {
+      ensureWaveformTexture(clip.audioBlobId);
+      const texture = waveTextureCache.get(clip.audioBlobId);
+      if (texture) {
+        if (!wave) {
+          wave = new Sprite(texture);
+          wave.eventMode = "none";
+          waveSpriteByRow.set(g, wave);
+          g.addChild(wave);
+        }
+        wave.texture = texture;
+        wave.visible = true;
+        const inset = 3;
+        wave.x = left + inset;
+        wave.y = top + inset;
+        wave.width = Math.max(1, width - inset * 2);
+        wave.height = Math.max(1, height - inset * 2);
+        wave.alpha = 0.85;
+      } else if (wave) {
+        wave.visible = false;
+      }
+    } else if (wave) {
+      wave.visible = false;
     }
 
     if (isTrimmable(clip)) {
@@ -415,10 +512,12 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
     const hit = hitTest(local.x, local.y);
     if (hit) {
       if (hit.region === "delete") {
+        const clip = getClips()[hit.index];
         commit(getClips().filter((_, idx) => idx !== hit.index));
         // always clear (not just when the deleted clip was itself selected)
         // — avoids needing to re-index `selectedIndex` after the splice.
         setSelectedIndex(null);
+        if (clip) onClipDelete?.(clip);
         return;
       }
       // selecting happens at drag-start (not just on a plain click) so a
@@ -646,7 +745,7 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
     if (hoveredIndex !== null && hoveredIndex >= clips.length) hoveredIndex = null;
     if (selectedIndex !== null && selectedIndex >= clips.length) selectedIndex = null;
     while (rows.length > clips.length) {
-      rows.pop()?.destroy();
+      rows.pop()?.destroy({ children: true });
     }
     while (rows.length < clips.length) {
       const g = new Graphics();
@@ -663,17 +762,27 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
 
   return {
     refresh,
+    setRecordingPreview(clipId: string | null, elapsedSec = 0): void {
+      recordingPreview = clipId === null ? null : { clipId, elapsedSec };
+      refresh();
+    },
     getSelectedClip() {
       return selectedIndex !== null ? (getClips()[selectedIndex] ?? null) : null;
     },
     deleteSelected() {
       if (selectedIndex === null) return;
       const index = selectedIndex;
+      const clip = getClips()[index];
       commit(getClips().filter((_, idx) => idx !== index));
       setSelectedIndex(null);
+      if (clip) onClipDelete?.(clip);
     },
     clearSelection() {
       setSelectedIndex(null);
+    },
+    selectClip(clipId: string): void {
+      const index = getClips().findIndex((c) => c.id === clipId);
+      if (index !== -1) setSelectedIndex(index);
     },
     destroy() {
       offViewChange();

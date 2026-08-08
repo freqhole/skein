@@ -56,6 +56,9 @@ export interface SkeinInputHandle {
   focus(): void;
   blur(): void;
   setWidth(w: number): void;
+  /** change the placeholder shown while the field is empty (and, if
+   *  currently being edited, the DOM overlay's own placeholder too). */
+  setPlaceholder(text: string): void;
   destroy(): void;
 }
 
@@ -63,6 +66,7 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
   const height = options.height ?? 28;
   let currentWidth = options.width;
   let currentValue = options.value ?? "";
+  let currentPlaceholder = options.placeholder ?? "";
   let editing = false;
   let activeOverlay: DomOverlayHandle | null = null;
 
@@ -120,7 +124,7 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
 
   // placeholder text
   const placeholderText = new Text({
-    text: options.placeholder ?? "",
+    text: currentPlaceholder,
     style: {
       fontFamily: styleFontFamily,
       fontSize: styleFontSize,
@@ -182,7 +186,7 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
       width: currentWidth,
       height,
       value: currentValue,
-      placeholder: options.placeholder,
+      placeholder: currentPlaceholder,
       maxLength: options.maxLength,
       enterCommits: true,
       selectAll: false,
@@ -258,6 +262,14 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
       drawTextMask();
       alignTexts();
       syncDisplay();
+    },
+
+    setPlaceholder(text: string): void {
+      currentPlaceholder = text;
+      placeholderText.text = text;
+      if (editing && activeOverlay && !activeOverlay.removed) {
+        activeOverlay.element.placeholder = text;
+      }
     },
 
     destroy(): void {
