@@ -1,10 +1,13 @@
 /**
  * stfu's "SEGMENTS" panel — a below-timeline scrollable list of rows,
  * switchable (multi-select) between the editable cut list, the read-only
- * reference data, and the audio-clips track via a hover-pill flyout (same
- * visual language as `reference-track.ts`'s speaker popover), with an
- * "autoscroll" toggle that follows the playhead. design-ports editor.js's
- * dub panel (`createDubRowContainer()`/`layoutDubRow()`/
+ * reference data, and the audio-clips track. which sources are visible is
+ * toggled externally now (clicking a track's own label in the timeline —
+ * see `video-timeline.ts`/`reference-track.ts` — calls `toggleViewMode()`
+ * below), not via an in-panel flyout; likewise "autoscroll" (follow the
+ * playhead) is now a single toggle owned by `video-timeline.ts`'s toolbar,
+ * read here via `getAutoScrollEnabled()`. design-ports editor.js's dub
+ * panel (`createDubRowContainer()`/`layoutDubRow()`/
  * `createSegmentsViewControl()`/`maybeSyncPanelScroll()`), including its
  * inline tts-text authoring (`openDubEditOverlay()`'s reusable DOM
  * `<textarea>`-over-a-pixi-box technique) directly in each audio-clip row
@@ -14,12 +17,10 @@
  * unlike `reference-track.ts` (nested inside `video-timeline.ts`'s layered
  * containers, so its popover needs an externally-supplied `overlayParent`
  * to render on top of sibling layers), this panel is its own flat
- * top-level container — the flyout/backdrop are just appended as its last
- * children, no external overlay parent needed.
+ * top-level container.
  */
 
 import { Container, Graphics, Rectangle, Text, type FederatedPointerEvent } from "pixi.js";
-import { createExpandingPanel, type ExpandingPanelHandle } from "../../src/widgets/expanding-panel";
 import { createScrollableContent, type ScrollableContent } from "../../src/widgets/scrollable-content";
 import { createSkeinInput, type SkeinInputHandle } from "../../src/widgets/skein-input";
 import type { EditableSegment } from "./cut-segments-track";
@@ -64,26 +65,21 @@ const TAG = "stfu.segments-panel";
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2;
 
-// matches trek-minus-paris's --color-magenta / --color-magenta-hover custom properties
+// matches trek-minus-paris's --color-magenta custom property
 const MAGENTA = 0xe619b3;
-const MAGENTA_HOVER = 0xff33c9;
 
-export const SEGMENTS_TOOLBAR_HEIGHT = 20;
 const ROW_HEIGHT = 60;
 /** taller row for an audio clip — room for the time/meta line plus the
  *  inline tts-text box and voice/rate/generate controls below it. */
 const AUDIO_ROW_HEIGHT = 150;
 const ROW_GAP = 6;
 const ROW_PAD_X = 8;
-const PAD_X = 8;
-const TOOLBAR_GAP = 4;
 const RATE_MIN = 0.5;
 const RATE_MAX = 2;
 const RATE_STEP = 0.25;
-/** how many rows' worth of vertical space the scrollable list reserves below the toolbar */
+/** how many rows' worth of vertical space the scrollable list reserves */
 const VISIBLE_ROWS = 2;
-export const SEGMENTS_PANEL_HEIGHT =
-  SEGMENTS_TOOLBAR_HEIGHT + TOOLBAR_GAP + ROW_HEIGHT * VISIBLE_ROWS + ROW_GAP * (VISIBLE_ROWS - 1);
+export const SEGMENTS_PANEL_HEIGHT = ROW_HEIGHT * VISIBLE_ROWS + ROW_GAP * (VISIBLE_ROWS - 1);
 
 export interface SegmentsPanelOptions {
   canvasElement: HTMLCanvasElement;
@@ -111,13 +107,16 @@ export interface SegmentsPanelOptions {
     voiceLang: string,
     rate: number
   ) => void;
-  /** localStorage key for the view-modes + autoscroll prefs (browser-local UI state) */
+  /** localStorage key for the view-modes pref (browser-local UI state) */
   storageKey: string;
   /** opens the (widget-wide) voice-picker dialog for a row's voice button —
    *  the panel itself is only ~150px tall, nowhere near enough room for a
    *  scrollable voice list, so the dialog is owned/mounted at the widget
    *  root by `index.ts` instead and just triggered from here. */
   onOpenVoicePicker: (opts: VoicePickerOpenOptions) => void;
+  /** whether "autoscroll" (follow the playhead) is currently on — owned by
+   *  `video-timeline.ts`'s toolbar toggle now, read here every `onTimeUpdate()`. */
+  getAutoScrollEnabled: () => boolean;
 }
 
 export interface SegmentsPanelHandle {
@@ -138,12 +137,19 @@ export interface SegmentsPanelHandle {
    *  view; pass `null` to clear. a no-op while audio clips aren't
    *  currently a visible source. */
   setSelectedClip(clipId: string | null): void;
+  /** flip whether `mode` is one of the currently visible sources — called
+   *  from a track's own label click (`video-timeline.ts`/`reference-track.ts`),
+   *  now that the in-panel flyout that used to trigger this is gone. keeps
+   *  at least one mode active (mirrors the old flyout's own guard). */
+  toggleViewMode(mode: SegmentsViewMode): void;
+  /** whether `mode` is currently one of the visible sources — lets a
+   *  track's own label render an active/inactive highlight. */
+  isViewModeActive(mode: SegmentsViewMode): boolean;
   destroy(): void;
 }
 
 interface PanelPrefs {
   viewModes: SegmentsViewMode[];
-  autoscroll: boolean;
 }
 
 const ALL_MODE_IDS = SEGMENTS_VIEW_MODES.map((m) => m.id);
@@ -156,16 +162,15 @@ function sanitizeModes(raw: unknown): SegmentsViewMode[] {
 function loadPrefs(storageKey: string): PanelPrefs {
   try {
     const raw = localStorage.getItem(storageKey);
-    if (!raw) return { viewModes: ["cutlist"], autoscroll: false };
+    if (!raw) return { viewModes: ["cutlist"] };
     const parsed = JSON.parse(raw);
     // migrate the old single-`viewMode` shape transparently
     const modesSource = Array.isArray(parsed.viewModes) ? parsed.viewModes : [parsed.viewMode];
     return {
       viewModes: sanitizeModes(modesSource),
-      autoscroll: Boolean(parsed.autoscroll),
     };
   } catch {
-    return { viewModes: ["cutlist"], autoscroll: false };
+    return { viewModes: ["cutlist"] };
   }
 }
 
@@ -183,58 +188,6 @@ function formatTime(t: number): string {
   return `${m}:${s.padStart(5, "0")}`;
 }
 
-function createToggleButton(
-  label: string,
-  getActive: () => boolean,
-  onClick: () => void
-): { container: Container; width: number; draw(): void } {
-  const container = new Container();
-  container.eventMode = "static";
-  container.cursor = "pointer";
-  const bg = new Graphics();
-  const text = new Text({
-    text: label,
-    style: { fontFamily: FONT_FAMILY, fontSize: 10, fill: 0xdddddd },
-    resolution: TEXT_RESOLUTION,
-  });
-  text.anchor.set(0.5);
-  container.addChild(bg, text);
-
-  const height = 20;
-  let width = 0;
-  let hover = false;
-
-  const self = {
-    container,
-    width: 0,
-    draw() {
-      width = Math.max(60, Math.ceil(text.width) + 16);
-      self.width = width;
-      text.x = width / 2;
-      text.y = height / 2;
-      container.hitArea = new Rectangle(0, 0, width, height);
-      const active = getActive();
-      bg.clear();
-      bg.roundRect(0, 0, width, height, 4).fill({ color: active ? (hover ? MAGENTA_HOVER : MAGENTA) : hover ? 0x4a4a4a : 0x3a3a3a });
-      text.style.fill = active ? 0xffffff : 0xdddddd;
-    },
-  };
-
-  container.on("pointerover", () => {
-    hover = true;
-    self.draw();
-  });
-  container.on("pointerout", () => {
-    hover = false;
-    self.draw();
-  });
-  container.on("pointertap", (e: FederatedPointerEvent) => {
-    e.stopPropagation();
-    onClick();
-  });
-
-  return self;
-}
 
 interface AudioRowExtras {
   root: Container;
@@ -603,6 +556,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     onPreviewDurationMeasured,
     storageKey,
     onOpenVoicePicker,
+    getAutoScrollEnabled,
   } = options;
 
   let prefs = loadPrefs(storageKey);
@@ -618,87 +572,9 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
   const bg = new Graphics();
   container.addChild(bg);
 
-  // -- toolbar: view-mode label+caret (left) / autoscroll toggle (right) -------
-
-  const toolbar = new Container();
-  container.addChild(toolbar);
-
-  const viewModeLabel = new Container();
-  viewModeLabel.eventMode = "static";
-  viewModeLabel.cursor = "pointer";
-  const viewModeLabelBorder = new Graphics();
-  const viewModeLabelText = new Text({
-    text: "",
-    style: { fontFamily: FONT_FAMILY, fontSize: 10, fill: 0x888888, letterSpacing: 0.4 },
-    resolution: TEXT_RESOLUTION,
-  });
-  viewModeLabelText.anchor.set(0, 0.5);
-  const viewModeCaret = new Graphics();
-  viewModeLabel.addChild(viewModeLabelBorder, viewModeLabelText, viewModeCaret);
-  toolbar.addChild(viewModeLabel);
-
-  function drawViewModeLabel(hover: boolean): void {
-    const label = SEGMENTS_VIEW_MODES.filter((m) => prefs.viewModes.includes(m.id))
-      .map((m) => m.label.toUpperCase())
-      .join(" + ");
-    viewModeLabelText.text = label || SEGMENTS_VIEW_MODES[0].label.toUpperCase();
-    const caretW = 6;
-    const caretH = 4;
-    const gap = 6;
-    const caretX = viewModeLabelText.width + gap;
-    viewModeCaret
-      .clear()
-      .moveTo(caretX, -caretH / 2)
-      .lineTo(caretX + caretW, -caretH / 2)
-      .lineTo(caretX + caretW / 2, caretH / 2)
-      .closePath()
-      .fill({ color: 0x888888 });
-    const totalW = caretX + caretW;
-    const pad = 4;
-    viewModeLabelBorder.clear();
-    if (hover) {
-      viewModeLabelBorder.roundRect(-pad, -8, totalW + pad * 2, 16, 3).stroke({ width: 1, color: 0x555555 });
-    }
-    viewModeLabel.hitArea = new Rectangle(-pad, -8, totalW + pad * 2, 16);
-  }
-  drawViewModeLabel(false);
-  viewModeLabel.x = PAD_X;
-  viewModeLabel.y = SEGMENTS_TOOLBAR_HEIGHT / 2;
-  viewModeLabel.on("pointerover", () => drawViewModeLabel(true));
-  viewModeLabel.on("pointerout", () => drawViewModeLabel(false));
-  viewModeLabel.on("pointertap", (e: FederatedPointerEvent) => {
-    e.stopPropagation();
-    viewModeFlyoutPanel.toggle();
-  });
-
-  // -- view-mode flyout (3 toggle chips: "cut list" / "reference" / "audio clips") --
-
-  const viewModeFlyout = new Container();
-  interface Chip {
-    container: Container;
-    bg: Graphics;
-    label: Text;
-    mode: SegmentsViewMode;
-  }
-  const chips: Chip[] = SEGMENTS_VIEW_MODES.map((mode) => {
-    const chipContainer = new Container();
-    chipContainer.eventMode = "static";
-    chipContainer.cursor = "pointer";
-    const chipBg = new Graphics();
-    const chipLabel = new Text({
-      text: mode.label,
-      style: { fontFamily: FONT_FAMILY, fontSize: 10, fontWeight: "600", fill: 0xffffff },
-      resolution: TEXT_RESOLUTION,
-    });
-    chipLabel.anchor.set(0.5);
-    chipContainer.addChild(chipBg, chipLabel);
-    viewModeFlyout.addChild(chipContainer);
-    chipContainer.on("pointertap", (e: FederatedPointerEvent) => {
-      e.stopPropagation();
-      toggleMode(mode.id);
-    });
-    return { container: chipContainer, bg: chipBg, label: chipLabel, mode: mode.id };
-  });
+  // -- view-mode toggling (triggered externally now \u2014 see `toggleViewMode()`
+  // on the returned handle \u2014 by clicking a track's own label in
+  // `video-timeline.ts`/`reference-track.ts` rather than an in-panel flyout) --
 
   function toggleMode(mode: SegmentsViewMode): void {
     const active = new Set(prefs.viewModes);
@@ -711,61 +587,12 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     prefs = { ...prefs, viewModes: ALL_MODE_IDS.filter((id) => active.has(id)) };
     savePrefs(storageKey, prefs);
     lastAutoScrolledIndex = -1;
-    drawViewModeLabel(false);
-    layoutChips();
     redraw();
-  }
-
-  function layoutChips(): void {
-    const chipHeight = 20;
-    const chipGap = 4;
-    const chipPadX = 8;
-    let x = 0;
-    for (const chip of chips) {
-      const w = Math.ceil(chip.label.width) + chipPadX * 2;
-      chip.label.x = w / 2;
-      chip.label.y = chipHeight / 2;
-      const active = prefs.viewModes.includes(chip.mode);
-      chip.bg.clear().roundRect(0, 0, w, chipHeight, 4).fill({ color: active ? MAGENTA : 0x3a3a3a });
-      chip.container.hitArea = new Rectangle(0, 0, w, chipHeight);
-      chip.container.x = x;
-      x += w + chipGap;
-    }
-    viewModeFlyout.x = PAD_X;
-    viewModeFlyout.y = SEGMENTS_TOOLBAR_HEIGHT / 2 - 10;
-    // covers the whole panel (not just the toolbar strip) so the backdrop
-    // dims the row list behind it too while the flyout is open.
-    viewModeFlyoutPanel.resize(contentWidth, SEGMENTS_PANEL_HEIGHT);
-  }
-
-  const viewModeFlyoutPanel: ExpandingPanelHandle = createExpandingPanel({
-    overlayParent: container,
-    panel: viewModeFlyout,
-    onOpenChange: (open) => {
-      if (open) layoutChips();
-    },
-  });
-
-  const autoscrollBtn = createToggleButton(
-    "autoscroll",
-    () => prefs.autoscroll,
-    () => {
-      prefs = { ...prefs, autoscroll: !prefs.autoscroll };
-      savePrefs(storageKey, prefs);
-      autoscrollBtn.draw();
-    }
-  );
-  toolbar.addChild(autoscrollBtn.container);
-
-  function layoutToolbar(): void {
-    autoscrollBtn.draw();
-    autoscrollBtn.container.x = contentWidth - PAD_X - autoscrollBtn.width;
-    autoscrollBtn.container.y = (SEGMENTS_TOOLBAR_HEIGHT - 20) / 2;
   }
 
   // -- scrollable row list -------------------------------------------------------
 
-  const listY = SEGMENTS_TOOLBAR_HEIGHT + TOOLBAR_GAP;
+  const listY = 0;
   const listVisibleHeight = SEGMENTS_PANEL_HEIGHT - listY;
   const scrollable: ScrollableContent = createScrollableContent(
     container,
@@ -1002,8 +829,6 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
 
     const totalHeight = currentSegments.length > 0 ? y - ROW_GAP : emptyText.height;
     scrollable.reflow(Math.max(1, contentWidth), Math.max(1, totalHeight));
-
-    if (viewModeFlyoutPanel.isOpen) layoutChips();
   }
 
   function scrollRowIntoView(index: number): void {
@@ -1018,7 +843,6 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     if (target !== current) scrollable.scrollToY(Math.max(0, target));
   }
 
-  drawViewModeLabel(false);
   redraw();
 
   return {
@@ -1035,13 +859,12 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
         width: 1,
         color: 0x333333,
       });
-      layoutToolbar();
       scrollable.resize(Math.max(1, contentWidth), listVisibleHeight);
       redraw();
     },
 
     onTimeUpdate(currentTime: number) {
-      if (!prefs.autoscroll) return;
+      if (!getAutoScrollEnabled()) return;
       const index = findActiveSegmentIndex(currentSegments, currentTime);
       if (index === -1 || index === lastAutoScrolledIndex) return;
       lastAutoScrolledIndex = index;
@@ -1068,11 +891,19 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
       }
     },
 
+    toggleViewMode(mode: SegmentsViewMode) {
+      toggleMode(mode);
+    },
+
+    isViewModeActive(mode: SegmentsViewMode) {
+      return prefs.viewModes.includes(mode);
+    },
+
     destroy() {
       // `scrollable.destroy()` removes its document-level wheel listener —
       // not covered by pixi's own destroy cascade below. everything else
-      // (rows, chips, the flyout's backdrop/panel, the scrollBox itself) is
-      // a descendant of `container`, so one recursive destroy handles it.
+      // (rows, the scrollBox itself) is a descendant of `container`, so one
+      // recursive destroy handles it.
       for (const row of rowPool) row.audio?.destroy();
       scrollable.destroy();
       container.destroy({ children: true });

@@ -2,9 +2,13 @@
  * stfu's reference/diarization track — renders per-speaker colored segments
  * (once reference data has been loaded, see `reference-data.ts` + the
  * "load reference data..." widget action in `index.ts`) into
- * `video-timeline.ts`'s `referenceContentLayer`, and a "REFERENCE" label
- * button that opens a speaker-visibility popover. direct design-port of
- * `editor.js`'s `rebuildReferenceGraphics()`/`createRefLabelButton()`/
+ * `video-timeline.ts`'s `referenceContentLayer`. the row's label column
+ * hosts two separate buttons: the whole column toggles the segments
+ * panel's "reference" source (mirrors the CUT LIST/AUDIO CLIPS labels in
+ * `video-timeline.ts`), and a bigger caret-only button opens a
+ * speaker-visibility popover (also reachable via right-click anywhere on
+ * the row). direct design-port of `editor.js`'s
+ * `rebuildReferenceGraphics()`/`createRefLabelButton()`/
  * `openSpeakerDialog()` — the popover itself is built with the generic
  * `expanding-panel.ts` helper (no full-modal dialog infra exists yet in
  * skein) rather than editor.js's own dialog system, but the row layout
@@ -22,6 +26,7 @@ import {
   AUDIO_CLIP_TRACK_HEIGHT,
   CUT_TRACK_HEIGHT,
   REFERENCE_TRACK_HEIGHT,
+  TRACK_LABEL_COLUMN_WIDTH,
   type VideoTimelineHandle,
 } from "./video-timeline";
 import type { ReferenceSpeaker, TranscriptSegment } from "./types";
@@ -68,6 +73,13 @@ export interface ReferenceTrackOptions {
    *  editor.js's own reference-track click behavior (`video.currentTime =
    *  hit.start`), which this is a direct port of. */
   onSeek?: (time: number) => void;
+  /** fires when the reference row's own label area (the whole
+   *  `TRACK_LABEL_COLUMN_WIDTH` column, minus the caret button) is
+   *  clicked — wired to `SegmentsPanelHandle.toggleViewMode("reference")`. */
+  onToggleVisible?: () => void;
+  /** whether reference data is currently a visible segments-panel source —
+   *  drives the label area's highlight. */
+  isReferenceActive?: () => boolean;
 }
 
 export interface ReferenceTrackHandle {
@@ -128,6 +140,8 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     onCreateCutSegment,
     onCreateAudioClip,
     onSeek,
+    onToggleVisible,
+    isReferenceActive,
   } = options;
 
   let contentWidth = 0;
@@ -387,57 +401,122 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
   timeline.referenceHitArea.on("pointermove", onReferenceTrackPointerMove);
   timeline.referenceHitArea.on("pointerout", onReferenceTrackPointerOut);
 
-  // -- "REFERENCE" label button --------------------------------------------------
+  // right-click anywhere on the reference row (content area AND label
+  // column) opens the speaker popover — `expandingPanel` is declared
+  // further down, but this handler only reads it once actually invoked,
+  // well after the whole function has finished initializing (same pattern
+  // the caret button's own handler already relies on).
+  function openSpeakerPopoverFromRightClick(e: FederatedPointerEvent): void {
+    e.stopPropagation();
+    expandingPanel.toggle();
+    if (expandingPanel.isOpen) refreshPanel();
+  }
+  timeline.referenceHitArea.on("rightclick", openSpeakerPopoverFromRightClick);
+  // the canvas has no other use for a native context menu (this is a fully
+  // custom-rendered pixi surface) — suppress it everywhere so right-click
+  // reads as "open the speaker popover" instead of flashing the browser's
+  // own menu first.
+  function onCanvasContextMenu(e: MouseEvent): void {
+    e.preventDefault();
+  }
+  canvasElement.addEventListener("contextmenu", onCanvasContextMenu);
 
-  const labelButton = new Container();
-  labelButton.eventMode = "static";
-  labelButton.cursor = "pointer";
-  timeline.referenceLabelLayer.addChild(labelButton);
+  // -- reference-row label column ------------------------------------------------
+  // two separate buttons, mirroring `video-timeline.ts`'s own CUT LIST /
+  // AUDIO CLIPS labels: (1) the whole column (including its "REFERENCE"
+  // text) toggles the segments panel's "reference" source, (2) a bigger,
+  // caret-only button at the column's right edge opens the
+  // speaker-visibility popover — layered on top so its own smaller hit area
+  // intercepts clicks before they reach the column-wide toggle underneath.
+  // right-click anywhere in the column (either button) also opens the
+  // popover, matching the content area's own right-click handler above.
 
-  const labelBorder = new Graphics();
-  const labelText = new Text({
+  const visibilityToggle = new Container();
+  visibilityToggle.eventMode = "static";
+  visibilityToggle.cursor = "pointer";
+  visibilityToggle.hitArea = new Rectangle(0, 0, TRACK_LABEL_COLUMN_WIDTH, REFERENCE_TRACK_HEIGHT);
+  timeline.referenceLabelLayer.addChild(visibilityToggle);
+
+  const visibilityBg = new Graphics();
+  const visibilityLabel = new Text({
     text: "REFERENCE",
     style: { fontFamily: FONT_FAMILY, fontSize: 9, fill: 0x888888, letterSpacing: 0.3 },
     resolution: TEXT_RESOLUTION,
   });
-  labelText.anchor.set(0, 0.5);
-  const caret = new Graphics();
-  labelButton.addChild(labelBorder, labelText, caret);
+  visibilityLabel.anchor.set(0, 0.5);
+  visibilityLabel.x = 8;
+  visibilityLabel.y = REFERENCE_TRACK_HEIGHT / 2;
+  visibilityToggle.addChild(visibilityBg, visibilityLabel);
 
-  function drawLabelButton(hover: boolean): void {
-    const caretW = 6;
-    const caretH = 4;
-    const gap = 5;
-    const caretX = labelText.width + gap;
-    caret.clear();
-    caret
-      .moveTo(caretX, -caretH / 2)
-      .lineTo(caretX + caretW, -caretH / 2)
-      .lineTo(caretX + caretW / 2, caretH / 2)
-      .closePath()
-      .fill({ color: 0x888888 });
-    const totalW = caretX + caretW;
-    const pad = 4;
-    labelBorder.clear();
-    labelBorder.roundRect(-pad, -8, totalW + pad * 2, 16, 3).fill({ color: 0x1a1a1a, alpha: 0.75 });
-    if (hover) {
-      labelBorder.roundRect(-pad, -8, totalW + pad * 2, 16, 3).stroke({ width: 1, color: 0x555555 });
+  function drawVisibilityToggle(hover: boolean): void {
+    const active = isReferenceActive?.() ?? false;
+    visibilityBg.clear();
+    if (active) {
+      visibilityBg
+        .roundRect(2, 2, TRACK_LABEL_COLUMN_WIDTH - 6, REFERENCE_TRACK_HEIGHT - 4, 3)
+        .fill({ color: 0x3a1a30, alpha: 0.85 });
+    } else if (hover) {
+      visibilityBg
+        .roundRect(2, 2, TRACK_LABEL_COLUMN_WIDTH - 6, REFERENCE_TRACK_HEIGHT - 4, 3)
+        .stroke({ width: 1, color: 0x444444 });
     }
-    labelButton.hitArea = new Rectangle(-pad, -8, totalW + pad * 2, 16);
+    visibilityLabel.style.fill = active ? 0xf5b8e8 : 0x888888;
   }
-  drawLabelButton(false);
-  labelButton.x = LABEL_PAD_X;
-  labelButton.y = REFERENCE_TRACK_HEIGHT / 2;
+  drawVisibilityToggle(false);
+  visibilityToggle.on("pointerover", () => drawVisibilityToggle(true));
+  visibilityToggle.on("pointerout", () => drawVisibilityToggle(false));
+  visibilityToggle.on("pointertap", (e: FederatedPointerEvent) => {
+    e.stopPropagation();
+    onToggleVisible?.();
+    drawVisibilityToggle(false);
+  });
+  visibilityToggle.on("rightclick", openSpeakerPopoverFromRightClick);
 
-  labelButton.on("pointerover", () => drawLabelButton(true));
-  labelButton.on("pointerout", () => drawLabelButton(false));
-  labelButton.on("pointertap", (e: FederatedPointerEvent) => {
+  const CARET_BUTTON_SIZE = 24;
+  const caretButton = new Container();
+  caretButton.eventMode = "static";
+  caretButton.cursor = "pointer";
+  caretButton.hitArea = new Rectangle(0, 0, CARET_BUTTON_SIZE, CARET_BUTTON_SIZE);
+  caretButton.x = TRACK_LABEL_COLUMN_WIDTH - CARET_BUTTON_SIZE - 2;
+  caretButton.y = (REFERENCE_TRACK_HEIGHT - CARET_BUTTON_SIZE) / 2;
+  timeline.referenceLabelLayer.addChild(caretButton);
+
+  const caretBg = new Graphics();
+  const caret = new Graphics();
+  caretButton.addChild(caretBg, caret);
+
+  function drawCaretButton(hover: boolean): void {
+    const caretW = 10;
+    const caretH = 7;
+    const cx = CARET_BUTTON_SIZE / 2;
+    const cy = CARET_BUTTON_SIZE / 2;
+    caret
+      .clear()
+      .moveTo(cx - caretW / 2, cy - caretH / 2)
+      .lineTo(cx + caretW / 2, cy - caretH / 2)
+      .lineTo(cx, cy + caretH / 2)
+      .closePath()
+      .fill({ color: 0xaaaaaa });
+    caretBg.clear();
+    if (hover) {
+      caretBg
+        .roundRect(1, 1, CARET_BUTTON_SIZE - 2, CARET_BUTTON_SIZE - 2, 4)
+        .fill({ color: 0x1a1a1a, alpha: 0.6 })
+        .stroke({ width: 1, color: 0x555555 });
+    }
+  }
+  drawCaretButton(false);
+  caretButton.on("pointerover", () => drawCaretButton(true));
+  caretButton.on("pointerout", () => drawCaretButton(false));
+  caretButton.on("pointertap", (e: FederatedPointerEvent) => {
     e.stopPropagation();
     expandingPanel.toggle();
     if (expandingPanel.isOpen) refreshPanel();
   });
+  caretButton.on("rightclick", openSpeakerPopoverFromRightClick);
 
   // -- speaker-visibility popover -------------------------------------------------
+
 
   const panel = new Container();
   const panelBg = new Graphics();
@@ -625,10 +704,13 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
       timeline.referenceHitArea.off("pointerupoutside", onGlobalPointerUp);
       timeline.referenceHitArea.off("pointermove", onReferenceTrackPointerMove);
       timeline.referenceHitArea.off("pointerout", onReferenceTrackPointerOut);
+      timeline.referenceHitArea.off("rightclick");
+      canvasElement.removeEventListener("contextmenu", onCanvasContextMenu);
       destroyGhost();
       scrollable.destroy();
       expandingPanel.destroy();
-      labelButton.destroy({ children: true });
+      visibilityToggle.destroy({ children: true });
+      caretButton.destroy({ children: true });
       segmentPool.forEach((g) => g.destroy());
     },
   };

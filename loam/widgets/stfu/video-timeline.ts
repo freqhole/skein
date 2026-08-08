@@ -53,6 +53,33 @@ function writeSnapEnabledPref(enabled: boolean): void {
   }
 }
 
+// local-only (not doc-persisted), same convention as `SNAP_ENABLED_STORAGE_KEY`
+// above — whether the timeline scrolls to keep the playhead in view during
+// playback, AND (per `segments-panel.ts`'s `getAutoScrollEnabled` option)
+// whether the segments panel scrolls its own row list to follow the
+// playhead/selection. a single shared toggle (owned here since the
+// timeline's own scroll-to-playhead behavior is entirely internal to this
+// module) mounted in the toolbar's trailing area — see `autoscrollBtn` below.
+const AUTOSCROLL_ENABLED_STORAGE_KEY = "skein.stfu.autoscrollEnabled";
+
+function readAutoScrollEnabledPref(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(AUTOSCROLL_ENABLED_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeAutoScrollEnabledPref(enabled: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(AUTOSCROLL_ENABLED_STORAGE_KEY, enabled ? "1" : "0");
+  } catch {
+    // ignore (private browsing / storage disabled)
+  }
+}
+
 export const TOOLBAR_HEIGHT = 24;
 export const ROW_GAP = 3;
 /** reserved left-margin width (px), inside every track row, for that row's
@@ -138,9 +165,9 @@ function makeTextButton(label: string, onClick: () => void): Container {
 }
 
 /** like `makeTextButton()`, but stays visually "pressed" (a filled/outlined
- *  highlight) while `isOn()` is true — used for the "snap" toggle. exposes a
- *  `redraw()` escape hatch so external state changes (not just hover/click)
- *  can refresh the highlight. */
+ *  highlight) while `isOn()` is true — used for the "snap"/"autoscroll"
+ *  toggles. exposes a `redraw()` escape hatch so external state changes
+ *  (not just hover/click) can refresh the highlight. */
 function makeToggleButton(label: string, isOn: () => boolean, onClick: () => void): Container {
   const c = new Container();
   const bg = new Graphics();
@@ -174,6 +201,55 @@ function makeToggleButton(label: string, isOn: () => boolean, onClick: () => voi
   (c as Container & { buttonWidth: number; redraw: () => void }).buttonWidth = w;
   (c as Container & { redraw: () => void }).redraw = () => draw(false);
   return c;
+}
+
+/** a track's own label ("CUT LIST"/"AUDIO CLIPS") as a clickable toggle
+ *  covering the whole reserved `TRACK_LABEL_COLUMN_WIDTH` \u00d7 `rowHeight`
+ *  area \u2014 highlights (tinted background + brighter text) while `isActive()`
+ *  is true, mirroring the segments panel's own view-mode chips. clicking
+ *  fires `onClick()` (wired to `SegmentsPanelHandle.toggleViewMode()`). */
+function makeTrackLabelButton(
+  labelLayer: Container,
+  text: string,
+  rowHeight: number,
+  isActive: () => boolean,
+  onClick: () => void
+): Container & { redraw: () => void } {
+  const button = new Container();
+  button.eventMode = "static";
+  button.cursor = "pointer";
+  button.hitArea = new Rectangle(0, 0, TRACK_LABEL_COLUMN_WIDTH, rowHeight);
+  const bg = new Graphics();
+  const label = new Text({
+    text,
+    style: { fontFamily: FONT_FAMILY, fontSize: 9, fill: 0x888888, letterSpacing: 0.3 },
+    resolution: TEXT_RESOLUTION,
+  });
+  label.anchor.set(0, 0.5);
+  label.x = 8;
+  label.y = rowHeight / 2;
+  button.addChild(bg, label);
+  labelLayer.addChild(button);
+
+  function draw(hover: boolean): void {
+    const active = isActive();
+    bg.clear();
+    if (active) {
+      bg.roundRect(2, 2, TRACK_LABEL_COLUMN_WIDTH - 6, rowHeight - 4, 3).fill({ color: 0x3a1a30, alpha: 0.85 });
+    } else if (hover) {
+      bg.roundRect(2, 2, TRACK_LABEL_COLUMN_WIDTH - 6, rowHeight - 4, 3).stroke({ width: 1, color: 0x444444 });
+    }
+    label.style.fill = active ? 0xf5b8e8 : 0x888888;
+  }
+  draw(false);
+  button.on("pointerover", () => draw(true));
+  button.on("pointerout", () => draw(false));
+  button.on("pointertap", (e) => {
+    e.stopPropagation();
+    onClick();
+    draw(false);
+  });
+  return Object.assign(button, { redraw: () => draw(false) });
 }
 
 export interface VideoTimelineHandle {
@@ -242,6 +318,13 @@ export interface VideoTimelineHandle {
   /** flip the "snap" toolbar toggle — same effect as clicking it, for the
    *  `s` keyboard shortcut. */
   toggleSnap(): void;
+  /** whether the "autoscroll" toolbar toggle is on — gates both this
+   *  timeline's own scroll-to-playhead behavior (`setCurrentTime()`'s
+   *  `scrollTimeIntoView()`) and, via `segments-panel.ts`'s
+   *  `getAutoScrollEnabled` option, the segments panel's own row-follow
+   *  behavior. a single shared toggle since this is the one place both
+   *  features can read from. */
+  isAutoScrollEnabled(): boolean;
   timeToScreenX(t: number): number;
   screenXToTime(x: number): number;
   /** current visible content width (screen px) of the track rows — the
@@ -255,10 +338,26 @@ export interface VideoTimelineHandle {
   destroy(): void;
 }
 
+export interface VideoTimelineTrackLabelOptions {
+  /** fires when the "CUT LIST" track label is clicked — wired to
+   *  `SegmentsPanelHandle.toggleViewMode("cutlist")`. */
+  onToggleCutListVisible?: () => void;
+  /** fires when the "AUDIO CLIPS" track label is clicked — wired to
+   *  `SegmentsPanelHandle.toggleViewMode("audioclips")`. */
+  onToggleAudioClipsVisible?: () => void;
+  /** whether the cut list is currently a visible segments-panel source —
+   *  drives the "CUT LIST" label's highlight. */
+  isCutListVisible?: () => boolean;
+  /** whether audio clips are currently a visible segments-panel source —
+   *  drives the "AUDIO CLIPS" label's highlight. */
+  isAudioClipsVisible?: () => boolean;
+}
+
 export function createVideoTimeline(
   initialContentWidth: number,
   canvasElement: HTMLCanvasElement,
-  onSeek?: (t: number) => void
+  onSeek?: (t: number) => void,
+  trackLabelOptions?: VideoTimelineTrackLabelOptions
 ): VideoTimelineHandle {
   const container = new Container();
 
@@ -273,17 +372,37 @@ export function createVideoTimeline(
   let zoomIndex = 0;
   let currentTime = 0;
   let snapEnabled = readSnapEnabledPref();
+  let autoScrollEnabled = readAutoScrollEnabledPref();
 
   const viewChangeHandlers: Array<() => void> = [];
 
-  // -- toolbar row (zoom out / label / level / in / fit / snap) ----------------
+  // -- toolbar row (zoom out / label / level / in / fit / snap / autoscroll) ---
 
   const toolbarRow = new Container();
   container.addChild(toolbarRow);
 
   const toolbarTrailingSlot = new Container();
-  toolbarTrailingSlot.x = Math.max(0, contentWidth - TOOLBAR_TRAILING_SLOT_WIDTH);
   toolbarRow.addChild(toolbarTrailingSlot);
+
+  // "autoscroll" sits just left of the trailing slot (the keyboard-shortcuts
+  // "?" button, mounted externally into `toolbarTrailingSlot` by
+  // `index.ts`/`keyboard-shortcuts-control.ts`) — both stay right-anchored
+  // via `layoutTrailing()`, called here and again on every `resize()`.
+  const autoscrollBtn = makeToggleButton(
+    "autoscroll",
+    () => autoScrollEnabled,
+    () => setAutoScrollEnabled(!autoScrollEnabled)
+  );
+  toolbarRow.addChild(autoscrollBtn);
+
+  function layoutTrailing(): void {
+    toolbarTrailingSlot.x = Math.max(0, contentWidth - TOOLBAR_TRAILING_SLOT_WIDTH);
+    autoscrollBtn.x = Math.max(
+      0,
+      toolbarTrailingSlot.x - 8 - (autoscrollBtn as Container & { buttonWidth: number }).buttonWidth
+    );
+  }
+  layoutTrailing();
 
   // "ZOOM" stacked just above the numeric level, matching editor.js's
   // `zoomLabelText`/`zoomLevelText` layout between the out/in buttons.
@@ -337,6 +456,12 @@ export function createVideoTimeline(
     snapEnabled = next;
     writeSnapEnabledPref(next);
     (snapBtn as any).redraw();
+  }
+
+  function setAutoScrollEnabled(next: boolean): void {
+    autoScrollEnabled = next;
+    writeAutoScrollEnabledPref(next);
+    (autoscrollBtn as any).redraw();
   }
 
   // -- reference/diarization track row (background + content layer) -----------
@@ -412,15 +537,13 @@ export function createVideoTimeline(
   const trackLabelLayer = new Container();
   trackLabelLayer.y = trackRow.y;
   container.addChild(trackLabelLayer);
-  const trackLabelText = new Text({
-    text: "CUT LIST",
-    style: { fontFamily: FONT_FAMILY, fontSize: 9, fill: 0x888888, letterSpacing: 0.3 },
-    resolution: TEXT_RESOLUTION,
-  });
-  trackLabelText.anchor.set(0, 0.5);
-  trackLabelText.x = 8;
-  trackLabelText.y = CUT_TRACK_HEIGHT / 2;
-  trackLabelLayer.addChild(trackLabelText);
+  makeTrackLabelButton(
+    trackLabelLayer,
+    "CUT LIST",
+    CUT_TRACK_HEIGHT,
+    () => trackLabelOptions?.isCutListVisible?.() ?? false,
+    () => trackLabelOptions?.onToggleCutListVisible?.()
+  );
 
   // -- audio-clips track row (background + unscaled content layer) -------------
 
@@ -440,15 +563,13 @@ export function createVideoTimeline(
   const audioClipsLabelLayer = new Container();
   audioClipsLabelLayer.y = audioClipsRow.y;
   container.addChild(audioClipsLabelLayer);
-  const audioClipsLabelText = new Text({
-    text: "AUDIO CLIPS",
-    style: { fontFamily: FONT_FAMILY, fontSize: 9, fill: 0x888888, letterSpacing: 0.3 },
-    resolution: TEXT_RESOLUTION,
-  });
-  audioClipsLabelText.anchor.set(0, 0.5);
-  audioClipsLabelText.x = 8;
-  audioClipsLabelText.y = AUDIO_CLIP_TRACK_HEIGHT / 2;
-  audioClipsLabelLayer.addChild(audioClipsLabelText);
+  makeTrackLabelButton(
+    audioClipsLabelLayer,
+    "AUDIO CLIPS",
+    AUDIO_CLIP_TRACK_HEIGHT,
+    () => trackLabelOptions?.isAudioClipsVisible?.() ?? false,
+    () => trackLabelOptions?.onToggleAudioClipsVisible?.()
+  );
 
   // sibling of audioClipsRow, not a child of it — see comment on referenceMask.
   const audioClipsMask = new Graphics();
@@ -749,6 +870,7 @@ export function createVideoTimeline(
   }
 
   function scrollTimeIntoView(t: number): void {
+    if (!autoScrollEnabled) return;
     if (duration <= 0 || viewDuration >= duration) return;
     const center = viewStartTime + viewDuration / 2;
     const tolerance = viewDuration * 0.15;
@@ -778,7 +900,7 @@ export function createVideoTimeline(
     resize(newContentWidth: number) {
       contentWidth = Math.max(0, newContentWidth);
       rowWidth = Math.max(0, contentWidth - TRACK_LABEL_COLUMN_WIDTH);
-      toolbarTrailingSlot.x = Math.max(0, contentWidth - TOOLBAR_TRAILING_SLOT_WIDTH);
+      layoutTrailing();
       updateRulerMask();
       applyViewChange(false);
     },
@@ -812,6 +934,9 @@ export function createVideoTimeline(
     },
     toggleSnap() {
       setSnapEnabled(!snapEnabled);
+    },
+    isAutoScrollEnabled() {
+      return autoScrollEnabled;
     },
     timeToScreenX,
     screenXToTime,

@@ -798,9 +798,19 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
 
     function ensureTimeline(): VideoTimelineHandle {
       if (timeline) return timeline;
-      timeline = createVideoTimeline(Math.max(0, currentWidth - TIMELINE_INSET * 2), ctx.canvasElement, (t) => {
-        if (mediaOverlay) mediaOverlay.video.currentTime = t;
-      });
+      timeline = createVideoTimeline(
+        Math.max(0, currentWidth - TIMELINE_INSET * 2),
+        ctx.canvasElement,
+        (t) => {
+          if (mediaOverlay) mediaOverlay.video.currentTime = t;
+        },
+        {
+          onToggleCutListVisible: () => segmentsPanel?.toggleViewMode("cutlist"),
+          onToggleAudioClipsVisible: () => segmentsPanel?.toggleViewMode("audioclips"),
+          isCutListVisible: () => segmentsPanel?.isViewModeActive("cutlist") ?? false,
+          isAudioClipsVisible: () => segmentsPanel?.isViewModeActive("audioclips") ?? false,
+        }
+      );
       timeline.container.x = TIMELINE_INSET;
       timeline.container.y = timelineY(currentHeight);
       timeline.setDuration(ctx.doc.current.videoDurationSec);
@@ -922,6 +932,11 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         onSeek: (t) => {
           if (mediaOverlay) mediaOverlay.video.currentTime = t;
         },
+        // clicking the row's label column (anywhere but the caret button)
+        // toggles the segments panel's "reference" source, mirroring the
+        // CUT LIST/AUDIO CLIPS labels in `video-timeline.ts`.
+        onToggleVisible: () => segmentsPanel?.toggleViewMode("reference"),
+        isReferenceActive: () => segmentsPanel?.isViewModeActive("reference") ?? false,
       });
       referenceTrack.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
       segmentsPanel = createSegmentsPanel({
@@ -976,6 +991,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         },
         onOpenVoicePicker: (opts) => voicePickerDialog?.open(opts),
         storageKey: `skein.stfu.${ctx.widgetId}.segmentsPanel`,
+        getAutoScrollEnabled: () => (timeline ? timeline.isAutoScrollEnabled() : false),
       });
       segmentsPanel.container.x = TIMELINE_INSET;
       segmentsPanel.container.y = segmentsPanelY(currentHeight);
