@@ -11,11 +11,13 @@
 
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { getLocalNodeId, guessMimeFromFilename, type PeersMap } from "../../src/file-utils/file-shared";
-import { pickFiles, uploadFile } from "../../src/file-utils/upload";
+import { pickFiles, pickJsonFile, readPickedFileText, uploadFile } from "../../src/file-utils/upload";
 import { getMediaPlaybackUrl } from "../../src/media";
 import { createMediaDomOverlay, type MediaDomOverlayHandle } from "../../src/widgets/media-dom-overlay";
 import { createCutModeControl, CUT_MODE_CONTROL_RESERVED_WIDTH, type CutModeControlHandle } from "./cut-mode-control";
 import { createCutSegmentsTrack, type CutSegmentsTrackHandle, type EditableSegment } from "./cut-segments-track";
+import { mergeCombinedData, mergeDiarizeData, mergeTranscribeData, parseReferenceDataJson } from "./reference-data";
+import { createReferenceTrack, type ReferenceTrackHandle } from "./reference-track";
 import { createVideoTimeline, TIMELINE_SHELL_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
 import type {
   CompactInfo,
@@ -76,11 +78,18 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     let uploadCancelled = false;
     let statusMessage = "";
     let progressText = "";
+    // transient feedback for the "load reference data..." action — shown
+    // appended to the header line (statusMessage above is only ever shown
+    // in the pre-upload "empty" placeholder state, not once a video is
+    // loaded, so reference-data feedback needed its own surface).
+    let referenceDataMessage = "";
+    let referenceDataMessageTimer: ReturnType<typeof setTimeout> | null = null;
     let loadedVideoKey = "";
     let mediaOverlay: MediaDomOverlayHandle | null = null;
     let timeline: VideoTimelineHandle | null = null;
     let cutTrack: CutSegmentsTrackHandle | null = null;
     let cutModeControl: CutModeControlHandle | null = null;
+    let referenceTrack: ReferenceTrackHandle | null = null;
     let cutOverlayEl: HTMLDivElement | null = null;
     let timeUpdateHandler: (() => void) | null = null;
 
@@ -320,6 +329,72 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       cutModeControl?.refresh();
     }
 
+    // -- reference data (diarization/transcript) load ------------------------------
+
+    async function handleLoadReferenceData(): Promise<void> {
+      if (destroyed) return;
+      if (ctx.canvasStore?.isLocalViewer()) return;
+
+      // immediate feedback before the (possibly slow, modal) file picker
+      // opens — without this the widget looked "locked up" with no
+      // indication anything was happening.
+      setReferenceDataMessage("loading reference data…", 0);
+
+      const picked = await pickJsonFile();
+      if (destroyed) return;
+      if (!picked) {
+        setReferenceDataMessage("");
+        return;
+      }
+
+      let raw: unknown;
+      try {
+        const text = await readPickedFileText(picked);
+        raw = JSON.parse(text);
+      } catch (err) {
+        console.error("stfu widget: failed to read/parse reference data json:", err);
+        setReferenceDataMessage(`could not read "${picked.filename}" — not valid json`);
+        return;
+      }
+      if (destroyed) return;
+
+      const parsed = parseReferenceDataJson(raw);
+      if (!parsed) {
+        setReferenceDataMessage(
+          `"${picked.filename}" doesn't match the expected diarization or transcript json shape`
+        );
+        return;
+      }
+
+      let summary = "";
+      ctx.doc.change((d) => {
+        if (parsed.kind === "diarize") {
+          const speakerCount = Object.keys(parsed.ranges).length;
+          const merged = mergeDiarizeData(d.referenceSpeakers, d.transcriptSegments, parsed);
+          d.referenceSpeakers = merged.referenceSpeakers;
+          d.transcriptSegments = merged.transcriptSegments;
+          const hasTranscriptText = merged.transcriptSegments.some((s) => s.text);
+          summary =
+            `loaded diarization: ${speakerCount} speaker(s)` +
+            (hasTranscriptText ? "" : " — now load the matching transcript json for text");
+        } else if (parsed.kind === "transcribe") {
+          d.transcriptSegments = mergeTranscribeData(d.transcriptSegments, parsed);
+          const hasSpeakers = Object.keys(d.referenceSpeakers).length > 0;
+          summary =
+            `loaded transcript: ${parsed.segments.length} segment(s)` +
+            (hasSpeakers ? "" : " — now load the matching diarization json for speaker labels");
+        } else {
+          const speakerCount = Object.keys(parsed.ranges).length;
+          const merged = mergeCombinedData(d.referenceSpeakers, d.transcriptSegments, parsed);
+          d.referenceSpeakers = merged.referenceSpeakers;
+          d.transcriptSegments = merged.transcriptSegments;
+          summary = `loaded reference data: ${speakerCount} speaker(s), ${parsed.segments.length} segment(s)`;
+        }
+      });
+      referenceTrack?.refresh();
+      setReferenceDataMessage(summary);
+    }
+
     // -- helpers -----------------------------------------------------------------
 
     function syncVisibility(): void {
@@ -338,10 +413,30 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       }
       headerText.text =
         loadState === "ready"
-          ? [state.videoFilename, state.videoDurationSec ? `${Math.round(state.videoDurationSec)}s` : null]
+          ? [
+              state.videoFilename,
+              state.videoDurationSec ? `${Math.round(state.videoDurationSec)}s` : null,
+              referenceDataMessage || null,
+            ]
               .filter(Boolean)
               .join(" · ")
           : "";
+    }
+
+    function setReferenceDataMessage(message: string, autoClearMs = 6000): void {
+      referenceDataMessage = message;
+      refresh();
+      if (referenceDataMessageTimer !== null) {
+        clearTimeout(referenceDataMessageTimer);
+        referenceDataMessageTimer = null;
+      }
+      if (message && autoClearMs > 0) {
+        referenceDataMessageTimer = setTimeout(() => {
+          referenceDataMessageTimer = null;
+          referenceDataMessage = "";
+          refresh();
+        }, autoClearMs);
+      }
     }
 
     function teardownMediaOverlay(): void {
@@ -360,6 +455,8 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       cutModeControl = null;
       cutTrack?.destroy();
       cutTrack = null;
+      referenceTrack?.destroy();
+      referenceTrack = null;
       timeline?.destroy();
       timeline = null;
     }
@@ -395,6 +492,14 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         onMuteEarlyMsChange: handleMuteEarlyMsChange,
       });
       cutModeControl.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
+      referenceTrack = createReferenceTrack({
+        timeline,
+        overlayParent: timeline.container,
+        getReferenceSpeakers: () => ctx.doc.current.referenceSpeakers,
+        getTranscriptSegments: () => ctx.doc.current.transcriptSegments,
+        storageKey: `skein.stfu.${ctx.widgetId}.visibleSpeakers`,
+      });
+      referenceTrack.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
       return timeline;
     }
 
@@ -487,6 +592,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       timeline?.setDuration(ctx.doc.current.videoDurationSec);
       cutTrack?.refresh();
       cutModeControl?.refresh();
+      referenceTrack?.refresh();
     }
 
     applyDocState();
@@ -583,6 +689,8 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     return {
       container,
 
+      widgetActions: [{ id: "load-reference-data", label: "load reference data...", onClick: handleLoadReferenceData }],
+
       resize(w: number, h: number) {
         currentWidth = w;
         currentHeight = h;
@@ -594,6 +702,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           timeline.container.y = h - TIMELINE_SHELL_HEIGHT - PADDING;
           timeline.resize(Math.max(0, w - TIMELINE_INSET * 2));
           cutModeControl?.resize(Math.max(0, w - TIMELINE_INSET * 2));
+          referenceTrack?.resize(Math.max(0, w - TIMELINE_INSET * 2));
         }
       },
 
@@ -601,6 +710,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         destroyed = true;
         uploadCancelled = true;
         uploadAbort?.abort();
+        if (referenceDataMessageTimer !== null) clearTimeout(referenceDataMessageTimer);
         unsubscribe();
         teardownMediaOverlay();
         teardownTimeline();

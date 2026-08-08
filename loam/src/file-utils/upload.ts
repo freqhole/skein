@@ -228,6 +228,86 @@ async function pickDocumentFileBrowser(): Promise<PickedFile | null> {
   }
 }
 
+/**
+ * open a file picker filtered to `.json` — used by stfu's "load reference
+ * data..." action (accepts either a diarization cache or a whisper
+ * transcript cache, see `widgets/stfu/reference-data.ts`). in Tauri mode,
+ * uses the native dialog with a json extension filter. in browser mode,
+ * uses a hidden input with `accept=".json,application/json"`. returns null
+ * if the user cancels.
+ */
+export async function pickJsonFile(): Promise<PickedFile | null> {
+  if (isTauriMode()) {
+    return pickJsonFileTauri();
+  }
+  return pickJsonFileBrowser();
+}
+
+async function pickJsonFileTauri(): Promise<PickedFile | null> {
+  try {
+    const result = await open({
+      multiple: false,
+      filters: [{ name: "json", extensions: ["json"] }],
+    });
+
+    if (result === null) return null;
+
+    const filePath = Array.isArray(result) ? result[0] : result;
+    if (!filePath) return null;
+
+    const filename = filePath.split(/[\\/]/).pop() ?? filePath;
+
+    return {
+      path: filePath,
+      filename,
+      size: 0,
+      file: null,
+    };
+  } catch (err) {
+    log.error(TAG, "json file picker failed:", err);
+    return null;
+  }
+}
+
+async function pickJsonFileBrowser(): Promise<PickedFile | null> {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".json,application/json";
+  input.style.display = "none";
+
+  document.body.appendChild(input);
+
+  try {
+    input.click();
+
+    const file = await new Promise<File | null>((resolve) => {
+      input.addEventListener("change", () => {
+        resolve(input.files?.[0] ?? null);
+      });
+
+      const onFocus = () => {
+        window.removeEventListener("focus", onFocus);
+        setTimeout(() => resolve(null), 300);
+      };
+      window.addEventListener("focus", onFocus);
+    });
+
+    if (!file) return null;
+
+    return {
+      path: null,
+      filename: file.name,
+      size: file.size,
+      file,
+    };
+  } catch (err) {
+    log.error(TAG, "browser json file picker failed:", err);
+    return null;
+  } finally {
+    input.remove();
+  }
+}
+
 /** Tauri-mode multi-file picker — uses @tauri-apps/plugin-dialog with multiple: true */
 async function pickFilesTauri(): Promise<PickedFile[]> {
   try {

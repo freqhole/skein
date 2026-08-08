@@ -30,19 +30,31 @@ const NICE_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 
 
 export const TOOLBAR_HEIGHT = 20;
 export const ROW_GAP = 3;
-/** height of the cut-segments track row (the only track row this shell owns
- *  today — the future audio-clips track gets its own row, phase 4). */
+/** height of the reference/diarization track row — always present (even
+ *  with zero reference data, same as the cut-segments row), matching
+ *  editor.js's `TRACK_HEIGHT`. */
+export const REFERENCE_TRACK_HEIGHT = 36;
+/** height of the cut-segments track row — the future audio-clips track
+ *  gets its own row, phase 4. */
 export const CUT_TRACK_HEIGHT = 28;
 const RULER_HEIGHT = 14;
 const SCROLLBAR_GAP = 4;
 const SCROLLBAR_HEIGHT = 8;
 const RULER_LABEL_POOL_SIZE = 16;
 
-/** total fixed height of the whole shell (toolbar + track + ruler +
- *  scrollbar rows) — only the width is responsive, mirroring editor.js's
- *  own layout model. */
+/** total fixed height of the whole shell (toolbar + reference + track +
+ *  ruler + scrollbar rows) — only the width is responsive, mirroring
+ *  editor.js's own layout model. */
 export const TIMELINE_SHELL_HEIGHT =
-  TOOLBAR_HEIGHT + ROW_GAP + CUT_TRACK_HEIGHT + ROW_GAP + RULER_HEIGHT + SCROLLBAR_GAP + SCROLLBAR_HEIGHT;
+  TOOLBAR_HEIGHT +
+  ROW_GAP +
+  REFERENCE_TRACK_HEIGHT +
+  ROW_GAP +
+  CUT_TRACK_HEIGHT +
+  ROW_GAP +
+  RULER_HEIGHT +
+  SCROLLBAR_GAP +
+  SCROLLBAR_HEIGHT;
 
 function niceStep(target: number): number {
   for (const s of NICE_STEPS) {
@@ -109,6 +121,15 @@ export interface VideoTimelineHandle {
   /** shift the built-in zoom controls right by `width` px to make room for
    *  an externally-mounted leading control (see `toolbarRow`). */
   reserveToolbarStart(width: number): void;
+  /** unscaled layer the reference/diarization track draws its colored
+   *  speaker segments into — same coordinate convention as
+   *  `trackContentLayer` (reposition from scratch on every
+   *  `onViewChange()`, x=0 is the visible content area's left edge). */
+  referenceContentLayer: Container;
+  /** background of the reference track row — external code (stfu's
+   *  reference-track.ts) attaches its own drag/hover pointer handling and
+   *  the "REFERENCE" label button here. */
+  referenceHitArea: Container;
   /** call whenever the widget's own width changes. */
   resize(contentWidth: number): void;
   setDuration(duration: number): void;
@@ -173,10 +194,27 @@ export function createVideoTimeline(initialContentWidth: number): VideoTimelineH
   }
   layoutToolbar();
 
+  // -- reference/diarization track row (background + content layer) -----------
+
+  const referenceRow = new Container();
+  referenceRow.y = TOOLBAR_HEIGHT + ROW_GAP;
+  container.addChild(referenceRow);
+
+  const referenceBg = new Graphics();
+  referenceBg.eventMode = "static";
+  referenceRow.addChild(referenceBg);
+
+  const referenceContentLayer = new Container();
+  referenceRow.addChild(referenceContentLayer);
+
+  const referenceMask = new Graphics();
+  referenceRow.addChild(referenceMask);
+  referenceRow.mask = referenceMask;
+
   // -- cut-segments track row (background + scaled content layer) --------------
 
   const trackRow = new Container();
-  trackRow.y = TOOLBAR_HEIGHT + ROW_GAP;
+  trackRow.y = TOOLBAR_HEIGHT + ROW_GAP + REFERENCE_TRACK_HEIGHT + ROW_GAP;
   container.addChild(trackRow);
 
   const trackBg = new Graphics();
@@ -193,7 +231,7 @@ export function createVideoTimeline(initialContentWidth: number): VideoTimelineH
   // -- ruler row (pooled labels + tick marks) -----------------------------------
 
   const rulerRow = new Container();
-  rulerRow.y = TOOLBAR_HEIGHT + ROW_GAP + CUT_TRACK_HEIGHT + ROW_GAP;
+  rulerRow.y = TOOLBAR_HEIGHT + ROW_GAP + REFERENCE_TRACK_HEIGHT + ROW_GAP + CUT_TRACK_HEIGHT + ROW_GAP;
   container.addChild(rulerRow);
 
   const rulerTicks = new Graphics();
@@ -226,7 +264,15 @@ export function createVideoTimeline(initialContentWidth: number): VideoTimelineH
   // -- scrollbar row -------------------------------------------------------------
 
   const scrollbarRow = new Container();
-  scrollbarRow.y = TOOLBAR_HEIGHT + ROW_GAP + CUT_TRACK_HEIGHT + ROW_GAP + RULER_HEIGHT + SCROLLBAR_GAP;
+  scrollbarRow.y =
+    TOOLBAR_HEIGHT +
+    ROW_GAP +
+    REFERENCE_TRACK_HEIGHT +
+    ROW_GAP +
+    CUT_TRACK_HEIGHT +
+    ROW_GAP +
+    RULER_HEIGHT +
+    SCROLLBAR_GAP;
   container.addChild(scrollbarRow);
 
   const scrollbarTrack = new Graphics();
@@ -286,6 +332,12 @@ export function createVideoTimeline(initialContentWidth: number): VideoTimelineH
     trackBg.rect(0, 0, contentWidth, CUT_TRACK_HEIGHT).fill({ color: 0x1c1c28 });
     trackBg.hitArea = new Rectangle(0, 0, contentWidth, CUT_TRACK_HEIGHT);
     trackMask.clear().rect(0, 0, contentWidth, CUT_TRACK_HEIGHT).fill({ color: 0xffffff });
+
+    referenceBg.clear();
+    // matches editor.js's `refBackground` (0x262626)
+    referenceBg.rect(0, 0, contentWidth, REFERENCE_TRACK_HEIGHT).fill({ color: 0x262626 });
+    referenceBg.hitArea = new Rectangle(0, 0, contentWidth, REFERENCE_TRACK_HEIGHT);
+    referenceMask.clear().rect(0, 0, contentWidth, REFERENCE_TRACK_HEIGHT).fill({ color: 0xffffff });
   }
 
   function updateRuler(): void {
@@ -389,6 +441,8 @@ export function createVideoTimeline(initialContentWidth: number): VideoTimelineH
     trackContentLayer,
     trackHitArea: trackBg,
     toolbarRow,
+    referenceContentLayer,
+    referenceHitArea: referenceBg,
 
     reserveToolbarStart(width: number) {
       toolbarLeadingWidth = Math.max(0, width);
