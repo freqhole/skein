@@ -28,6 +28,15 @@ export function speakerColorForIndex(index: number): number {
   return hslToColorInt(hue, 65, 55);
 }
 
+/** black or white — whichever reads better on top of `bgColor`, by relative luminance. */
+export function contrastTextColor(bgColor: number): number {
+  const r = (bgColor >> 16) & 0xff;
+  const g = (bgColor >> 8) & 0xff;
+  const b = bgColor & 0xff;
+  const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  return luminance > 0.55 ? 0x000000 : 0xffffff;
+}
+
 function hslToColorInt(h: number, s: number, l: number): number {
   const sat = s / 100;
   const light = l / 100;

@@ -63,7 +63,19 @@ export function createExpandingPanel(options: ExpandingPanelOptions): ExpandingP
   function drawBackdrop(): void {
     backdrop.clear();
     if (width <= 0 || height <= 0) return;
-    backdrop.rect(0, 0, width, height).fill({ color: 0x000000, alpha: 0.001 }); // near-invisible, only needs to catch pointer events
+    // visibly dims whatever's behind the panel (matches trek-minus-paris's
+    // editor.js `createSegmentsViewControl()`/dialog backdrops), and still
+    // catches pointer events for click-away.
+    backdrop.rect(0, 0, width, height).fill({ color: 0x000000, alpha: 0.4 });
+  }
+
+  // keeps the panel fully inside (0, 0, width, height) — every skein widget
+  // clips its own content to its bounds (see widget-frame.ts), so a panel
+  // positioned/sized without regard for the covered area would get cut off
+  // rather than just overlapping sibling content.
+  function clampPanelPosition(): void {
+    if (width > 0) panel.x = Math.min(Math.max(0, panel.x), Math.max(0, width - panel.width));
+    if (height > 0) panel.y = Math.min(Math.max(0, panel.y), Math.max(0, height - panel.height));
   }
 
   function open_(): void {
@@ -71,6 +83,7 @@ export function createExpandingPanel(options: ExpandingPanelOptions): ExpandingP
     open = true;
     backdrop.visible = true;
     panel.visible = true;
+    clampPanelPosition();
     onOpenChange?.(true);
   }
 
@@ -96,6 +109,7 @@ export function createExpandingPanel(options: ExpandingPanelOptions): ExpandingP
       width = Math.max(0, newWidth);
       height = Math.max(0, newHeight);
       drawBackdrop();
+      clampPanelPosition();
     },
     destroy() {
       backdrop.destroy();

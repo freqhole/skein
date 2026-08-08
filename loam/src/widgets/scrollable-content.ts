@@ -19,6 +19,10 @@ export interface ScrollableContent {
   resize(width: number, height: number): void;
   /** call after content changes (text/reflow) with the new total content height */
   reflow(contentWidth: number, contentHeight: number): void;
+  /** current scroll offset from the top, in content-local px (0 = scrolled to top). */
+  getScrollY(): number;
+  /** scroll so the top of the content sits `y` px above the viewport's top edge. */
+  scrollToY(y: number): void;
   /** call from the widget's destroy() */
   destroy(): void;
 }
@@ -115,6 +119,14 @@ export function createScrollableContent(
     reflow(contentWidth: number, contentHeight: number) {
       drawSizing(contentWidth, contentHeight);
       scrollBox.resize(true);
+    },
+
+    getScrollY() {
+      return -scrollBox.scrollY;
+    },
+
+    scrollToY(y: number) {
+      scrollBox.scrollToPosition({ y });
     },
 
     destroy() {

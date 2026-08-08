@@ -9,23 +9,28 @@
  * created now don't need reshaping later.
  */
 
+import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { getLocalNodeId, guessMimeFromFilename, type PeersMap } from "../../src/file-utils/file-shared";
 import { pickFiles, pickJsonFile, readPickedFileText, uploadFile } from "../../src/file-utils/upload";
 import { getMediaPlaybackUrl } from "../../src/media";
 import { createMediaDomOverlay, type MediaDomOverlayHandle } from "../../src/widgets/media-dom-overlay";
+import type { WidgetRegistry } from "../../src/widgets/widget-registry";
+import { createAudioClipsTrack, type AudioClipsTrackHandle } from "./audio-clips-track";
+import { createClipEditorPanel, type ClipEditorPanelHandle } from "./clip-editor-panel";
 import { createCutModeControl, CUT_MODE_CONTROL_RESERVED_WIDTH, type CutModeControlHandle } from "./cut-mode-control";
 import { createCutSegmentsTrack, type CutSegmentsTrackHandle, type EditableSegment } from "./cut-segments-track";
 import { mergeCombinedData, mergeDiarizeData, mergeTranscribeData, parseReferenceDataJson } from "./reference-data";
 import { createReferenceTrack, type ReferenceTrackHandle } from "./reference-track";
-import { createVideoTimeline, TIMELINE_SHELL_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
+import { createSegmentsPanel, SEGMENTS_PANEL_HEIGHT, type SegmentsPanelHandle } from "./segments-panel";
+import { AUDIO_CLIP_TRACK_HEIGHT, createVideoTimeline, TIMELINE_SHELL_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
 import type {
   CompactInfo,
   WidgetController,
   WidgetFactory,
   WidgetMountContext,
 } from "../../src/widgets/widget-types";
-import { stfuSchema, type StfuState } from "./types";
+import { stfuSchema, type AudioClip, type StfuState } from "./types";
 
 const PADDING = 8;
 const HEADER_HEIGHT = 20;
@@ -47,7 +52,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     version: "0.1.0",
     category: "media",
     defaultWidth: 480,
-    defaultHeight: 320,
+    defaultHeight: 480,
   },
   schema: stfuSchema,
 
@@ -72,6 +77,14 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     // racing to upload into the same empty stfu widget.
     const iAmCreator = !ctx.canvasStore || ctx.canvasStore.isLocalWidgetCreator(ctx.widgetId);
 
+    // -- cross-widget "drop an audio-recording/tts widget onto the audio
+    // clips track" support (see docs/stfu-widget-plan.md's cross-widget
+    // drag-and-drop section) — same store/repo/registry plumbing bin/index.ts
+    // uses for its own dropTarget implementation.
+    const store = ctx.canvasStore ?? null;
+    const repo: Repo | null = store?.repo ?? null;
+    const registry: WidgetRegistry | null = _stfuWidgetRegistry;
+
     let loadState: LoadState = ctx.doc.current.videoBlobId ? "ready" : "empty";
 
     let uploadAbort: AbortController | null = null;
@@ -88,8 +101,11 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     let mediaOverlay: MediaDomOverlayHandle | null = null;
     let timeline: VideoTimelineHandle | null = null;
     let cutTrack: CutSegmentsTrackHandle | null = null;
+    let audioClipsTrack: AudioClipsTrackHandle | null = null;
+    let clipEditorPanel: ClipEditorPanelHandle | null = null;
     let cutModeControl: CutModeControlHandle | null = null;
     let referenceTrack: ReferenceTrackHandle | null = null;
+    let segmentsPanel: SegmentsPanelHandle | null = null;
     let cutOverlayEl: HTMLDivElement | null = null;
     let timeUpdateHandler: (() => void) | null = null;
 
@@ -105,6 +121,21 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       bg.stroke({ color: 0x2a2a3e, width: 1 });
     };
     drawBg(currentWidth, currentHeight);
+
+    // whole-widget hover tracking (used to scope global keyboard shortcuts
+    // below to "pointer is over this stfu instance" — there's no existing
+    // canvas-level "focused widget" concept a widget factory can query, so
+    // hover is the simplest reliable signal for which instance the shortcuts
+    // apply to when several stfu widgets are on the same canvas).
+    let pointerInsideWidget = false;
+    container.eventMode = "static";
+    container.hitArea = new Rectangle(0, 0, currentWidth, currentHeight);
+    container.on("pointerover", () => {
+      pointerInsideWidget = true;
+    });
+    container.on("pointerout", () => {
+      pointerInsideWidget = false;
+    });
 
     // -- header (filename / duration / status) ----------------------------------
 
@@ -455,17 +486,35 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       cutModeControl = null;
       cutTrack?.destroy();
       cutTrack = null;
+      clipEditorPanel?.destroy();
+      clipEditorPanel = null;
+      audioClipsTrack?.destroy();
+      audioClipsTrack = null;
       referenceTrack?.destroy();
       referenceTrack = null;
+      segmentsPanel?.destroy();
+      segmentsPanel = null;
       timeline?.destroy();
       timeline = null;
     }
 
+    // vertical space the timeline shell reserves above the bottom edge, now
+    // that the segments panel also lives down there (below the timeline,
+    // per the plan doc's "below/beside-timeline list of rows" wording).
+    function timelineY(h: number): number {
+      return h - SEGMENTS_PANEL_HEIGHT - PADDING - TIMELINE_SHELL_HEIGHT - PADDING;
+    }
+    function segmentsPanelY(h: number): number {
+      return h - SEGMENTS_PANEL_HEIGHT - PADDING;
+    }
+
     function ensureTimeline(): VideoTimelineHandle {
       if (timeline) return timeline;
-      timeline = createVideoTimeline(Math.max(0, currentWidth - TIMELINE_INSET * 2));
+      timeline = createVideoTimeline(Math.max(0, currentWidth - TIMELINE_INSET * 2), ctx.canvasElement, (t) => {
+        if (mediaOverlay) mediaOverlay.video.currentTime = t;
+      });
       timeline.container.x = TIMELINE_INSET;
-      timeline.container.y = currentHeight - TIMELINE_SHELL_HEIGHT - PADDING;
+      timeline.container.y = timelineY(currentHeight);
       timeline.setDuration(ctx.doc.current.videoDurationSec);
       container.addChild(timeline.container);
       cutTrack = createCutSegmentsTrack({
@@ -477,6 +526,62 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           });
         },
         getDuration: () => ctx.doc.current.videoDurationSec,
+        // snap to the reference/diarization track's own segment edges and
+        // the current playhead too, not just other cut-list segments —
+        // matches editor.js's `maybeSnap()`.
+        getSnapTimes: () => [
+          ...ctx.doc.current.transcriptSegments.flatMap((s) => [s.start, s.end]),
+          timeline ? timeline.getCurrentTime() : 0,
+        ],
+        // selecting a segment (so keyboard shortcuts have a clear target)
+        // also scrolls its matching row in the segments panel into view and
+        // highlights it there, mirroring the prototype's own selection UX.
+        onSelectionChange: (seg) => segmentsPanel?.setSelectedSegment(seg),
+      });
+      audioClipsTrack = createAudioClipsTrack({
+        timeline,
+        getClips: () => ctx.doc.current.audioClips,
+        onChange: (next) => {
+          ctx.doc.change((d) => {
+            d.audioClips = next;
+          });
+        },
+        getDuration: () => ctx.doc.current.videoDurationSec,
+        // snap clip placement to the cut list's own edges, the reference
+        // track's edges, and the current playhead too, not just other
+        // audio clips.
+        getSnapTimes: () => [
+          ...ctx.doc.current.editableSegments.flat(),
+          ...ctx.doc.current.transcriptSegments.flatMap((s) => [s.start, s.end]),
+          timeline ? timeline.getCurrentTime() : 0,
+        ],
+        getWorldContainer: () => findWorldContainer(),
+        onDragOut: (clip, worldX, worldY) => void handleAudioClipDragOut(clip, worldX, worldY),
+        onClipTap: (clip, screenX, screenY) => {
+          if (!timeline) return;
+          const local = timeline.container.toLocal({ x: screenX, y: screenY });
+          clipEditorPanel?.open(clip, local.x, local.y);
+        },
+      });
+      clipEditorPanel = createClipEditorPanel({
+        overlayParent: timeline.container,
+        canvasElement: ctx.canvasElement,
+        onGenerated: (clip, text, result, voiceName, voiceLang, rate) => {
+          ctx.doc.change((d) => {
+            const idx = d.audioClips.findIndex((c) => c.id === clip.id);
+            if (idx === -1) return;
+            const target = d.audioClips[idx];
+            target.audioBlobId = result.blobId;
+            target.audioBlake3 = result.blake3;
+            target.audioMime = result.mime;
+            target.durationSec = result.duration;
+            target.ttsText = text;
+            target.ttsVoiceName = voiceName;
+            target.ttsVoiceLang = voiceLang;
+            target.ttsRate = rate;
+            if (!target.label) target.label = text.slice(0, 40);
+          });
+        },
       });
       timeline.reserveToolbarStart(CUT_MODE_CONTROL_RESERVED_WIDTH);
       cutModeControl = createCutModeControl({
@@ -495,11 +600,45 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       referenceTrack = createReferenceTrack({
         timeline,
         overlayParent: timeline.container,
+        canvasElement: ctx.canvasElement,
         getReferenceSpeakers: () => ctx.doc.current.referenceSpeakers,
         getTranscriptSegments: () => ctx.doc.current.transcriptSegments,
         storageKey: `skein.stfu.${ctx.widgetId}.visibleSpeakers`,
+        // the speaker popover is allowed to cover the rest of the timeline
+        // shell + the segments panel below it while open (it's modal-ish),
+        // but must still fit inside the widget's own clipped bounds.
+        overlayMaxHeight: TIMELINE_SHELL_HEIGHT + PADDING + SEGMENTS_PANEL_HEIGHT + PADDING,
+        // drag a reference/diarization segment down into the cut list to
+        // create a new editable segment snapped exactly to its start/end
+        // (it can then be resized like any other cut-list segment).
+        onCreateCutSegment: (start, end) => {
+          ctx.doc.change((d) => {
+            d.editableSegments = [...d.editableSegments, [start, end]];
+          });
+        },
       });
       referenceTrack.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
+      segmentsPanel = createSegmentsPanel({
+        canvasElement: ctx.canvasElement,
+        getEditableSegments: () => ctx.doc.current.editableSegments,
+        getTranscriptSegments: () => ctx.doc.current.transcriptSegments,
+        getReferenceSpeakers: () => ctx.doc.current.referenceSpeakers,
+        onSeek: (t: number) => {
+          if (mediaOverlay) mediaOverlay.video.currentTime = t;
+        },
+        storageKey: `skein.stfu.${ctx.widgetId}.segmentsPanel`,
+      });
+      segmentsPanel.container.x = TIMELINE_INSET;
+      segmentsPanel.container.y = segmentsPanelY(currentHeight);
+      container.addChild(segmentsPanel.container);
+      segmentsPanel.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
+      // re-add `timeline.container` so it renders ABOVE `segmentsPanel.container`
+      // (siblings render in addChild order) — the reference speaker popover
+      // (mounted inside `timeline.container`) is deliberately allowed to
+      // extend down over the segments panel while open (see its
+      // `overlayMaxHeight`), which only actually shows on top if the timeline
+      // itself is the later sibling.
+      container.addChild(timeline.container);
       return timeline;
     }
 
@@ -534,7 +673,10 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         canvasElement: ctx.canvasElement,
         getSize: () => ({
           width: currentWidth,
-          height: Math.max(0, currentHeight - HEADER_HEIGHT - TIMELINE_SHELL_HEIGHT - PADDING),
+          height: Math.max(
+            0,
+            currentHeight - HEADER_HEIGHT - SEGMENTS_PANEL_HEIGHT - PADDING - TIMELINE_SHELL_HEIGHT - PADDING
+          ),
         }),
         muted: false,
         loop: false,
@@ -569,6 +711,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       timeUpdateHandler = () => {
         if (mediaOverlay) tl.setCurrentTime(mediaOverlay.video.currentTime);
         applyCutPlaybackEffects();
+        if (mediaOverlay) segmentsPanel?.onTimeUpdate(mediaOverlay.video.currentTime);
       };
       mediaOverlay.video.addEventListener("timeupdate", timeUpdateHandler);
     }
@@ -591,8 +734,10 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     function refreshTimelineFromDoc(): void {
       timeline?.setDuration(ctx.doc.current.videoDurationSec);
       cutTrack?.refresh();
+      audioClipsTrack?.refresh();
       cutModeControl?.refresh();
       referenceTrack?.refresh();
+      segmentsPanel?.refresh();
     }
 
     applyDocState();
@@ -686,23 +831,267 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     placeholderText.on("pointertap", () => void handleUpload());
     placeholderBorder.on("pointertap", () => void handleUpload());
 
+    // -- keyboard shortcuts (playback only) --------------------------------------
+    //
+    // deliberately scoped to playback/view controls that don't depend on a
+    // "selected segment" or undo-stack concept (neither exists anywhere in
+    // stfu yet): play/pause, seek, and timeline zoom. editor.js's fuller set
+    // (mark in/out, delete selected, trim to playhead, undo/redo, snap
+    // toggle) all need a persistent selection or undo history first.
+    function handleKeyDown(e: KeyboardEvent): void {
+      if (!pointerInsideWidget || !mediaOverlay) return;
+      // some other widget's text-input overlay (label/notepad/markdown) may
+      // currently hold the keyboard driver — don't steal its keystrokes just
+      // because the mouse happens to be hovering this widget.
+      if (ctx.keyboard.isAcquired) return;
+
+      const video = mediaOverlay.video;
+      const seekAmount = e.shiftKey ? 10 : 1;
+      switch (e.key) {
+        case " ":
+          if (video.paused) void video.play();
+          else video.pause();
+          break;
+        case "ArrowLeft":
+          video.currentTime = Math.max(0, video.currentTime - seekAmount);
+          break;
+        case "ArrowRight":
+          video.currentTime = Math.min(video.duration || video.currentTime, video.currentTime + seekAmount);
+          break;
+        case "+":
+        case "=":
+          timeline?.zoomIn();
+          break;
+        case "-":
+        case "_":
+          timeline?.zoomOut();
+          break;
+        case "0":
+          timeline?.zoomFit();
+          break;
+        default:
+          return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+
+    // -- "widget → track" drag: drop an audio-recording/tts widget onto the
+    // audio clips track -----------------------------------------------------
+    //
+    // mirrors bin/index.ts's own dropTarget exactly in mechanics (hitTest/
+    // onHover/onLeave/onDrop, pointer-position-based, no HTML5 DnD), but the
+    // outcome is "move" not "nest": the dragged widget is removed from the
+    // canvas entirely and a new AudioClip referencing the same audioBlobId
+    // (content-addressed, so no byte copy) is appended to this doc — see
+    // docs/stfu-widget-plan.md's cross-widget drag-and-drop section.
+    const DROPPABLE_TYPES = new Set(["audio-recording", "tts"]);
+
+    /** walk up from this widget's own root container to the shared pan/zoom
+     *  "world" container — same 3-levels-up hierarchy every widget's own
+     *  container sits inside (contentContainer → frame.root → world), per
+     *  bin-drag.ts's own `getWorld()` helper. */
+    function findWorldContainer(): Container {
+      let current: Container = container;
+      for (let i = 0; i < 3 && current.parent; i++) {
+        current = current.parent;
+      }
+      return current;
+    }
+
+    /** convert a `dropTarget` callback's world-space point into the audio
+     *  clips row's own local coordinate frame (x=0 at the row's left edge,
+     *  matching `timeline.screenXToTime()`'s convention) — returns null if
+     *  the timeline isn't mounted yet. */
+    function toAudioClipsLocal(worldX: number, worldY: number): { x: number; y: number } | null {
+      if (!timeline) return null;
+      const world = findWorldContainer();
+      return timeline.audioClipsHitArea.toLocal({ x: worldX, y: worldY }, world);
+    }
+
+    let dropHighlight: Graphics | null = null;
+    function setAudioClipsDropHighlight(active: boolean): void {
+      if (!active) {
+        dropHighlight?.destroy();
+        dropHighlight = null;
+        return;
+      }
+      if (!timeline) return;
+      if (!dropHighlight) {
+        dropHighlight = new Graphics();
+        dropHighlight.eventMode = "none";
+        timeline.audioClipsHitArea.addChild(dropHighlight);
+      }
+      const rowWidth = Math.max(0, currentWidth - TIMELINE_INSET * 2);
+      dropHighlight
+        .clear()
+        .rect(0, 0, rowWidth, AUDIO_CLIP_TRACK_HEIGHT)
+        .stroke({ width: 2, color: 0xe619b3 });
+    }
+
+    /** read a dropped widget's doc (audio-recording or tts shape) via the
+     *  repo/registry, same pattern as bin-drag.ts's readLabel(). returns
+     *  null if the doc isn't readable yet or isn't a droppable type. */
+    function readDroppedAudioState(
+      entryType: string,
+      docId: string | null,
+    ): { blobId: string; blake3: string; mime: string; duration: number; filename?: string; ttsText?: string; ttsVoiceName?: string; ttsVoiceLang?: string; ttsRate?: number } | null {
+      if (!repo || !registry || !docId || !DROPPABLE_TYPES.has(entryType)) return null;
+      const factory = registry.get(entryType);
+      if (!factory?.schema) return null;
+      try {
+        const handle = repo.handles[docId as DocumentId];
+        const rawDoc = handle?.doc();
+        if (!rawDoc) return null;
+        const state = factory.schema.parse(rawDoc) as Record<string, unknown>;
+        if (!state.blobId) return null; // nothing generated/recorded yet — no audio to place
+        return {
+          blobId: String(state.blobId),
+          blake3: typeof state.blake3 === "string" ? state.blake3 : "",
+          mime: typeof state.mime === "string" ? state.mime : "",
+          duration: typeof state.duration === "number" ? state.duration : 0,
+          filename: typeof state.filename === "string" ? state.filename : undefined,
+          ttsText: typeof state.ttsText === "string" ? state.ttsText : undefined,
+          ttsVoiceName: typeof state.ttsVoiceName === "string" ? state.ttsVoiceName : undefined,
+          ttsVoiceLang: typeof state.ttsVoiceLang === "string" ? state.ttsVoiceLang : undefined,
+          ttsRate: typeof state.ttsRate === "number" ? state.ttsRate : undefined,
+        };
+      } catch {
+        return null;
+      }
+    }
+
+    // -- "track → widget" drag (inverse): lift a clip off the audio-clips
+    // track back onto the open canvas as its own standalone widget --------
+    //
+    // mirrors createFileWidgetFromBlob's own repo.create()+store.addWidget()
+    // pattern exactly. a clip with `ttsText` becomes a `tts` widget (so it
+    // stays editable/regeneratable); anything else becomes a plain
+    // `audio-recording` widget — same content-addressed `blobId`, no byte
+    // copy, matching the "move not copy" semantics of the "widget → track"
+    // direction above.
+    async function handleAudioClipDragOut(clip: AudioClip, worldX: number, worldY: number): Promise<void> {
+      if (!store || !repo || !registry || !clip.audioBlobId) return;
+      const type = clip.ttsText ? "tts" : "audio-recording";
+      const factory = registry.get(type);
+      if (!factory?.schema) return;
+
+      const width = factory.metadata.defaultWidth ?? 320;
+      const height = factory.metadata.defaultHeight ?? (type === "tts" ? 220 : 160);
+
+      const widgetDoc = factory.schema.parse({
+        blobId: clip.audioBlobId,
+        blake3: clip.audioBlake3 ?? "",
+        mime: clip.audioMime ?? "",
+        duration: clip.durationSec,
+        filename: clip.label || "",
+        ...(type === "tts"
+          ? {
+              ttsText: clip.ttsText ?? "",
+              ttsVoiceName: clip.ttsVoiceName ?? "",
+              ttsVoiceLang: clip.ttsVoiceLang ?? "",
+              ttsRate: clip.ttsRate ?? 1,
+            }
+          : {}),
+      });
+
+      const handle = repo.create(widgetDoc);
+      const zIndex = 1 + Math.max(0, ...store.allWidgets().map((w) => w.zIndex || 0));
+
+      store.addWidget({
+        id: crypto.randomUUID(),
+        type,
+        x: worldX - width / 2,
+        y: worldY - height / 2,
+        width,
+        height,
+        zIndex,
+        props: {},
+        collapsed: false,
+        docId: handle.documentId,
+        parentId: null,
+      });
+    }
+
     return {
       container,
 
       widgetActions: [{ id: "load-reference-data", label: "load reference data...", onClick: handleLoadReferenceData }],
 
+      dropTarget: store
+        ? {
+            hitTest(worldX: number, worldY: number): boolean {
+              if (!timeline) return false;
+              const local = toAudioClipsLocal(worldX, worldY);
+              if (!local) return false;
+              const rowWidth = Math.max(0, currentWidth - TIMELINE_INSET * 2);
+              return local.x >= 0 && local.x <= rowWidth && local.y >= 0 && local.y <= AUDIO_CLIP_TRACK_HEIGHT;
+            },
+
+            onHover(_worldX: number, _worldY: number, draggedWidgetId: string): void {
+              const entry = store.getWidget(draggedWidgetId);
+              setAudioClipsDropHighlight(!!entry && DROPPABLE_TYPES.has(entry.type));
+            },
+
+            onLeave(): void {
+              setAudioClipsDropHighlight(false);
+            },
+
+            onDrop(draggedWidgetId: string, worldX: number, worldY: number): boolean {
+              setAudioClipsDropHighlight(false);
+              if (!timeline) return false;
+
+              const entry = store.getWidget(draggedWidgetId);
+              if (!entry) return false;
+              const dropped = readDroppedAudioState(entry.type, entry.docId);
+              if (!dropped) return false;
+
+              const local = toAudioClipsLocal(worldX, worldY);
+              const start = Math.max(0, timeline.screenXToTime(local?.x ?? 0));
+
+              const clip: AudioClip = {
+                id: crypto.randomUUID(),
+                trackId: "default",
+                start,
+                durationSec: dropped.duration,
+                label: entry.type === "tts" ? (dropped.ttsText ?? "").slice(0, 40) : (dropped.filename ?? ""),
+                audioBlobId: dropped.blobId,
+                audioBlake3: dropped.blake3 || undefined,
+                audioMime: dropped.mime || undefined,
+                ttsText: dropped.ttsText || undefined,
+                ttsVoiceName: dropped.ttsVoiceName || undefined,
+                ttsVoiceLang: dropped.ttsVoiceLang || undefined,
+                ttsRate: dropped.ttsRate,
+              };
+
+              ctx.doc.change((d) => {
+                d.audioClips.push(clip);
+              });
+
+              store.removeWidget(draggedWidgetId);
+              return true;
+            },
+          }
+        : undefined,
+
       resize(w: number, h: number) {
         currentWidth = w;
         currentHeight = h;
         drawBg(w, h);
+        container.hitArea = new Rectangle(0, 0, w, h);
         drawPlaceholderBorder(w, h);
         placeholderText.x = w / 2;
         placeholderText.y = h / 2;
         if (timeline) {
-          timeline.container.y = h - TIMELINE_SHELL_HEIGHT - PADDING;
+          timeline.container.y = timelineY(h);
           timeline.resize(Math.max(0, w - TIMELINE_INSET * 2));
           cutModeControl?.resize(Math.max(0, w - TIMELINE_INSET * 2));
           referenceTrack?.resize(Math.max(0, w - TIMELINE_INSET * 2));
+        }
+        if (segmentsPanel) {
+          segmentsPanel.container.y = segmentsPanelY(h);
+          segmentsPanel.resize(Math.max(0, w - TIMELINE_INSET * 2));
         }
       },
 
@@ -711,6 +1100,9 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         uploadCancelled = true;
         uploadAbort?.abort();
         if (referenceDataMessageTimer !== null) clearTimeout(referenceDataMessageTimer);
+        document.removeEventListener("keydown", handleKeyDown);
+        dropHighlight?.destroy();
+        dropHighlight = null;
         unsubscribe();
         teardownMediaOverlay();
         teardownTimeline();
@@ -718,3 +1110,24 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     };
   },
 };
+
+// -----------------------------------------------------------------------
+// registry bootstrapping
+// -----------------------------------------------------------------------
+
+// module-level reference set by registerStfuWidget() so the widget's own
+// create() can look up other widget types' factories/schemas at runtime
+// (needed by the "widget → track" dropTarget above to read a dragged
+// audio-recording/tts widget's doc) — mirrors bin/index.ts's identical
+// _binWidgetRegistry pattern.
+let _stfuWidgetRegistry: WidgetRegistry | null = null;
+
+/**
+ * register the stfu widget and stash the registry reference so the widget
+ * can look up other widget factories at runtime (for its dropTarget).
+ */
+export function registerStfuWidget(registry: WidgetRegistry): void {
+  _stfuWidgetRegistry = registry;
+  registry.register(stfuWidget);
+}
+
