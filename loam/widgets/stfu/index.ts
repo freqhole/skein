@@ -10,7 +10,7 @@
  */
 
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
-import { Container, Graphics, Rectangle, Text } from "pixi.js";
+import { Container, type FederatedPointerEvent, Graphics, Rectangle, Text } from "pixi.js";
 import { checkBlobLocality } from "../../src/file-utils/blob-locality";
 import { getLocalNodeId, guessMimeFromFilename, type PeersMap } from "../../src/file-utils/file-shared";
 import { snatchBlob } from "../../src/file-utils/snatch";
@@ -38,7 +38,6 @@ import type {
 import { stfuSchema, type AudioClip, type StfuState } from "./types";
 
 const PADDING = 8;
-const HEADER_HEIGHT = 20;
 const TIMELINE_INSET = 6;
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 
@@ -123,6 +122,9 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     let cutOverlayEl: HTMLDivElement | null = null;
     let timeUpdateHandler: (() => void) | null = null;
     let pauseHandler: (() => void) | null = null;
+    // the video/timeline splitter handle — created once alongside the
+    // timeline itself (see `ensureTimeline()`), null until a video is loaded.
+    let videoResizeHandle: Container | null = null;
     // audio-clips playback while the video plays — either the clip's own
     // generated/recorded audio file (`clipAudioEl`, lazily created) or, for
     // a clip that hasn't been generated yet, a live speechSynthesis reading
@@ -167,6 +169,13 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           label: videoSnatchProgressText || "snatching…",
           disabled: true,
         });
+      }
+      // transient feedback for the "load reference data..." action — shown
+      // as a non-clickable info badge in the widget frame's own header
+      // (there's no in-canvas header row anymore, and this area sits above
+      // the DOM video overlay's z-index instead of underneath it).
+      if (referenceDataMessage) {
+        actions.push({ id: "reference-data-status", label: referenceDataMessage, isInfo: true });
       }
       ctx.setHeaderActions(actions);
     }
@@ -282,27 +291,18 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       pointerInsideWidget = false;
     });
 
-    // -- header (filename / duration / status) ----------------------------------
-
-    const headerText = new Text({
-      text: "",
-      style: {
-        fontFamily: FONT_FAMILY,
-        fontSize: 11,
-        fill: 0x94a3b8,
-      },
-      resolution: typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2,
-    });
-    headerText.x = PADDING;
-    headerText.y = PADDING;
-    container.addChild(headerText);
+    // -- video area ---------------------------------------------------------------
+    // no dedicated header row — the video area starts at y=0 so the player
+    // gets the widget's full height. the "load reference data..." action's
+    // transient feedback now surfaces via `updateVideoHeaderActions()`'s
+    // info badge instead (see above).
 
     // dedicated child container whose local (0,0) is the video area's own
-    // top-left (below the header row) — createMediaDomOverlay tracks *this*
-    // container's bounds, so the DOM video element is positioned correctly
-    // without needing a CSS margin hack on the video itself.
+    // top-left (there's no header row above it anymore) — createMediaDomOverlay
+    // tracks *this* container's bounds, so the DOM video element is positioned
+    // correctly without needing a CSS margin hack on the video itself.
     const videoArea = new Container();
-    videoArea.y = HEADER_HEIGHT;
+    videoArea.y = 0;
     container.addChild(videoArea);
 
     // -- placeholder (empty/loading state) --------------------------------------
@@ -374,6 +374,45 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     }
 
     let localPrefs = loadLocalPrefs();
+
+    // -- vertical resize handles (video area / timeline / segments panel) -------
+    // the timeline shell itself is a fixed height; only the video area and
+    // the segments panel below it are user-resizable, via a drag handle
+    // above and below the timeline respectively. dragging either one only
+    // redistributes space between the video area and segments panel — the
+    // widget's own height never changes (purely local UI state, not synced
+    // via the doc) — see docs/stfu-widget-plan.md.
+    const HANDLE_GAP = 10;
+    const VIDEO_AREA_MIN_HEIGHT = 100;
+    const SEGMENTS_PANEL_MIN_HEIGHT = 80;
+    const SEGMENTS_PANEL_MAX_HEIGHT = 480;
+
+    function clampSegmentsPanelHeight(h: number): number {
+      return Math.max(SEGMENTS_PANEL_MIN_HEIGHT, Math.min(SEGMENTS_PANEL_MAX_HEIGHT, Math.round(h)));
+    }
+
+    const segmentsPanelHeightKey = `skein.stfu.${ctx.widgetId}.segmentsPanelHeight`;
+
+    function loadSegmentsPanelHeight(): number {
+      try {
+        const raw = localStorage.getItem(segmentsPanelHeightKey);
+        const n = raw ? Number(raw) : NaN;
+        if (Number.isFinite(n)) return clampSegmentsPanelHeight(n);
+      } catch {
+        // private browsing / storage disabled — fall back to the default below
+      }
+      return SEGMENTS_PANEL_HEIGHT;
+    }
+
+    function saveSegmentsPanelHeight(): void {
+      try {
+        localStorage.setItem(segmentsPanelHeightKey, String(segmentsPanelHeight));
+      } catch {
+        // not fatal, just doesn't persist
+      }
+    }
+
+    let segmentsPanelHeight = loadSegmentsPanelHeight();
 
     // -- cut-overlay DOM element (the "overlay cuts" playback effect) ------------
     // a red-tinted fade-in indicator over the video while the playhead is
@@ -699,27 +738,16 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
 
     function refresh(): void {
       syncVisibility();
-      const state = ctx.doc.current;
       if (loadState === "loading") {
         placeholderText.text = progressText || "uploading…";
       } else if (loadState === "empty") {
         placeholderText.text = statusMessage || (iAmCreator ? "click to upload video" : "waiting for video");
       }
-      headerText.text =
-        loadState === "ready"
-          ? [
-              state.videoFilename,
-              state.videoDurationSec ? `${Math.round(state.videoDurationSec)}s` : null,
-              referenceDataMessage || null,
-            ]
-              .filter(Boolean)
-              .join(" · ")
-          : "";
     }
 
     function setReferenceDataMessage(message: string, autoClearMs = 6000): void {
       referenceDataMessage = message;
-      refresh();
+      updateVideoHeaderActions();
       if (referenceDataMessageTimer !== null) {
         clearTimeout(referenceDataMessageTimer);
         referenceDataMessageTimer = null;
@@ -728,7 +756,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         referenceDataMessageTimer = setTimeout(() => {
           referenceDataMessageTimer = null;
           referenceDataMessage = "";
-          refresh();
+          updateVideoHeaderActions();
         }, autoClearMs);
       }
     }
@@ -768,6 +796,8 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     }
 
     function teardownTimeline(): void {
+      videoResizeHandle?.destroy({ children: true });
+      videoResizeHandle = null;
       cutModeControl?.destroy();
       cutModeControl = null;
       keyboardShortcutsControl?.destroy();
@@ -789,11 +819,65 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     // vertical space the timeline shell reserves above the bottom edge, now
     // that the segments panel also lives down there (below the timeline,
     // per the plan doc's "below/beside-timeline list of rows" wording).
-    function timelineY(h: number): number {
-      return h - SEGMENTS_PANEL_HEIGHT - PADDING - TIMELINE_SHELL_HEIGHT - PADDING;
-    }
+    // `HANDLE_GAP` above and below the timeline leaves room for the two
+    // drag handles without them overlapping the timeline shell itself.
     function segmentsPanelY(h: number): number {
-      return h - SEGMENTS_PANEL_HEIGHT - PADDING;
+      return h - segmentsPanelHeight - PADDING;
+    }
+    function timelineY(h: number): number {
+      return segmentsPanelY(h) - TIMELINE_SHELL_HEIGHT - HANDLE_GAP;
+    }
+    // pixel height available to the video area — it starts at y=0 (no header
+    // row), so this is also its own bottom edge / total height.
+    function videoAreaHeight(h: number): number {
+      return timelineY(h) - HANDLE_GAP;
+    }
+
+    // shared layout pass — repositions/resizes every widget-owned piece for
+    // a given (width, height). used both by the controller's own `resize()`
+    // (driven by the widget frame / other peers' synced doc changes) and,
+    // during a local drag of one of the two splitter handles below, to
+    // apply a new `segmentsPanelHeight` at the *same* (w, h) — dragging a
+    // splitter never changes the widget's own width/height, only the split.
+    function applyLayout(w: number, h: number): void {
+      currentWidth = w;
+      currentHeight = h;
+      drawBg(w, h);
+      container.hitArea = new Rectangle(0, 0, w, h);
+      drawPlaceholderBorder(w, h);
+      placeholderText.x = w / 2;
+      placeholderText.y = h / 2;
+      if (timeline) {
+        timeline.container.y = timelineY(h);
+        timeline.resize(Math.max(0, w - TIMELINE_INSET * 2));
+        cutModeControl?.resize(Math.max(0, w - TIMELINE_INSET * 2));
+        referenceTrack?.resize(Math.max(0, w - TIMELINE_INSET * 2));
+      }
+      keyboardShortcutsControl?.resize(w, h);
+      if (segmentsPanel) {
+        segmentsPanel.container.y = segmentsPanelY(h);
+        segmentsPanel.resize(Math.max(0, w - TIMELINE_INSET * 2), segmentsPanelHeight);
+      }
+      voicePickerDialog?.resize(w, h);
+      if (videoResizeHandle) {
+        videoResizeHandle.x = TIMELINE_INSET;
+        videoResizeHandle.y = videoAreaHeight(h);
+        drawSplitterHandle(videoResizeHandle, Math.max(0, w - TIMELINE_INSET * 2));
+      }
+    }
+
+    // draws (or redraws, on width change) a thin horizontal grip bar — a
+    // dim centered dash, matching the visual weight of the property-tray's
+    // own resize handles rather than a full-width divider line.
+    function drawSplitterHandle(handle: Container, width: number): void {
+      const gfx = handle.getChildAt(0) as Graphics;
+      gfx.clear();
+      gfx.rect(0, 0, width, HANDLE_GAP).fill({ color: 0x000000, alpha: 0.001 });
+      const dashWidth = Math.min(32, Math.max(0, width - 8));
+      gfx
+        .roundRect((width - dashWidth) / 2, HANDLE_GAP / 2 - 1.5, dashWidth, 3, 1.5)
+        .fill({ color: 0x555566 });
+      handle.hitArea = new Rectangle(0, 0, width, HANDLE_GAP);
     }
 
     function ensureTimeline(): VideoTimelineHandle {
@@ -898,7 +982,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         // the speaker popover is allowed to cover the rest of the timeline
         // shell + the segments panel below it while open (it's modal-ish),
         // but must still fit inside the widget's own clipped bounds.
-        overlayMaxHeight: TIMELINE_SHELL_HEIGHT + PADDING + SEGMENTS_PANEL_HEIGHT + PADDING,
+        overlayMaxHeight: TIMELINE_SHELL_HEIGHT + PADDING + segmentsPanelHeight + PADDING,
         // drag a reference/diarization segment down into the cut list to
         // create a new editable segment snapped exactly to its start/end
         // (it can then be resized like any other cut-list segment).
@@ -992,11 +1076,12 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         onOpenVoicePicker: (opts) => voicePickerDialog?.open(opts),
         storageKey: `skein.stfu.${ctx.widgetId}.segmentsPanel`,
         getAutoScrollEnabled: () => (timeline ? timeline.isAutoScrollEnabled() : false),
+        initialHeight: segmentsPanelHeight,
       });
       segmentsPanel.container.x = TIMELINE_INSET;
       segmentsPanel.container.y = segmentsPanelY(currentHeight);
       container.addChild(segmentsPanel.container);
-      segmentsPanel.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
+      segmentsPanel.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2), segmentsPanelHeight);
       // re-add `timeline.container` so it renders ABOVE `segmentsPanel.container`
       // (siblings render in addChild order) — the reference speaker popover
       // (mounted inside `timeline.container`) is deliberately allowed to
@@ -1004,6 +1089,44 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       // `overlayMaxHeight`), which only actually shows on top if the timeline
       // itself is the later sibling.
       container.addChild(timeline.container);
+      // vertical splitter handle above the timeline — adjusts how the fixed
+      // vertical space between the video area and the segments panel is
+      // divided, via the single stored `segmentsPanelHeight` (video area
+      // height stays fully derived, see `videoAreaHeight()`): dragging down
+      // grows the video area and shrinks the segments panel by the same
+      // amount; dragging up does the opposite. the widget's own
+      // height/footprint never changes from this drag (no doc write at
+      // all — purely local UI state, like the autoscroll/snap prefs above).
+      videoResizeHandle = new Container();
+      videoResizeHandle.addChild(new Graphics());
+      videoResizeHandle.eventMode = "static";
+      videoResizeHandle.cursor = "ns-resize";
+      container.addChild(videoResizeHandle);
+
+      let splitterDrag: { startGlobalY: number; startSegmentsPanelHeight: number } | null = null;
+      videoResizeHandle.on("pointerdown", (e: FederatedPointerEvent) => {
+        e.stopPropagation();
+        splitterDrag = { startGlobalY: e.global.y, startSegmentsPanelHeight: segmentsPanelHeight };
+      });
+      videoResizeHandle.on("globalpointermove", (e: FederatedPointerEvent) => {
+        if (!splitterDrag) return;
+        const zoom = findWorldContainer().scale.x || 1;
+        const dy = (e.global.y - splitterDrag.startGlobalY) / zoom;
+        // moving the handle down (positive dy) shrinks the segments panel
+        // and grows the video area by the same amount (total height fixed).
+        const maxForVideoMin =
+          currentHeight - TIMELINE_SHELL_HEIGHT - HANDLE_GAP * 2 - PADDING - VIDEO_AREA_MIN_HEIGHT;
+        const proposed = clampSegmentsPanelHeight(splitterDrag.startSegmentsPanelHeight - dy);
+        segmentsPanelHeight = Math.max(SEGMENTS_PANEL_MIN_HEIGHT, Math.min(maxForVideoMin, proposed));
+        applyLayout(currentWidth, currentHeight);
+      });
+      const finishSplitterDrag = () => {
+        if (!splitterDrag) return;
+        splitterDrag = null;
+        saveSegmentsPanelHeight();
+      };
+      videoResizeHandle.on("pointerup", finishSplitterDrag);
+      videoResizeHandle.on("pointerupoutside", finishSplitterDrag);
       // created last (after every reorder above) so their backdrop+panel —
       // added straight to the widget-root `container` — land as the LAST,
       // hence topmost, siblings; created any earlier and the final
@@ -1024,6 +1147,10 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         onOpenChange: handleFullWidgetDialogOpenChange,
       });
       voicePickerDialog.resize(currentWidth, currentHeight);
+      // draws/positions the two splitter handles for the first time (their
+      // Graphics start out empty with no hitArea until `applyLayout()` runs
+      // at least once) and re-confirms every other piece's layout too.
+      applyLayout(currentWidth, currentHeight);
       return timeline;
     }
 
@@ -1066,7 +1193,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           width: currentWidth,
           height: Math.max(
             0,
-            currentHeight - HEADER_HEIGHT - SEGMENTS_PANEL_HEIGHT - PADDING - TIMELINE_SHELL_HEIGHT - PADDING
+            videoAreaHeight(currentHeight)
           ),
         }),
         muted: false,
@@ -1546,25 +1673,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         : undefined,
 
       resize(w: number, h: number) {
-        currentWidth = w;
-        currentHeight = h;
-        drawBg(w, h);
-        container.hitArea = new Rectangle(0, 0, w, h);
-        drawPlaceholderBorder(w, h);
-        placeholderText.x = w / 2;
-        placeholderText.y = h / 2;
-        if (timeline) {
-          timeline.container.y = timelineY(h);
-          timeline.resize(Math.max(0, w - TIMELINE_INSET * 2));
-          cutModeControl?.resize(Math.max(0, w - TIMELINE_INSET * 2));
-          referenceTrack?.resize(Math.max(0, w - TIMELINE_INSET * 2));
-        }
-        keyboardShortcutsControl?.resize(w, h);
-        if (segmentsPanel) {
-          segmentsPanel.container.y = segmentsPanelY(h);
-          segmentsPanel.resize(Math.max(0, w - TIMELINE_INSET * 2));
-        }
-        voicePickerDialog?.resize(w, h);
+        applyLayout(w, h);
       },
 
       destroy() {

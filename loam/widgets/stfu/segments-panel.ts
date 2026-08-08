@@ -117,13 +117,20 @@ export interface SegmentsPanelOptions {
   /** whether "autoscroll" (follow the playhead) is currently on — owned by
    *  `video-timeline.ts`'s toolbar toggle now, read here every `onTimeUpdate()`. */
   getAutoScrollEnabled: () => boolean;
+  /** initial panel height in px — defaults to `SEGMENTS_PANEL_HEIGHT` (the
+   *  original fixed size) if omitted. `resize()`'s own `height` argument is
+   *  the only other way to change it afterward (see `index.ts`'s vertical
+   *  resize handles, which own the persisted preference for this value). */
+  initialHeight?: number;
 }
 
 export interface SegmentsPanelHandle {
   container: Container;
   /** re-draw rows — call after editableSegments/transcriptSegments/referenceSpeakers/audioClips change. */
   refresh(): void;
-  resize(width: number): void;
+  /** `height` is optional — omit it to just reflow at the current height
+   *  (e.g. a plain width-only resize) rather than changing it. */
+  resize(width: number, height?: number): void;
   /** call on every video timeupdate with the current playhead time — advances autoscroll. */
   onTimeUpdate(currentTime: number): void;
   /**
@@ -557,10 +564,12 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     storageKey,
     onOpenVoicePicker,
     getAutoScrollEnabled,
+    initialHeight,
   } = options;
 
   let prefs = loadPrefs(storageKey);
   let contentWidth = 0;
+  let panelHeight = initialHeight ?? SEGMENTS_PANEL_HEIGHT;
   let currentSegments: PanelSegment[] = [];
   let rowTops: number[] = [];
   let lastAutoScrolledIndex = -1;
@@ -593,7 +602,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
   // -- scrollable row list -------------------------------------------------------
 
   const listY = 0;
-  const listVisibleHeight = SEGMENTS_PANEL_HEIGHT - listY;
+  let listVisibleHeight = panelHeight - listY;
   const scrollable: ScrollableContent = createScrollableContent(
     container,
     canvasElement,
@@ -852,10 +861,14 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
       redraw();
     },
 
-    resize(width: number) {
+    resize(width: number, height?: number) {
       contentWidth = Math.max(0, width);
+      if (height !== undefined) {
+        panelHeight = Math.max(1, height);
+        listVisibleHeight = panelHeight - listY;
+      }
       bg.clear();
-      bg.roundRect(0, 0, contentWidth, SEGMENTS_PANEL_HEIGHT, 6).fill({ color: 0x1e1e1e }).stroke({
+      bg.roundRect(0, 0, contentWidth, panelHeight, 6).fill({ color: 0x1e1e1e }).stroke({
         width: 1,
         color: 0x333333,
       });
