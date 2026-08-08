@@ -14,6 +14,7 @@ import { getLocalNodeId, guessMimeFromFilename, type PeersMap } from "../../src/
 import { pickFiles, uploadFile } from "../../src/file-utils/upload";
 import { getMediaPlaybackUrl } from "../../src/media";
 import { createMediaDomOverlay, type MediaDomOverlayHandle } from "../../src/widgets/media-dom-overlay";
+import { createCutModeControl, CUT_MODE_CONTROL_RESERVED_WIDTH, type CutModeControlHandle } from "./cut-mode-control";
 import { createCutSegmentsTrack, type CutSegmentsTrackHandle, type EditableSegment } from "./cut-segments-track";
 import { createVideoTimeline, TIMELINE_SHELL_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
 import type {
@@ -79,6 +80,8 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     let mediaOverlay: MediaDomOverlayHandle | null = null;
     let timeline: VideoTimelineHandle | null = null;
     let cutTrack: CutSegmentsTrackHandle | null = null;
+    let cutModeControl: CutModeControlHandle | null = null;
+    let cutOverlayEl: HTMLDivElement | null = null;
     let timeUpdateHandler: (() => void) | null = null;
 
     // -- background ------------------------------------------------------------
@@ -151,6 +154,172 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     placeholderText.cursor = iAmCreator ? "pointer" : "default";
     container.addChild(placeholderText);
 
+    // -- cut-playback local-only prefs (overlay display + mute latency-comp ms) --
+    // never part of the automerge doc — these don't affect the exported/rendered
+    // output, only how this browser instance previews cuts locally (mirrors
+    // trek-minus-paris's localStorage-vs-manifest split — see docs/stfu-widget-plan.md).
+
+    interface LocalCutPrefs {
+      overlayEnabled: boolean;
+      muteEarlyMs: number;
+    }
+
+    const localPrefsKey = `skein.stfu.${ctx.widgetId}.cutPlaybackPrefs`;
+
+    function loadLocalPrefs(): LocalCutPrefs {
+      try {
+        const raw = localStorage.getItem(localPrefsKey);
+        if (!raw) return { overlayEnabled: false, muteEarlyMs: 150 };
+        const parsed = JSON.parse(raw);
+        return {
+          overlayEnabled: Boolean(parsed.overlayEnabled),
+          muteEarlyMs: typeof parsed.muteEarlyMs === "number" ? parsed.muteEarlyMs : 150,
+        };
+      } catch {
+        return { overlayEnabled: false, muteEarlyMs: 150 };
+      }
+    }
+
+    function saveLocalPrefs(): void {
+      try {
+        localStorage.setItem(localPrefsKey, JSON.stringify(localPrefs));
+      } catch {
+        // private browsing / storage disabled / quota exceeded — not fatal, prefs just don't persist
+      }
+    }
+
+    let localPrefs = loadLocalPrefs();
+
+    // -- cut-overlay DOM element (the "overlay cuts" playback effect) ------------
+    // a red-tinted fade-in indicator over the video while the playhead is
+    // inside a cut segment — appended into the media overlay's own wrapper
+    // div (see media-dom-overlay.ts) so it's torn down automatically
+    // alongside the video element. direct port of trek-minus-paris
+    // editor.js's `#cut-overlay` (see editor.css), including the giant
+    // red "×" mark above the "cut" label.
+
+    function createCutOverlayEl(): HTMLDivElement {
+      const el = document.createElement("div");
+      const s = el.style;
+      s.position = "absolute";
+      s.inset = "0";
+      s.display = "flex";
+      s.flexDirection = "column";
+      s.alignItems = "center";
+      s.justifyContent = "center";
+      s.gap = "0.5rem";
+      s.background = "rgba(200, 0, 0, 0.18)";
+      s.opacity = "0";
+      s.pointerEvents = "none";
+      s.transition = "opacity 0.08s ease";
+
+      const xMark = document.createElement("div");
+      xMark.textContent = "\u00d7";
+      const xs = xMark.style;
+      xs.fontSize = "9rem";
+      xs.lineHeight = "1";
+      xs.fontWeight = "700";
+      xs.color = "rgba(255, 45, 45, 0.9)";
+      xs.textShadow = "0 0 24px rgba(0, 0, 0, 0.7)";
+
+      const label = document.createElement("div");
+      label.textContent = "cut";
+      const ls = label.style;
+      ls.fontSize = "1.1rem";
+      ls.fontWeight = "600";
+      ls.letterSpacing = "0.25em";
+      ls.textTransform = "uppercase";
+      ls.color = "rgba(255, 255, 255, 0.92)";
+      ls.background = "rgba(0, 0, 0, 0.55)";
+      ls.padding = "0.2rem 0.9rem";
+      ls.borderRadius = "4px";
+
+      el.appendChild(xMark);
+      el.appendChild(label);
+      return el;
+    }
+
+    function setCutOverlayActive(active: boolean): void {
+      if (cutOverlayEl) cutOverlayEl.style.opacity = active ? "1" : "0";
+    }
+
+    // -- cut-playback effects (skip / overlay / mute) -----------------------------
+
+    function findContainingSegment(t: number): EditableSegment | null {
+      for (const seg of ctx.doc.current.editableSegments) {
+        if (t >= seg[0] && t < seg[1]) return seg;
+      }
+      return null;
+    }
+
+    function applyCutPlaybackEffects(): void {
+      if (!mediaOverlay) return;
+      const video = mediaOverlay.video;
+      const state = ctx.doc.current;
+
+      if (state.cutSkipEnabled) {
+        setCutOverlayActive(false);
+        video.muted = false;
+        if (video.paused || video.seeking) return;
+        let seg = findContainingSegment(video.currentTime);
+        let guard = 0;
+        while (seg && guard < 10) {
+          video.currentTime = Math.min(video.duration || seg[1], seg[1] + 0.01);
+          seg = findContainingSegment(video.currentTime);
+          guard++;
+        }
+        return;
+      }
+
+      const seg = findContainingSegment(video.currentTime);
+      setCutOverlayActive(localPrefs.overlayEnabled && Boolean(seg));
+      const upcomingSeg = findContainingSegment(video.currentTime + localPrefs.muteEarlyMs / 1000);
+      video.muted = state.cutMuteEnabled && Boolean(upcomingSeg);
+    }
+
+    function handleToggleSkip(): void {
+      const next = !ctx.doc.current.cutSkipEnabled;
+      ctx.doc.change((d) => {
+        d.cutSkipEnabled = next;
+        if (next) d.cutMuteEnabled = false;
+      });
+      if (next && localPrefs.overlayEnabled) {
+        localPrefs = { ...localPrefs, overlayEnabled: false };
+        saveLocalPrefs();
+      }
+      cutModeControl?.refresh();
+      applyCutPlaybackEffects();
+    }
+
+    function handleToggleOverlay(): void {
+      const nextOverlay = !localPrefs.overlayEnabled;
+      localPrefs = { ...localPrefs, overlayEnabled: nextOverlay };
+      saveLocalPrefs();
+      if (nextOverlay && ctx.doc.current.cutSkipEnabled) {
+        ctx.doc.change((d) => {
+          d.cutSkipEnabled = false;
+        });
+      }
+      cutModeControl?.refresh();
+      applyCutPlaybackEffects();
+    }
+
+    function handleToggleMute(): void {
+      const next = !ctx.doc.current.cutMuteEnabled;
+      ctx.doc.change((d) => {
+        d.cutMuteEnabled = next;
+        if (next) d.cutSkipEnabled = false;
+      });
+      cutModeControl?.refresh();
+      applyCutPlaybackEffects();
+    }
+
+    function handleMuteEarlyMsChange(ms: number): void {
+      localPrefs = { ...localPrefs, muteEarlyMs: ms };
+      saveLocalPrefs();
+      cutModeControl?.refresh();
+    }
+
     // -- helpers -----------------------------------------------------------------
 
     function syncVisibility(): void {
@@ -182,10 +351,13 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       timeUpdateHandler = null;
       mediaOverlay?.close();
       mediaOverlay = null;
+      cutOverlayEl = null;
       loadedVideoKey = "";
     }
 
     function teardownTimeline(): void {
+      cutModeControl?.destroy();
+      cutModeControl = null;
       cutTrack?.destroy();
       cutTrack = null;
       timeline?.destroy();
@@ -209,6 +381,20 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         },
         getDuration: () => ctx.doc.current.videoDurationSec,
       });
+      timeline.reserveToolbarStart(CUT_MODE_CONTROL_RESERVED_WIDTH);
+      cutModeControl = createCutModeControl({
+        toolbar: timeline.toolbarRow,
+        overlayParent: timeline.container,
+        getSkipEnabled: () => ctx.doc.current.cutSkipEnabled,
+        getOverlayEnabled: () => localPrefs.overlayEnabled,
+        getMuteEnabled: () => ctx.doc.current.cutMuteEnabled,
+        getMuteEarlyMs: () => localPrefs.muteEarlyMs,
+        onToggleSkip: handleToggleSkip,
+        onToggleOverlay: handleToggleOverlay,
+        onToggleMute: handleToggleMute,
+        onMuteEarlyMsChange: handleMuteEarlyMsChange,
+      });
+      cutModeControl.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
       return timeline;
     }
 
@@ -251,6 +437,9 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         objectFit: "contain",
       });
 
+      cutOverlayEl = createCutOverlayEl();
+      mediaOverlay.wrapper.appendChild(cutOverlayEl);
+
       const tl = ensureTimeline();
 
       // best-effort duration — populated from the browser's own metadata
@@ -274,6 +463,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
 
       timeUpdateHandler = () => {
         if (mediaOverlay) tl.setCurrentTime(mediaOverlay.video.currentTime);
+        applyCutPlaybackEffects();
       };
       mediaOverlay.video.addEventListener("timeupdate", timeUpdateHandler);
     }
@@ -296,6 +486,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     function refreshTimelineFromDoc(): void {
       timeline?.setDuration(ctx.doc.current.videoDurationSec);
       cutTrack?.refresh();
+      cutModeControl?.refresh();
     }
 
     applyDocState();
@@ -402,6 +593,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         if (timeline) {
           timeline.container.y = h - TIMELINE_SHELL_HEIGHT - PADDING;
           timeline.resize(Math.max(0, w - TIMELINE_INSET * 2));
+          cutModeControl?.resize(Math.max(0, w - TIMELINE_INSET * 2));
         }
       },
 

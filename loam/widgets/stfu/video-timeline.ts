@@ -28,8 +28,8 @@ const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePi
 const ZOOM_LEVELS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
 const NICE_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200];
 
-const TOOLBAR_HEIGHT = 20;
-const ROW_GAP = 3;
+export const TOOLBAR_HEIGHT = 20;
+export const ROW_GAP = 3;
 /** height of the cut-segments track row (the only track row this shell owns
  *  today — the future audio-clips track gets its own row, phase 4). */
 export const CUT_TRACK_HEIGHT = 28;
@@ -102,6 +102,13 @@ export interface VideoTimelineHandle {
    *  handling here; its local coordinate frame matches `timeToScreenX()`/
    *  `screenXToTime()` (x=0 is the left edge of the visible content area). */
   trackHitArea: Container;
+  /** the toolbar row (zoom out/level/in/fit buttons) — external controls
+   *  (stfu's cut-mode-control) mount their collapsed trigger here, leftmost,
+   *  after calling `reserveToolbarStart()` to make room. */
+  toolbarRow: Container;
+  /** shift the built-in zoom controls right by `width` px to make room for
+   *  an externally-mounted leading control (see `toolbarRow`). */
+  reserveToolbarStart(width: number): void;
   /** call whenever the widget's own width changes. */
   resize(contentWidth: number): void;
   setDuration(duration: number): void;
@@ -149,8 +156,13 @@ export function createVideoTimeline(initialContentWidth: number): VideoTimelineH
   const fitBtn = makeTextButton("fit", () => zoomFit());
   toolbarRow.addChild(zoomOutBtn, zoomLevelText, zoomInBtn, fitBtn);
 
+  // reserved space at the row's start for an externally-mounted control
+  // (stfu's cut-mode-control sits leftmost, matching editor.js's own
+  // `layoutToolbar()` order) — set via `reserveToolbarStart()`.
+  let toolbarLeadingWidth = 0;
+
   function layoutToolbar(): void {
-    let x = 0;
+    let x = toolbarLeadingWidth;
     zoomOutBtn.x = x;
     x += (zoomOutBtn as any).buttonWidth + 4;
     zoomLevelText.x = x + 14;
@@ -376,6 +388,12 @@ export function createVideoTimeline(initialContentWidth: number): VideoTimelineH
     container,
     trackContentLayer,
     trackHitArea: trackBg,
+    toolbarRow,
+
+    reserveToolbarStart(width: number) {
+      toolbarLeadingWidth = Math.max(0, width);
+      layoutToolbar();
+    },
 
     resize(newContentWidth: number) {
       contentWidth = Math.max(0, newContentWidth);
