@@ -41,7 +41,7 @@ const DRAG_THRESHOLD_PX = 3; // pointer movement past this counts as a drag, not
 const DRAG_OUT_VERTICAL_PX = 20;
 /** nominal display width (seconds) for a clip with no known real duration
  *  yet (durationSec 0, i.e. audio not yet recorded/generated). */
-const PENDING_DISPLAY_SEC = 1;
+const PENDING_DISPLAY_SEC = 10;
 
 type DragMode = "create" | "move" | "resize-left" | "resize-right";
 

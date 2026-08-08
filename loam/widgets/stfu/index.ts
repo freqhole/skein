@@ -25,6 +25,7 @@ import { createKeyboardShortcutsControl, type KeyboardShortcutsControlHandle } f
 import { mergeCombinedData, mergeDiarizeData, mergeTranscribeData, parseReferenceDataJson } from "./reference-data";
 import { createReferenceTrack, type ReferenceTrackHandle } from "./reference-track";
 import { createSegmentsPanel, SEGMENTS_PANEL_HEIGHT, type SegmentsPanelHandle } from "./segments-panel";
+import { cancelPreview, speakPreview } from "../tts/voices";
 import { AUDIO_CLIP_TRACK_HEIGHT, createVideoTimeline, TIMELINE_SHELL_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
 import { createVoicePickerDialog, type VoicePickerDialogHandle } from "./voice-picker-dialog";
 import type {
@@ -121,6 +122,13 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     let voicePickerDialog: VoicePickerDialogHandle | null = null;
     let cutOverlayEl: HTMLDivElement | null = null;
     let timeUpdateHandler: (() => void) | null = null;
+    let pauseHandler: (() => void) | null = null;
+    // audio-clips playback while the video plays — either the clip's own
+    // generated/recorded audio file (`clipAudioEl`, lazily created) or, for
+    // a clip that hasn't been generated yet, a live speechSynthesis reading
+    // of its `ttsText` (see applyAudioClipPlayback() below).
+    let clipAudioEl: HTMLAudioElement | null = null;
+    let activeAudioClipId: string | null = null;
 
     // -- "snatch" header action for peers that don't have the video blob
     // locally yet (see docs/stfu-widget-plan.md) — mirrors peedeeeff/index.ts's
@@ -446,6 +454,91 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       video.muted = state.cutMuteEnabled && Boolean(upcomingSeg);
     }
 
+    // -- audio-clip playback (tts speech synth / generated audio file / recording) --
+
+    // a not-yet-generated clip has no real `durationSec` yet — estimate a
+    // rough speaking length from its text just to gate *when* playback
+    // should start; the actual stop is driven by speechSynthesis's own
+    // "end" event, not this estimate.
+    function estimatedClipDuration(clip: AudioClip): number {
+      if (clip.durationSec > 0) return clip.durationSec;
+      const chars = (clip.ttsText || "").length;
+      const rate = clip.ttsRate || 1;
+      return Math.max(1, chars / (12 * rate));
+    }
+
+    function stopClipAudio(): void {
+      if (!activeAudioClipId) return;
+      cancelPreview();
+      clipAudioEl?.pause();
+      activeAudioClipId = null;
+    }
+
+    async function playClipAudioFile(clip: AudioClip, offset: number): Promise<void> {
+      if (!clip.audioBlobId) return;
+      const peers = ctx.canvasStore?.peers() as PeersMap | undefined;
+      const url = await getMediaPlaybackUrl(clip.audioBlobId, {
+        category: "audio",
+        mime: clip.audioMime,
+        blake3: clip.audioBlake3 || undefined,
+        peers,
+      });
+      if (destroyed || activeAudioClipId !== clip.id || !url) return;
+      if (!clipAudioEl) {
+        clipAudioEl = document.createElement("audio");
+        clipAudioEl.addEventListener("ended", () => {
+          activeAudioClipId = null;
+        });
+      }
+      if (clipAudioEl.src !== url) clipAudioEl.src = url;
+      clipAudioEl.currentTime = offset;
+      try {
+        await clipAudioEl.play();
+      } catch {
+        if (activeAudioClipId === clip.id) activeAudioClipId = null;
+      }
+    }
+
+    function startClipAudio(clip: AudioClip, offset: number): void {
+      activeAudioClipId = clip.id;
+      if (clip.audioBlobId) {
+        void playClipAudioFile(clip, offset);
+        return;
+      }
+      if (clip.ttsText) {
+        speakPreview(clip.ttsText, clip.ttsVoiceName || "", clip.ttsRate || 1, () => {
+          if (activeAudioClipId === clip.id) activeAudioClipId = null;
+        });
+        return;
+      }
+      activeAudioClipId = null;
+    }
+
+    function applyAudioClipPlayback(): void {
+      if (!mediaOverlay) return;
+      const video = mediaOverlay.video;
+      if (video.paused) {
+        stopClipAudio();
+        return;
+      }
+      const t = video.currentTime;
+      if (activeAudioClipId) {
+        const activeClip = ctx.doc.current.audioClips.find((c) => c.id === activeAudioClipId);
+        // grace window past the estimate — the real stop is the clip's own
+        // "ended"/speechSynthesis callback, not this check; only force-stop
+        // once the playhead has clearly moved away from the clip entirely
+        // (e.g. the user scrubbed elsewhere mid-clip).
+        if (activeClip && t >= activeClip.start - 0.25 && t <= activeClip.start + estimatedClipDuration(activeClip) + 1) {
+          return;
+        }
+        stopClipAudio();
+      }
+      const clip = ctx.doc.current.audioClips.find(
+        (c) => (c.audioBlobId || c.ttsText) && t >= c.start && t < c.start + estimatedClipDuration(c)
+      );
+      if (clip) startClipAudio(clip, Math.max(0, t - clip.start));
+    }
+
     function handleToggleSkip(): void {
       const next = !ctx.doc.current.cutSkipEnabled;
       ctx.doc.change((d) => {
@@ -632,10 +725,15 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     }
 
     function teardownMediaOverlay(): void {
+      stopClipAudio();
       if (mediaOverlay && timeUpdateHandler) {
         mediaOverlay.video.removeEventListener("timeupdate", timeUpdateHandler);
       }
+      if (mediaOverlay && pauseHandler) {
+        mediaOverlay.video.removeEventListener("pause", pauseHandler);
+      }
       timeUpdateHandler = null;
+      pauseHandler = null;
       mediaOverlay?.close();
       mediaOverlay = null;
       cutOverlayEl = null;
@@ -653,7 +751,10 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     function handleFullWidgetDialogOpenChange(open: boolean): void {
       openFullWidgetDialogCount = Math.max(0, openFullWidgetDialogCount + (open ? 1 : -1));
       if (!mediaOverlay) return;
-      if (openFullWidgetDialogCount > 0) mediaOverlay.video.pause();
+      if (openFullWidgetDialogCount > 0) {
+        mediaOverlay.video.pause();
+        stopClipAudio();
+      }
       mediaOverlay.wrapper.style.visibility = openFullWidgetDialogCount > 0 ? "hidden" : "visible";
     }
 
@@ -930,9 +1031,15 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       timeUpdateHandler = () => {
         if (mediaOverlay) tl.setCurrentTime(mediaOverlay.video.currentTime);
         applyCutPlaybackEffects();
+        applyAudioClipPlayback();
         if (mediaOverlay) segmentsPanel?.onTimeUpdate(mediaOverlay.video.currentTime);
       };
       mediaOverlay.video.addEventListener("timeupdate", timeUpdateHandler);
+      // "timeupdate" stops firing once paused, so a clip mid-playback needs
+      // its own explicit stop trigger here rather than relying on the next
+      // (nonexistent) timeupdate tick.
+      pauseHandler = () => stopClipAudio();
+      mediaOverlay.video.addEventListener("pause", pauseHandler);
     }
 
     function applyDocState(): void {
@@ -1392,6 +1499,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         dropHighlight?.destroy();
         dropHighlight = null;
         unsubscribe();
+        stopClipAudio();
         teardownMediaOverlay();
         teardownTimeline();
       },
