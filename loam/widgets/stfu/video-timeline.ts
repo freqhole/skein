@@ -73,6 +73,9 @@ const RULER_HEIGHT = 14;
 const SCROLLBAR_GAP = 4;
 const SCROLLBAR_HEIGHT = 8;
 const RULER_LABEL_POOL_SIZE = 16;
+/** fixed width reserved at the toolbar row's trailing (right) edge for an
+ *  externally-mounted control — see `toolbarTrailingSlot`. */
+export const TOOLBAR_TRAILING_SLOT_WIDTH = 24;
 
 /** total fixed height of the whole shell (toolbar + reference + cut track +
  *  audio-clips track + ruler + scrollbar rows) — only the width is
@@ -194,6 +197,11 @@ export interface VideoTimelineHandle {
   /** shift the built-in zoom controls right by `width` px to make room for
    *  an externally-mounted leading control (see `toolbarRow`). */
   reserveToolbarStart(width: number): void;
+  /** fixed anchor at the toolbar row's right edge (repositioned on every
+   *  `resize()`), `TOOLBAR_TRAILING_SLOT_WIDTH` px wide — external controls
+   *  (stfu's keyboard-shortcuts button) add their own child here at local
+   *  (0, 0) rather than computing their own x position. */
+  toolbarTrailingSlot: Container;
   /** unscaled layer the reference/diarization track draws its colored
    *  speaker segments into — same coordinate convention as
    *  `trackContentLayer` (reposition from scratch on every
@@ -263,6 +271,10 @@ export function createVideoTimeline(
 
   const toolbarRow = new Container();
   container.addChild(toolbarRow);
+
+  const toolbarTrailingSlot = new Container();
+  toolbarTrailingSlot.x = Math.max(0, contentWidth - TOOLBAR_TRAILING_SLOT_WIDTH);
+  toolbarRow.addChild(toolbarTrailingSlot);
 
   // "ZOOM" stacked just above the numeric level, matching editor.js's
   // `zoomLabelText`/`zoomLevelText` layout between the out/in buttons.
@@ -742,6 +754,7 @@ export function createVideoTimeline(
     trackContentLayer,
     trackHitArea: trackBg,
     toolbarRow,
+    toolbarTrailingSlot,
     referenceContentLayer,
     referenceHitArea: referenceBg,
     referenceLabelLayer,
@@ -756,6 +769,7 @@ export function createVideoTimeline(
     resize(newContentWidth: number) {
       contentWidth = Math.max(0, newContentWidth);
       rowWidth = Math.max(0, contentWidth - TRACK_LABEL_COLUMN_WIDTH);
+      toolbarTrailingSlot.x = Math.max(0, contentWidth - TOOLBAR_TRAILING_SLOT_WIDTH);
       updateRulerMask();
       applyViewChange(false);
     },

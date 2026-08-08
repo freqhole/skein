@@ -253,11 +253,6 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
   function onReferencePointerDown(e: FederatedPointerEvent): void {
     const local = e.getLocalPosition(timeline.referenceHitArea);
     const seg = hitTestReferenceEntry(local.x);
-    // TEMP DEBUG (remove once the drag-to-cutlist bug is diagnosed)
-    console.debug(
-      "[stfu:debug] reference-track pointerdown",
-      JSON.stringify({ localX: local.x, seg: seg ? { start: seg.start, end: seg.end, speaker: seg.speaker } : null })
-    );
     if (!seg) return;
     refDrag = { seg, startGlobalX: e.global.x, startGlobalY: e.global.y, moved: false };
   }
@@ -267,7 +262,6 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     const dx = e.global.x - refDrag.startGlobalX;
     const dy = e.global.y - refDrag.startGlobalY;
     if (!refDrag.moved && Math.hypot(dx, dy) <= REF_DRAG_THRESHOLD_PX) return;
-    const justStartedMoving = !refDrag.moved;
     refDrag.moved = true;
 
     const seg = refDrag.seg;
@@ -278,14 +272,6 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     const width = Math.max(2, x2 - x1);
     const overCutList = isOverCutList(e.global);
     const local = timeline.container.toLocal(e.global);
-    // TEMP DEBUG (remove once the drag-to-cutlist bug is diagnosed): only
-    // once per drag, not every move, to avoid flooding the log.
-    if (justStartedMoving) {
-      console.debug(
-        "[stfu:debug] reference-track drag started moving",
-        JSON.stringify({ seg: { start: seg.start, end: seg.end }, x1, x2, width, overCutList })
-      );
-    }
 
     const ghost = ensureGhost();
     ghost.clear();
@@ -303,16 +289,6 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     refDrag = null;
     destroyGhost();
     const overCutList = isOverCutList(e.global);
-    // TEMP DEBUG (remove once the drag-to-cutlist bug is diagnosed)
-    console.debug(
-      "[stfu:debug] reference-track pointerup",
-      JSON.stringify({
-        moved: finished.moved,
-        overCutList,
-        seg: { start: finished.seg.start, end: finished.seg.end },
-        willCreateCutSegment: finished.moved && overCutList,
-      })
-    );
     if (finished.moved && overCutList) {
       onCreateCutSegment?.(finished.seg.start, finished.seg.end);
     }

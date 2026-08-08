@@ -11,7 +11,9 @@
 
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
+import { checkBlobLocality } from "../../src/file-utils/blob-locality";
 import { getLocalNodeId, guessMimeFromFilename, type PeersMap } from "../../src/file-utils/file-shared";
+import { snatchBlob } from "../../src/file-utils/snatch";
 import { pickFiles, pickJsonFile, readPickedFileText, uploadFile } from "../../src/file-utils/upload";
 import { getMediaPlaybackUrl } from "../../src/media";
 import { createMediaDomOverlay, type MediaDomOverlayHandle } from "../../src/widgets/media-dom-overlay";
@@ -20,12 +22,14 @@ import { createAudioClipsTrack, type AudioClipsTrackHandle } from "./audio-clips
 import { createClipEditorPanel, type ClipEditorPanelHandle } from "./clip-editor-panel";
 import { createCutModeControl, CUT_MODE_CONTROL_RESERVED_WIDTH, type CutModeControlHandle } from "./cut-mode-control";
 import { createCutSegmentsTrack, type CutSegmentsTrackHandle, type EditableSegment } from "./cut-segments-track";
+import { createKeyboardShortcutsControl, type KeyboardShortcutsControlHandle } from "./keyboard-shortcuts-control";
 import { mergeCombinedData, mergeDiarizeData, mergeTranscribeData, parseReferenceDataJson } from "./reference-data";
 import { createReferenceTrack, type ReferenceTrackHandle } from "./reference-track";
 import { createSegmentsPanel, SEGMENTS_PANEL_HEIGHT, type SegmentsPanelHandle } from "./segments-panel";
 import { AUDIO_CLIP_TRACK_HEIGHT, createVideoTimeline, TIMELINE_SHELL_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
 import type {
   CompactInfo,
+  HeaderAction,
   WidgetController,
   WidgetFactory,
   WidgetMountContext,
@@ -36,6 +40,14 @@ const PADDING = 8;
 const HEADER_HEIGHT = 20;
 const TIMELINE_INSET = 6;
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
+
+/** drop a trailing file extension for use as the widget's display title
+ *  (e.g. "caretaker.mp4" -> "caretaker") — falls back to the original
+ *  string unchanged if there's no extension to strip. */
+function stripExtension(filename: string): string {
+  const idx = filename.lastIndexOf(".");
+  return idx > 0 ? filename.slice(0, idx) : filename;
+}
 
 // a fresh upload lock claim older than this is presumed abandoned (crashed
 // uploader) and no longer blocks a new upload attempt — mirrors file.ts's
@@ -106,8 +118,118 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     let cutModeControl: CutModeControlHandle | null = null;
     let referenceTrack: ReferenceTrackHandle | null = null;
     let segmentsPanel: SegmentsPanelHandle | null = null;
+    let keyboardShortcutsControl: KeyboardShortcutsControlHandle | null = null;
     let cutOverlayEl: HTMLDivElement | null = null;
     let timeUpdateHandler: (() => void) | null = null;
+
+    // -- "snatch" header action for peers that don't have the video blob
+    // locally yet (see docs/stfu-widget-plan.md) — mirrors peedeeeff/index.ts's
+    // simpler-than-file.ts single-blob locality-check + snatch flow (stfu
+    // only ever has one video blob to worry about, unlike file.ts's paused/
+    // friend-request states built for arbitrary large downloads).
+    type VideoActionState = "idle" | "checking" | "local" | "remote" | "snatching";
+    let videoActionState: VideoActionState = "idle";
+    let videoSnatchAbort: AbortController | null = null;
+    let videoSnatchCancelled = false;
+    let videoSnatchProgressText = "";
+    // guards against re-probing locality on every doc-change tick — only
+    // re-check when the blob identity actually changes (new upload/snatch).
+    let checkedVideoLocalityKey = "";
+
+    function updateVideoHeaderActions(): void {
+      if (!ctx.setHeaderActions) return;
+      const actions: HeaderAction[] = [];
+      if (videoActionState === "remote") {
+        actions.push({
+          id: "snatch-video",
+          label: "snatch video",
+          onClick: () => void handleSnatchVideo(),
+        });
+      } else if (videoActionState === "snatching") {
+        actions.push({
+          id: "snatch-video",
+          label: videoSnatchProgressText || "snatching…",
+          disabled: true,
+        });
+      }
+      ctx.setHeaderActions(actions);
+    }
+
+    async function checkVideoLocality(): Promise<void> {
+      const state = ctx.doc.current;
+      if (!state.videoBlobId) {
+        videoActionState = "idle";
+        updateVideoHeaderActions();
+        return;
+      }
+      const key = `${state.videoBlobId}:${state.videoBlake3}`;
+      if (key === checkedVideoLocalityKey) return;
+      checkedVideoLocalityKey = key;
+      videoActionState = "checking";
+      updateVideoHeaderActions();
+      try {
+        const info = await checkBlobLocality(state.videoBlobId, state.videoBlake3 || undefined);
+        if (destroyed) return;
+        videoActionState = info.locality === "local" ? "local" : "remote";
+      } catch (err) {
+        if (destroyed) return;
+        console.error("stfu widget: video locality check failed:", err);
+        videoActionState = "remote";
+      }
+      updateVideoHeaderActions();
+    }
+
+    async function handleSnatchVideo(): Promise<void> {
+      if (videoActionState !== "remote") return;
+      const state = ctx.doc.current;
+      const allPeers = ctx.canvasStore?.peers();
+      if (!allPeers || Object.keys(allPeers).length === 0) {
+        console.warn("stfu widget: no peers available for snatch");
+        return;
+      }
+
+      videoSnatchCancelled = false;
+      videoSnatchAbort = new AbortController();
+      videoActionState = "snatching";
+      videoSnatchProgressText = "probing…";
+      updateVideoHeaderActions();
+
+      try {
+        await snatchBlob(
+          {
+            blobId: String(state.videoBlobId || ""),
+            filename: String(state.videoFilename || ""),
+            mime: String(state.videoMime || ""),
+            size: state.videoSize || 0,
+            blake3: String(state.videoBlake3 || ""),
+            domain: "video",
+          },
+          allPeers as PeersMap,
+          {
+            onProgress: (fraction) => {
+              if (videoSnatchCancelled || destroyed) return;
+              videoSnatchProgressText = fraction >= 0 ? `${Math.round(fraction * 100)}%` : "snatching…";
+              updateVideoHeaderActions();
+            },
+            signal: videoSnatchAbort?.signal,
+            isPeerOnline: ctx.canvasStore ? (nodeId: string) => ctx.canvasStore!.isPeerOnline(nodeId) : undefined,
+          }
+        );
+
+        if (videoSnatchCancelled || destroyed) return;
+        videoActionState = "local";
+        videoSnatchProgressText = "";
+        updateVideoHeaderActions();
+      } catch (err) {
+        if (videoSnatchCancelled || destroyed) return;
+        console.error("stfu widget: video snatch failed:", err);
+        videoActionState = "remote";
+        videoSnatchProgressText = "";
+        updateVideoHeaderActions();
+      } finally {
+        videoSnatchAbort = null;
+      }
+    }
 
     // -- background ------------------------------------------------------------
 
@@ -426,6 +548,38 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       setReferenceDataMessage(summary);
     }
 
+    /**
+     * download the cut list as a manifest json compatible with
+     * trek-minus-paris's `process.py --cut-list` arg — matches the "newer"
+     * object shape `editor.py`'s `load_manual_cuts_file()` already accepts
+     * (`{segments, cut_skip_enabled, cut_mute_enabled}`), so no translation
+     * step is needed on the python side. audio-clip data isn't included —
+     * `process.py`'s separate `--dub-segments` arg uses an unrelated shape
+     * (see docs/stfu-widget-plan.md's phase-6 export section).
+     */
+    function downloadCutManifest(): void {
+      const state = ctx.doc.current;
+      const manifest = {
+        segments: state.editableSegments,
+        cut_skip_enabled: state.cutSkipEnabled,
+        cut_mute_enabled: state.cutMuteEnabled,
+      };
+      const json = JSON.stringify(manifest, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const baseName = stripExtension(state.videoFilename || "cut-manifest");
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${baseName}_manual_cuts.json`;
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        a.remove();
+      }, 1000);
+    }
+
     // -- helpers -----------------------------------------------------------------
 
     function syncVisibility(): void {
@@ -484,6 +638,8 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     function teardownTimeline(): void {
       cutModeControl?.destroy();
       cutModeControl = null;
+      keyboardShortcutsControl?.destroy();
+      keyboardShortcutsControl = null;
       cutTrack?.destroy();
       cutTrack = null;
       clipEditorPanel?.destroy();
@@ -597,6 +753,11 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         onMuteEarlyMsChange: handleMuteEarlyMsChange,
       });
       cutModeControl.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
+      keyboardShortcutsControl = createKeyboardShortcutsControl({
+        toolbar: timeline.toolbarTrailingSlot,
+        overlayParent: timeline.container,
+      });
+      keyboardShortcutsControl.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
       referenceTrack = createReferenceTrack({
         timeline,
         overlayParent: timeline.container,
@@ -615,6 +776,12 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           ctx.doc.change((d) => {
             d.editableSegments = [...d.editableSegments, [start, end]];
           });
+          // unlike remote peers' edits (handled by the doc-change
+          // subscription below), our own local edit needs an immediate
+          // refresh here too, matching every other local mutation handler
+          // in this file (`handleToggleSkip` etc) — otherwise the new
+          // segment doesn't visually appear until some unrelated redraw.
+          cutTrack?.refresh();
         },
       });
       referenceTrack.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
@@ -723,6 +890,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
 
       if (loadState === "ready") {
         void mountMediaOverlay();
+        void checkVideoLocality();
         refreshTimelineFromDoc();
       } else {
         teardownMediaOverlay();
@@ -811,6 +979,10 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           d.uploadingBy = "";
           d.uploadingAt = 0;
         });
+        // name the widget after the video so it's identifiable in the layer
+        // flyout/property tray instead of showing generically as "stfu".
+        ctx.canvasStore?.setWidgetTitle(ctx.widgetId, stripExtension(file.filename));
+        void checkVideoLocality();
       } catch (err) {
         if (destroyed) return;
         console.error("stfu widget: video upload failed:", err);
@@ -886,7 +1058,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     // canvas entirely and a new AudioClip referencing the same audioBlobId
     // (content-addressed, so no byte copy) is appended to this doc — see
     // docs/stfu-widget-plan.md's cross-widget drag-and-drop section.
-    const DROPPABLE_TYPES = new Set(["audio-recording", "tts"]);
+    const DROPPABLE_TYPES = new Set(["audio-recording", "tts", "voice-recording"]);
 
     /** walk up from this widget's own root container to the shared pan/zoom
      *  "world" container — same 3-levels-up hierarchy every widget's own
@@ -1017,7 +1189,10 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     return {
       container,
 
-      widgetActions: [{ id: "load-reference-data", label: "load reference data...", onClick: handleLoadReferenceData }],
+      widgetActions: [
+        { id: "load-reference-data", label: "load reference data...", onClick: handleLoadReferenceData },
+        { id: "download-cut-manifest", label: "download cut manifest...", onClick: downloadCutManifest },
+      ],
 
       dropTarget: store
         ? {
@@ -1087,6 +1262,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           timeline.container.y = timelineY(h);
           timeline.resize(Math.max(0, w - TIMELINE_INSET * 2));
           cutModeControl?.resize(Math.max(0, w - TIMELINE_INSET * 2));
+          keyboardShortcutsControl?.resize(Math.max(0, w - TIMELINE_INSET * 2));
           referenceTrack?.resize(Math.max(0, w - TIMELINE_INSET * 2));
         }
         if (segmentsPanel) {
@@ -1099,6 +1275,8 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         destroyed = true;
         uploadCancelled = true;
         uploadAbort?.abort();
+        videoSnatchCancelled = true;
+        videoSnatchAbort?.abort();
         if (referenceDataMessageTimer !== null) clearTimeout(referenceDataMessageTimer);
         document.removeEventListener("keydown", handleKeyDown);
         dropHighlight?.destroy();
