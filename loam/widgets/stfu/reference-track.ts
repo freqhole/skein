@@ -18,7 +18,12 @@
 import { Container, Graphics, Rectangle, Text, type FederatedPointerEvent } from "pixi.js";
 import { createExpandingPanel, type ExpandingPanelHandle } from "../../src/widgets/expanding-panel";
 import { createScrollableContent, type ScrollableContent } from "../../src/widgets/scrollable-content";
-import { CUT_TRACK_HEIGHT, REFERENCE_TRACK_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
+import {
+  AUDIO_CLIP_TRACK_HEIGHT,
+  CUT_TRACK_HEIGHT,
+  REFERENCE_TRACK_HEIGHT,
+  type VideoTimelineHandle,
+} from "./video-timeline";
 import type { ReferenceSpeaker, TranscriptSegment } from "./types";
 
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
@@ -56,6 +61,13 @@ export interface ReferenceTrackOptions {
    *  snap exactly to the dragged segment's own [start, end] (it can be
    *  resized like any other cut-list segment afterwards). */
   onCreateCutSegment?: (start: number, end: number) => void;
+  /** same as `onCreateCutSegment`, but for dropping onto the audio-clips
+   *  row instead — the new clip should snap to the same [start, end]. */
+  onCreateAudioClip?: (start: number, end: number) => void;
+  /** called on a plain click (no drag) on a reference segment — matches
+   *  editor.js's own reference-track click behavior (`video.currentTime =
+   *  hit.start`), which this is a direct port of. */
+  onSeek?: (time: number) => void;
 }
 
 export interface ReferenceTrackHandle {
@@ -114,12 +126,26 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     storageKey,
     overlayMaxHeight,
     onCreateCutSegment,
+    onCreateAudioClip,
+    onSeek,
   } = options;
 
   let contentWidth = 0;
   let visibleSpeakers = new Set<string>();
   let knownSpeakers: string[] = [];
   let initializedVisibility = false;
+  /** the segment currently under the pointer (no active drag) — drawn with
+   *  a white hover outline, mirroring cut-segments-track.ts's/
+   *  audio-clips-track.ts's own hover styling. compared by value, not
+   *  identity, since `getTranscriptSegments()` isn't guaranteed to return
+   *  the exact same object reference across calls. */
+  let hoveredSeg: TranscriptSegment | null = null;
+
+  function sameSegment(a: TranscriptSegment | null, b: TranscriptSegment | null): boolean {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return a.start === b.start && a.end === b.end && a.speaker === b.speaker;
+  }
 
   function loadVisibility(): void {
     try {
@@ -179,9 +205,18 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
       if (x2 < 0 || x1 > contentWidth) continue; // fully offscreen
       const w = Math.max(2, x2 - x1);
       const color = speakers[seg.speaker]?.color ?? 0x60a5fa;
+      const height = Math.max(1, REFERENCE_TRACK_HEIGHT - 2 * MARGIN_Y);
       const g = segmentGraphicsAt(i++);
+      const hovered = sameSegment(seg, hoveredSeg);
       g.clear();
-      g.rect(0, MARGIN_Y, w, Math.max(1, REFERENCE_TRACK_HEIGHT - 2 * MARGIN_Y)).fill({ color, alpha: 0.55 });
+      // hover just saturates this segment's own color (brighter fill +
+      // a border in the same hue) — mirrors cut-segments-track.ts's/
+      // audio-clips-track.ts's own hover treatment, no white accent (that's
+      // reserved for a "selected" state, which reference segments don't have).
+      g.rect(0, MARGIN_Y, w, height).fill({ color, alpha: hovered ? 0.85 : 0.55 });
+      if (hovered) {
+        g.rect(0, MARGIN_Y, w, height).stroke({ width: 1, color });
+      }
       g.x = x1;
       g.visible = true;
     }
@@ -243,17 +278,29 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     dragGhost = null;
   }
 
+  type DropTarget = "cut-list" | "audio-clips" | null;
+
   /** `globalPoint` in `toLocal(...)`'s expected space (i.e. an event's own
-   *  `.global`) — true once it falls within the cut-list row's own bounds. */
-  function isOverCutList(globalPoint: { x: number; y: number }): boolean {
-    const local = timeline.trackHitArea.toLocal(globalPoint);
-    return local.y >= 0 && local.y <= CUT_TRACK_HEIGHT;
+   *  `.global`) — identifies which (if any) of the two valid drop rows it
+   *  currently falls within. */
+  function hitDropTarget(globalPoint: { x: number; y: number }): DropTarget {
+    const cutLocal = timeline.trackHitArea.toLocal(globalPoint);
+    if (cutLocal.y >= 0 && cutLocal.y <= CUT_TRACK_HEIGHT) return "cut-list";
+    const clipsLocal = timeline.audioClipsHitArea.toLocal(globalPoint);
+    if (clipsLocal.y >= 0 && clipsLocal.y <= AUDIO_CLIP_TRACK_HEIGHT) return "audio-clips";
+    return null;
   }
 
   function onReferencePointerDown(e: FederatedPointerEvent): void {
     const local = e.getLocalPosition(timeline.referenceHitArea);
     const seg = hitTestReferenceEntry(local.x);
     if (!seg) return;
+    // the drag ghost conveys "grabbed" on its own — drop the hover outline
+    // so it doesn't sit stacked underneath the ghost for the rest of the drag.
+    if (hoveredSeg) {
+      hoveredSeg = null;
+      redrawSegments();
+    }
     refDrag = { seg, startGlobalX: e.global.x, startGlobalY: e.global.y, moved: false };
   }
 
@@ -261,26 +308,41 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     if (!refDrag) return;
     const dx = e.global.x - refDrag.startGlobalX;
     const dy = e.global.y - refDrag.startGlobalY;
-    if (!refDrag.moved && Math.hypot(dx, dy) <= REF_DRAG_THRESHOLD_PX) return;
-    refDrag.moved = true;
+    if (!refDrag.moved) {
+      if (Math.hypot(dx, dy) <= REF_DRAG_THRESHOLD_PX) return;
+      refDrag.moved = true;
 
-    const seg = refDrag.seg;
-    const speakers = getReferenceSpeakers();
-    const color = (seg.speaker && speakers[seg.speaker]?.color) ?? 0x60a5fa;
-    const x1 = timeline.timeToScreenX(seg.start);
-    const x2 = timeline.timeToScreenX(seg.end);
-    const width = Math.max(2, x2 - x1);
-    const overCutList = isOverCutList(e.global);
+      // ghost is pinned to the segment's own time range for its entire
+      // life — only its y follows the pointer from here on, so dragging can
+      // only ever choose *which row* to drop into, never retime the copy in
+      // flight (direct port of editor.js's showRefDragGhost(), which fixes
+      // x/width once and only ever updates y via updateRefDragGhostPosition()).
+      const seg = refDrag.seg;
+      const speakers = getReferenceSpeakers();
+      const color = (seg.speaker && speakers[seg.speaker]?.color) ?? 0x60a5fa;
+      const x1 = timeline.timeToScreenX(seg.start);
+      const x2 = timeline.timeToScreenX(seg.end);
+      const width = Math.max(2, x2 - x1);
+      const height = Math.max(1, REFERENCE_TRACK_HEIGHT - 2 * MARGIN_Y);
+      // `timeToScreenX()` is in `referenceContentLayer`'s own local frame,
+      // not `timeline.container`'s (the ghost's parent) — bridge the two via
+      // pixi's own transform chain rather than assuming a fixed offset
+      // between them.
+      const topLeftGlobal = timeline.referenceContentLayer.toGlobal({ x: x1, y: 0 });
+      const topLeftLocal = timeline.container.toLocal(topLeftGlobal);
+
+      const ghost = ensureGhost();
+      ghost.clear();
+      ghost.roundRect(0, 0, width, height, 3).fill({ color, alpha: 0.85 }).stroke({ width: 2, color: 0xffffff, alpha: 0.9 });
+      ghost.x = topLeftLocal.x;
+    }
+
+    // only y tracks the pointer, centered on it (matches editor.js's
+    // `globalY - (TRACK_HEIGHT - 2*MARGIN_Y)/2`).
+    const height = Math.max(1, REFERENCE_TRACK_HEIGHT - 2 * MARGIN_Y);
     const local = timeline.container.toLocal(e.global);
-
     const ghost = ensureGhost();
-    ghost.clear();
-    ghost
-      .roundRect(-width / 2, -10, width, 20, 3)
-      .fill({ color, alpha: overCutList ? 0.85 : 0.4 })
-      .stroke({ width: overCutList ? 2 : 1, color: overCutList ? 0xffffff : color });
-    ghost.x = local.x;
-    ghost.y = local.y;
+    ghost.y = local.y - height / 2;
   }
 
   function onGlobalPointerUp(e: FederatedPointerEvent): void {
@@ -288,16 +350,42 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     const finished = refDrag;
     refDrag = null;
     destroyGhost();
-    const overCutList = isOverCutList(e.global);
-    if (finished.moved && overCutList) {
-      onCreateCutSegment?.(finished.seg.start, finished.seg.end);
+    if (!finished.moved) {
+      onSeek?.(finished.seg.start);
+      return;
     }
+    const target = hitDropTarget(e.global);
+    if (target === "cut-list") onCreateCutSegment?.(finished.seg.start, finished.seg.end);
+    else if (target === "audio-clips") onCreateAudioClip?.(finished.seg.start, finished.seg.end);
+  }
+
+  // hover (no active drag) — mirrors cut-segments-track.ts's/
+  // audio-clips-track.ts's own hover handling, independent of the drag
+  // gesture above.
+  function onReferenceTrackPointerMove(e: FederatedPointerEvent): void {
+    if (refDrag) return;
+    const local = e.getLocalPosition(timeline.referenceHitArea);
+    const seg = hitTestReferenceEntry(local.x);
+    timeline.referenceHitArea.cursor = seg ? "grab" : "default";
+    if (sameSegment(seg, hoveredSeg)) return;
+    hoveredSeg = seg;
+    redrawSegments();
+  }
+
+  function onReferenceTrackPointerOut(): void {
+    if (refDrag) return;
+    timeline.referenceHitArea.cursor = "default";
+    if (!hoveredSeg) return;
+    hoveredSeg = null;
+    redrawSegments();
   }
 
   timeline.referenceHitArea.on("pointerdown", onReferencePointerDown);
   timeline.referenceHitArea.on("globalpointermove", onGlobalPointerMove);
   timeline.referenceHitArea.on("pointerup", onGlobalPointerUp);
   timeline.referenceHitArea.on("pointerupoutside", onGlobalPointerUp);
+  timeline.referenceHitArea.on("pointermove", onReferenceTrackPointerMove);
+  timeline.referenceHitArea.on("pointerout", onReferenceTrackPointerOut);
 
   // -- "REFERENCE" label button --------------------------------------------------
 
@@ -535,6 +623,8 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
       timeline.referenceHitArea.off("globalpointermove", onGlobalPointerMove);
       timeline.referenceHitArea.off("pointerup", onGlobalPointerUp);
       timeline.referenceHitArea.off("pointerupoutside", onGlobalPointerUp);
+      timeline.referenceHitArea.off("pointermove", onReferenceTrackPointerMove);
+      timeline.referenceHitArea.off("pointerout", onReferenceTrackPointerOut);
       destroyGhost();
       scrollable.destroy();
       expandingPanel.destroy();

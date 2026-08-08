@@ -244,6 +244,12 @@ export interface VideoTimelineHandle {
   toggleSnap(): void;
   timeToScreenX(t: number): number;
   screenXToTime(x: number): number;
+  /** current visible content width (screen px) of the track rows — the
+   *  same frame `timeToScreenX()`/`screenXToTime()` use (x=0 is the left
+   *  edge). track rows use this to clamp UI (e.g. a clip's delete glyph)
+   *  to stay within the visible viewport rather than scrolling off with
+   *  the clip's own (possibly far off-screen) edge. */
+  getRowWidth(): number;
   /** fires after any pan/zoom/resize — track rows re-draw their content here. */
   onViewChange(handler: () => void): () => void;
   destroy(): void;
@@ -809,6 +815,9 @@ export function createVideoTimeline(
     },
     timeToScreenX,
     screenXToTime,
+    getRowWidth() {
+      return rowWidth;
+    },
 
     onViewChange(handler: () => void) {
       viewChangeHandlers.push(handler);

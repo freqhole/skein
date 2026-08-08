@@ -95,6 +95,12 @@ export interface SegmentsPanelOptions {
   /** commits an audio clip's edited tts text (fires on blur/Enter, same as
    *  every other skein-input-backed text field in this codebase). */
   onClipTextCommit: (clip: AudioClip, text: string) => void;
+  /** fires once a speechSynthesis preview of a clip's tts text finishes,
+   *  reporting how long it actually took to speak (wall-clock seconds) —
+   *  the caller uses this to size the clip's timeline box for a clip that
+   *  hasn't been generated/recorded yet (no `audioBlobId`), since there's
+   *  no real audio file duration to fall back on until then. */
+  onPreviewDurationMeasured?: (clip: AudioClip, seconds: number) => void;
   /** fires once tts generation succeeds for a clip's inline "generate"
    *  button — caller writes the result onto the clip's doc fields. */
   onClipGenerate: (
@@ -240,7 +246,8 @@ interface AudioRowExtras {
 /**
  * inline tts-authoring controls for one audio-clip row: a `createSkeinInput()`
  * text box (commits via `onEnter`, same convention `hub-profile-panel.ts`
- * uses) plus a voice-cycle button, rate +/- steppers, and a "generate"
+ * uses) plus a button opening the full voice-picker dialog, rate +/- steppers,
+ * a "▶ preview"/"■ stop" speechSynthesis button, and a "generate"
  * button — ported from clip-editor-panel.ts's popover, but always visible
  * as part of the row rather than behind a popup. one instance is created
  * lazily per pooled row slot and re-`bind()`-ed to whichever clip currently
@@ -250,7 +257,8 @@ function createAudioRowExtras(
   canvasElement: HTMLCanvasElement,
   onClipTextCommit: SegmentsPanelOptions["onClipTextCommit"],
   onClipGenerate: SegmentsPanelOptions["onClipGenerate"],
-  onOpenVoicePicker: SegmentsPanelOptions["onOpenVoicePicker"]
+  onOpenVoicePicker: SegmentsPanelOptions["onOpenVoicePicker"],
+  onPreviewDurationMeasured: SegmentsPanelOptions["onPreviewDurationMeasured"]
 ): AudioRowExtras {
   let currentClip: AudioClip | null = null;
   let voiceName = VOICE_DEFAULT;
@@ -368,9 +376,19 @@ function createAudioRowExtras(
     errorMessage = "";
     layoutPreviewButton();
     log.debug(TAG, `previewing clip ${currentClip?.id ?? "?"} via speechSynthesis (voice=${voiceName}, rate=${rate})`);
+    const previewClip = currentClip;
+    const startedAt = performance.now();
     speakPreview(text, voiceName === VOICE_DEFAULT ? "" : voiceName, rate, () => {
       previewing = false;
       layoutPreviewButton();
+      // only trust this as a real duration measurement if the clip is
+      // still the same one (not swapped out mid-preview via `bind()`) and
+      // doesn't already have real generated/recorded audio to size itself
+      // from instead.
+      if (previewClip && previewClip.id === currentClip?.id && !previewClip.audioBlobId) {
+        const seconds = (performance.now() - startedAt) / 1000;
+        if (seconds > 0) onPreviewDurationMeasured?.(previewClip, seconds);
+      }
     });
   });
 
@@ -582,6 +600,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     onSeek,
     onClipTextCommit,
     onClipGenerate,
+    onPreviewDurationMeasured,
     storageKey,
     onOpenVoicePicker,
   } = options;
@@ -823,7 +842,13 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
 
   function ensureAudioExtras(row: Row): AudioRowExtras {
     if (!row.audio) {
-      const extras = createAudioRowExtras(canvasElement, onClipTextCommit, onClipGenerate, onOpenVoicePicker);
+      const extras = createAudioRowExtras(
+        canvasElement,
+        onClipTextCommit,
+        onClipGenerate,
+        onOpenVoicePicker,
+        onPreviewDurationMeasured
+      );
       row.container.addChild(extras.root);
       row.audio = extras;
     }

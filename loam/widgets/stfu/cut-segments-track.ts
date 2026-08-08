@@ -81,6 +81,10 @@ export interface CutSegmentsTrackHandle {
    *  at least `MIN_SEGMENT_SEC` after the start edge) — no-op if nothing is
    *  selected. */
   trimSelectedEndTo(time: number): boolean;
+  /** clear the selection without deleting anything — used to enforce
+   *  "only one timeline segment selected at once" when the audio-clips
+   *  track selects something instead. */
+  clearSelection(): void;
   destroy(): void;
 }
 
@@ -486,6 +490,9 @@ export function createCutSegmentsTrack(options: CutSegmentsTrackOptions): CutSeg
       segments[selectedIndex] = [seg[0], newEnd];
       commit(segments);
       return true;
+    },
+    clearSelection() {
+      setSelectedIndex(null);
     },
     destroy() {
       offViewChange();

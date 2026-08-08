@@ -129,6 +129,14 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     // of its `ttsText` (see applyAudioClipPlayback() below).
     let clipAudioEl: HTMLAudioElement | null = null;
     let activeAudioClipId: string | null = null;
+    // the clip currently "occupying" the playhead's position — set once
+    // when first triggered for this residency and NOT cleared just because
+    // playback finishes naturally (that would let the playhead's own
+    // still-being-within-the-clip's-window re-trigger it on the very next
+    // timeupdate tick, looping it for the rest of the clip's estimated
+    // length). only cleared once the playhead genuinely leaves every clip's
+    // window, or the video pauses (see stopClipAudio()).
+    let residentClipId: string | null = null;
 
     // -- "snatch" header action for peers that don't have the video blob
     // locally yet (see docs/stfu-widget-plan.md) — mirrors peedeeeff/index.ts's
@@ -468,10 +476,12 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     }
 
     function stopClipAudio(): void {
-      if (!activeAudioClipId) return;
-      cancelPreview();
-      clipAudioEl?.pause();
-      activeAudioClipId = null;
+      if (activeAudioClipId) {
+        cancelPreview();
+        clipAudioEl?.pause();
+        activeAudioClipId = null;
+      }
+      residentClipId = null;
     }
 
     async function playClipAudioFile(clip: AudioClip, offset: number): Promise<void> {
@@ -522,21 +532,20 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         return;
       }
       const t = video.currentTime;
-      if (activeAudioClipId) {
-        const activeClip = ctx.doc.current.audioClips.find((c) => c.id === activeAudioClipId);
-        // grace window past the estimate — the real stop is the clip's own
-        // "ended"/speechSynthesis callback, not this check; only force-stop
-        // once the playhead has clearly moved away from the clip entirely
-        // (e.g. the user scrubbed elsewhere mid-clip).
-        if (activeClip && t >= activeClip.start - 0.25 && t <= activeClip.start + estimatedClipDuration(activeClip) + 1) {
-          return;
-        }
-        stopClipAudio();
-      }
       const clip = ctx.doc.current.audioClips.find(
         (c) => (c.audioBlobId || c.ttsText) && t >= c.start && t < c.start + estimatedClipDuration(c)
       );
-      if (clip) startClipAudio(clip, Math.max(0, t - clip.start));
+      if (!clip) {
+        // playhead isn't within any clip's window anymore — clear residency
+        // so a later re-entry into this (or another) clip's window can
+        // trigger playback again.
+        residentClipId = null;
+        return;
+      }
+      if (clip.id === residentClipId) return; // already triggered once for this residency — play exactly once, don't loop
+      stopClipAudio();
+      residentClipId = clip.id;
+      startClipAudio(clip, Math.max(0, t - clip.start));
     }
 
     function handleToggleSkip(): void {
@@ -815,7 +824,13 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         // selecting a segment (so keyboard shortcuts have a clear target)
         // also scrolls its matching row in the segments panel into view and
         // highlights it there, mirroring the prototype's own selection UX.
-        onSelectionChange: (seg) => segmentsPanel?.setSelectedSegment(seg),
+        // only one timeline segment (cut-list or audio-clip) is ever
+        // selected at once, so selecting a cut segment clears any selected
+        // audio clip.
+        onSelectionChange: (seg) => {
+          segmentsPanel?.setSelectedSegment(seg);
+          if (seg) audioClipsTrack?.clearSelection();
+        },
       });
       audioClipsTrack = createAudioClipsTrack({
         timeline,
@@ -841,6 +856,12 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         // not in a popup (see segments-panel.ts's inline audio-clip rows).
         onClipTap: (clip) => {
           segmentsPanel?.setSelectedClip(clip.id);
+        },
+        // only one timeline segment (cut-list or audio-clip) is ever
+        // selected at once, so selecting an audio clip clears any selected
+        // cut-list segment.
+        onSelectionChange: (clip) => {
+          if (clip) cutTrack?.clearSelection();
         },
       });
       timeline.reserveToolbarStart(CUT_MODE_CONTROL_RESERVED_WIDTH);
@@ -873,7 +894,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         // (it can then be resized like any other cut-list segment).
         onCreateCutSegment: (start, end) => {
           ctx.doc.change((d) => {
-            d.editableSegments = [...d.editableSegments, [start, end]];
+            d.editableSegments.push([start, end]);
           });
           // unlike remote peers' edits (handled by the doc-change
           // subscription below), our own local edit needs an immediate
@@ -881,6 +902,25 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           // in this file (`handleToggleSkip` etc) — otherwise the new
           // segment doesn't visually appear until some unrelated redraw.
           cutTrack?.refresh();
+        },
+        // same drag gesture, but dropped onto the audio-clips row instead —
+        // snap a new clip to the same [start, end].
+        onCreateAudioClip: (start, end) => {
+          ctx.doc.change((d) => {
+            d.audioClips.push({
+              id: crypto.randomUUID(),
+              trackId: "default",
+              start,
+              durationSec: Math.max(0.05, end - start),
+              label: "",
+            });
+          });
+          audioClipsTrack?.refresh();
+        },
+        // matches editor.js's own reference-track click behavior — a plain
+        // click (no drag) on a segment seeks the video to its start.
+        onSeek: (t) => {
+          if (mediaOverlay) mediaOverlay.video.currentTime = t;
         },
       });
       referenceTrack.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
@@ -897,8 +937,26 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           ctx.doc.change((d) => {
             const idx = d.audioClips.findIndex((c) => c.id === clip.id);
             if (idx === -1) return;
-            d.audioClips[idx].ttsText = text;
+            const target = d.audioClips[idx];
+            target.ttsText = text;
+            // the clip's displayed length no longer reflects this new text
+            // until it's re-measured (a fresh preview) or re-generated —
+            // reset back to the nominal placeholder width in the meantime.
+            // real generated/recorded audio (an `audioBlobId` already set)
+            // keeps its own real file duration instead.
+            if (!target.audioBlobId) target.durationSec = 0;
           });
+          audioClipsTrack?.refresh();
+        },
+        onPreviewDurationMeasured: (clip, seconds) => {
+          ctx.doc.change((d) => {
+            const idx = d.audioClips.findIndex((c) => c.id === clip.id);
+            if (idx === -1) return;
+            const target = d.audioClips[idx];
+            if (target.audioBlobId) return; // a real generated/recorded file already owns the duration
+            target.durationSec = seconds;
+          });
+          audioClipsTrack?.refresh();
         },
         onClipGenerate: (clip, text, result, voiceName, voiceLang, rate) => {
           ctx.doc.change((d) => {
@@ -1186,7 +1244,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       const eTime = Math.max(start, end);
       if (eTime - s < 0.05) return;
       ctx.doc.change((d) => {
-        d.editableSegments = [...d.editableSegments, [s, eTime]];
+        d.editableSegments.push([s, eTime]);
       });
       cutTrack?.refresh();
     }
@@ -1235,7 +1293,12 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           break;
         case "Delete":
         case "Backspace":
+          // only one of the two tracks ever has an active selection at a
+          // time (see the cross-track `clearSelection()` wiring above), so
+          // calling both is safe — whichever has nothing selected is a
+          // no-op.
           cutTrack?.deleteSelected();
+          audioClipsTrack?.deleteSelected();
           break;
         case ",":
           video.currentTime = Math.max(0, video.currentTime - frameDuration());
