@@ -26,6 +26,7 @@ import { mergeCombinedData, mergeDiarizeData, mergeTranscribeData, parseReferenc
 import { createReferenceTrack, type ReferenceTrackHandle } from "./reference-track";
 import { createSegmentsPanel, SEGMENTS_PANEL_HEIGHT, type SegmentsPanelHandle } from "./segments-panel";
 import { AUDIO_CLIP_TRACK_HEIGHT, createVideoTimeline, TIMELINE_SHELL_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
+import { createVoicePickerDialog, type VoicePickerDialogHandle } from "./voice-picker-dialog";
 import type {
   CompactInfo,
   HeaderAction,
@@ -117,6 +118,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     let referenceTrack: ReferenceTrackHandle | null = null;
     let segmentsPanel: SegmentsPanelHandle | null = null;
     let keyboardShortcutsControl: KeyboardShortcutsControlHandle | null = null;
+    let voicePickerDialog: VoicePickerDialogHandle | null = null;
     let cutOverlayEl: HTMLDivElement | null = null;
     let timeUpdateHandler: (() => void) | null = null;
 
@@ -640,11 +642,28 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       loadedVideoKey = "";
     }
 
+    // the DOM `<video>` overlay (media-dom-overlay.ts) sits above all pixi
+    // content — a real element at `z-index: 15000`, positioned in a
+    // different stacking context entirely — so a widget-wide dialog (drawn
+    // in pixi, underneath) would otherwise render invisibly behind it.
+    // paused + hidden for as long as at least one such dialog is open;
+    // a signed counter (not a boolean) so two dialogs opening/closing out of
+    // order can't prematurely reveal the video while another is still up.
+    let openFullWidgetDialogCount = 0;
+    function handleFullWidgetDialogOpenChange(open: boolean): void {
+      openFullWidgetDialogCount = Math.max(0, openFullWidgetDialogCount + (open ? 1 : -1));
+      if (!mediaOverlay) return;
+      if (openFullWidgetDialogCount > 0) mediaOverlay.video.pause();
+      mediaOverlay.wrapper.style.visibility = openFullWidgetDialogCount > 0 ? "hidden" : "visible";
+    }
+
     function teardownTimeline(): void {
       cutModeControl?.destroy();
       cutModeControl = null;
       keyboardShortcutsControl?.destroy();
       keyboardShortcutsControl = null;
+      voicePickerDialog?.destroy();
+      voicePickerDialog = null;
       cutTrack?.destroy();
       cutTrack = null;
       audioClipsTrack?.destroy();
@@ -737,11 +756,6 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         onMuteEarlyMsChange: handleMuteEarlyMsChange,
       });
       cutModeControl.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
-      keyboardShortcutsControl = createKeyboardShortcutsControl({
-        toolbar: timeline.toolbarTrailingSlot,
-        overlayParent: timeline.container,
-      });
-      keyboardShortcutsControl.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
       referenceTrack = createReferenceTrack({
         timeline,
         overlayParent: timeline.container,
@@ -801,6 +815,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
             if (!target.label) target.label = text.slice(0, 40);
           });
         },
+        onOpenVoicePicker: (opts) => voicePickerDialog?.open(opts),
         storageKey: `skein.stfu.${ctx.widgetId}.segmentsPanel`,
       });
       segmentsPanel.container.x = TIMELINE_INSET;
@@ -814,6 +829,26 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       // `overlayMaxHeight`), which only actually shows on top if the timeline
       // itself is the later sibling.
       container.addChild(timeline.container);
+      // created last (after every reorder above) so their backdrop+panel —
+      // added straight to the widget-root `container` — land as the LAST,
+      // hence topmost, siblings; created any earlier and the final
+      // `timeline.container` re-add above would render on top of them instead.
+      keyboardShortcutsControl = createKeyboardShortcutsControl({
+        toolbar: timeline.toolbarTrailingSlot,
+        overlayParent: container,
+        onOpenChange: handleFullWidgetDialogOpenChange,
+      });
+      keyboardShortcutsControl.resize(currentWidth, currentHeight);
+      voicePickerDialog ??= createVoicePickerDialog({
+        // mounted at the widget root (not `timeline.container`) — the
+        // segments panel alone is only ~150px tall, nowhere near enough
+        // room for a scrollable voice list, so this dialog covers the
+        // *whole* widget instead, sized in `resize()` below.
+        overlayParent: container,
+        canvasElement: ctx.canvasElement,
+        onOpenChange: handleFullWidgetDialogOpenChange,
+      });
+      voicePickerDialog.resize(currentWidth, currentHeight);
       return timeline;
     }
 
@@ -864,6 +899,9 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         controls: true,
         objectFit: "contain",
       });
+      // stays hidden if a full-widget dialog was already open at mount time
+      // (e.g. re-mounting after a blob re-fetch while the panel is up).
+      if (openFullWidgetDialogCount > 0) mediaOverlay.wrapper.style.visibility = "hidden";
 
       cutOverlayEl = createCutOverlayEl();
       mediaOverlay.wrapper.appendChild(cutOverlayEl);
@@ -1017,13 +1055,35 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     placeholderText.on("pointertap", () => void handleUpload());
     placeholderBorder.on("pointertap", () => void handleUpload());
 
-    // -- keyboard shortcuts (playback only) --------------------------------------
+    // -- keyboard shortcuts --------------------------------------------------
     //
-    // deliberately scoped to playback/view controls that don't depend on a
-    // "selected segment" or undo-stack concept (neither exists anywhere in
-    // stfu yet): play/pause, seek, and timeline zoom. editor.js's fuller set
-    // (mark in/out, delete selected, trim to playhead, undo/redo, snap
-    // toggle) all need a persistent selection or undo history first.
+    // matches keyboard-shortcuts-control.ts's SHORTCUTS_LIST — keep the two
+    // in sync by hand whenever a shortcut is added/changed/removed.
+
+    /** in-point set by `i`, consumed by `o` to create a cut segment — mirrors
+     *  editor.js's own in/out marking convention. cleared once consumed, or
+     *  whenever a new `i` overwrites it. */
+    let pendingInTime: number | null = null;
+
+    function frameDuration(): number {
+      const fps = ctx.doc.current.videoFps;
+      return fps > 0 ? 1 / fps : 1 / 30;
+    }
+
+    /** creates a new cut-list segment spanning [start, end] (order-
+     *  independent) — shared by the `o` shortcut and (eventually) any other
+     *  in/out-marking gesture. too-short spans are silently dropped, same
+     *  threshold `cut-segments-track.ts`'s own create-drag gesture uses. */
+    function createCutSegment(start: number, end: number): void {
+      const s = Math.min(start, end);
+      const eTime = Math.max(start, end);
+      if (eTime - s < 0.05) return;
+      ctx.doc.change((d) => {
+        d.editableSegments = [...d.editableSegments, [s, eTime]];
+      });
+      cutTrack?.refresh();
+    }
+
     function handleKeyDown(e: KeyboardEvent): void {
       if (!pointerInsideWidget || !mediaOverlay) return;
       // some other widget's text-input overlay (label/notepad/markdown) may
@@ -1054,6 +1114,41 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           break;
         case "0":
           timeline?.zoomFit();
+          break;
+        case "i":
+        case "I":
+          pendingInTime = video.currentTime;
+          break;
+        case "o":
+        case "O":
+          if (pendingInTime !== null) {
+            createCutSegment(pendingInTime, video.currentTime);
+            pendingInTime = null;
+          }
+          break;
+        case "Delete":
+        case "Backspace":
+          cutTrack?.deleteSelected();
+          break;
+        case ",":
+          video.currentTime = Math.max(0, video.currentTime - frameDuration());
+          break;
+        case ".":
+          video.currentTime = Math.min(video.duration || video.currentTime, video.currentTime + frameDuration());
+          break;
+        case "[":
+          cutTrack?.trimSelectedStartTo(video.currentTime);
+          break;
+        case "]":
+          cutTrack?.trimSelectedEndTo(video.currentTime);
+          break;
+        case "s":
+        case "S":
+          timeline?.toggleSnap();
+          break;
+        case "/":
+        case "?":
+          keyboardShortcutsControl?.toggle();
           break;
         default:
           return;
@@ -1276,13 +1371,14 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           timeline.container.y = timelineY(h);
           timeline.resize(Math.max(0, w - TIMELINE_INSET * 2));
           cutModeControl?.resize(Math.max(0, w - TIMELINE_INSET * 2));
-          keyboardShortcutsControl?.resize(Math.max(0, w - TIMELINE_INSET * 2));
           referenceTrack?.resize(Math.max(0, w - TIMELINE_INSET * 2));
         }
+        keyboardShortcutsControl?.resize(w, h);
         if (segmentsPanel) {
           segmentsPanel.container.y = segmentsPanelY(h);
           segmentsPanel.resize(Math.max(0, w - TIMELINE_INSET * 2));
         }
+        voicePickerDialog?.resize(w, h);
       },
 
       destroy() {

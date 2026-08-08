@@ -15,7 +15,6 @@
 
 import { Container, Graphics, Text } from "pixi.js";
 import { createExpandingPanel, type ExpandingPanelHandle } from "../../src/widgets/expanding-panel";
-import { TIMELINE_SHELL_HEIGHT } from "./video-timeline";
 
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2;
@@ -62,16 +61,24 @@ const MOUSE_INTERACTIONS_LIST: string[] = [
 ];
 
 export interface KeyboardShortcutsControlOptions {
-  /** mount point for the collapsed trigger \u2014 pass
+  /** mount point for the collapsed trigger — pass
    *  `timeline.toolbarTrailingSlot`. */
   toolbar: Container;
-  /** mount point for the expanded panel + backdrop \u2014 pass `timeline.container`. */
+  /** mount point for the expanded panel + backdrop — pass the widget's own
+   *  root `container`, NOT `timeline.container`: this dialog reads as
+   *  centered over the *whole* widget (video + timeline + segments panel),
+   *  not just the timeline shell strip it's triggered from. */
   overlayParent: Container;
+  /** fires as the panel opens/closes — the widget's DOM video overlay sits
+   *  above pixi content (a real `<video>` element, `z-index: 15000`), so it
+   *  would otherwise visually cover a widget-wide dialog like this one; the
+   *  caller uses this to pause + hide it while the dialog is open. */
+  onOpenChange?: (open: boolean) => void;
 }
 
 export interface KeyboardShortcutsControlHandle {
-  /** call whenever the timeline shell's own width changes. */
-  resize(contentWidth: number): void;
+  /** call whenever the widget's own (width, height) changes. */
+  resize(width: number, height: number): void;
   /** toggle the panel open/closed — wired to the `/`/`?` keyboard shortcut. */
   toggle(): void;
   destroy(): void;
@@ -95,7 +102,7 @@ function wrapText(text: string, style: ConstructorParameters<typeof Text>[0], wr
 export function createKeyboardShortcutsControl(
   options: KeyboardShortcutsControlOptions
 ): KeyboardShortcutsControlHandle {
-  const { toolbar, overlayParent } = options;
+  const { toolbar, overlayParent, onOpenChange } = options;
 
   // -- collapsed "?" trigger -------------------------------------------------
 
@@ -209,24 +216,28 @@ export function createKeyboardShortcutsControl(
     panel,
     onOpenChange: (open) => {
       collapsed.visible = !open;
+      onOpenChange?.(open);
     },
   });
 
-  /** center the panel within the timeline shell's own bounds — previously
-   *  pinned at (0,0), which jammed it into the toolbar's top-left corner
-   *  instead of reading as a centered dialog. */
-  let lastContentWidth = 0;
+  /** center the panel within the *whole widget's* own bounds (not just the
+   *  timeline shell) — previously scoped to `TIMELINE_SHELL_HEIGHT`, which
+   *  jammed the dialog up near the top strip instead of reading as a
+   *  properly centered modal over the whole widget. */
+  let lastWidth = 0;
+  let lastHeight = 0;
   function centerPanel(): void {
-    panel.x = Math.max(0, (lastContentWidth - PANEL_WIDTH) / 2);
-    panel.y = Math.max(0, (TIMELINE_SHELL_HEIGHT - panelHeight) / 2);
+    panel.x = Math.max(0, (lastWidth - PANEL_WIDTH) / 2);
+    panel.y = Math.max(0, (lastHeight - panelHeight) / 2);
   }
   centerPanel();
 
   return {
-    resize(contentWidth: number) {
-      lastContentWidth = contentWidth;
+    resize(width: number, height: number) {
+      lastWidth = width;
+      lastHeight = height;
       centerPanel();
-      expandingPanel.resize(Math.max(0, contentWidth), TIMELINE_SHELL_HEIGHT);
+      expandingPanel.resize(Math.max(0, width), Math.max(0, height));
     },
     toggle() {
       expandingPanel.toggle();

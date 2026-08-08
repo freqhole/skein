@@ -33,8 +33,31 @@ import {
 } from "./segments-panel-data";
 import { generateTtsAudio, type TtsGenerateResult } from "../tts/generate";
 import { cancelPreview, isGenerateAvailable, listVoiceNames, speakPreview, VOICE_DEFAULT } from "../tts/voices";
+import type { VoicePickerOpenOptions } from "./voice-picker-dialog";
 import type { AudioClip, ReferenceSpeaker, TranscriptSegment } from "./types";
 import { log } from "@freqhole/reliquary/utils";
+
+// the last voice picked (in any clip's voice picker) becomes the default for
+// the NEXT brand-new clip created — deliberately a single global key (not
+// scoped per-widget/per-clip) per the user's own "global setting" wording,
+// since each individual clip can still override it afterward.
+const LAST_VOICE_STORAGE_KEY = "skein.stfu.lastTtsVoiceName";
+
+function loadLastVoiceName(): string {
+  try {
+    return localStorage.getItem(LAST_VOICE_STORAGE_KEY) || VOICE_DEFAULT;
+  } catch {
+    return VOICE_DEFAULT;
+  }
+}
+
+function saveLastVoiceName(name: string): void {
+  try {
+    localStorage.setItem(LAST_VOICE_STORAGE_KEY, name);
+  } catch {
+    // private browsing / storage disabled / quota exceeded — not fatal, just doesn't persist
+  }
+}
 
 const TAG = "stfu.segments-panel";
 
@@ -84,6 +107,11 @@ export interface SegmentsPanelOptions {
   ) => void;
   /** localStorage key for the view-modes + autoscroll prefs (browser-local UI state) */
   storageKey: string;
+  /** opens the (widget-wide) voice-picker dialog for a row's voice button —
+   *  the panel itself is only ~150px tall, nowhere near enough room for a
+   *  scrollable voice list, so the dialog is owned/mounted at the widget
+   *  root by `index.ts` instead and just triggered from here. */
+  onOpenVoicePicker: (opts: VoicePickerOpenOptions) => void;
 }
 
 export interface SegmentsPanelHandle {
@@ -221,7 +249,8 @@ interface AudioRowExtras {
 function createAudioRowExtras(
   canvasElement: HTMLCanvasElement,
   onClipTextCommit: SegmentsPanelOptions["onClipTextCommit"],
-  onClipGenerate: SegmentsPanelOptions["onClipGenerate"]
+  onClipGenerate: SegmentsPanelOptions["onClipGenerate"],
+  onOpenVoicePicker: SegmentsPanelOptions["onOpenVoicePicker"]
 ): AudioRowExtras {
   let currentClip: AudioClip | null = null;
   let voiceName = VOICE_DEFAULT;
@@ -276,10 +305,23 @@ function createAudioRowExtras(
   voiceButton.on("pointerout", () => drawButton(voiceBg, Math.max(70, voiceLabel.width + 12), 20, false, false));
   voiceButton.on("pointertap", (e: FederatedPointerEvent) => {
     e.stopPropagation();
-    const names = listVoiceNames();
-    const idx = names.indexOf(voiceName);
-    voiceName = names[(idx + 1) % names.length] ?? VOICE_DEFAULT;
-    layoutVoiceButton();
+    onOpenVoicePicker({
+      text: input.value,
+      currentVoiceName: voiceName,
+      rate,
+      onTextChange: (text) => {
+        if (currentClip) onClipTextCommit(currentClip, text);
+      },
+      onSelectVoice: (name) => {
+        voiceName = name;
+        saveLastVoiceName(name);
+        // `layoutVoiceButton()` alone only resizes the voice button itself —
+        // `layout()` is what repositions the rate stepper/generate button
+        // against its (now possibly wider/narrower) width.
+        layoutVoiceButton();
+        layout();
+      },
+    });
   });
 
   // preview (speechSynthesis) works everywhere, unlike `generate` below —
@@ -504,7 +546,10 @@ function createAudioRowExtras(
       const isSameClip = currentClip?.id === clip.id;
       currentClip = clip;
       if (!isSameClip) {
-        voiceName = clip.ttsVoiceName || VOICE_DEFAULT;
+        // a clip that's never had a voice explicitly set (brand new) defaults
+        // to whichever voice was last picked, in any clip's voice picker —
+        // not always back to VOICE_DEFAULT.
+        voiceName = clip.ttsVoiceName || loadLastVoiceName();
         rate = clip.ttsRate ?? 1;
         errorMessage = "";
         generating = false;
@@ -538,6 +583,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     onClipTextCommit,
     onClipGenerate,
     storageKey,
+    onOpenVoicePicker,
   } = options;
 
   let prefs = loadPrefs(storageKey);
@@ -777,7 +823,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
 
   function ensureAudioExtras(row: Row): AudioRowExtras {
     if (!row.audio) {
-      const extras = createAudioRowExtras(canvasElement, onClipTextCommit, onClipGenerate);
+      const extras = createAudioRowExtras(canvasElement, onClipTextCommit, onClipGenerate, onOpenVoicePicker);
       row.container.addChild(extras.root);
       row.audio = extras;
     }
