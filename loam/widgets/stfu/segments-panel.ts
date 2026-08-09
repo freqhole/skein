@@ -134,6 +134,11 @@ export interface SegmentsPanelOptions {
    *  `getMediaPlaybackUrl`'s own `peers` option — see index.ts's identical
    *  use for the video-timeline-driven clip playback). */
   getPeers?: () => PeersMap | undefined;
+  /** reads the widget's preferred mic input device label (property-tray
+   *  `micDeviceLabel` prop, see index.ts) — used to resolve a `deviceId`
+   *  for `startMicRecording()`, same convention as audio-recording.ts /
+   *  voice-recording.ts's own device selects. */
+  getMicDeviceLabel?: () => string;
   /** opens the (widget-wide) voice-picker dialog for a row's voice button —
    *  the panel itself is only ~150px tall, nowhere near enough room for a
    *  scrollable voice list, so the dialog is owned/mounted at the widget
@@ -249,6 +254,14 @@ interface AudioRowExtrasOptions {
   /** fires if mic permission is denied, or storing the finished recording
    *  fails. */
   onClipRecordError?: (clip: AudioClip, err: unknown) => void;
+  /** resolves the currently preferred mic device (from `getMicDeviceLabel`)
+   *  to a concrete `deviceId` for `startMicRecording()`; `undefined` means
+   *  system default. */
+  resolveDeviceId: () => string | undefined;
+  /** re-runs `enumerateDevices()` — device labels are empty until mic
+   *  permission is granted once, so this is called right after a recording
+   *  actually starts (mirrors audio-recording.ts's own re-enumeration). */
+  refreshDeviceList: () => void;
 }
 
 /**
@@ -273,6 +286,8 @@ function createAudioRowExtras(opts: AudioRowExtrasOptions): AudioRowExtras {
     onClipRecordSample,
     onClipRecordFinish,
     onClipRecordError,
+    resolveDeviceId,
+    refreshDeviceList,
   } = opts;
   let currentClip: AudioClip | null = null;
   let voiceName = VOICE_DEFAULT;
@@ -531,6 +546,7 @@ function createAudioRowExtras(opts: AudioRowExtrasOptions): AudioRowExtras {
     if (playing) stopPlayback();
     const session = await startMicRecording({
       filenamePrefix: `clip-${clip.id}`,
+      deviceId: resolveDeviceId(),
       onStart: () => {
         recording = true;
         hasRecorded = true;
@@ -538,8 +554,8 @@ function createAudioRowExtras(opts: AudioRowExtrasOptions): AudioRowExtras {
         layoutRecordButton();
         layout();
         onClipRecordStart?.(clip);
-      },
-      onSample: (_amplitude, elapsedSec) => {
+        refreshDeviceList();
+      },      onSample: (_amplitude, elapsedSec) => {
         recordElapsed = elapsedSec;
         if (recording) layoutRecordButton();
         onClipRecordSample?.(clip, _amplitude, elapsedSec);
@@ -832,10 +848,33 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     onPreviewDurationMeasured,
     storageKey,
     getPeers,
+    getMicDeviceLabel,
     onOpenVoicePicker,
     getAutoScrollEnabled,
     initialHeight,
   } = options;
+
+  // -- mic input device resolution (for the record button below) --------------
+  // mirrors audio-recording.ts's own device-select plumbing: labels are
+  // empty until mic permission is granted once, so devices are re-enumerated
+  // after the first successful recording too (see onClipRecordStart's caller
+  // in startRecordingClip, which fires right after getUserMedia succeeds).
+  let cachedMicDevices: MediaDeviceInfo[] = [];
+  const enumerateMicDevices = async (): Promise<void> => {
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      cachedMicDevices = all.filter((d) => d.kind === "audioinput");
+    } catch {
+      // enumerateDevices may be unavailable without a secure context
+    }
+  };
+  void enumerateMicDevices();
+  const resolveDeviceId = (): string | undefined => {
+    const label = getMicDeviceLabel?.();
+    if (!label) return undefined;
+    return cachedMicDevices.find((d) => d.label === label)?.deviceId;
+  };
+  const refreshDeviceList = (): void => void enumerateMicDevices();
 
   let prefs = loadPrefs(storageKey);
   let contentWidth = 0;
@@ -960,6 +999,8 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
         onClipRecordSample,
         onClipRecordFinish,
         onClipRecordError,
+        resolveDeviceId,
+        refreshDeviceList,
       });
       row.container.addChild(extras.root);
       row.audio = extras;

@@ -109,21 +109,33 @@ export const TOOLBAR_TRAILING_SLOT_WIDTH = 24;
  *  group (e.g. zoom out→zoom in→fit, undo→redo). */
 export const TOOLBAR_GROUP_GAP = 24;
 
-/** total fixed height of the whole shell (toolbar + reference + cut track +
- *  audio-clips track + ruler + scrollbar rows) — only the width is
- *  responsive, mirroring editor.js's own layout model. */
-export const TIMELINE_SHELL_HEIGHT =
-  TOOLBAR_HEIGHT +
-  ROW_GAP +
-  REFERENCE_TRACK_HEIGHT +
-  ROW_GAP +
-  CUT_TRACK_HEIGHT +
-  ROW_GAP +
-  AUDIO_CLIP_TRACK_HEIGHT +
-  ROW_GAP +
-  RULER_HEIGHT +
-  SCROLLBAR_GAP +
-  SCROLLBAR_HEIGHT;
+/** total fixed height of the whole shell (toolbar + N reference rows + cut
+ *  track + audio-clips track + ruler + scrollbar rows) — only the width is
+ *  responsive, mirroring editor.js's own layout model. `N` (the number of
+ *  stacked reference-track rows, one per `ReferenceTrack` in the doc) is
+ *  the one dimension that varies at runtime — see `computeTimelineShellHeight()`
+ *  below and `VideoTimelineHandle.setReferenceRowCount()`. */
+export function computeTimelineShellHeight(referenceRowCount: number): number {
+  const rowCount = Math.max(1, referenceRowCount);
+  return (
+    TOOLBAR_HEIGHT +
+    ROW_GAP +
+    rowCount * (REFERENCE_TRACK_HEIGHT + ROW_GAP) +
+    CUT_TRACK_HEIGHT +
+    ROW_GAP +
+    AUDIO_CLIP_TRACK_HEIGHT +
+    ROW_GAP +
+    RULER_HEIGHT +
+    SCROLLBAR_GAP +
+    SCROLLBAR_HEIGHT
+  );
+}
+
+/** shell height with exactly one reference row — the default/fallback used
+ *  wherever a caller doesn't yet know the real reference-track count (e.g.
+ *  before the doc has loaded). prefer `computeTimelineShellHeight()` once
+ *  the real count is known. */
+export const TIMELINE_SHELL_HEIGHT = computeTimelineShellHeight(1);
 
 function niceStep(target: number): number {
   for (const s of NICE_STEPS) {
@@ -297,6 +309,19 @@ function makeTrackLabelButton(
   return Object.assign(button, { redraw: () => draw(false) });
 }
 
+/** one stacked reference-track row's own layers/hit area — see
+ *  `VideoTimelineHandle.getReferenceRow()`. same coordinate conventions as
+ *  the row-level fields it replaces (`trackContentLayer` etc): `contentLayer`
+ *  is unscaled and repositions from scratch on every `onViewChange()`
+ *  (x=0 is the visible content area's left edge); `labelLayer` lives in the
+ *  reserved `TRACK_LABEL_COLUMN_WIDTH` column to the row's own left, at
+ *  local (0, 0) == the row's own top-left corner. */
+export interface ReferenceRowHandle {
+  contentLayer: Container;
+  hitArea: Container;
+  labelLayer: Container;
+}
+
 export interface VideoTimelineHandle {
   /** add this to the widget's own container; positioned at (0, 0) locally —
    *  the caller sets `container.y` to place it below the video area. */
@@ -323,20 +348,22 @@ export interface VideoTimelineHandle {
    *  (stfu's keyboard-shortcuts button) add their own child here at local
    *  (0, 0) rather than computing their own x position. */
   toolbarTrailingSlot: Container;
-  /** unscaled layer the reference/diarization track draws its colored
-   *  speaker segments into — same coordinate convention as
-   *  `trackContentLayer` (reposition from scratch on every
-   *  `onViewChange()`, x=0 is the visible content area's left edge). */
-  referenceContentLayer: Container;
-  /** background of the reference track row — external code (stfu's
-   *  reference-track.ts) attaches its own drag/hover pointer handling here. */
-  referenceHitArea: Container;
-  /** lives in the reserved `TRACK_LABEL_COLUMN_WIDTH` column to the left of
-   *  the row's own content (not masked by it) — the "REFERENCE" label
-   *  button mounts here. positioned at (0, row's own y); local (0, 0) is
-   *  the row's own top-left corner, same convention as if it were still a
-   *  child of the row itself. */
-  referenceLabelLayer: Container;
+  /** ensure exactly `count` (minimum 1) reference-track rows exist, stacked
+   *  below the toolbar in order — call whenever
+   *  `ctx.doc.current.referenceTracks.length` changes. this shifts the
+   *  cut-list/audio-clips/ruler/scrollbar rows and the playhead down (or
+   *  back up) to make room; returns the new total shell height so the
+   *  caller can re-run its own layout pass (e.g. repositioning whatever
+   *  sits below the timeline). rows beyond `count` are hidden, not
+   *  destroyed, and reused if the count grows again later. */
+  setReferenceRowCount(count: number): number;
+  /** access a specific reference-track row's own layers/hit area (0-indexed
+   *  in the same order last passed to `setReferenceRowCount()`) — one
+   *  `reference-track.ts` instance is mounted per row. */
+  getReferenceRow(index: number): ReferenceRowHandle;
+  /** current total shell height, reflecting the last `setReferenceRowCount()`
+   *  call (starts at a single row's worth — see `TIMELINE_SHELL_HEIGHT`). */
+  getShellHeight(): number;
   /** unscaled layer the audio-clips track draws its clip graphics into —
    *  same coordinate convention as `trackContentLayer` (reposition from
    *  scratch on every `onViewChange()`, x=0 is the visible content area's
@@ -538,59 +565,131 @@ export function createVideoTimeline(
     (autoscrollBtn as any).redraw();
   }
 
-  // -- reference/diarization track row (background + content layer) -----------
+  // -- reference/diarization track rows (one per `ReferenceTrack`, stacked
+  //    below the toolbar) — background + content layer per row, pooled so
+  //    a track count that shrinks then grows again reuses the same row
+  //    instances rather than destroying/recreating them. -----------------
 
-  const referenceRow = new Container();
-  // "wheel" listener lives on the row (below), not `referenceBg` — a
-  // descendant-only listener never fires while hovering a segment inside
-  // `referenceContentLayer`, since bubbling only walks up through shared
-  // ancestors, not sideways to siblings.
-  referenceRow.eventMode = "static";
-  referenceRow.x = TRACK_LABEL_COLUMN_WIDTH;
-  referenceRow.y = TOOLBAR_HEIGHT + ROW_GAP;
-  container.addChild(referenceRow);
+  interface ReferenceRowInternal {
+    row: Container;
+    bg: Graphics;
+    contentLayer: Container;
+    mask: Graphics;
+    labelLayer: Container;
+  }
 
-  const referenceBg = new Graphics();
-  referenceBg.eventMode = "static";
-  referenceRow.addChild(referenceBg);
+  const referenceRows: ReferenceRowInternal[] = [];
+  let referenceRowCount = 0;
 
-  const referenceContentLayer = new Container();
-  referenceRow.addChild(referenceContentLayer);
+  function referenceRowY(i: number): number {
+    return TOOLBAR_HEIGHT + ROW_GAP + i * (REFERENCE_TRACK_HEIGHT + ROW_GAP);
+  }
+  function referenceStackHeight(): number {
+    return referenceRowCount * (REFERENCE_TRACK_HEIGHT + ROW_GAP);
+  }
+  function trackRowY(): number {
+    return TOOLBAR_HEIGHT + ROW_GAP + referenceStackHeight();
+  }
+  function audioClipsRowY(): number {
+    return trackRowY() + CUT_TRACK_HEIGHT + ROW_GAP;
+  }
+  function rulerRowY(): number {
+    return audioClipsRowY() + AUDIO_CLIP_TRACK_HEIGHT + ROW_GAP;
+  }
+  function scrollbarRowY(): number {
+    return rulerRowY() + RULER_HEIGHT + SCROLLBAR_GAP;
+  }
+  function shellHeight(): number {
+    return scrollbarRowY() + SCROLLBAR_HEIGHT;
+  }
 
-  // a mask must live outside the container it clips — pixi's hit-testing
-  // treats a mask that's also a descendant of the masked container as
-  // self-referential, which silently breaks hit-testing on the masked
-  // content underneath it. so this is a *sibling* of referenceRow (both
-  // children of `container`), positioned to match its on-screen rect.
-  const referenceMask = new Graphics();
-  // a plain "passive" Graphics with real drawn geometry still answers
-  // hitTestRecursive's leaf test once an ancestor (the widget root) is
-  // interactive — the inherited eventMode, not this object's own, is what
-  // gets checked there — and since it isn't itself interactive, that
-  // returns `[]` (empty but truthy), which stops the reverse children loop
-  // dead before `referenceRow` (added earlier, tested later) is ever tried.
-  // `eventMode = "none"` hard-blocks it in `_interactivePrune()` instead.
-  referenceMask.eventMode = "none";
-  referenceMask.x = referenceRow.x;
-  referenceMask.y = referenceRow.y;
-  container.addChild(referenceMask);
-  referenceRow.mask = referenceMask;
+  function makeReferenceRowInternal(): ReferenceRowInternal {
+    const row = new Container();
+    // "wheel" listener lives on the row (below), not `bg` — a
+    // descendant-only listener never fires while hovering a segment inside
+    // `contentLayer`, since bubbling only walks up through shared
+    // ancestors, not sideways to siblings.
+    row.eventMode = "static";
+    row.x = TRACK_LABEL_COLUMN_WIDTH;
+    container.addChild(row);
 
-  // lives in the reserved label column to the row's *left* (a sibling of
-  // referenceRow, not a child of it — so it isn't clipped by
-  // `referenceMask` and doesn't overlap the row's own content). positioned
-  // at (0, referenceRow.y) so its own local (0, 0) still means "row's own
-  // top-left corner", same convention `reference-track.ts` already expects.
-  const referenceLabelLayer = new Container();
-  referenceLabelLayer.y = referenceRow.y;
-  container.addChild(referenceLabelLayer);
+    const bg = new Graphics();
+    bg.eventMode = "static";
+    row.addChild(bg);
+
+    const contentLayer = new Container();
+    row.addChild(contentLayer);
+
+    // a mask must live outside the container it clips — pixi's hit-testing
+    // treats a mask that's also a descendant of the masked container as
+    // self-referential, which silently breaks hit-testing on the masked
+    // content underneath it. so this is a *sibling* of `row` (both children
+    // of `container`), positioned to match its on-screen rect.
+    const mask = new Graphics();
+    // a plain "passive" Graphics with real drawn geometry still answers
+    // hitTestRecursive's leaf test once an ancestor (the widget root) is
+    // interactive — the inherited eventMode, not this object's own, is what
+    // gets checked there — and since it isn't itself interactive, that
+    // returns `[]` (empty but truthy), which stops the reverse children loop
+    // dead before `row` (added earlier, tested later) is ever tried.
+    // `eventMode = "none"` hard-blocks it in `_interactivePrune()` instead.
+    mask.eventMode = "none";
+    mask.x = row.x;
+    container.addChild(mask);
+    row.mask = mask;
+
+    // lives in the reserved label column to the row's *left* (a sibling of
+    // `row`, not a child of it — so it isn't clipped by `mask` and doesn't
+    // overlap the row's own content). local (0, 0) is the row's own
+    // top-left corner, same convention `reference-track.ts` already expects.
+    const labelLayer = new Container();
+    container.addChild(labelLayer);
+
+    row.on("wheel", onWheelPan);
+
+    return { row, bg, contentLayer, mask, labelLayer };
+  }
+
+  /** grow the pool to `count` rows (never shrinks it — rows beyond `count`
+   *  are just hidden, so a track count that later grows back reuses the
+   *  same instances instead of rebuilding them). */
+  function ensureReferenceRowPool(count: number): void {
+    while (referenceRows.length < count) referenceRows.push(makeReferenceRowInternal());
+    for (let i = 0; i < referenceRows.length; i++) {
+      const visible = i < count;
+      referenceRows[i].row.visible = visible;
+      referenceRows[i].labelLayer.visible = visible;
+    }
+  }
+
+  /** repositions every row (reference rows, cut-list, audio-clips, ruler,
+   *  scrollbar, playhead) from scratch — call after `referenceRowCount`
+   *  changes (widths are handled separately, by `resize()`/`updateTrackChrome()`). */
+  function relayoutRows(): void {
+    for (let i = 0; i < referenceRowCount; i++) {
+      const y = referenceRowY(i);
+      const r = referenceRows[i];
+      r.row.y = y;
+      r.mask.y = y;
+      r.labelLayer.y = y;
+    }
+    trackRow.y = trackRowY();
+    trackMask.y = trackRow.y;
+    trackLabelLayer.y = trackRow.y;
+    audioClipsRow.y = audioClipsRowY();
+    audioClipsMask.y = audioClipsRow.y;
+    audioClipsLabelLayer.y = audioClipsRow.y;
+    rulerRow.y = rulerRowY();
+    rulerMask.y = rulerRow.y;
+    scrollbarRow.y = scrollbarRowY();
+    playhead.y = referenceRows[0].row.y;
+  }
 
   // -- cut-segments track row (background + scaled content layer) --------------
 
   const trackRow = new Container();
-  trackRow.eventMode = "static"; // see comment on referenceRow.eventMode.
+  trackRow.eventMode = "static"; // see comment on reference row's own eventMode above.
   trackRow.x = TRACK_LABEL_COLUMN_WIDTH;
-  trackRow.y = TOOLBAR_HEIGHT + ROW_GAP + REFERENCE_TRACK_HEIGHT + ROW_GAP;
   container.addChild(trackRow);
 
   const trackBg = new Graphics();
@@ -600,16 +699,15 @@ export function createVideoTimeline(
   const trackContentLayer = new Container();
   trackRow.addChild(trackContentLayer);
 
-  // sibling of trackRow, not a child of it — see comment on referenceMask.
+  // sibling of trackRow, not a child of it — see comment on the reference
+  // row's own mask above.
   const trackMask = new Graphics();
-  trackMask.eventMode = "none"; // see comment on referenceMask.eventMode.
+  trackMask.eventMode = "none"; // see comment on the reference row's own mask above.
   trackMask.x = trackRow.x;
-  trackMask.y = trackRow.y;
   container.addChild(trackMask);
   trackRow.mask = trackMask;
 
   const trackLabelLayer = new Container();
-  trackLabelLayer.y = trackRow.y;
   container.addChild(trackLabelLayer);
   makeTrackLabelButton(
     trackLabelLayer,
@@ -622,9 +720,8 @@ export function createVideoTimeline(
   // -- audio-clips track row (background + unscaled content layer) -------------
 
   const audioClipsRow = new Container();
-  audioClipsRow.eventMode = "static"; // see comment on referenceRow.eventMode.
+  audioClipsRow.eventMode = "static"; // see comment on reference row's own eventMode above.
   audioClipsRow.x = TRACK_LABEL_COLUMN_WIDTH;
-  audioClipsRow.y = TOOLBAR_HEIGHT + ROW_GAP + REFERENCE_TRACK_HEIGHT + ROW_GAP + CUT_TRACK_HEIGHT + ROW_GAP;
   container.addChild(audioClipsRow);
 
   const audioClipsBg = new Graphics();
@@ -635,7 +732,6 @@ export function createVideoTimeline(
   audioClipsRow.addChild(audioClipsContentLayer);
 
   const audioClipsLabelLayer = new Container();
-  audioClipsLabelLayer.y = audioClipsRow.y;
   container.addChild(audioClipsLabelLayer);
   makeTrackLabelButton(
     audioClipsLabelLayer,
@@ -645,11 +741,11 @@ export function createVideoTimeline(
     () => trackLabelOptions?.onToggleAudioClipsVisible?.()
   );
 
-  // sibling of audioClipsRow, not a child of it — see comment on referenceMask.
+  // sibling of audioClipsRow, not a child of it — see comment on the
+  // reference row's own mask above.
   const audioClipsMask = new Graphics();
-  audioClipsMask.eventMode = "none"; // see comment on referenceMask.eventMode.
+  audioClipsMask.eventMode = "none"; // see comment on the reference row's own mask above.
   audioClipsMask.x = audioClipsRow.x;
-  audioClipsMask.y = audioClipsRow.y;
   container.addChild(audioClipsMask);
   audioClipsRow.mask = audioClipsMask;
 
@@ -657,18 +753,9 @@ export function createVideoTimeline(
 
   const rulerRow = new Container();
   // clicking the ruler (timestamps + ticks strip) seeks the player, same
-  // pattern as `referenceRow`/`trackRow`'s own eventMode comment above.
+  // pattern as the reference/cut rows' own eventMode comment above.
   rulerRow.eventMode = "static";
   rulerRow.x = TRACK_LABEL_COLUMN_WIDTH;
-  rulerRow.y =
-    TOOLBAR_HEIGHT +
-    ROW_GAP +
-    REFERENCE_TRACK_HEIGHT +
-    ROW_GAP +
-    CUT_TRACK_HEIGHT +
-    ROW_GAP +
-    AUDIO_CLIP_TRACK_HEIGHT +
-    ROW_GAP;
   container.addChild(rulerRow);
 
   rulerRow.on("pointerdown", (e: FederatedPointerEvent) => {
@@ -677,14 +764,14 @@ export function createVideoTimeline(
   });
 
   const rulerTicks = new Graphics();
-  rulerTicks.eventMode = "none"; // see comment on referenceMask.eventMode.
+  rulerTicks.eventMode = "none"; // see comment on the reference row's own mask above.
   rulerRow.addChild(rulerTicks);
 
-  // sibling of rulerRow, not a child of it — see comment on referenceMask.
+  // sibling of rulerRow, not a child of it — see comment on the reference
+  // row's own mask above.
   const rulerMask = new Graphics();
-  rulerMask.eventMode = "none"; // see comment on referenceMask.eventMode.
+  rulerMask.eventMode = "none"; // see comment on the reference row's own mask above.
   rulerMask.x = rulerRow.x;
-  rulerMask.y = rulerRow.y;
   container.addChild(rulerMask);
   rulerRow.mask = rulerMask;
 
@@ -705,34 +792,26 @@ export function createVideoTimeline(
     rulerRow.addChild(t);
   }
 
-  // -- playhead: one solid vertical line spanning the whole shell (reference
-  //    row through the ruler), a sibling of the rows rather than drawn once
-  //    per row -- an earlier version drew a separate short line per row,
-  //    which (with `ROW_GAP` between rows) read as a dashed/broken line
-  //    rather than one continuous playhead. --
+  // -- playhead: one solid vertical line spanning the whole shell (first
+  //    reference row through the ruler), a sibling of the rows rather than
+  //    drawn once per row -- an earlier version drew a separate short line
+  //    per row, which (with `ROW_GAP` between rows) read as a
+  //    dashed/broken line rather than one continuous playhead. --
 
   const playhead = new Graphics();
-  playhead.eventMode = "none"; // see comment on referenceMask.eventMode.
+  playhead.eventMode = "none"; // see comment on the reference row's own mask above.
   playhead.x = TRACK_LABEL_COLUMN_WIDTH;
-  playhead.y = referenceRow.y;
   container.addChild(playhead);
 
   // -- scrollbar row -------------------------------------------------------------
 
   const scrollbarRow = new Container();
   scrollbarRow.x = TRACK_LABEL_COLUMN_WIDTH;
-  scrollbarRow.y =
-    TOOLBAR_HEIGHT +
-    ROW_GAP +
-    REFERENCE_TRACK_HEIGHT +
-    ROW_GAP +
-    CUT_TRACK_HEIGHT +
-    ROW_GAP +
-    AUDIO_CLIP_TRACK_HEIGHT +
-    ROW_GAP +
-    RULER_HEIGHT +
-    SCROLLBAR_GAP;
   container.addChild(scrollbarRow);
+
+  ensureReferenceRowPool(1);
+  referenceRowCount = 1;
+  relayoutRows();
 
   const scrollbarTrack = new Graphics();
   scrollbarTrack.eventMode = "static";
@@ -786,7 +865,6 @@ export function createVideoTimeline(
     viewStartTime = clampViewStart(viewStartTime + deltaTime);
     applyViewChange(false);
   }
-  referenceRow.on("wheel", onWheelPan);
   trackRow.on("wheel", onWheelPan);
   audioClipsRow.on("wheel", onWheelPan);
 
@@ -807,13 +885,13 @@ export function createVideoTimeline(
     const rect = canvasElement.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
-    const g = referenceRow.getGlobalPosition();
+    const g = referenceRows[0].row.getGlobalPosition();
     // local widget dimensions and screen/global dimensions only match at
     // 1x canvas zoom -- correct for the canvas's own zoom via the row's
     // world transform scale, same technique `scrollable-content.ts` uses.
-    const scaleX = referenceRow.worldTransform.a;
-    const scaleY = referenceRow.worldTransform.d;
-    const totalHeight = REFERENCE_TRACK_HEIGHT + ROW_GAP + CUT_TRACK_HEIGHT + ROW_GAP + AUDIO_CLIP_TRACK_HEIGHT;
+    const scaleX = referenceRows[0].row.worldTransform.a;
+    const scaleY = referenceRows[0].row.worldTransform.d;
+    const totalHeight = referenceStackHeight() + CUT_TRACK_HEIGHT + ROW_GAP + AUDIO_CLIP_TRACK_HEIGHT;
     const inside =
       px >= g.x && px <= g.x + rowWidth * scaleX && py >= g.y && py <= g.y + totalHeight * scaleY;
     if (inside) (e as WheelEvent & { _skeinWidgetScroll?: boolean })._skeinWidgetScroll = true;
@@ -846,11 +924,14 @@ export function createVideoTimeline(
     audioClipsBg.hitArea = new Rectangle(0, 0, rowWidth, AUDIO_CLIP_TRACK_HEIGHT);
     audioClipsMask.clear().rect(0, 0, rowWidth, AUDIO_CLIP_TRACK_HEIGHT).fill({ color: 0xffffff });
 
-    referenceBg.clear();
-    // matches editor.js's `refBackground` (0x262626)
-    referenceBg.rect(0, 0, rowWidth, REFERENCE_TRACK_HEIGHT).fill({ color: 0x262626 });
-    referenceBg.hitArea = new Rectangle(0, 0, rowWidth, REFERENCE_TRACK_HEIGHT);
-    referenceMask.clear().rect(0, 0, rowWidth, REFERENCE_TRACK_HEIGHT).fill({ color: 0xffffff });
+    for (let i = 0; i < referenceRowCount; i++) {
+      const r = referenceRows[i];
+      r.bg.clear();
+      // matches editor.js's `refBackground` (0x262626)
+      r.bg.rect(0, 0, rowWidth, REFERENCE_TRACK_HEIGHT).fill({ color: 0x262626 });
+      r.bg.hitArea = new Rectangle(0, 0, rowWidth, REFERENCE_TRACK_HEIGHT);
+      r.mask.clear().rect(0, 0, rowWidth, REFERENCE_TRACK_HEIGHT).fill({ color: 0xffffff });
+    }
   }
 
   function updateRuler(): void {
@@ -905,10 +986,10 @@ export function createVideoTimeline(
     playhead.clear();
     const x = timeToScreenX(currentTime);
     if (x < 0 || x > rowWidth) return;
-    // spans from the reference row's own top down through the bottom of the
-    // ruler row (i.e. the whole shell minus the toolbar/scrollbar), so it
-    // reads as one solid line rather than one dashed segment per row.
-    const totalHeight = rulerRow.y + RULER_HEIGHT - referenceRow.y;
+    // spans from the first reference row's own top down through the bottom
+    // of the ruler row (i.e. the whole shell minus the toolbar/scrollbar),
+    // so it reads as one solid line rather than one dashed segment per row.
+    const totalHeight = rulerRow.y + RULER_HEIGHT - referenceRows[0].row.y;
     playhead.moveTo(x, 0).lineTo(x, totalHeight).stroke({ width: 1, color: 0xd946ef });
   }
 
@@ -960,11 +1041,31 @@ export function createVideoTimeline(
     trackHitArea: trackBg,
     toolbarRow,
     toolbarTrailingSlot,
-    referenceContentLayer,
-    referenceHitArea: referenceBg,
-    referenceLabelLayer,
     audioClipsContentLayer,
     audioClipsHitArea: audioClipsBg,
+
+    setReferenceRowCount(count: number): number {
+      const next = Math.max(1, count);
+      ensureReferenceRowPool(next);
+      referenceRowCount = next;
+      relayoutRows();
+      updateTrackChrome();
+      updateRulerMask();
+      applyViewChange(false);
+      return shellHeight();
+    },
+    getReferenceRow(index: number): ReferenceRowHandle {
+      const r = referenceRows[index];
+      if (!r) {
+        throw new Error(
+          `video-timeline: reference row ${index} not allocated — call setReferenceRowCount() first`
+        );
+      }
+      return { contentLayer: r.contentLayer, hitArea: r.bg, labelLayer: r.labelLayer };
+    },
+    getShellHeight() {
+      return shellHeight();
+    },
 
     reserveToolbarStart(width: number) {
       toolbarLeadingWidth = Math.max(0, width);

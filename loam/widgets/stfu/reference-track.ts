@@ -1,66 +1,65 @@
 /**
- * stfu's reference/diarization track — renders per-speaker colored segments
- * (once reference data has been loaded, see `reference-data.ts` + the
- * "load reference data..." widget action in `index.ts`) into
- * `video-timeline.ts`'s `referenceContentLayer`. the row's label column
- * hosts two separate buttons: the whole column toggles the segments
- * panel's "reference" source (mirrors the CUT LIST/AUDIO CLIPS labels in
- * `video-timeline.ts`), and a bigger caret-only button opens a
- * speaker-visibility popover (also reachable via right-click anywhere on
- * the row). direct design-port of `editor.js`'s
- * `rebuildReferenceGraphics()`/`createRefLabelButton()`/
- * `openSpeakerDialog()` — the popover itself is built with the generic
- * `expanding-panel.ts` helper (no full-modal dialog infra exists yet in
- * skein) rather than editor.js's own dialog system, but the row layout
- * (checkbox/swatch/label), "select all"/"clear all" buttons, and empty
- * state copy match it closely.
+ * stfu's reference/diarization track — one instance per `ReferenceTrack`
+ * (see `reference-dialog.ts`'s speaker grouping), each rendering only its
+ * own members' colored segments (once reference data has been loaded, see
+ * `reference-data.ts` + the "load reference data..." widget action in
+ * `index.ts`) into its own stacked row —
+ * `video-timeline.ts`'s `VideoTimelineHandle.getReferenceRow(index)`. the
+ * row's label column hosts two separate buttons: the whole column toggles
+ * the segments panel's "reference" source (mirrors the CUT LIST/AUDIO
+ * CLIPS labels in `video-timeline.ts`), and a bigger caret-only button
+ * opens the reference dialog (`reference-dialog.ts`, also reachable via
+ * right-click anywhere on the row) — this track only draws segments and
+ * owns the row's own buttons/drag gestures; all speaker-grouping/
+ * visibility UI lives in that separate, centered, full-widget dialog
+ * instead.
  *
  * this track needs zero reference data to mount cleanly — an empty track
- * row and an empty-state popover are both valid states.
+ * row is a valid state.
  */
 
 import { Container, Graphics, Rectangle, Text, type FederatedPointerEvent } from "pixi.js";
-import { createExpandingPanel, type ExpandingPanelHandle } from "../../src/widgets/expanding-panel";
-import { createScrollableContent, type ScrollableContent } from "../../src/widgets/scrollable-content";
 import {
   AUDIO_CLIP_TRACK_HEIGHT,
   CUT_TRACK_HEIGHT,
   REFERENCE_TRACK_HEIGHT,
   TRACK_LABEL_COLUMN_WIDTH,
+  type ReferenceRowHandle,
   type VideoTimelineHandle,
 } from "./video-timeline";
-import type { ReferenceSpeaker, TranscriptSegment } from "./types";
+import { resolveReferenceTrackId, type ReferenceSpeaker, type ReferenceTrack, type TranscriptSegment } from "./types";
 
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2;
 
-// matches trek-minus-paris's --color-magenta custom property
-const MAGENTA = 0xe619b3;
-
 const MARGIN_Y = 4;
-const LABEL_PAD_X = 8;
-const DIALOG_WIDTH = 220;
-const ROW_HEIGHT = 26;
-const HEADER_BTN_HEIGHT = 24;
-const HEADER_BTN_GAP = 8;
 
 export interface ReferenceTrackOptions {
   timeline: VideoTimelineHandle;
-  overlayParent: Container;
-  /** canvas element the widget is rendered on — the speaker list's
-   *  scrollable area needs this for wheel-event hit testing (see
-   *  `createScrollableContent()`). */
+  /** which `ReferenceTrack` this row instance renders — only segments
+   *  whose speaker resolves to this track id (via `resolveReferenceTrackId`)
+   *  are drawn/draggable here. */
+  trackId: string;
+  /** the stacked row (layers + hit area) this instance should draw into —
+   *  obtained via `timeline.getReferenceRow(rowIndex)` after the caller has
+   *  already called `timeline.setReferenceRowCount()` for the current
+   *  number of reference tracks. */
+  row: ReferenceRowHandle;
+  /** the row's own label text — reference-dialog.ts's own fallback
+   *  (`track.label || "track N"`) for a mult-track doc, or "REFERENCE" for
+   *  the single-track case. re-read on every `refresh()` so a rename in
+   *  the dialog shows up here too. */
+  getTrackLabel: () => string;
+  /** canvas element the widget is rendered on — used only to suppress the
+   *  browser's native context menu on right-click (see below). */
   canvasElement: HTMLCanvasElement;
   getReferenceSpeakers: () => Record<string, ReferenceSpeaker>;
+  getReferenceTracks: () => ReferenceTrack[];
   getTranscriptSegments: () => TranscriptSegment[];
-  /** localStorage key for the visible-speakers preference (browser-local UI
-   *  state, mirrors editor.js's `trek-editor-visible-speakers`). */
-  storageKey: string;
-  /** how tall the speaker popover is allowed to get, in `overlayParent`'s
-   *  local space, before it runs into the widget's own clipping bounds —
-   *  pass the space available below the reference row (timeline shell +
-   *  segments panel), since the popover is allowed to cover them while open. */
-  overlayMaxHeight: number;
+  /** whether a speaker's segments should currently be drawn/draggable — the
+   *  reference dialog (`reference-dialog.ts`) owns this preference (and its
+   *  localStorage persistence); this track just reads it. */
+  isSpeakerVisible: (label: string) => boolean;
   /** called when the user drags a reference/diarization segment down into
    *  the cut-list row and releases it there — the new cut segment should
    *  snap exactly to the dragged segment's own [start, end] (it can be
@@ -80,74 +79,40 @@ export interface ReferenceTrackOptions {
   /** whether reference data is currently a visible segments-panel source —
    *  drives the label area's highlight. */
   isReferenceActive?: () => boolean;
+  /** opens the reference dialog (`reference-dialog.ts`) — wired to the
+   *  caret button, right-click, and the label column's own right-click. */
+  onOpenDialog?: () => void;
 }
 
 export interface ReferenceTrackHandle {
-  /** re-draw segment graphics and the (if open) speaker popover — call
-   *  after `referenceSpeakers`/`transcriptSegments` change for any reason. */
+  /** re-draw segment graphics — call after `referenceSpeakers`/
+   *  `transcriptSegments` change for any reason. */
   refresh(): void;
   /** call whenever the widget's own width changes. */
   resize(contentWidth: number): void;
   destroy(): void;
 }
 
-function makeSecondaryButton(label: string, onClick: () => void): { container: Container; draw(width: number): void } {
-  const container = new Container();
-  container.eventMode = "static";
-  container.cursor = "pointer";
-  const bg = new Graphics();
-  const text = new Text({
-    text: label,
-    style: { fontFamily: FONT_FAMILY, fontSize: 11, fill: 0xdddddd },
-    resolution: TEXT_RESOLUTION,
-  });
-  text.anchor.set(0.5);
-  container.addChild(bg, text);
-
-  let currentWidth = 0;
-  const paint = (color: number) => {
-    bg.clear();
-    bg.roundRect(0, 0, currentWidth, HEADER_BTN_HEIGHT, 4).fill({ color });
-  };
-  container.on("pointerover", () => paint(0x4a4a4a));
-  container.on("pointerout", () => paint(0x3a3a3a));
-  container.on("pointertap", (e: FederatedPointerEvent) => {
-    e.stopPropagation();
-    onClick();
-  });
-
-  return {
-    container,
-    draw(width: number) {
-      currentWidth = width;
-      paint(0x3a3a3a);
-      text.x = width / 2;
-      text.y = HEADER_BTN_HEIGHT / 2;
-      container.hitArea = new Rectangle(0, 0, width, HEADER_BTN_HEIGHT);
-    },
-  };
-}
-
 export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceTrackHandle {
   const {
     timeline,
-    overlayParent,
+    trackId,
+    row,
+    getTrackLabel,
     canvasElement,
     getReferenceSpeakers,
+    getReferenceTracks,
     getTranscriptSegments,
-    storageKey,
-    overlayMaxHeight,
+    isSpeakerVisible,
     onCreateCutSegment,
     onCreateAudioClip,
     onSeek,
     onToggleVisible,
     isReferenceActive,
+    onOpenDialog,
   } = options;
 
   let contentWidth = 0;
-  let visibleSpeakers = new Set<string>();
-  let knownSpeakers: string[] = [];
-  let initializedVisibility = false;
   /** the segment currently under the pointer (no active drag) — drawn with
    *  a white hover outline, mirroring cut-segments-track.ts's/
    *  audio-clips-track.ts's own hover styling. compared by value, not
@@ -161,29 +126,15 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     return a.start === b.start && a.end === b.end && a.speaker === b.speaker;
   }
 
-  function loadVisibility(): void {
-    try {
-      const raw = localStorage.getItem(storageKey);
-      if (raw === null) return;
-      const arr: unknown = JSON.parse(raw);
-      if (Array.isArray(arr)) {
-        visibleSpeakers = new Set(arr.filter((l): l is string => typeof l === "string"));
-        initializedVisibility = true;
-      }
-    } catch {
-      // malformed/unavailable storage — fall through to the "all visible" default
-    }
+  /** whether `seg` belongs on *this* row — its speaker must both be visible
+   *  (the dialog's per-speaker preference) AND resolve (via
+   *  `resolveReferenceTrackId`) to this row's own `trackId`. */
+  function segmentBelongsHere(seg: TranscriptSegment): boolean {
+    if (!seg.speaker || !isSpeakerVisible(seg.speaker)) return false;
+    const speaker = getReferenceSpeakers()[seg.speaker];
+    if (!speaker) return false;
+    return resolveReferenceTrackId(speaker, getReferenceTracks()) === trackId;
   }
-
-  function persistVisibility(): void {
-    try {
-      localStorage.setItem(storageKey, JSON.stringify([...visibleSpeakers]));
-    } catch {
-      // private browsing / quota — not fatal, just doesn't persist
-    }
-  }
-
-  loadVisibility();
 
   // -- segment graphics (pooled, redrawn from scratch on every refresh) --------
 
@@ -194,7 +145,7 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
       const g = new Graphics();
       // purely visual — see cut-segments-track.ts's `g.eventMode` comment.
       g.eventMode = "none";
-      timeline.referenceContentLayer.addChild(g);
+      row.contentLayer.addChild(g);
       segmentPool.push(g);
     }
     return segmentPool[i];
@@ -204,16 +155,9 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     const speakers = getReferenceSpeakers();
     const segments = getTranscriptSegments();
 
-    const allLabels = Object.keys(speakers).sort();
-    if (!initializedVisibility) {
-      visibleSpeakers = new Set(allLabels);
-      initializedVisibility = true;
-    }
-    knownSpeakers = allLabels;
-
     let i = 0;
     for (const seg of segments) {
-      if (!seg.speaker || !visibleSpeakers.has(seg.speaker)) continue;
+      if (!segmentBelongsHere(seg)) continue;
       const x1 = timeline.timeToScreenX(seg.start);
       const x2 = timeline.timeToScreenX(seg.end);
       if (x2 < 0 || x1 > contentWidth) continue; // fully offscreen
@@ -269,7 +213,7 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     const segments = getTranscriptSegments();
     for (let idx = segments.length - 1; idx >= 0; idx--) {
       const seg = segments[idx];
-      if (!seg.speaker || !visibleSpeakers.has(seg.speaker)) continue;
+      if (!segmentBelongsHere(seg)) continue;
       const x1 = timeline.timeToScreenX(seg.start);
       const x2 = timeline.timeToScreenX(seg.end);
       const w = Math.max(2, x2 - x1);
@@ -306,7 +250,7 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
   }
 
   function onReferencePointerDown(e: FederatedPointerEvent): void {
-    const local = e.getLocalPosition(timeline.referenceHitArea);
+    const local = e.getLocalPosition(row.hitArea);
     const seg = hitTestReferenceEntry(local.x);
     if (!seg) return;
     // the drag ghost conveys "grabbed" on its own — drop the hover outline
@@ -338,11 +282,11 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
       const x2 = timeline.timeToScreenX(seg.end);
       const width = Math.max(2, x2 - x1);
       const height = Math.max(1, REFERENCE_TRACK_HEIGHT - 2 * MARGIN_Y);
-      // `timeToScreenX()` is in `referenceContentLayer`'s own local frame,
+      // `timeToScreenX()` is in `row.contentLayer`'s own local frame,
       // not `timeline.container`'s (the ghost's parent) — bridge the two via
       // pixi's own transform chain rather than assuming a fixed offset
       // between them.
-      const topLeftGlobal = timeline.referenceContentLayer.toGlobal({ x: x1, y: 0 });
+      const topLeftGlobal = row.contentLayer.toGlobal({ x: x1, y: 0 });
       const topLeftLocal = timeline.container.toLocal(topLeftGlobal);
 
       const ghost = ensureGhost();
@@ -378,9 +322,9 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
   // gesture above.
   function onReferenceTrackPointerMove(e: FederatedPointerEvent): void {
     if (refDrag) return;
-    const local = e.getLocalPosition(timeline.referenceHitArea);
+    const local = e.getLocalPosition(row.hitArea);
     const seg = hitTestReferenceEntry(local.x);
-    timeline.referenceHitArea.cursor = seg ? "grab" : "default";
+    row.hitArea.cursor = seg ? "grab" : "default";
     if (sameSegment(seg, hoveredSeg)) return;
     hoveredSeg = seg;
     redrawSegments();
@@ -388,33 +332,29 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
 
   function onReferenceTrackPointerOut(): void {
     if (refDrag) return;
-    timeline.referenceHitArea.cursor = "default";
+    row.hitArea.cursor = "default";
     if (!hoveredSeg) return;
     hoveredSeg = null;
     redrawSegments();
   }
 
-  timeline.referenceHitArea.on("pointerdown", onReferencePointerDown);
-  timeline.referenceHitArea.on("globalpointermove", onGlobalPointerMove);
-  timeline.referenceHitArea.on("pointerup", onGlobalPointerUp);
-  timeline.referenceHitArea.on("pointerupoutside", onGlobalPointerUp);
-  timeline.referenceHitArea.on("pointermove", onReferenceTrackPointerMove);
-  timeline.referenceHitArea.on("pointerout", onReferenceTrackPointerOut);
+  row.hitArea.on("pointerdown", onReferencePointerDown);
+  row.hitArea.on("globalpointermove", onGlobalPointerMove);
+  row.hitArea.on("pointerup", onGlobalPointerUp);
+  row.hitArea.on("pointerupoutside", onGlobalPointerUp);
+  row.hitArea.on("pointermove", onReferenceTrackPointerMove);
+  row.hitArea.on("pointerout", onReferenceTrackPointerOut);
 
   // right-click anywhere on the reference row (content area AND label
-  // column) opens the speaker popover — `expandingPanel` is declared
-  // further down, but this handler only reads it once actually invoked,
-  // well after the whole function has finished initializing (same pattern
-  // the caret button's own handler already relies on).
-  function openSpeakerPopoverFromRightClick(e: FederatedPointerEvent): void {
+  // column) opens the reference dialog.
+  function openReferenceDialogFromRightClick(e: FederatedPointerEvent): void {
     e.stopPropagation();
-    expandingPanel.toggle();
-    if (expandingPanel.isOpen) refreshPanel();
+    onOpenDialog?.();
   }
-  timeline.referenceHitArea.on("rightclick", openSpeakerPopoverFromRightClick);
+  row.hitArea.on("rightclick", openReferenceDialogFromRightClick);
   // the canvas has no other use for a native context menu (this is a fully
   // custom-rendered pixi surface) — suppress it everywhere so right-click
-  // reads as "open the speaker popover" instead of flashing the browser's
+  // reads as "open the reference dialog" instead of flashing the browser's
   // own menu first.
   function onCanvasContextMenu(e: MouseEvent): void {
     e.preventDefault();
@@ -425,21 +365,21 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
   // two separate buttons, mirroring `video-timeline.ts`'s own CUT LIST /
   // AUDIO CLIPS labels: (1) the whole column (including its "REFERENCE"
   // text) toggles the segments panel's "reference" source, (2) a bigger,
-  // caret-only button at the column's right edge opens the
-  // speaker-visibility popover — layered on top so its own smaller hit area
-  // intercepts clicks before they reach the column-wide toggle underneath.
-  // right-click anywhere in the column (either button) also opens the
-  // popover, matching the content area's own right-click handler above.
+  // caret-only button at the column's right edge opens the reference
+  // dialog — layered on top so its own smaller hit area intercepts clicks
+  // before they reach the column-wide toggle underneath. right-click
+  // anywhere in the column (either button) also opens the dialog, matching
+  // the content area's own right-click handler above.
 
   const visibilityToggle = new Container();
   visibilityToggle.eventMode = "static";
   visibilityToggle.cursor = "pointer";
   visibilityToggle.hitArea = new Rectangle(0, 0, TRACK_LABEL_COLUMN_WIDTH, REFERENCE_TRACK_HEIGHT);
-  timeline.referenceLabelLayer.addChild(visibilityToggle);
+  row.labelLayer.addChild(visibilityToggle);
 
   const visibilityBg = new Graphics();
   const visibilityLabel = new Text({
-    text: "REFERENCE",
+    text: getTrackLabel(),
     style: { fontFamily: FONT_FAMILY, fontSize: 9, fill: 0x888888, letterSpacing: 0.3 },
     resolution: TEXT_RESOLUTION,
   });
@@ -470,7 +410,7 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
     onToggleVisible?.();
     drawVisibilityToggle(false);
   });
-  visibilityToggle.on("rightclick", openSpeakerPopoverFromRightClick);
+  visibilityToggle.on("rightclick", openReferenceDialogFromRightClick);
 
   const CARET_BUTTON_SIZE = 24;
   const caretButton = new Container();
@@ -479,7 +419,7 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
   caretButton.hitArea = new Rectangle(0, 0, CARET_BUTTON_SIZE, CARET_BUTTON_SIZE);
   caretButton.x = TRACK_LABEL_COLUMN_WIDTH - CARET_BUTTON_SIZE - 2;
   caretButton.y = (REFERENCE_TRACK_HEIGHT - CARET_BUTTON_SIZE) / 2;
-  timeline.referenceLabelLayer.addChild(caretButton);
+  row.labelLayer.addChild(caretButton);
 
   const caretBg = new Graphics();
   const caret = new Graphics();
@@ -510,208 +450,38 @@ export function createReferenceTrack(options: ReferenceTrackOptions): ReferenceT
   caretButton.on("pointerout", () => drawCaretButton(false));
   caretButton.on("pointertap", (e: FederatedPointerEvent) => {
     e.stopPropagation();
-    expandingPanel.toggle();
-    if (expandingPanel.isOpen) refreshPanel();
+    onOpenDialog?.();
   });
-  caretButton.on("rightclick", openSpeakerPopoverFromRightClick);
-
-  // -- speaker-visibility popover -------------------------------------------------
-
-
-  const panel = new Container();
-  const panelBg = new Graphics();
-  panel.addChild(panelBg);
-
-  const selectAllBtn = makeSecondaryButton("select all", () => {
-    visibleSpeakers = new Set(knownSpeakers);
-    onVisibleSpeakersChanged();
-  });
-  const clearAllBtn = makeSecondaryButton("clear all", () => {
-    visibleSpeakers = new Set();
-    onVisibleSpeakersChanged();
-  });
-  panel.addChild(selectAllBtn.container, clearAllBtn.container);
-
-  // fixed y where the (scrollable) speaker row list starts, below the
-  // select-all/clear-all header — the header never scrolls.
-  const ROWS_AREA_Y = LABEL_PAD_X + HEADER_BTN_HEIGHT + LABEL_PAD_X;
-  const ROWS_AREA_WIDTH = DIALOG_WIDTH - LABEL_PAD_X * 2;
-
-  // the row list scrolls internally once there are more speakers than fit
-  // in `overlayMaxHeight` — otherwise a long speaker list simply got
-  // clipped by the widget's own bounds with no way to reach the rest.
-  const scrollable: ScrollableContent = createScrollableContent(
-    panel,
-    canvasElement,
-    LABEL_PAD_X,
-    ROWS_AREA_Y,
-    ROWS_AREA_WIDTH,
-    Math.max(1, overlayMaxHeight - ROWS_AREA_Y - LABEL_PAD_X),
-  );
-
-  const emptyText = new Text({
-    text: "no diarization data found for this video",
-    style: {
-      fontFamily: FONT_FAMILY,
-      fontSize: 12,
-      fill: 0x888888,
-      wordWrap: true,
-      wordWrapWidth: ROWS_AREA_WIDTH,
-    },
-    resolution: TEXT_RESOLUTION,
-  });
-  scrollable.content.addChild(emptyText);
-
-  interface SpeakerRow {
-    container: Container;
-    bg: Graphics;
-    checkbox: Graphics;
-    swatch: Graphics;
-    label: Text;
-  }
-  const rowPool: SpeakerRow[] = [];
-
-  function rowAt(i: number): SpeakerRow {
-    while (rowPool.length <= i) {
-      const container = new Container();
-      container.eventMode = "static";
-      container.cursor = "pointer";
-      const bg = new Graphics();
-      const checkbox = new Graphics();
-      const swatch = new Graphics();
-      const label = new Text({
-        text: "",
-        style: { fontFamily: FONT_FAMILY, fontSize: 12, fill: 0xdddddd },
-        resolution: TEXT_RESOLUTION,
-      });
-      container.addChild(bg, checkbox, swatch, label);
-      scrollable.content.addChild(container);
-      rowPool.push({ container, bg, checkbox, swatch, label });
-    }
-    return rowPool[i];
-  }
-
-  function onVisibleSpeakersChanged(): void {
-    persistVisibility();
-    redrawSegments();
-    refreshPanel();
-  }
-
-  function refreshPanel(): void {
-    const speakers = getReferenceSpeakers();
-    const labels = Object.keys(speakers).sort();
-    knownSpeakers = labels;
-
-    const w = DIALOG_WIDTH;
-    const btnW = (w - LABEL_PAD_X * 2 - HEADER_BTN_GAP) / 2;
-    selectAllBtn.draw(btnW);
-    clearAllBtn.draw(btnW);
-    selectAllBtn.container.x = LABEL_PAD_X;
-    selectAllBtn.container.y = LABEL_PAD_X;
-    clearAllBtn.container.x = LABEL_PAD_X + btnW + HEADER_BTN_GAP;
-    clearAllBtn.container.y = LABEL_PAD_X;
-
-    emptyText.visible = labels.length === 0;
-    emptyText.x = 0;
-    emptyText.y = 0;
-
-    labels.forEach((label, i) => {
-      const row = rowAt(i);
-      row.container.visible = true;
-      row.container.x = 0;
-      row.container.y = i * ROW_HEIGHT;
-      row.container.hitArea = new Rectangle(0, 0, ROWS_AREA_WIDTH, ROW_HEIGHT);
-
-      const checked = visibleSpeakers.has(label);
-      row.checkbox.clear();
-      row.checkbox
-        .roundRect(0, (ROW_HEIGHT - 14) / 2, 14, 14, 3)
-        .fill({ color: checked ? MAGENTA : 0x1a1a1a })
-        .stroke({ width: 1, color: checked ? MAGENTA : 0x555555 });
-      if (checked) {
-        row.checkbox
-          .moveTo(3, ROW_HEIGHT / 2)
-          .lineTo(6, ROW_HEIGHT / 2 + 3)
-          .lineTo(11, ROW_HEIGHT / 2 - 4)
-          .stroke({ width: 1.5, color: 0xffffff });
-      }
-
-      const color = speakers[label]?.color ?? 0x60a5fa;
-      row.swatch.clear().roundRect(22, (ROW_HEIGHT - 10) / 2, 10, 10, 2).fill({ color });
-
-      row.label.text = label;
-      row.label.x = 40;
-      row.label.y = (ROW_HEIGHT - row.label.height) / 2;
-
-      row.bg.clear();
-      row.container.off("pointerover").on("pointerover", () => {
-        row.bg.clear().rect(0, 0, ROWS_AREA_WIDTH, ROW_HEIGHT).fill({ color: 0x2c2c2c });
-      });
-      row.container.off("pointerout").on("pointerout", () => row.bg.clear());
-      row.container.off("pointertap").on("pointertap", (e: FederatedPointerEvent) => {
-        e.stopPropagation();
-        if (visibleSpeakers.has(label)) visibleSpeakers.delete(label);
-        else visibleSpeakers.add(label);
-        onVisibleSpeakersChanged();
-      });
-    });
-    for (let i = labels.length; i < rowPool.length; i++) rowPool[i].container.visible = false;
-
-    const rowsContentHeight = labels.length > 0 ? labels.length * ROW_HEIGHT : emptyText.height;
-    const maxRowsAreaHeight = Math.max(0, overlayMaxHeight - ROWS_AREA_Y - LABEL_PAD_X);
-    const rowsAreaHeight = Math.min(rowsContentHeight, maxRowsAreaHeight);
-    scrollable.resize(ROWS_AREA_WIDTH, Math.max(1, rowsAreaHeight));
-    scrollable.reflow(ROWS_AREA_WIDTH, rowsContentHeight);
-
-    const panelHeight = ROWS_AREA_Y + rowsAreaHeight + LABEL_PAD_X;
-
-    panelBg.clear();
-    panelBg.roundRect(0, 0, w, panelHeight, 6).fill({ color: 0x1e1e1e }).stroke({ width: 1, color: 0x333333 });
-
-    panel.x = LABEL_PAD_X;
-    panel.y = REFERENCE_TRACK_HEIGHT + 4;
-
-    expandingPanel.resize(contentWidth, overlayMaxHeight);
-  }
-
-  const expandingPanel: ExpandingPanelHandle = createExpandingPanel({
-    overlayParent,
-    panel,
-    onOpenChange: (open) => {
-      if (open) refreshPanel();
-    },
-  });
+  caretButton.on("rightclick", openReferenceDialogFromRightClick);
 
   redrawSegments();
 
   return {
     refresh() {
+      visibilityLabel.text = getTrackLabel();
       redrawSegments();
-      if (expandingPanel.isOpen) refreshPanel();
     },
 
     resize(newContentWidth: number) {
       contentWidth = Math.max(0, newContentWidth);
       redrawSegments();
-      if (expandingPanel.isOpen) refreshPanel();
     },
 
     destroy() {
       offViewChange();
-      timeline.referenceHitArea.off("pointerdown", onReferencePointerDown);
-      timeline.referenceHitArea.off("globalpointermove", onGlobalPointerMove);
-      timeline.referenceHitArea.off("pointerup", onGlobalPointerUp);
-      timeline.referenceHitArea.off("pointerupoutside", onGlobalPointerUp);
-      timeline.referenceHitArea.off("pointermove", onReferenceTrackPointerMove);
-      timeline.referenceHitArea.off("pointerout", onReferenceTrackPointerOut);
-      timeline.referenceHitArea.off("rightclick");
+      row.hitArea.off("pointerdown", onReferencePointerDown);
+      row.hitArea.off("globalpointermove", onGlobalPointerMove);
+      row.hitArea.off("pointerup", onGlobalPointerUp);
+      row.hitArea.off("pointerupoutside", onGlobalPointerUp);
+      row.hitArea.off("pointermove", onReferenceTrackPointerMove);
+      row.hitArea.off("pointerout", onReferenceTrackPointerOut);
+      row.hitArea.off("rightclick");
       canvasElement.removeEventListener("contextmenu", onCanvasContextMenu);
       destroyGhost();
-      scrollable.destroy();
-      expandingPanel.destroy();
       visibilityToggle.destroy({ children: true });
       caretButton.destroy({ children: true });
       segmentPool.forEach((g) => g.destroy());
     },
   };
 }
+

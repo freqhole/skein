@@ -53,8 +53,55 @@ export const referenceSpeakerSchema = z.object({
   name: z.string().default(""),
   /** pixi hex color used to tint this speaker's transcript segments */
   color: z.number().default(0x60a5fa),
+  /** which `ReferenceTrack` (see below) this speaker is grouped under in
+   *  the reference dialog — always a valid id from `referenceTracks`
+   *  (falls back to the first track's id if its own track was removed). */
+  trackId: z.string().default("default"),
+  // -- speaker sample clip (process.py's `{speaker}_sample_{i}{ext}`,
+  // picked up from a `{video title}_speaker_samples/` dir alongside the
+  // rest of a project's reference data — see reference-data-actions.ts) --
+  sampleVideoBlobId: z.string().optional(),
+  sampleVideoBlake3: z.string().optional(),
+  sampleVideoMime: z.string().optional(),
+  sampleVideoFilename: z.string().optional(),
+  sampleVideoSize: z.number().optional(),
+  // -- speaker sample thumbnail (process.py's `{speaker}_sample_{i}_thumb.jpg`,
+  // a frame grabbed from the middle of the sample clip) --
+  thumbnailBlobId: z.string().optional(),
+  thumbnailBlake3: z.string().optional(),
+  thumbnailMime: z.string().optional(),
+  thumbnailFilename: z.string().optional(),
+  thumbnailSize: z.number().optional(),
 });
 export type ReferenceSpeaker = z.infer<typeof referenceSpeakerSchema>;
+
+// ---------------------------------------------------------------------------
+// reference tracks (speaker groupings shown in the reference dialog)
+// ---------------------------------------------------------------------------
+
+export const referenceTrackSchema = z.object({
+  id: z.string(),
+  /** only shown/editable once there's more than one track — see
+   *  reference-dialog.ts. */
+  label: z.string().default(""),
+});
+export type ReferenceTrack = z.infer<typeof referenceTrackSchema>;
+
+/** every document starts with exactly one track (matching every speaker's
+ *  own `trackId` default of `"default"`) so a fresh project needs no
+ *  migration before it can be grouped further. */
+export const DEFAULT_REFERENCE_TRACK_ID = "default";
+
+/** resolves which `ReferenceTrack` a speaker belongs to — falls back to the
+ *  canonical default track (or the first track) if the speaker's own
+ *  `trackId` doesn't match any current track (e.g. its track was removed).
+ *  shared between reference-dialog.ts (the grouping UI) and
+ *  reference-track.ts (one timeline row per track) so both agree on the
+ *  same speaker→track assignment. */
+export function resolveReferenceTrackId(speaker: ReferenceSpeaker, tracks: ReferenceTrack[]): string {
+  if (speaker.trackId && tracks.some((t) => t.id === speaker.trackId)) return speaker.trackId;
+  return tracks.find((t) => t.id === DEFAULT_REFERENCE_TRACK_ID)?.id ?? tracks[0]?.id ?? DEFAULT_REFERENCE_TRACK_ID;
+}
 
 export const transcriptSegmentSchema = z.object({
   start: z.number(),
@@ -100,6 +147,9 @@ export const stfuSchema = z.object({
   // -- transcript / diarization ------------------------------------------------
   referenceSpeakers: z.record(z.string(), referenceSpeakerSchema).default({}),
   transcriptSegments: z.array(transcriptSegmentSchema).default([]),
+  /** speaker groupings shown in the reference dialog — see
+   *  `DEFAULT_REFERENCE_TRACK_ID` above. */
+  referenceTracks: z.array(referenceTrackSchema).default([{ id: DEFAULT_REFERENCE_TRACK_ID, label: "" }]),
 
   // -- cut timeline -------------------------------------------------------------
   /** [start, end] ranges (seconds) the user has marked for removal */
@@ -109,6 +159,14 @@ export const stfuSchema = z.object({
 
   // -- audio clips track ----------------------------------------------------------
   audioClips: z.array(audioClipSchema).default([]),
+  /**
+   * preferred mic input device label for new/re-recorded audio clips
+   * (property-tray "mic input device" select) — empty string means system
+   * default. matched against enumerateDevices() labels; if the label isn't
+   * found on this machine, recording falls back to default (mirrors
+   * audio-recording.ts's deviceLabel field).
+   */
+  micDeviceLabel: z.string().default(""),
 
   // -- tts defaults applied to new clips on this widget ------------------------------
   ttsDefaultVoiceName: z.string().default(""),

@@ -14,7 +14,7 @@
  * into that single array by time-range overlap.
  */
 
-import type { ReferenceSpeaker, TranscriptSegment } from "./types";
+import { DEFAULT_REFERENCE_TRACK_ID, type ReferenceSpeaker, type TranscriptSegment } from "./types";
 
 // golden-angle hue spread — same constants as editor.js's
 // `computeSpeakerColors()`, offset away from the red playhead / magenta
@@ -72,6 +72,31 @@ export interface ParsedCombinedData {
   kind: "combined";
   ranges: Record<string, [number, number][]>;
   segments: { start: number; end: number; text: string }[];
+}
+
+/** `process.py`'s `generate_speaker_samples()` naming convention:
+ *  `{speaker}_sample_{i}{ext}` for the clip, `{speaker}_sample_{i}_thumb.jpg`
+ *  for its thumbnail (a frame grabbed from the clip's midpoint) — both
+ *  written into a `{video title}_speaker_samples/` directory alongside a
+ *  project's diarize/transcribe/reference json. */
+const SPEAKER_SAMPLE_FILENAME_RE = /^(.+)_sample_(\d+)(_thumb)?\.[^.]+$/;
+
+export interface ParsedSpeakerSampleFilename {
+  speaker: string;
+  index: number;
+  kind: "video" | "thumbnail";
+}
+
+/** parse a speaker-sample filename (see `SPEAKER_SAMPLE_FILENAME_RE`), or
+ *  return null if `filename` doesn't match that convention at all. */
+export function parseSpeakerSampleFilename(filename: string): ParsedSpeakerSampleFilename | null {
+  const match = SPEAKER_SAMPLE_FILENAME_RE.exec(filename);
+  if (!match) return null;
+  return {
+    speaker: match[1],
+    index: Number(match[2]),
+    kind: match[3] ? "thumbnail" : "video",
+  };
 }
 
 function parseRangesDict(obj: Record<string, unknown>): Record<string, [number, number][]> | null {
@@ -174,14 +199,20 @@ export function mergeDiarizeData(
 ): MergedReferenceData {
   const nextSpeakers: Record<string, ReferenceSpeaker> = {};
   for (const [label, speaker] of Object.entries(referenceSpeakers)) {
-    nextSpeakers[label] = { name: speaker.name, color: speaker.color };
+    // preserve every existing field (trackId, sample/thumbnail blob refs,
+    // etc) — this merge only ever touches name/color/new-speaker creation.
+    nextSpeakers[label] = { ...speaker };
   }
 
   const labels = Object.keys(parsed.ranges).sort();
   let colorIndex = Object.keys(nextSpeakers).length;
   for (const label of labels) {
     if (!nextSpeakers[label]) {
-      nextSpeakers[label] = { name: label, color: speakerColorForIndex(colorIndex) };
+      nextSpeakers[label] = {
+        name: label,
+        color: speakerColorForIndex(colorIndex),
+        trackId: DEFAULT_REFERENCE_TRACK_ID,
+      };
       colorIndex++;
     }
   }
@@ -250,3 +281,57 @@ export function mergeCombinedData(
   });
   return { referenceSpeakers: afterDiarize.referenceSpeakers, transcriptSegments: finalSegments };
 }
+
+/** an uploaded sample video or thumbnail's blob metadata — matches
+ *  `FileUploadResult`'s shape (see file-shared.ts), trimmed to the fields
+ *  `ReferenceSpeaker`'s own `sampleVideo*`/`thumbnail*` fields need. */
+export interface UploadedSampleMedia {
+  blobId: string;
+  blake3: string;
+  mime: string;
+  filename: string;
+  size: number;
+}
+
+/**
+ * attach an already-uploaded sample video and/or thumbnail to a speaker,
+ * creating the speaker entry (with a freshly assigned color) if one
+ * doesn't exist yet — a project folder's `*_speaker_samples/` files can be
+ * loaded before or after its diarize/transcribe json, in any order, same
+ * as `mergeDiarizeData`/`mergeTranscribeData` above.
+ */
+export function mergeSpeakerSampleMedia(
+  referenceSpeakers: Record<string, ReferenceSpeaker>,
+  speakerLabel: string,
+  media: { video?: UploadedSampleMedia; thumbnail?: UploadedSampleMedia }
+): Record<string, ReferenceSpeaker> {
+  const nextSpeakers: Record<string, ReferenceSpeaker> = {};
+  for (const [label, speaker] of Object.entries(referenceSpeakers)) {
+    nextSpeakers[label] = { ...speaker };
+  }
+
+  const existing = nextSpeakers[speakerLabel];
+  const target: ReferenceSpeaker = existing ?? {
+    name: speakerLabel,
+    color: speakerColorForIndex(Object.keys(nextSpeakers).length),
+    trackId: DEFAULT_REFERENCE_TRACK_ID,
+  };
+
+  if (media.video) {
+    target.sampleVideoBlobId = media.video.blobId;
+    target.sampleVideoBlake3 = media.video.blake3;
+    target.sampleVideoMime = media.video.mime;
+    target.sampleVideoFilename = media.video.filename;
+    target.sampleVideoSize = media.video.size;
+  }
+  if (media.thumbnail) {
+    target.thumbnailBlobId = media.thumbnail.blobId;
+    target.thumbnailBlake3 = media.thumbnail.blake3;
+    target.thumbnailMime = media.thumbnail.mime;
+    target.thumbnailFilename = media.thumbnail.filename;
+    target.thumbnailSize = media.thumbnail.size;
+  }
+  nextSpeakers[speakerLabel] = target;
+  return nextSpeakers;
+}
+

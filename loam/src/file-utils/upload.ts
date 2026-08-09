@@ -306,41 +306,60 @@ async function pickJsonFilesBrowser(): Promise<PickedFile[]> {
 
 /**
  * pick an entire directory and return every `.json` file directly inside it
- * (non-recursive) — used by stfu's "load project folder..." action to bulk-
- * load a trek-minus-paris project folder's diarize/transcribe/reference json
- * files in one go, instead of picking each file by hand. returns [] if the
- * user cancels or the folder has no json files.
+ * (non-recursive), plus every file inside any `*_speaker_samples/`
+ * subdirectory (`process.py`'s per-speaker sample clips + thumbnails) --
+ * used by stfu's "load project folder..." action to bulk-load a whole
+ * trek-minus-paris project folder in one go, instead of picking each file
+ * by hand. returns empty arrays if the user cancels or the folder has
+ * neither.
  */
-export async function pickJsonDirectory(): Promise<PickedFile[]> {
-  if (isTauriMode()) {
-    return pickJsonDirectoryTauri();
-  }
-  return pickJsonDirectoryBrowser();
+export interface PickedReferenceDirectory {
+  jsonFiles: PickedFile[];
+  sampleFiles: PickedFile[];
 }
 
-async function pickJsonDirectoryTauri(): Promise<PickedFile[]> {
+const SPEAKER_SAMPLES_DIR_RE = /_speaker_samples[\\/]/;
+
+export async function pickReferenceDirectory(): Promise<PickedReferenceDirectory> {
+  if (isTauriMode()) {
+    return pickReferenceDirectoryTauri();
+  }
+  return pickReferenceDirectoryBrowser();
+}
+
+async function pickReferenceDirectoryTauri(): Promise<PickedReferenceDirectory> {
   try {
     const result = await open({ directory: true, multiple: false });
-    if (result === null) return [];
+    if (result === null) return { jsonFiles: [], sampleFiles: [] };
 
     const dirPath = Array.isArray(result) ? result[0] : result;
-    if (!dirPath) return [];
+    if (!dirPath) return { jsonFiles: [], sampleFiles: [] };
 
-    const { files } = (await dispatch("list_json_files_in_dir", { path: dirPath })) as {
-      files: { path: string; filename: string }[];
+    const [{ files: jsonEntries }, { files: sampleEntries }] = await Promise.all([
+      dispatch("list_json_files_in_dir", { path: dirPath }) as Promise<{
+        files: { path: string; filename: string }[];
+      }>,
+      dispatch("list_speaker_samples", { path: dirPath }) as Promise<{
+        files: { path: string; filename: string }[];
+      }>,
+    ]);
+    return {
+      jsonFiles: jsonEntries.map((f) => ({ path: f.path, filename: f.filename, size: 0, file: null })),
+      sampleFiles: sampleEntries.map((f) => ({ path: f.path, filename: f.filename, size: 0, file: null })),
     };
-    return files.map((f) => ({ path: f.path, filename: f.filename, size: 0, file: null }));
   } catch (err) {
-    log.error(TAG, "directory picker failed:", err);
-    return [];
+    log.error(TAG, "reference directory picker failed:", err);
+    return { jsonFiles: [], sampleFiles: [] };
   }
 }
 
-async function pickJsonDirectoryBrowser(): Promise<PickedFile[]> {
+async function pickReferenceDirectoryBrowser(): Promise<PickedReferenceDirectory> {
   const input = document.createElement("input");
   input.type = "file";
   // non-standard, but supported by every major browser — lets the user pick
-  // a whole folder instead of individual files.
+  // a whole folder instead of individual files. recurses into
+  // subdirectories (e.g. `*_speaker_samples/`), exposing each file's
+  // relative path via `webkitRelativePath`.
   input.webkitdirectory = true;
   input.style.display = "none";
 
@@ -361,14 +380,22 @@ async function pickJsonDirectoryBrowser(): Promise<PickedFile[]> {
       window.addEventListener("focus", onFocus);
     });
 
-    if (!files || files.length === 0) return [];
+    if (!files || files.length === 0) return { jsonFiles: [], sampleFiles: [] };
 
-    return Array.from(files)
-      .filter((file) => file.name.toLowerCase().endsWith(".json"))
-      .map((file) => ({ path: null, filename: file.name, size: file.size, file }));
+    const jsonFiles: PickedFile[] = [];
+    const sampleFiles: PickedFile[] = [];
+    for (const file of Array.from(files)) {
+      const relPath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+      if (file.name.toLowerCase().endsWith(".json")) {
+        jsonFiles.push({ path: null, filename: file.name, size: file.size, file });
+      } else if (SPEAKER_SAMPLES_DIR_RE.test(relPath)) {
+        sampleFiles.push({ path: null, filename: file.name, size: file.size, file });
+      }
+    }
+    return { jsonFiles, sampleFiles };
   } catch (err) {
     log.error(TAG, "browser directory picker failed:", err);
-    return [];
+    return { jsonFiles: [], sampleFiles: [] };
   } finally {
     input.remove();
   }

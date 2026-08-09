@@ -5,8 +5,16 @@
  * index.ts to keep that file from growing further.
  */
 
-import { pickJsonDirectory, pickJsonFiles, readPickedFileText } from "../../src/file-utils/upload";
-import { mergeCombinedData, mergeDiarizeData, mergeTranscribeData, parseReferenceDataJson } from "./reference-data";
+import { pickJsonFiles, pickReferenceDirectory, readPickedFileText, uploadFile } from "../../src/file-utils/upload";
+import type { PickedFile } from "../../src/file-utils/file-shared";
+import {
+  mergeCombinedData,
+  mergeDiarizeData,
+  mergeSpeakerSampleMedia,
+  mergeTranscribeData,
+  parseReferenceDataJson,
+  parseSpeakerSampleFilename,
+} from "./reference-data";
 import type { StfuState } from "./types";
 
 /** drop a trailing file extension for use as a download's base filename
@@ -69,6 +77,76 @@ export interface LoadReferenceDataOptions {
   fromDirectory?: boolean;
 }
 
+/**
+ * upload a `*_speaker_samples/` directory's sample clips + thumbnails
+ * (see `parseSpeakerSampleFilename`) and attach the lowest-numbered sample
+ * of each kind to its speaker. returns the number of distinct speakers
+ * updated (0 if `sampleFiles` is empty or none of it matched the naming
+ * convention).
+ */
+async function loadSpeakerSampleMedia(
+  sampleFiles: PickedFile[],
+  changeDoc: (fn: (d: StfuState) => void) => void,
+  isDestroyed: () => boolean
+): Promise<number> {
+  if (sampleFiles.length === 0) return 0;
+
+  const bySpeaker = new Map<string, { video?: PickedFile; thumbnail?: PickedFile }>();
+  const bestIndex = new Map<string, number>(); // `${speaker}:${kind}` -> lowest index seen
+  for (const file of sampleFiles) {
+    const parsed = parseSpeakerSampleFilename(file.filename);
+    if (!parsed) continue;
+    const key = `${parsed.speaker}:${parsed.kind}`;
+    const prevIndex = bestIndex.get(key);
+    if (prevIndex !== undefined && prevIndex <= parsed.index) continue;
+    bestIndex.set(key, parsed.index);
+    const bucket = bySpeaker.get(parsed.speaker) ?? {};
+    if (parsed.kind === "video") bucket.video = file;
+    else bucket.thumbnail = file;
+    bySpeaker.set(parsed.speaker, bucket);
+  }
+
+  let updated = 0;
+  for (const [speaker, { video, thumbnail }] of bySpeaker) {
+    if (isDestroyed()) return updated;
+    try {
+      const [videoResult, thumbnailResult] = await Promise.all([
+        video ? uploadFile(video) : Promise.resolve(null),
+        thumbnail ? uploadFile(thumbnail) : Promise.resolve(null),
+      ]);
+      if (isDestroyed()) return updated;
+      if (!videoResult && !thumbnailResult) continue;
+
+      changeDoc((d) => {
+        d.referenceSpeakers = mergeSpeakerSampleMedia(d.referenceSpeakers, speaker, {
+          video: videoResult
+            ? {
+                blobId: videoResult.blobId,
+                blake3: videoResult.blake3 || "",
+                mime: videoResult.mime,
+                filename: video!.filename,
+                size: videoResult.size,
+              }
+            : undefined,
+          thumbnail: thumbnailResult
+            ? {
+                blobId: thumbnailResult.blobId,
+                blake3: thumbnailResult.blake3 || "",
+                mime: thumbnailResult.mime,
+                filename: thumbnail!.filename,
+                size: thumbnailResult.size,
+              }
+            : undefined,
+        });
+      });
+      updated++;
+    } catch (err) {
+      console.error(`stfu widget: failed to upload sample media for speaker "${speaker}":`, err);
+    }
+  }
+  return updated;
+}
+
 export async function handleLoadReferenceData(options: LoadReferenceDataOptions): Promise<void> {
   const { isViewerOnly, isDestroyed, changeDoc, onMerged, setMessage, fromDirectory } = options;
   if (isDestroyed() || isViewerOnly) return;
@@ -78,9 +156,11 @@ export async function handleLoadReferenceData(options: LoadReferenceDataOptions)
   // was happening.
   setMessage(fromDirectory ? "loading project folder…" : "loading reference data…", 0);
 
-  const picked = await (fromDirectory ? pickJsonDirectory() : pickJsonFiles());
+  const { jsonFiles: picked, sampleFiles } = fromDirectory
+    ? await pickReferenceDirectory()
+    : { jsonFiles: await pickJsonFiles(), sampleFiles: [] };
   if (isDestroyed()) return;
-  if (picked.length === 0) {
+  if (picked.length === 0 && sampleFiles.length === 0) {
     setMessage("");
     return;
   }
@@ -126,6 +206,12 @@ export async function handleLoadReferenceData(options: LoadReferenceDataOptions)
     mergedCount++;
   }
 
+  const sampleCount = await loadSpeakerSampleMedia(sampleFiles, changeDoc, isDestroyed);
+  if (sampleCount > 0) {
+    summaries.push(`${sampleCount} speaker sample(s)`);
+    mergedCount++;
+  }
+
   if (mergedCount === 0) {
     setMessage(summaries[0] ?? "no matching reference data found");
     return;
@@ -134,6 +220,7 @@ export async function handleLoadReferenceData(options: LoadReferenceDataOptions)
   onMerged();
   setMessage(mergedCount === 1 ? summaries[0] : `loaded ${mergedCount} file(s): ${summaries.join("; ")}`);
 }
+
 
 /**
  * download the cut list as a manifest json compatible with

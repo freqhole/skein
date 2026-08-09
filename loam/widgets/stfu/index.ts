@@ -41,6 +41,7 @@ import {
   type LocalCutPrefs,
 } from "./local-prefs";
 import { createReferenceTrack, type ReferenceTrackHandle } from "./reference-track";
+import { createReferenceDialog, type ReferenceDialogHandle } from "./reference-dialog";
 import {
   createReferenceDataMessageController,
   downloadCutManifest as downloadCutManifest_,
@@ -49,7 +50,7 @@ import {
 } from "./reference-data-actions";
 import { createSegmentsPanel, SEGMENTS_PANEL_HEIGHT, type SegmentsPanelHandle } from "./segments-panel";
 import { createSnatchController } from "./snatch-controller";
-import { createVideoTimeline, TIMELINE_SHELL_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
+import { createVideoTimeline, computeTimelineShellHeight, type VideoTimelineHandle } from "./video-timeline";
 import { createVoicePickerDialog, type VoicePickerDialogHandle } from "./voice-picker-dialog";
 import type {
   CompactInfo,
@@ -124,7 +125,12 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     let cutTrack: CutSegmentsTrackHandle | null = null;
     let audioClipsTrack: AudioClipsTrackHandle | null = null;
     let cutModeControl: CutModeControlHandle | null = null;
-    let referenceTrack: ReferenceTrackHandle | null = null;
+    // one `reference-track.ts` row per `ReferenceTrack` in the doc (see
+    // reference-dialog.ts's speaker grouping), keyed by track id — kept in
+    // sync with `ctx.doc.current.referenceTracks` by `syncReferenceTracks()`.
+    let referenceTracks = new Map<string, ReferenceTrackHandle>();
+    let referenceTrackOrder: string[] = [];
+    let referenceDialog: ReferenceDialogHandle | null = null;
     let segmentsPanel: SegmentsPanelHandle | null = null;
     let keyboardShortcutsControl: KeyboardShortcutsControlHandle | null = null;
     let voicePickerDialog: VoicePickerDialogHandle | null = null;
@@ -140,6 +146,26 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     // in the pre-upload "empty" placeholder state, not once a video is
     // loaded, so reference-data feedback needed its own surface).
     const referenceDataMessages = createReferenceDataMessageController(() => updateVideoHeaderActions());
+
+    // -- mic input device selection (property tray "mic input device" select)
+    // for segments-panel.ts's audio-clip record button — mirrors
+    // audio-recording.ts's own device-select plumbing exactly.
+    const MIC_DEVICE_DEFAULT = "System default";
+    let cachedMicDevices: MediaDeviceInfo[] = [];
+    const enumerateMicDevices = async (): Promise<void> => {
+      try {
+        const all = await navigator.mediaDevices.enumerateDevices();
+        cachedMicDevices = all.filter((d) => d.kind === "audioinput");
+      } catch {
+        // enumerateDevices may be unavailable without a secure context
+      }
+    };
+    void enumerateMicDevices();
+    // called fresh each time the property tray opens the dropdown.
+    const micDeviceOptions = (): string[] => [
+      MIC_DEVICE_DEFAULT,
+      ...cachedMicDevices.map((d) => d.label || `Microphone (${d.deviceId.slice(0, 8)}\u2026)`),
+    ];
 
     // audio-clips playback while the video plays (tts speech synth / real
     // generated or recorded audio file) — see audio-clip-playback.ts.
@@ -413,7 +439,11 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         isViewerOnly: Boolean(ctx.canvasStore?.isLocalViewer()),
         isDestroyed: () => destroyed,
         changeDoc: (fn) => ctx.doc.change(fn),
-        onMerged: () => referenceTrack?.refresh(),
+        onMerged: () => {
+          syncReferenceTracks();
+          for (const h of referenceTracks.values()) h.refresh();
+          referenceDialog?.refresh();
+        },
         setMessage: (message, autoClearMs) => referenceDataMessages.set(message, autoClearMs),
       });
     }
@@ -423,7 +453,11 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         isViewerOnly: Boolean(ctx.canvasStore?.isLocalViewer()),
         isDestroyed: () => destroyed,
         changeDoc: (fn) => ctx.doc.change(fn),
-        onMerged: () => referenceTrack?.refresh(),
+        onMerged: () => {
+          syncReferenceTracks();
+          for (const h of referenceTracks.values()) h.refresh();
+          referenceDialog?.refresh();
+        },
         setMessage: (message, autoClearMs) => referenceDataMessages.set(message, autoClearMs),
         fromDirectory: true,
       });
@@ -503,12 +537,13 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       keyboardShortcutsControl = null;
       voicePickerDialog?.destroy();
       voicePickerDialog = null;
+      referenceDialog?.destroy();
+      referenceDialog = null;
       cutTrack?.destroy();
       cutTrack = null;
       audioClipsTrack?.destroy();
       audioClipsTrack = null;
-      referenceTrack?.destroy();
-      referenceTrack = null;
+      destroyReferenceTracks();
       segmentsPanel?.destroy();
       segmentsPanel = null;
       timeline?.destroy();
@@ -524,7 +559,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       return h - segmentsPanelHeight - PADDING;
     }
     function timelineY(h: number): number {
-      return segmentsPanelY(h) - TIMELINE_SHELL_HEIGHT - HANDLE_GAP;
+      return segmentsPanelY(h) - computeTimelineShellHeight(ctx.doc.current.referenceTracks.length) - HANDLE_GAP;
     }
     // pixel height available to the video area — it starts at y=0 (no header
     // row), so this is also its own bottom edge / total height.
@@ -550,7 +585,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         timeline.container.y = timelineY(h);
         timeline.resize(Math.max(0, w - TIMELINE_INSET * 2));
         cutModeControl?.resize(Math.max(0, w - TIMELINE_INSET * 2));
-        referenceTrack?.resize(Math.max(0, w - TIMELINE_INSET * 2));
+        for (const h of referenceTracks.values()) h.resize(Math.max(0, w - TIMELINE_INSET * 2));
       }
       keyboardShortcutsControl?.resize(w, h);
       if (segmentsPanel) {
@@ -558,6 +593,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         segmentsPanel.resize(Math.max(0, w - TIMELINE_INSET * 2), segmentsPanelHeight);
       }
       voicePickerDialog?.resize(w, h);
+      referenceDialog?.resize(w, h);
       if (videoResizeHandle) {
         videoResizeHandle.x = TIMELINE_INSET;
         videoResizeHandle.y = videoAreaHeight(h);
@@ -577,6 +613,98 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         .roundRect((width - dashWidth) / 2, HANDLE_GAP / 2 - 1.5, dashWidth, 3, 1.5)
         .fill({ color: 0x555566 });
       handle.hitArea = new Rectangle(0, 0, width, HANDLE_GAP);
+    }
+
+    function destroyReferenceTracks(): void {
+      for (const handle of referenceTracks.values()) handle.destroy();
+      referenceTracks = new Map();
+      referenceTrackOrder = [];
+    }
+
+    // mounts/unmounts one `reference-track.ts` row per `ReferenceTrack` in
+    // the doc (see reference-dialog.ts's speaker grouping) — called on
+    // every doc change (`refreshTimelineFromDoc()`) so adding/removing/
+    // reordering a track there immediately grows/shrinks the stacked
+    // timeline rows. cheap to call even when nothing changed: bails out
+    // early on an identical (same ids, same order) track list.
+    function syncReferenceTracks(): void {
+      if (!timeline) return;
+      const tracks = ctx.doc.current.referenceTracks;
+      const ids = tracks.map((t) => t.id);
+      const unchanged =
+        ids.length === referenceTrackOrder.length && ids.every((id, i) => id === referenceTrackOrder[i]);
+      if (unchanged) return;
+
+      destroyReferenceTracks();
+      timeline.setReferenceRowCount(tracks.length);
+      tracks.forEach((track, i) => {
+        const trackId = track.id;
+        const handle = createReferenceTrack({
+          timeline: timeline!,
+          trackId,
+          row: timeline!.getReferenceRow(i),
+          // a lone default track keeps the original "REFERENCE" label; once
+          // there's more than one, fall back to a positional "track N" name
+          // for any track the user hasn't renamed yet.
+          getTrackLabel: () => {
+            const current = ctx.doc.current.referenceTracks;
+            if (current.length <= 1) return "REFERENCE";
+            const idx = current.findIndex((t) => t.id === trackId);
+            const t = idx === -1 ? undefined : current[idx];
+            return t?.label || `track ${idx + 1}`;
+          },
+          canvasElement: ctx.canvasElement,
+          getReferenceSpeakers: () => ctx.doc.current.referenceSpeakers,
+          getReferenceTracks: () => ctx.doc.current.referenceTracks,
+          getTranscriptSegments: () => ctx.doc.current.transcriptSegments,
+          isSpeakerVisible: (label) => referenceDialog?.isSpeakerVisible(label) ?? true,
+          onOpenDialog: () => referenceDialog?.toggle(),
+          // drag a reference/diarization segment down into the cut list to
+          // create a new editable segment snapped exactly to its start/end
+          // (it can then be resized like any other cut-list segment).
+          onCreateCutSegment: (start, end) => {
+            ctx.doc.change((d) => {
+              d.editableSegments.push([start, end]);
+            });
+            // unlike remote peers' edits (handled by the doc-change
+            // subscription below), our own local edit needs an immediate
+            // refresh here too, matching every other local mutation handler
+            // in this file (`handleToggleSkip` etc) — otherwise the new
+            // segment doesn't visually appear until some unrelated redraw.
+            cutTrack?.refresh();
+            pushHistory();
+          },
+          // same drag gesture, but dropped onto the audio-clips row instead —
+          // snap a new clip to the same [start, end].
+          onCreateAudioClip: (start, end) => {
+            ctx.doc.change((d) => {
+              d.audioClips.push({
+                id: crypto.randomUUID(),
+                trackId: "default",
+                start,
+                durationSec: Math.max(0.05, end - start),
+                label: "",
+              });
+            });
+            audioClipsTrack?.refresh();
+            pushHistory();
+          },
+          // matches editor.js's own reference-track click behavior — a plain
+          // click (no drag) on a segment seeks the video to its start.
+          onSeek: (t) => {
+            if (mediaOverlay) mediaOverlay.video.currentTime = t;
+          },
+          // clicking the row's label column (anywhere but the caret button)
+          // toggles the segments panel's "reference" source, mirroring the
+          // CUT LIST/AUDIO CLIPS labels in `video-timeline.ts`.
+          onToggleVisible: () => segmentsPanel?.toggleViewMode("reference"),
+          isReferenceActive: () => segmentsPanel?.isViewModeActive("reference") ?? false,
+        });
+        handle.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
+        referenceTracks.set(trackId, handle);
+      });
+      referenceTrackOrder = ids;
+      applyLayout(currentWidth, currentHeight);
     }
 
     function ensureTimeline(): VideoTimelineHandle {
@@ -691,59 +819,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         onMuteEarlyMsChange: handleMuteEarlyMsChange,
       });
       cutModeControl.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
-      referenceTrack = createReferenceTrack({
-        timeline,
-        overlayParent: timeline.container,
-        canvasElement: ctx.canvasElement,
-        getReferenceSpeakers: () => ctx.doc.current.referenceSpeakers,
-        getTranscriptSegments: () => ctx.doc.current.transcriptSegments,
-        storageKey: `skein.stfu.${ctx.widgetId}.visibleSpeakers`,
-        // the speaker popover is allowed to cover the rest of the timeline
-        // shell + the segments panel below it while open (it's modal-ish),
-        // but must still fit inside the widget's own clipped bounds.
-        overlayMaxHeight: TIMELINE_SHELL_HEIGHT + PADDING + segmentsPanelHeight + PADDING,
-        // drag a reference/diarization segment down into the cut list to
-        // create a new editable segment snapped exactly to its start/end
-        // (it can then be resized like any other cut-list segment).
-        onCreateCutSegment: (start, end) => {
-          ctx.doc.change((d) => {
-            d.editableSegments.push([start, end]);
-          });
-          // unlike remote peers' edits (handled by the doc-change
-          // subscription below), our own local edit needs an immediate
-          // refresh here too, matching every other local mutation handler
-          // in this file (`handleToggleSkip` etc) — otherwise the new
-          // segment doesn't visually appear until some unrelated redraw.
-          cutTrack?.refresh();
-          pushHistory();
-        },
-        // same drag gesture, but dropped onto the audio-clips row instead —
-        // snap a new clip to the same [start, end].
-        onCreateAudioClip: (start, end) => {
-          ctx.doc.change((d) => {
-            d.audioClips.push({
-              id: crypto.randomUUID(),
-              trackId: "default",
-              start,
-              durationSec: Math.max(0.05, end - start),
-              label: "",
-            });
-          });
-          audioClipsTrack?.refresh();
-          pushHistory();
-        },
-        // matches editor.js's own reference-track click behavior — a plain
-        // click (no drag) on a segment seeks the video to its start.
-        onSeek: (t) => {
-          if (mediaOverlay) mediaOverlay.video.currentTime = t;
-        },
-        // clicking the row's label column (anywhere but the caret button)
-        // toggles the segments panel's "reference" source, mirroring the
-        // CUT LIST/AUDIO CLIPS labels in `video-timeline.ts`.
-        onToggleVisible: () => segmentsPanel?.toggleViewMode("reference"),
-        isReferenceActive: () => segmentsPanel?.isViewModeActive("reference") ?? false,
-      });
-      referenceTrack.resize(Math.max(0, currentWidth - TIMELINE_INSET * 2));
+      syncReferenceTracks();
       segmentsPanel = createSegmentsPanel({
         canvasElement: ctx.canvasElement,
         getEditableSegments: () => ctx.doc.current.editableSegments,
@@ -754,6 +830,10 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           if (mediaOverlay) mediaOverlay.video.currentTime = t;
         },
         getPeers: () => ctx.canvasStore?.peers() as PeersMap | undefined,
+        getMicDeviceLabel: () => {
+          const label = ctx.doc.current.micDeviceLabel;
+          return label === MIC_DEVICE_DEFAULT ? "" : label;
+        },
         // a row click in the panel seeks (above) and should also select
         // the matching segment/clip up in the timeline tracks — "reference"
         // rows have no timeline selection concept, so only cutlist/audio
@@ -907,7 +987,11 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         // moving the handle down (positive dy) shrinks the segments panel
         // and grows the video area by the same amount (total height fixed).
         const maxForVideoMin =
-          currentHeight - TIMELINE_SHELL_HEIGHT - HANDLE_GAP * 2 - PADDING - VIDEO_AREA_MIN_HEIGHT;
+          currentHeight -
+          computeTimelineShellHeight(ctx.doc.current.referenceTracks.length) -
+          HANDLE_GAP * 2 -
+          PADDING -
+          VIDEO_AREA_MIN_HEIGHT;
         const proposed = clampSegmentsPanelHeight(splitterDrag.startSegmentsPanelHeight - dy);
         segmentsPanelHeight = Math.max(SEGMENTS_PANEL_MIN_HEIGHT, Math.min(maxForVideoMin, proposed));
         applyLayout(currentWidth, currentHeight);
@@ -939,6 +1023,19 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         onOpenChange: handleFullWidgetDialogOpenChange,
       });
       voicePickerDialog.resize(currentWidth, currentHeight);
+      referenceDialog ??= createReferenceDialog({
+        // same reasoning as `voicePickerDialog` above — the reference row
+        // alone has nowhere near enough room for a scrollable, multi-track
+        // speaker list, so this also covers the *whole* widget.
+        overlayParent: container,
+        canvasElement: ctx.canvasElement,
+        getReferenceSpeakers: () => ctx.doc.current.referenceSpeakers,
+        getReferenceTracks: () => ctx.doc.current.referenceTracks,
+        changeDoc: (fn) => ctx.doc.change(fn),
+        getPeers: () => ctx.canvasStore?.peers() as PeersMap | undefined,
+        onOpenChange: handleFullWidgetDialogOpenChange,
+      });
+      referenceDialog.resize(currentWidth, currentHeight);
       // draws/positions the splitter handle for the first time (its
       // Graphics start out empty with no hitArea until `applyLayout()` runs
       // at least once) and re-confirms every other piece's layout too.
@@ -1065,7 +1162,9 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       cutTrack?.refresh();
       audioClipsTrack?.refresh();
       cutModeControl?.refresh();
-      referenceTrack?.refresh();
+      syncReferenceTracks();
+      for (const h of referenceTracks.values()) h.refresh();
+      referenceDialog?.refresh();
       segmentsPanel?.refresh();
     }
 
@@ -1225,13 +1324,23 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     return {
       container,
 
+      editableProps: [
+        {
+          key: "micDeviceLabel",
+          label: "mic input device",
+          type: "select" as const,
+          options: micDeviceOptions,
+          default: MIC_DEVICE_DEFAULT,
+        },
+      ],
+
       widgetActions: [
         { id: "load-reference-data", label: "load reference data...", onClick: handleLoadReferenceData },
         { id: "load-reference-data-folder", label: "load project folder...", onClick: handleLoadReferenceDataFolder },
         { id: "download-cut-manifest", label: "download cut manifest...", onClick: downloadCutManifest },
         {
           id: "download-audio-clips",
-          label: isTauriMode() ? "download audio clips (manifest)..." : "download bundle...",
+          label: isTauriMode() ? "download audio clips" : "download bundle",
           onClick: downloadAudioClips,
         },
         {

@@ -50,6 +50,10 @@ const isLinuxWebKit = typeof navigator !== "undefined" && navigator.userAgent.in
 const mediaBlobSlots: Record<string, { blobId: string; url: string } | null> = {
   audio: null,
   video: null,
+  // no slot for "image" here -- unlike audio/video (one active playback at
+  // a time), a reference dialog can show several speaker thumbnails at
+  // once, so images are cached (never revoked on replacement) in
+  // `sessionBlobCache` below instead -- see `createMediaBlobUrl`.
 };
 
 /**
@@ -130,8 +134,25 @@ async function createMediaBlobUrl(
   blobId: string,
   localPath: string,
   mime: string | undefined,
-  category: "audio" | "video"
+  category: "audio" | "video" | "image"
 ): Promise<string> {
+  // images don't use the single-slot-per-category tracking (see
+  // `mediaBlobSlots`'s own comment) -- cache per-blobId instead, alongside
+  // the OPFS path's own session cache, so several thumbnails can be shown
+  // at once without each new one revoking the last.
+  if (category === "image") {
+    const cached = sessionBlobCache.get(blobId);
+    if (cached) return cached;
+    const assetUrl = convertFileSrc(localPath);
+    const resp = await fetch(assetUrl);
+    const arrayBuffer = await resp.arrayBuffer();
+    const blobMime = mime ?? resp.headers.get("content-type") ?? "image/jpeg";
+    const objectUrl = URL.createObjectURL(new Blob([arrayBuffer], { type: blobMime }));
+    ensureBeforeUnloadCleanup();
+    sessionBlobCache.set(blobId, objectUrl);
+    return objectUrl;
+  }
+
   // revoke previous URL in this category to free memory
   const prev = mediaBlobSlots[category];
   if (prev) {
@@ -218,7 +239,7 @@ async function getBlobDataUrl(blobId: string): Promise<string | null> {
 
 export interface MediaUrlOptions {
   /** hint for the media category — controls blob URL slot management */
-  category?: "audio" | "video";
+  category?: "audio" | "video" | "image";
   /** connected canvas peers for P2P fallback */
   peers?: PeersMap;
   /** known MIME type (avoids guessing) */
