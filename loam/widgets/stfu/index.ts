@@ -21,6 +21,10 @@ import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import { createAudioClipPlayback } from "./audio-clip-playback";
 import { createAudioClipDragController } from "./audio-clip-drag";
 import { createAudioClipsTrack, type AudioClipsTrackHandle } from "./audio-clips-track";
+import {
+  downloadAudioClipManifestLocal,
+  downloadStfuBundle,
+} from "./audio-clips-export";
 import { applyCutPlaybackEffects as applyCutPlaybackEffects_, createCutOverlayElement } from "./cut-playback-effects";
 import { createCutModeControl, CUT_MODE_CONTROL_RESERVED_WIDTH, type CutModeControlHandle } from "./cut-mode-control";
 import { createCutSegmentsTrack, type CutSegmentsTrackHandle, type EditableSegment } from "./cut-segments-track";
@@ -414,8 +418,29 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       });
     }
 
+    async function handleLoadReferenceDataFolder(): Promise<void> {
+      await handleLoadReferenceData_({
+        isViewerOnly: Boolean(ctx.canvasStore?.isLocalViewer()),
+        isDestroyed: () => destroyed,
+        changeDoc: (fn) => ctx.doc.change(fn),
+        onMerged: () => referenceTrack?.refresh(),
+        setMessage: (message, autoClearMs) => referenceDataMessages.set(message, autoClearMs),
+        fromDirectory: true,
+      });
+    }
+
     function downloadCutManifest(): void {
       downloadCutManifest_(ctx.doc.current);
+    }
+
+    // -- audio-clips export (phase 6, see audio-clips-export.ts's module doc) --
+
+    async function downloadAudioClips(): Promise<void> {
+      if (isTauriMode()) {
+        await downloadAudioClipManifestLocal(ctx.doc.current);
+      } else {
+        await downloadStfuBundle(ctx.doc.current);
+      }
     }
 
     // -- helpers -----------------------------------------------------------------
@@ -1027,6 +1052,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         void snatchController.checkVideoLocality();
         refreshTimelineFromDoc();
         snatchController.maybeAutoSnatchNew();
+        void snatchController.refreshLocalityCounts();
       } else {
         teardownMediaOverlay();
         teardownTimeline();
@@ -1201,8 +1227,25 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
 
       widgetActions: [
         { id: "load-reference-data", label: "load reference data...", onClick: handleLoadReferenceData },
+        { id: "load-reference-data-folder", label: "load project folder...", onClick: handleLoadReferenceDataFolder },
         { id: "download-cut-manifest", label: "download cut manifest...", onClick: downloadCutManifest },
+        {
+          id: "download-audio-clips",
+          label: isTauriMode() ? "download audio clips (manifest)..." : "download bundle...",
+          onClick: downloadAudioClips,
+        },
+        {
+          id: "snatch-all-blobs",
+          label: "snatch all",
+          onClick: () => void snatchController.handleSnatchAll(),
+        },
       ],
+
+      widgetInfoRows: () => {
+        const { known, local } = snatchController.getLocalityCounts();
+        if (known === 0) return [];
+        return [{ label: "blobs", value: `${local}/${known} local` }];
+      },
 
       dropTarget: audioClipDrag.dropTarget,
 

@@ -598,6 +598,14 @@ async fn dispatch(
         // document pipeline (see loam's `isPlainTextFilename`).
         "read_text_file" => read_text_file(decode("read_text_file", payload)?).await,
 
+        // list the `.json` files directly inside a directory — used by
+        // stfu's "load project folder..." action to bulk-load a
+        // trek-minus-paris project folder's diarize/transcribe/reference
+        // json files in one go.
+        "list_json_files_in_dir" => {
+            list_json_files_in_dir(decode("list_json_files_in_dir", payload)?).await
+        }
+
         // generate a thumbnail for a stored blob. supports image/*, application/pdf,
         // and video/* source types. returns { data: <base64>, mime } or { data: null }.
         "blob_thumbnail" => blob_thumbnail(decode("blob_thumbnail", payload)?, state).await,
@@ -2299,6 +2307,49 @@ async fn read_text_file(args: ReadTextFileArgs) -> Result<Value, DispatchError> 
         DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
     })?;
     Ok(json!({ "text": String::from_utf8_lossy(&bytes).into_owned() }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ListJsonFilesInDirArgs {
+    /// absolute path to a directory (e.g. from the native directory picker)
+    /// to scan for `.json` files.
+    path: String,
+}
+
+/// list every `.json` file directly inside a directory (non-recursive) --
+/// used by stfu's "load project folder..." action to bulk-load every
+/// diarize/transcribe/reference json sitting in a trek-minus-paris project
+/// folder without picking each file by hand.
+async fn list_json_files_in_dir(args: ListJsonFilesInDirArgs) -> Result<Value, DispatchError> {
+    let mut entries = tokio::fs::read_dir(&args.path).await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })?;
+
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })? {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let is_file = entry
+            .file_type()
+            .await
+            .map(|t| t.is_file())
+            .unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        files.push(json!({ "path": path.to_string_lossy(), "filename": filename }));
+    }
+
+    Ok(json!({ "files": files }))
 }
 
 // ---------------------------------------------------------------------------

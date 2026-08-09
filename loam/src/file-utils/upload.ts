@@ -229,50 +229,46 @@ async function pickDocumentFileBrowser(): Promise<PickedFile | null> {
 }
 
 /**
- * open a file picker filtered to `.json` — used by stfu's "load reference
- * data..." action (accepts either a diarization cache or a whisper
- * transcript cache, see `widgets/stfu/reference-data.ts`). in Tauri mode,
- * uses the native dialog with a json extension filter. in browser mode,
- * uses a hidden input with `accept=".json,application/json"`. returns null
- * if the user cancels.
+ * pick one or more `.json` files at once — used by stfu's "load reference
+ * data..." action so a diarization + transcript (+ combined) file can all be
+ * grabbed in a single dialog instead of one at a time. returns [] on cancel.
  */
-export async function pickJsonFile(): Promise<PickedFile | null> {
+export async function pickJsonFiles(): Promise<PickedFile[]> {
   if (isTauriMode()) {
-    return pickJsonFileTauri();
+    return pickJsonFilesTauri();
   }
-  return pickJsonFileBrowser();
+  return pickJsonFilesBrowser();
 }
 
-async function pickJsonFileTauri(): Promise<PickedFile | null> {
+async function pickJsonFilesTauri(): Promise<PickedFile[]> {
   try {
     const result = await open({
-      multiple: false,
+      multiple: true,
       filters: [{ name: "json", extensions: ["json"] }],
     });
 
-    if (result === null) return null;
+    if (result === null) return [];
 
-    const filePath = Array.isArray(result) ? result[0] : result;
-    if (!filePath) return null;
-
-    const filename = filePath.split(/[\\/]/).pop() ?? filePath;
-
-    return {
-      path: filePath,
-      filename,
-      size: 0,
-      file: null,
-    };
+    const paths = Array.isArray(result) ? result : [result];
+    return paths
+      .filter((p): p is string => typeof p === "string" && p.length > 0)
+      .map((filePath) => ({
+        path: filePath,
+        filename: filePath.split(/[\\/]/).pop() ?? filePath,
+        size: 0,
+        file: null,
+      }));
   } catch (err) {
-    log.error(TAG, "json file picker failed:", err);
-    return null;
+    log.error(TAG, "multi json file picker failed:", err);
+    return [];
   }
 }
 
-async function pickJsonFileBrowser(): Promise<PickedFile | null> {
+async function pickJsonFilesBrowser(): Promise<PickedFile[]> {
   const input = document.createElement("input");
   input.type = "file";
   input.accept = ".json,application/json";
+  input.multiple = true;
   input.style.display = "none";
 
   document.body.appendChild(input);
@@ -280,9 +276,9 @@ async function pickJsonFileBrowser(): Promise<PickedFile | null> {
   try {
     input.click();
 
-    const file = await new Promise<File | null>((resolve) => {
+    const files = await new Promise<FileList | null>((resolve) => {
       input.addEventListener("change", () => {
-        resolve(input.files?.[0] ?? null);
+        resolve(input.files);
       });
 
       const onFocus = () => {
@@ -292,17 +288,87 @@ async function pickJsonFileBrowser(): Promise<PickedFile | null> {
       window.addEventListener("focus", onFocus);
     });
 
-    if (!file) return null;
+    if (!files || files.length === 0) return [];
 
-    return {
+    return Array.from(files).map((file) => ({
       path: null,
       filename: file.name,
       size: file.size,
       file,
-    };
+    }));
   } catch (err) {
-    log.error(TAG, "browser json file picker failed:", err);
-    return null;
+    log.error(TAG, "browser multi json file picker failed:", err);
+    return [];
+  } finally {
+    input.remove();
+  }
+}
+
+/**
+ * pick an entire directory and return every `.json` file directly inside it
+ * (non-recursive) — used by stfu's "load project folder..." action to bulk-
+ * load a trek-minus-paris project folder's diarize/transcribe/reference json
+ * files in one go, instead of picking each file by hand. returns [] if the
+ * user cancels or the folder has no json files.
+ */
+export async function pickJsonDirectory(): Promise<PickedFile[]> {
+  if (isTauriMode()) {
+    return pickJsonDirectoryTauri();
+  }
+  return pickJsonDirectoryBrowser();
+}
+
+async function pickJsonDirectoryTauri(): Promise<PickedFile[]> {
+  try {
+    const result = await open({ directory: true, multiple: false });
+    if (result === null) return [];
+
+    const dirPath = Array.isArray(result) ? result[0] : result;
+    if (!dirPath) return [];
+
+    const { files } = (await dispatch("list_json_files_in_dir", { path: dirPath })) as {
+      files: { path: string; filename: string }[];
+    };
+    return files.map((f) => ({ path: f.path, filename: f.filename, size: 0, file: null }));
+  } catch (err) {
+    log.error(TAG, "directory picker failed:", err);
+    return [];
+  }
+}
+
+async function pickJsonDirectoryBrowser(): Promise<PickedFile[]> {
+  const input = document.createElement("input");
+  input.type = "file";
+  // non-standard, but supported by every major browser — lets the user pick
+  // a whole folder instead of individual files.
+  input.webkitdirectory = true;
+  input.style.display = "none";
+
+  document.body.appendChild(input);
+
+  try {
+    input.click();
+
+    const files = await new Promise<FileList | null>((resolve) => {
+      input.addEventListener("change", () => {
+        resolve(input.files);
+      });
+
+      const onFocus = () => {
+        window.removeEventListener("focus", onFocus);
+        setTimeout(() => resolve(null), 300);
+      };
+      window.addEventListener("focus", onFocus);
+    });
+
+    if (!files || files.length === 0) return [];
+
+    return Array.from(files)
+      .filter((file) => file.name.toLowerCase().endsWith(".json"))
+      .map((file) => ({ path: null, filename: file.name, size: file.size, file }));
+  } catch (err) {
+    log.error(TAG, "browser directory picker failed:", err);
+    return [];
   } finally {
     input.remove();
   }

@@ -5,7 +5,7 @@
  * index.ts to keep that file from growing further.
  */
 
-import { pickJsonFile, readPickedFileText } from "../../src/file-utils/upload";
+import { pickJsonDirectory, pickJsonFiles, readPickedFileText } from "../../src/file-utils/upload";
 import { mergeCombinedData, mergeDiarizeData, mergeTranscribeData, parseReferenceDataJson } from "./reference-data";
 import type { StfuState } from "./types";
 
@@ -63,68 +63,76 @@ export interface LoadReferenceDataOptions {
   changeDoc: (fn: (d: StfuState) => void) => void;
   onMerged: () => void;
   setMessage: (message: string, autoClearMs?: number) => void;
+  /** pick a whole project folder (every `.json` file directly inside it)
+   *  instead of picking file(s) by hand — used by the "load project
+   *  folder..." action. */
+  fromDirectory?: boolean;
 }
 
 export async function handleLoadReferenceData(options: LoadReferenceDataOptions): Promise<void> {
-  const { isViewerOnly, isDestroyed, changeDoc, onMerged, setMessage } = options;
+  const { isViewerOnly, isDestroyed, changeDoc, onMerged, setMessage, fromDirectory } = options;
   if (isDestroyed() || isViewerOnly) return;
 
   // immediate feedback before the (possibly slow, modal) file picker opens —
   // without this the widget looked "locked up" with no indication anything
   // was happening.
-  setMessage("loading reference data…", 0);
+  setMessage(fromDirectory ? "loading project folder…" : "loading reference data…", 0);
 
-  const picked = await pickJsonFile();
+  const picked = await (fromDirectory ? pickJsonDirectory() : pickJsonFiles());
   if (isDestroyed()) return;
-  if (!picked) {
+  if (picked.length === 0) {
     setMessage("");
     return;
   }
 
-  let raw: unknown;
-  try {
-    const text = await readPickedFileText(picked);
-    raw = JSON.parse(text);
-  } catch (err) {
-    console.error("stfu widget: failed to read/parse reference data json:", err);
-    setMessage(`could not read "${picked.filename}" — not valid json`);
-    return;
-  }
-  if (isDestroyed()) return;
-
-  const parsed = parseReferenceDataJson(raw);
-  if (!parsed) {
-    setMessage(`"${picked.filename}" doesn't match the expected diarization or transcript json shape`);
-    return;
-  }
-
-  let summary = "";
-  changeDoc((d) => {
-    if (parsed.kind === "diarize") {
-      const speakerCount = Object.keys(parsed.ranges).length;
-      const merged = mergeDiarizeData(d.referenceSpeakers, d.transcriptSegments, parsed);
-      d.referenceSpeakers = merged.referenceSpeakers;
-      d.transcriptSegments = merged.transcriptSegments;
-      const hasTranscriptText = merged.transcriptSegments.some((s) => s.text);
-      summary =
-        `loaded diarization: ${speakerCount} speaker(s)` +
-        (hasTranscriptText ? "" : " — now load the matching transcript json for text");
-    } else if (parsed.kind === "transcribe") {
-      d.transcriptSegments = mergeTranscribeData(d.transcriptSegments, parsed);
-      const hasSpeakers = Object.keys(d.referenceSpeakers).length > 0;
-      summary =
-        `loaded transcript: ${parsed.segments.length} segment(s)` +
-        (hasSpeakers ? "" : " — now load the matching diarization json for speaker labels");
-    } else {
-      const speakerCount = Object.keys(parsed.ranges).length;
-      const merged = mergeCombinedData(d.referenceSpeakers, d.transcriptSegments, parsed);
-      d.referenceSpeakers = merged.referenceSpeakers;
-      d.transcriptSegments = merged.transcriptSegments;
-      summary = `loaded reference data: ${speakerCount} speaker(s), ${parsed.segments.length} segment(s)`;
+  const summaries: string[] = [];
+  let mergedCount = 0;
+  for (const file of picked) {
+    let raw: unknown;
+    try {
+      const text = await readPickedFileText(file);
+      raw = JSON.parse(text);
+    } catch (err) {
+      console.error(`stfu widget: failed to read/parse "${file.filename}":`, err);
+      summaries.push(`"${file.filename}" — not valid json`);
+      continue;
     }
-  });
+    if (isDestroyed()) return;
+
+    const parsed = parseReferenceDataJson(raw);
+    if (!parsed) {
+      summaries.push(`"${file.filename}" — unrecognized shape`);
+      continue;
+    }
+
+    changeDoc((d) => {
+      if (parsed.kind === "diarize") {
+        const speakerCount = Object.keys(parsed.ranges).length;
+        const merged = mergeDiarizeData(d.referenceSpeakers, d.transcriptSegments, parsed);
+        d.referenceSpeakers = merged.referenceSpeakers;
+        d.transcriptSegments = merged.transcriptSegments;
+        summaries.push(`${file.filename}: ${speakerCount} speaker(s)`);
+      } else if (parsed.kind === "transcribe") {
+        d.transcriptSegments = mergeTranscribeData(d.transcriptSegments, parsed);
+        summaries.push(`${file.filename}: ${parsed.segments.length} segment(s)`);
+      } else {
+        const speakerCount = Object.keys(parsed.ranges).length;
+        const merged = mergeCombinedData(d.referenceSpeakers, d.transcriptSegments, parsed);
+        d.referenceSpeakers = merged.referenceSpeakers;
+        d.transcriptSegments = merged.transcriptSegments;
+        summaries.push(`${file.filename}: ${speakerCount} speaker(s), ${parsed.segments.length} segment(s)`);
+      }
+    });
+    mergedCount++;
+  }
+
+  if (mergedCount === 0) {
+    setMessage(summaries[0] ?? "no matching reference data found");
+    return;
+  }
+
   onMerged();
-  setMessage(summary);
+  setMessage(mergedCount === 1 ? summaries[0] : `loaded ${mergedCount} file(s): ${summaries.join("; ")}`);
 }
 
 /**

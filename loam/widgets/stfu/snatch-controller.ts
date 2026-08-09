@@ -38,6 +38,12 @@ export interface SnatchControllerHandle {
   /** best-effort, silent background snatch of whatever's newly appeared since
    *  the last pass — no-op until `handleSnatchAll()` has succeeded once. */
   maybeAutoSnatchNew(): void;
+  /** last-known "how many blobs (video + audio clips) does this widget know
+   *  about, and how many are actually local" snapshot — for the prop tray's
+   *  info row. refreshed in the background; call refreshLocalityCounts()
+   *  to kick off a new pass. */
+  getLocalityCounts(): { known: number; local: number };
+  refreshLocalityCounts(): Promise<void>;
   destroy(): void;
 }
 
@@ -61,6 +67,11 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
   const knownSnatchableBlobIds = new Set<string>();
   let autoSnatchInFlight = false;
   let autoSnatchQueued = false;
+
+  // last-known known/local blob counts (video + audio clips combined) — see
+  // getLocalityCounts()/refreshLocalityCounts() below.
+  let localityCounts = { known: 0, local: 0 };
+  let localityCountsInFlight = false;
 
   /** the video blob (if any) plus every audio clip's real audio blob — the
    *  full set of blobs "snatch all" gathers in one batch. */
@@ -98,6 +109,7 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
     try {
       await snatchBlobBatch(blobs, allPeers, { isPeerOnline });
       blobs.forEach((b) => knownSnatchableBlobIds.add(b.blobId));
+      void refreshLocalityCounts();
     } catch (err) {
       console.warn("stfu widget: background auto-snatch of new clip(s) failed (will retry):", err);
     } finally {
@@ -119,6 +131,27 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
       return;
     }
     void runAutoSnatch(blobs);
+  }
+
+  /** re-probe locality for every blob this widget knows about (video +
+   *  audio clips) and update the known/local snapshot for the prop tray's
+   *  info row. safe to call frequently — `checkBlobLocality` caches
+   *  already-local results, and this drops overlapping calls rather than
+   *  queuing them (a later doc-change trigger will just try again). */
+  async function refreshLocalityCounts(): Promise<void> {
+    if (localityCountsInFlight || isDestroyed()) return;
+    localityCountsInFlight = true;
+    try {
+      const blobs = buildSnatchAllBlobs();
+      const results = await Promise.all(blobs.map((b) => checkBlobLocality(b.blobId, b.blake3 || undefined)));
+      if (isDestroyed()) return;
+      localityCounts = { known: blobs.length, local: results.filter((r) => r.locality === "local").length };
+      onStateChange();
+    } catch (err) {
+      if (!isDestroyed()) console.warn("stfu widget: blob locality count refresh failed:", err);
+    } finally {
+      localityCountsInFlight = false;
+    }
   }
 
   async function checkVideoLocality(): Promise<void> {
@@ -146,7 +179,10 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
   }
 
   async function handleSnatchAll(): Promise<void> {
-    if (videoActionState !== "remote") return;
+    // reentrancy guard only — deliberately NOT gated on the video's own
+    // locality, so this still works as a general "sync everything" action
+    // when the video is already local but some audio clips aren't.
+    if (videoActionState === "snatching" || videoActionState === "checking") return;
     const allPeers = getPeers();
     if (!allPeers || Object.keys(allPeers).length === 0) {
       console.warn("stfu widget: no peers available for snatch");
@@ -186,12 +222,14 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
       saveAutoSnatchEnabled(widgetId);
       blobs.forEach((b) => knownSnatchableBlobIds.add(b.blobId));
       if (videoWasSnatched) onVideoSnatched();
+      void refreshLocalityCounts();
     } catch (err) {
       if (videoSnatchCancelled || isDestroyed()) return;
       console.error("stfu widget: snatch all failed:", err);
       videoActionState = "remote";
       videoSnatchProgressText = "";
       onStateChange();
+      void refreshLocalityCounts();
     } finally {
       videoSnatchAbort = null;
     }
@@ -209,6 +247,8 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
     handleSnatchAll,
     cancelSnatch,
     maybeAutoSnatchNew,
+    getLocalityCounts: () => localityCounts,
+    refreshLocalityCounts,
     destroy() {
       videoSnatchCancelled = true;
       videoSnatchAbort?.abort();

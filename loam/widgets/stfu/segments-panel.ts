@@ -842,6 +842,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
   let panelHeight = initialHeight ?? SEGMENTS_PANEL_HEIGHT;
   let currentSegments: PanelSegment[] = [];
   let rowTops: number[] = [];
+  let rowHeights: number[] = [];
   let lastAutoScrolledIndex = -1;
   let selectedSegment: EditableSegment | null = null;
   let selectedClipId: string | null = null;
@@ -966,11 +967,26 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     return row.audio;
   }
 
-  function layoutRow(row: Row, seg: PanelSegment, y: number): void {
+  /** vertical space above the wrapped transcript text (time/meta line) and
+   *  below it (bottom padding) — used to grow a row past ROW_HEIGHT when
+   *  the wrapped text needs more than one line. */
+  const REF_TEXT_TOP = 22;
+  const REF_TEXT_BOTTOM_PAD = 8;
+
+  function layoutRow(row: Row, seg: PanelSegment, y: number): number {
     const w = Math.max(1, contentWidth);
+
+    // set the wrapped text (and its wrap width) first so its resulting
+    // `.height` is known before sizing the row's background/hit area around it.
+    row.refText.text = seg.text || "(no matching transcript text)";
+    row.refText.style.wordWrapWidth = Math.max(1, w - ROW_PAD_X * 2);
+    row.refText.x = ROW_PAD_X;
+    row.refText.y = REF_TEXT_TOP;
+    const rowHeight = Math.max(ROW_HEIGHT, Math.ceil(REF_TEXT_TOP + row.refText.height + REF_TEXT_BOTTOM_PAD));
+
     row.container.y = y;
     row.container.visible = true;
-    row.container.hitArea = new Rectangle(0, 0, w, ROW_HEIGHT);
+    row.container.hitArea = new Rectangle(0, 0, w, rowHeight);
     row.container.off("pointertap").on("pointertap", (e: FederatedPointerEvent) => {
       e.stopPropagation();
       onSeek(seg.start);
@@ -991,7 +1007,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
       selectedSegment[1] === seg.end &&
       seg.source === "cut list";
     row.bg
-      .roundRect(0, 0, w, ROW_HEIGHT, 6)
+      .roundRect(0, 0, w, rowHeight, 6)
       .fill({ color: isSelected ? 0x2a2233 : 0x222222 })
       .stroke({ width: isSelected ? 2 : 1, color: isSelected ? MAGENTA : 0x333333 });
 
@@ -1028,16 +1044,13 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
       row.metaText.y = 6;
     }
 
-    row.refText.text = seg.text || "(no matching transcript text)";
-    row.refText.style.wordWrapWidth = Math.max(1, w - ROW_PAD_X * 2);
-    row.refText.x = ROW_PAD_X;
-    row.refText.y = 22;
+    return rowHeight;
   }
 
-  function layoutAudioClipRow(row: Row, seg: PanelSegment, y: number): void {
+  function layoutAudioClipRow(row: Row, seg: PanelSegment, y: number): number {
     const w = Math.max(1, contentWidth);
     const clip = seg.clip;
-    if (!clip) return;
+    if (!clip) return AUDIO_ROW_HEIGHT;
     row.container.y = y;
     row.container.visible = true;
     // no container-wide hitArea here (see the `rowBg` comment in `rowAt()`) —
@@ -1074,10 +1087,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     extras.root.visible = true;
     extras.root.x = ROW_PAD_X;
     extras.bind(clip, Math.max(1, w - ROW_PAD_X * 2), 24);
-  }
-
-  function rowHeightFor(seg: PanelSegment): number {
-    return seg.source === "audio clip" ? AUDIO_ROW_HEIGHT : ROW_HEIGHT;
+    return AUDIO_ROW_HEIGHT;
   }
 
   function redraw(): void {
@@ -1101,12 +1111,13 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
 
     let y = 0;
     rowTops = [];
+    rowHeights = [];
     currentSegments.forEach((seg, i) => {
       rowTops.push(y);
       const row = rowAt(i);
-      if (seg.source === "audio clip") layoutAudioClipRow(row, seg, y);
-      else layoutRow(row, seg, y);
-      y += rowHeightFor(seg) + ROW_GAP;
+      const height = seg.source === "audio clip" ? layoutAudioClipRow(row, seg, y) : layoutRow(row, seg, y);
+      rowHeights.push(height);
+      y += height + ROW_GAP;
     });
     for (let i = currentSegments.length; i < rowPool.length; i++) {
       rowPool[i].container.visible = false;
@@ -1121,7 +1132,7 @@ export function createSegmentsPanel(options: SegmentsPanelOptions): SegmentsPane
     const seg = currentSegments[index];
     if (!seg) return;
     const rowTop = rowTops[index] ?? 0;
-    const rowBottom = rowTop + rowHeightFor(seg);
+    const rowBottom = rowTop + (rowHeights[index] ?? ROW_HEIGHT);
     const current = scrollable.getScrollY();
     let target = current;
     if (rowTop < current) target = rowTop;
