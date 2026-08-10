@@ -25,6 +25,7 @@
 import { z } from "zod";
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
+import { resolveDocReadyCached } from "../p2p/doc-ready";
 import { canvasRoleSchema, type CanvasRole } from "./canvas-doc";
 
 // ---------------------------------------------------------------------------
@@ -160,7 +161,13 @@ export class ProfileStore {
 
   /** open an existing profile document by id. */
   static async open(repo: Repo, docId: DocumentId): Promise<ProfileStore> {
-    const handle = await repo.find<ProfileDocument>(docId);
+    // bare repo.find() defaults to allowableStates=["ready"], which blocks on
+    // networkSubsystem.whenReady() when the doc isn't already in local storage
+    // — use resolveDocReadyCached() like every other doc access instead.
+    const handle = await resolveDocReadyCached<ProfileDocument>(repo, docId);
+    if (!handle) {
+      throw new Error(`profile doc ${docId} did not become ready`);
+    }
     return new ProfileStore(repo, handle);
   }
 
