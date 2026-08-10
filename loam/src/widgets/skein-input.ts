@@ -14,8 +14,8 @@ import { Container, Graphics, Text } from "pixi.js";
 import { createDomOverlay, type DomOverlayHandle } from "./dom-overlay";
 import { colorToCss } from "./format";
 
-const FIELD_BG = 0x12121a;
-const FIELD_BORDER = 0x333348;
+export const FIELD_BG = 0x12121a;
+export const FIELD_BORDER = 0x333348;
 const FIELD_BORDER_ACTIVE = 0x6366f1;
 const TEXT_COLOR = 0xf0f0ff;
 const MUTED_TEXT = 0x666678;
@@ -56,6 +56,13 @@ export interface SkeinInputHandle {
   focus(): void;
   blur(): void;
   setWidth(w: number): void;
+  /** change the placeholder shown while the field is empty (and, if
+   *  currently being edited, the DOM overlay's own placeholder too). */
+  setPlaceholder(text: string): void;
+  /** recolor the field's border (e.g. a pooled/reused input taking on a
+   *  new per-row identity color) — the active-focus border color is
+   *  unaffected. */
+  setBorderColor(color: number): void;
   destroy(): void;
 }
 
@@ -63,6 +70,7 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
   const height = options.height ?? 28;
   let currentWidth = options.width;
   let currentValue = options.value ?? "";
+  let currentPlaceholder = options.placeholder ?? "";
   let editing = false;
   let activeOverlay: DomOverlayHandle | null = null;
 
@@ -70,7 +78,7 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
   const styleFontFamily = options.fontFamily ?? FONT;
   const styleTextColor = options.textColor ?? TEXT_COLOR;
   const styleBgColor = options.bgColor ?? FIELD_BG;
-  const styleBorderColor = options.borderColor ?? FIELD_BORDER;
+  let styleBorderColor = options.borderColor ?? FIELD_BORDER;
   const styleBorderActive = options.borderActiveColor ?? FIELD_BORDER_ACTIVE;
   const stylePlaceholderColor = options.placeholderColor ?? MUTED_TEXT;
   const styleCornerRadius = options.cornerRadius ?? CORNER_RADIUS;
@@ -120,7 +128,7 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
 
   // placeholder text
   const placeholderText = new Text({
-    text: options.placeholder ?? "",
+    text: currentPlaceholder,
     style: {
       fontFamily: styleFontFamily,
       fontSize: styleFontSize,
@@ -182,7 +190,7 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
       width: currentWidth,
       height,
       value: currentValue,
-      placeholder: options.placeholder,
+      placeholder: currentPlaceholder,
       maxLength: options.maxLength,
       enterCommits: true,
       selectAll: false,
@@ -258,6 +266,19 @@ export function createSkeinInput(options: SkeinInputOptions): SkeinInputHandle {
       drawTextMask();
       alignTexts();
       syncDisplay();
+    },
+
+    setPlaceholder(text: string): void {
+      currentPlaceholder = text;
+      placeholderText.text = text;
+      if (editing && activeOverlay && !activeOverlay.removed) {
+        activeOverlay.element.placeholder = text;
+      }
+    },
+
+    setBorderColor(color: number): void {
+      styleBorderColor = color;
+      drawBg(editing);
     },
 
     destroy(): void {

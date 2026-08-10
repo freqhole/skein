@@ -7,8 +7,7 @@
 import { log } from "@freqhole/reliquary/utils";
 import { dispatch, isTauriMode } from "../p2p/tauri-transport";
 import { getMiddenNode } from "../p2p/identity";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { getBlobObjectURL, resolveBlob, getBlobData } from "../storage/blob-store";
 import { getPeerNodeIds, withPeerTimeout, type PeersMap } from "./file-shared";
@@ -21,15 +20,15 @@ const TAG = "widgets.blob-io";
 
 /**
  * save a locally-stored blob to a user-chosen location on the filesystem.
- * opens a native save dialog, then copies the blob file to the chosen path.
  *
- * only works after the blob exists locally (either uploaded or snatched).
- * requires Tauri mode.
+ * not supported in Tauri mode — there's no native save-to-arbitrary-path
+ * command wired up on the rust side; use revealBlobInFinder() instead so
+ * the user can copy the file themselves from Finder/Explorer.
  *
  * for browser mode, falls back to a programmatic <a download> click using
  * blob data fetched from the local API.
  *
- * returns true if the file was saved, false if the user cancelled.
+ * returns true if the file was saved, false otherwise.
  */
 export async function saveBlobToDisk(blobId: string, filename: string): Promise<boolean> {
   if (!isTauriMode()) {
@@ -37,29 +36,8 @@ export async function saveBlobToDisk(blobId: string, filename: string): Promise<
     return saveBlobToDiskBrowser(blobId, filename);
   }
 
-  try {
-    // open native save dialog with suggested filename
-    const destPath = await save({
-      defaultPath: filename,
-      title: "save file",
-    });
-
-    if (!destPath) {
-      return false; // user cancelled
-    }
-
-    // copy blob file to chosen path via custom Tauri command
-    await invoke("save_blob_to_path", {
-      blobId,
-      destPath,
-    });
-
-    log.debug(TAG, `saved blob ${blobId.slice(0, 8)}... to ${destPath}`);
-    return true;
-  } catch (err) {
-    log.error(TAG, "save to disk failed:", err);
-    throw err;
-  }
+  log.error(TAG, "save to disk is not supported in tauri mode — use reveal in finder instead");
+  return false;
 }
 
 /**

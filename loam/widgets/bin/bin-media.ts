@@ -15,6 +15,7 @@ import { Container, Graphics } from "pixi.js";
 import { audioManager, getMediaPlaybackUrl } from "../../src/media";
 import { getFullBlobDataUrl } from "../../src/file-utils/blob-io";
 import { createMediaOverlay as createFullscreenOverlay } from "../../src/widgets/media-overlay";
+import { createMediaDomOverlay } from "../../src/widgets/media-dom-overlay";
 import { log } from "@freqhole/reliquary/utils";
 import type { RenderedCard } from "./bin-types";
 
@@ -193,123 +194,23 @@ function createVideoTracker(
   thumbW: number,
   thumbH: number
 ): VideoTracker {
-  const wrapper = document.createElement("div");
-  const ws = wrapper.style;
-  ws.position = "fixed";
-  ws.zIndex = "15000";
-  ws.pointerEvents = "none"; // let pixi handle pointer events
-  ws.overflow = "hidden";
-  ws.backgroundColor = "rgba(0,0,0,0.9)";
-  ws.borderRadius = "3px";
+  // delegates to the shared, generalized DOM-video-tracking helper (see
+  // loam/src/widgets/media-dom-overlay.ts) — this thin wrapper just keeps
+  // this file's existing external shape (VideoTracker with widgetId/rafId)
+  // unchanged for its callers below.
+  const overlay = createMediaDomOverlay({
+    src,
+    mime,
+    container: card.container,
+    canvasElement,
+    getSize: () => ({ width: thumbW, height: thumbH }),
+    muted: false,
+    loop: true,
+    controls: false,
+    objectFit: "cover",
+  });
 
-  const video = document.createElement("video");
-  video.src = src;
-  if (mime) video.setAttribute("type", mime);
-  video.playsInline = true;
-  video.muted = false;
-  video.loop = true;
-  const vs = video.style;
-  vs.width = "100%";
-  vs.height = "100%";
-  vs.objectFit = "cover";
-  vs.display = "block";
-  vs.borderRadius = "3px";
-  vs.outline = "none";
-  vs.pointerEvents = "none";
-  wrapper.appendChild(video);
-
-  // toggle pointer-events on fullscreen change so native controls are clickable
-  const onFullscreenChange = (): void => {
-    const fsEl = document.fullscreenElement ?? (document as any).webkitFullscreenElement;
-    if (fsEl === video || fsEl === wrapper) {
-      // entering fullscreen — enable pointer events so native controls work
-      ws.pointerEvents = "auto";
-      vs.pointerEvents = "auto";
-      video.controls = true;
-    } else {
-      // exiting fullscreen — restore pointer-events: none so pixi handles taps
-      ws.pointerEvents = "none";
-      vs.pointerEvents = "none";
-      video.controls = false;
-    }
-  };
-  document.addEventListener("fullscreenchange", onFullscreenChange);
-  document.addEventListener("webkitfullscreenchange", onFullscreenChange);
-
-  document.body.appendChild(wrapper);
-
-  let closed = false;
-  let rafId = 0;
-
-  // track last values to avoid redundant DOM updates
-  let lastX = -1;
-  let lastY = -1;
-  let lastW = -1;
-  let lastH = -1;
-
-  const track = (): void => {
-    if (closed) return;
-
-    const container = card.container;
-    if (!container || container.destroyed) {
-      close();
-      return;
-    }
-
-    const globalPos = container.toGlobal({ x: 0, y: 0 });
-    const globalEnd = container.toGlobal({ x: thumbW, y: thumbH });
-    const rect = canvasElement.getBoundingClientRect();
-
-    const screenX = Math.round(rect.left + globalPos.x);
-    const screenY = Math.round(rect.top + globalPos.y);
-    const screenW = Math.round(globalEnd.x - globalPos.x);
-    const screenH = Math.round(globalEnd.y - globalPos.y);
-
-    if (screenX !== lastX || screenY !== lastY || screenW !== lastW || screenH !== lastH) {
-      ws.left = `${screenX}px`;
-      ws.top = `${screenY}px`;
-      ws.width = `${screenW}px`;
-      ws.height = `${screenH}px`;
-      lastX = screenX;
-      lastY = screenY;
-      lastW = screenW;
-      lastH = screenH;
-    }
-
-    // hide if off-screen
-    const canvasRight = Math.round(rect.left + rect.width);
-    const canvasBottom = Math.round(rect.top + rect.height);
-    const visible =
-      screenX + screenW > Math.round(rect.left) &&
-      screenY + screenH > Math.round(rect.top) &&
-      screenX < canvasRight &&
-      screenY < canvasBottom;
-    ws.display = visible ? "block" : "none";
-
-    rafId = requestAnimationFrame(track);
-  };
-
-  const close = (): void => {
-    if (closed) return;
-    closed = true;
-    if (rafId) cancelAnimationFrame(rafId);
-    document.removeEventListener("fullscreenchange", onFullscreenChange);
-    document.removeEventListener("webkitfullscreenchange", onFullscreenChange);
-    // exit fullscreen if this video is currently fullscreen
-    const fsEl = document.fullscreenElement ?? (document as any).webkitFullscreenElement;
-    if (fsEl === video || fsEl === wrapper) {
-      document.exitFullscreen?.().catch(() => {});
-    }
-    video.pause();
-    video.removeAttribute("src");
-    video.load();
-    wrapper.remove();
-  };
-
-  // start tracking
-  rafId = requestAnimationFrame(track);
-
-  return { video, wrapper, widgetId: card.widgetId, rafId, close };
+  return { video: overlay.video, wrapper: overlay.wrapper, widgetId: card.widgetId, rafId: 0, close: overlay.close };
 }
 
 // ---------------------------------------------------------------------------

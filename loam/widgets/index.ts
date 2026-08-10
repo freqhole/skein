@@ -12,6 +12,8 @@ import { linkWidget } from "./link";
 import { markdownWidget } from "./markdown";
 import { notepadWidget } from "./notepad";
 import { peedeeeffWidget } from "./peedeeeff/index";
+import { registerStfuWidget } from "./stfu/index";
+import { ttsWidget } from "./tts/index";
 import { canvasCardWidget } from "./narthex/canvas-card";
 import { canvasWizardWidget } from "./narthex/canvas-wizard";
 
@@ -42,6 +44,8 @@ export function createTestRegistry(): WidgetRegistry {
   registry.register(markdownWidget);
   registry.register(notepadWidget);
   registry.register(peedeeeffWidget);
+  registerStfuWidget(registry);
+  registry.register(ttsWidget);
   // canvas-card (see widgets/narthex/canvas-card.ts) is registered here too
   // (not just the narthex registry) so a "link to canvas" card placed on a
   // REGULAR canvas can actually be rendered by widget-manager.ts — its own

@@ -84,8 +84,16 @@ export default defineConfig({
   },
   // exclude @freqhole/midden from esbuild pre-bundling — it contains a .wasm
   // file that esbuild can't handle; vite-plugin-wasm takes care of it instead.
+  // @freqhole/reliquary is excluded too — its worker entry constructs a
+  // `new Worker(new URL("./blob-worker.js", import.meta.url))`, a pattern
+  // vite's own dev-server/build transform recognizes and rewrites, but
+  // esbuild's dependency pre-bundler does not; pre-bundling it produces a
+  // worker chunk reference that never actually lands anywhere real, so the
+  // browser's worker fetch 404s and the blob worker silently falls back to
+  // main-thread hashing (see blob-worker-client.ts's getBlobWorker()) —
+  // same issue vite.config.ts documents for the main (non-tauri) config.
   optimizeDeps: {
-    exclude: ["@freqhole/midden"],
+    exclude: ["@freqhole/midden", "@freqhole/reliquary"],
   },
   // allow serving the @freqhole/midden package (../../tomb/lib/midden/pkg)
   // and the @freqhole/reliquary package (../../tomb/lib/reliquary/ts) -

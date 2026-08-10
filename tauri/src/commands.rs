@@ -313,6 +313,8 @@ pub(crate) enum DispatchError {
     Identity(String),
     #[error("fetch: {0}")]
     Fetch(String),
+    #[error("tts: {0}")]
+    Tts(String),
 }
 
 /// read the current node id without any side effects — never generates a
@@ -568,11 +570,57 @@ async fn dispatch(
             Ok(json!({ "available": crate::pdf::pandoc_backend_available().await }))
         }
 
+        // capability probe for the standalone tts widget's (and later
+        // stfu's) "generate audio" action — reports whether `say` was found
+        // on this machine, and if so, its full voice list (see `tts.rs`'s
+        // `say_check_available`). checked per-peer, live, every time —
+        // never cached in any doc — since it only ever gates a single
+        // action, never a whole widget's visibility (unlike
+        // `pdf_check_available` above): a doc authored on a say-less
+        // machine is still fully usable everywhere, and any tauri+`say`
+        // peer who later opens it gets a working "generate" button (see
+        // docs/stfu-widget-plan.md's tts scope note).
+        "say_check_available" => {
+            let voices = crate::tts::say_check_available().await;
+            Ok(json!({
+                "available": voices.is_some(),
+                "voices": voices.unwrap_or_default(),
+            }))
+        }
+
+        // generates real speech audio via `say` and adopts it into managed
+        // blob storage — see `tts::tts_generate`.
+        "tts_generate" => crate::tts::tts_generate(decode("tts_generate", payload)?, state).await,
+
         // read a small local text file (.txt/.text/.log) as utf-8 — used to
         // seed a notepad widget's initial text when one of these files is
         // picked/dropped, instead of routing it through the pdf/imagemagick
         // document pipeline (see loam's `isPlainTextFilename`).
         "read_text_file" => read_text_file(decode("read_text_file", payload)?).await,
+
+        // list the `.json` files directly inside a directory — used by
+        // stfu's "load project folder..." action to bulk-load a
+        // trek-minus-paris project folder's diarize/transcribe/reference
+        // json files in one go.
+        "list_json_files_in_dir" => {
+            list_json_files_in_dir(decode("list_json_files_in_dir", payload)?).await
+        }
+
+        // list every file inside a project folder's `*_speaker_samples/`
+        // subdirectory — used by stfu's "load project folder..." action to
+        // pick up process.py's per-speaker sample clips + thumbnails
+        // alongside the diarize/transcribe json.
+        "list_speaker_samples" => {
+            list_speaker_samples(decode("list_speaker_samples", payload)?).await
+        }
+
+        // list video files directly inside a directory — used by stfu's
+        // "load project folder..." action to auto-init the widget's video
+        // when one sits alongside the diarize/transcribe json, instead of
+        // making the user separately pick it by hand afterward.
+        "list_video_files_in_dir" => {
+            list_video_files_in_dir(decode("list_video_files_in_dir", payload)?).await
+        }
 
         // generate a thumbnail for a stored blob. supports image/*, application/pdf,
         // and video/* source types. returns { data: <base64>, mime } or { data: null }.
@@ -685,7 +733,7 @@ impl From<friendz::Friend> for FriendDto {
 }
 
 #[derive(Debug, Serialize)]
-struct BlobDto {
+pub(crate) struct BlobDto {
     blake3: String,
     iroh_hash: String,
     filename: Option<String>,
@@ -1433,7 +1481,7 @@ async fn blob_purge_local(args: BlobGetArgs, state: &AppState) -> Result<Value, 
 /// handler — easily blowing past the browser's 30 s strategy-1 timeout
 /// for video files. errors are logged and swallowed: the lazy
 /// `blob_iroh_ensure` path will still work as a fallback.
-async fn prewarm_fs_store(state: &AppState, blob: &BlobRecord) {
+pub(crate) async fn prewarm_fs_store(state: &AppState, blob: &BlobRecord) {
     prewarm_fs_store_for(&state.storage, blob).await;
 }
 
@@ -1597,7 +1645,7 @@ struct BlobInsertFromPathArgs {
 /// app on large files. widgets already handle "blob only reachable via
 /// tauri dispatch" gracefully (see `getBlobData()`'s tauri fallback), so a
 /// large file simply staying rust-only is fine.
-const MIRROR_DATA_MAX_BYTES: u64 = 25 * 1024 * 1024;
+pub(crate) const MIRROR_DATA_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
 /// thin tauri-facing wrapper around [`blob_insert_from_path_impl`]: its only
 /// job is turning `app`/`upload_id` into an `on_progress` closure that emits
@@ -2277,9 +2325,163 @@ async fn read_text_file(args: ReadTextFileArgs) -> Result<Value, DispatchError> 
     Ok(json!({ "text": String::from_utf8_lossy(&bytes).into_owned() }))
 }
 
-// ---------------------------------------------------------------------------
-// blob thumbnail
-// ---------------------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+struct ListJsonFilesInDirArgs {
+    /// absolute path to a directory (e.g. from the native directory picker)
+    /// to scan for `.json` files.
+    path: String,
+}
+
+/// list every `.json` file directly inside a directory (non-recursive) --
+/// used by stfu's "load project folder..." action to bulk-load every
+/// diarize/transcribe/reference json sitting in a trek-minus-paris project
+/// folder without picking each file by hand.
+async fn list_json_files_in_dir(args: ListJsonFilesInDirArgs) -> Result<Value, DispatchError> {
+    let mut entries = tokio::fs::read_dir(&args.path).await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })?;
+
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })? {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let is_file = entry
+            .file_type()
+            .await
+            .map(|t| t.is_file())
+            .unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        files.push(json!({ "path": path.to_string_lossy(), "filename": filename }));
+    }
+
+    Ok(json!({ "files": files }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ListSpeakerSamplesArgs {
+    /// absolute path to a directory (e.g. the same project folder passed to
+    /// `list_json_files_in_dir`) to look for a `*_speaker_samples/`
+    /// subdirectory in.
+    path: String,
+}
+
+/// list every file inside any `*_speaker_samples/` subdirectory directly
+/// under a project folder (non-recursive beyond that one level) -- these
+/// are `process.py`'s per-speaker sample clips (`{speaker}_sample_{i}{ext}`)
+/// and thumbnails (`{speaker}_sample_{i}_thumb.jpg`), picked up by stfu's
+/// "load project folder..." action alongside the diarize/transcribe json.
+async fn list_speaker_samples(args: ListSpeakerSamplesArgs) -> Result<Value, DispatchError> {
+    let mut dir_entries = tokio::fs::read_dir(&args.path).await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })?;
+
+    let mut sample_dirs = Vec::new();
+    while let Some(entry) = dir_entries.next_entry().await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })? {
+        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with("_speaker_samples") {
+            sample_dirs.push(entry.path());
+        }
+    }
+
+    let mut files = Vec::new();
+    for sample_dir in sample_dirs {
+        let mut entries = tokio::fs::read_dir(&sample_dir).await.map_err(|e| {
+            DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+        })?;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+        })? {
+            let is_file = entry
+                .file_type()
+                .await
+                .map(|t| t.is_file())
+                .unwrap_or(false);
+            if !is_file {
+                continue;
+            }
+            let path = entry.path();
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            files.push(json!({ "path": path.to_string_lossy(), "filename": filename }));
+        }
+    }
+
+    Ok(json!({ "files": files }))
+}
+
+/// video extensions stfu can play — kept in sync with loam's
+/// `guessMimeFromFilename()` (file-shared.ts).
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "webm", "mov", "mkv", "avi", "m4v", "flv", "wmv", "3gp", "3g2", "ts", "mts", "m2ts",
+    "mpg", "mpeg", "ogv",
+];
+
+#[derive(Debug, Deserialize)]
+struct ListVideoFilesInDirArgs {
+    /// absolute path to a directory (e.g. from the native directory picker)
+    /// to scan for video files.
+    path: String,
+}
+
+/// list every video file directly inside a directory (non-recursive) —
+/// used by stfu's "load project folder..." action to auto-init the
+/// widget's video when one sits alongside the diarize/transcribe json.
+async fn list_video_files_in_dir(args: ListVideoFilesInDirArgs) -> Result<Value, DispatchError> {
+    let mut entries = tokio::fs::read_dir(&args.path).await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })?;
+
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })? {
+        let path = entry.path();
+        let ext_matches = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| VIDEO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+            .unwrap_or(false);
+        if !ext_matches {
+            continue;
+        }
+        let is_file = entry
+            .file_type()
+            .await
+            .map(|t| t.is_file())
+            .unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        files.push(json!({ "path": path.to_string_lossy(), "filename": filename }));
+    }
+
+    Ok(json!({ "files": files }))
+}
 
 #[derive(Debug, Deserialize)]
 struct BlobThumbnailArgs {

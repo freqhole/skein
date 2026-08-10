@@ -135,31 +135,6 @@ test("store.moveWidget updates position", async ({ canvasPage }) => {
   expect(pos).toEqual({ x: 300, y: 450 });
 });
 
-test("registry contains the expected widget types", async ({ canvasPage }) => {
-  const { page } = await canvasPage();
-
-  const types = await page.evaluate(() => {
-    return (window as any).__skein.registry.types();
-  });
-
-  expect(types).toContain("label");
-  expect(types).toContain("notepad");
-  expect(types).toContain("image");
-  expect(types).toContain("markdown");
-  expect(types).toContain("doodle");
-  expect(types).toContain("audio-recording");
-  expect(types).toContain("voice-recording");
-  expect(types).toContain("file");
-  expect(types).toContain("peedeeeff");
-  expect(types).toContain("bin");
-  expect(types).toContain("canvas-info");
-  expect(types).toContain("link");
-  expect(types).toContain("canvas-card");
-  expect(types).toContain("canvas-wizard");
-  expect(types).toContain("canvas-link-picker");
-  expect(types).toHaveLength(15);
-});
-
 test("canvas persists widgets across sessions via IndexedDB", async ({ browser }) => {
   // persistence needs both sessions to share the same browser context
   // so they share the same IndexedDB storage

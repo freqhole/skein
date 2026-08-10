@@ -55,6 +55,18 @@ export function colorToCss(color: number): string {
 }
 
 /**
+ * pick black or white for readable text against a background color, using
+ * the standard YIQ perceptual brightness formula.
+ */
+export function contrastTextColor(bgColor: number): number {
+  const r = (bgColor >> 16) & 0xff;
+  const g = (bgColor >> 8) & 0xff;
+  const b = bgColor & 0xff;
+  const yiq = (r * 299 + g * 587 + b * 114) / 1000;
+  return yiq >= 128 ? 0x000000 : 0xffffff;
+}
+
+/**
  * format a file size in bytes to a human-readable string.
  * e.g. 1024 -> "1.0 KB", 1048576 -> "1.0 MB"
  */
