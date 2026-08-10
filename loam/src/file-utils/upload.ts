@@ -316,6 +316,10 @@ async function pickJsonFilesBrowser(): Promise<PickedFile[]> {
 export interface PickedReferenceDirectory {
   jsonFiles: PickedFile[];
   sampleFiles: PickedFile[];
+  /** the first video file found directly inside the picked folder (if
+   *  any) — lets "load project folder..." auto-init stfu's video instead
+   *  of leaving the widget waiting for a separate manual upload. */
+  videoFile: PickedFile | null;
 }
 
 const SPEAKER_SAMPLES_DIR_RE = /_speaker_samples[\\/]/;
@@ -330,26 +334,32 @@ export async function pickReferenceDirectory(): Promise<PickedReferenceDirectory
 async function pickReferenceDirectoryTauri(): Promise<PickedReferenceDirectory> {
   try {
     const result = await open({ directory: true, multiple: false });
-    if (result === null) return { jsonFiles: [], sampleFiles: [] };
+    if (result === null) return { jsonFiles: [], sampleFiles: [], videoFile: null };
 
     const dirPath = Array.isArray(result) ? result[0] : result;
-    if (!dirPath) return { jsonFiles: [], sampleFiles: [] };
+    if (!dirPath) return { jsonFiles: [], sampleFiles: [], videoFile: null };
 
-    const [{ files: jsonEntries }, { files: sampleEntries }] = await Promise.all([
+    const [{ files: jsonEntries }, { files: sampleEntries }, { files: videoEntries }] = await Promise.all([
       dispatch("list_json_files_in_dir", { path: dirPath }) as Promise<{
         files: { path: string; filename: string }[];
       }>,
       dispatch("list_speaker_samples", { path: dirPath }) as Promise<{
         files: { path: string; filename: string }[];
       }>,
+      dispatch("list_video_files_in_dir", { path: dirPath }) as Promise<{
+        files: { path: string; filename: string }[];
+      }>,
     ]);
     return {
       jsonFiles: jsonEntries.map((f) => ({ path: f.path, filename: f.filename, size: 0, file: null })),
       sampleFiles: sampleEntries.map((f) => ({ path: f.path, filename: f.filename, size: 0, file: null })),
+      videoFile: videoEntries[0]
+        ? { path: videoEntries[0].path, filename: videoEntries[0].filename, size: 0, file: null }
+        : null,
     };
   } catch (err) {
     log.error(TAG, "reference directory picker failed:", err);
-    return { jsonFiles: [], sampleFiles: [] };
+    return { jsonFiles: [], sampleFiles: [], videoFile: null };
   }
 }
 
@@ -380,22 +390,27 @@ async function pickReferenceDirectoryBrowser(): Promise<PickedReferenceDirectory
       window.addEventListener("focus", onFocus);
     });
 
-    if (!files || files.length === 0) return { jsonFiles: [], sampleFiles: [] };
+    if (!files || files.length === 0) return { jsonFiles: [], sampleFiles: [], videoFile: null };
 
     const jsonFiles: PickedFile[] = [];
     const sampleFiles: PickedFile[] = [];
+    let videoFile: PickedFile | null = null;
     for (const file of Array.from(files)) {
       const relPath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
       if (file.name.toLowerCase().endsWith(".json")) {
         jsonFiles.push({ path: null, filename: file.name, size: file.size, file });
       } else if (SPEAKER_SAMPLES_DIR_RE.test(relPath)) {
         sampleFiles.push({ path: null, filename: file.name, size: file.size, file });
+      } else if (!videoFile && !relPath.includes("/") && guessMimeFromFilename(file.name).startsWith("video/")) {
+        // "directly inside the folder" (not in a nested subdirectory), matching
+        // the jsonFiles handling above — first match wins.
+        videoFile = { path: null, filename: file.name, size: file.size, file };
       }
     }
-    return { jsonFiles, sampleFiles };
+    return { jsonFiles, sampleFiles, videoFile };
   } catch (err) {
     log.error(TAG, "browser directory picker failed:", err);
-    return { jsonFiles: [], sampleFiles: [] };
+    return { jsonFiles: [], sampleFiles: [], videoFile: null };
   } finally {
     input.remove();
   }

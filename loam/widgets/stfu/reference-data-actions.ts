@@ -10,12 +10,12 @@ import type { PickedFile } from "../../src/file-utils/file-shared";
 import {
   mergeCombinedData,
   mergeDiarizeData,
-  mergeSpeakerSampleMedia,
+  mergeSpeakerSamples,
   mergeTranscribeData,
   parseReferenceDataJson,
   parseSpeakerSampleFilename,
 } from "./reference-data";
-import type { StfuState } from "./types";
+import type { SpeakerSample, StfuState } from "./types";
 
 /** drop a trailing file extension for use as a download's base filename
  *  (e.g. "caretaker.mp4" -> "caretaker") — falls back to the original
@@ -75,14 +75,25 @@ export interface LoadReferenceDataOptions {
    *  instead of picking file(s) by hand — used by the "load project
    *  folder..." action. */
   fromDirectory?: boolean;
+  /** true if the widget already has a video loaded — used to skip
+   *  `onVideoFound` so an existing video is never clobbered by a folder
+   *  that happens to contain one too. only consulted when `fromDirectory`
+   *  is set. */
+  hasVideo?: () => boolean;
+  /** called when `fromDirectory` finds a video file directly inside the
+   *  picked folder and `hasVideo` reports none loaded yet — lets index.ts
+   *  perform the actual upload (it owns the upload-lock/progress state
+   *  `handleUpload()`'s manual pick also uses). resolves to whether the
+   *  upload succeeded. */
+  onVideoFound?: (file: PickedFile) => Promise<boolean>;
 }
 
 /**
  * upload a `*_speaker_samples/` directory's sample clips + thumbnails
- * (see `parseSpeakerSampleFilename`) and attach the lowest-numbered sample
- * of each kind to its speaker. returns the number of distinct speakers
- * updated (0 if `sampleFiles` is empty or none of it matched the naming
- * convention).
+ * (see `parseSpeakerSampleFilename`) and attach every numbered sample to
+ * its speaker (not just the lowest). returns the number of distinct
+ * speakers updated (0 if `sampleFiles` is empty or none of it matched the
+ * naming convention).
  */
 async function loadSpeakerSampleMedia(
   sampleFiles: PickedFile[],
@@ -91,53 +102,50 @@ async function loadSpeakerSampleMedia(
 ): Promise<number> {
   if (sampleFiles.length === 0) return 0;
 
-  const bySpeaker = new Map<string, { video?: PickedFile; thumbnail?: PickedFile }>();
-  const bestIndex = new Map<string, number>(); // `${speaker}:${kind}` -> lowest index seen
+  // speaker -> index -> {video?, thumbnail?}
+  const bySpeaker = new Map<string, Map<number, { video?: PickedFile; thumbnail?: PickedFile }>>();
   for (const file of sampleFiles) {
     const parsed = parseSpeakerSampleFilename(file.filename);
     if (!parsed) continue;
-    const key = `${parsed.speaker}:${parsed.kind}`;
-    const prevIndex = bestIndex.get(key);
-    if (prevIndex !== undefined && prevIndex <= parsed.index) continue;
-    bestIndex.set(key, parsed.index);
-    const bucket = bySpeaker.get(parsed.speaker) ?? {};
+    const byIndex = bySpeaker.get(parsed.speaker) ?? new Map<number, { video?: PickedFile; thumbnail?: PickedFile }>();
+    const bucket = byIndex.get(parsed.index) ?? {};
     if (parsed.kind === "video") bucket.video = file;
     else bucket.thumbnail = file;
-    bySpeaker.set(parsed.speaker, bucket);
+    byIndex.set(parsed.index, bucket);
+    bySpeaker.set(parsed.speaker, byIndex);
   }
 
   let updated = 0;
-  for (const [speaker, { video, thumbnail }] of bySpeaker) {
+  for (const [speaker, byIndex] of bySpeaker) {
     if (isDestroyed()) return updated;
+    const indices = Array.from(byIndex.keys()).sort((a, b) => a - b);
+    const samples: SpeakerSample[] = [];
     try {
-      const [videoResult, thumbnailResult] = await Promise.all([
-        video ? uploadFile(video) : Promise.resolve(null),
-        thumbnail ? uploadFile(thumbnail) : Promise.resolve(null),
-      ]);
-      if (isDestroyed()) return updated;
-      if (!videoResult && !thumbnailResult) continue;
+      for (const index of indices) {
+        const { video, thumbnail } = byIndex.get(index)!;
+        if (!video) continue; // a sample with no clip (thumbnail-only) isn't usable
+        const [videoResult, thumbnailResult] = await Promise.all([
+          uploadFile(video),
+          thumbnail ? uploadFile(thumbnail) : Promise.resolve(null),
+        ]);
+        if (isDestroyed()) return updated;
+        samples.push({
+          videoBlobId: videoResult.blobId,
+          videoBlake3: videoResult.blake3 || "",
+          videoMime: videoResult.mime,
+          videoFilename: video.filename,
+          videoSize: videoResult.size,
+          thumbnailBlobId: thumbnailResult?.blobId,
+          thumbnailBlake3: thumbnailResult?.blake3 || undefined,
+          thumbnailMime: thumbnailResult?.mime,
+          thumbnailFilename: thumbnail?.filename,
+          thumbnailSize: thumbnailResult?.size,
+        });
+      }
+      if (samples.length === 0) continue;
 
       changeDoc((d) => {
-        d.referenceSpeakers = mergeSpeakerSampleMedia(d.referenceSpeakers, speaker, {
-          video: videoResult
-            ? {
-                blobId: videoResult.blobId,
-                blake3: videoResult.blake3 || "",
-                mime: videoResult.mime,
-                filename: video!.filename,
-                size: videoResult.size,
-              }
-            : undefined,
-          thumbnail: thumbnailResult
-            ? {
-                blobId: thumbnailResult.blobId,
-                blake3: thumbnailResult.blake3 || "",
-                mime: thumbnailResult.mime,
-                filename: thumbnail!.filename,
-                size: thumbnailResult.size,
-              }
-            : undefined,
-        });
+        d.referenceSpeakers = mergeSpeakerSamples(d.referenceSpeakers, speaker, samples);
       });
       updated++;
     } catch (err) {
@@ -148,7 +156,8 @@ async function loadSpeakerSampleMedia(
 }
 
 export async function handleLoadReferenceData(options: LoadReferenceDataOptions): Promise<void> {
-  const { isViewerOnly, isDestroyed, changeDoc, onMerged, setMessage, fromDirectory } = options;
+  const { isViewerOnly, isDestroyed, changeDoc, onMerged, setMessage, fromDirectory, hasVideo, onVideoFound } =
+    options;
   if (isDestroyed() || isViewerOnly) return;
 
   // immediate feedback before the (possibly slow, modal) file picker opens —
@@ -156,17 +165,41 @@ export async function handleLoadReferenceData(options: LoadReferenceDataOptions)
   // was happening.
   setMessage(fromDirectory ? "loading project folder…" : "loading reference data…", 0);
 
-  const { jsonFiles: picked, sampleFiles } = fromDirectory
+  const { jsonFiles: picked, sampleFiles, videoFile } = fromDirectory
     ? await pickReferenceDirectory()
-    : { jsonFiles: await pickJsonFiles(), sampleFiles: [] };
+    : { jsonFiles: await pickJsonFiles(), sampleFiles: [], videoFile: null };
   if (isDestroyed()) return;
-  if (picked.length === 0 && sampleFiles.length === 0) {
-    setMessage("");
+  if (picked.length === 0 && sampleFiles.length === 0 && !videoFile) {
+    setMessage(fromDirectory ? "no reference data or video found in that folder" : "");
     return;
   }
 
   const summaries: string[] = [];
   let mergedCount = 0;
+
+  // auto-init the widget's video from the folder if one was found and the
+  // widget doesn't already have one loaded — otherwise the user is left
+  // waiting to add a video by hand even though one was right there. runs
+  // first so its own progress message (index.ts's `performVideoUpload()`
+  // drives `progressText`, not this transient message) is visible while the
+  // json/sample handling below proceeds.
+  if (videoFile && onVideoFound) {
+    if (hasVideo?.()) {
+      summaries.push(`video "${videoFile.filename}" found but widget already has one — skipped`);
+    } else {
+      setMessage(`found video "${videoFile.filename}" — uploading…`, 0);
+      let uploaded = false;
+      try {
+        uploaded = await onVideoFound(videoFile);
+      } catch (err) {
+        console.error(`stfu widget: failed to auto-load video "${videoFile.filename}":`, err);
+      }
+      if (isDestroyed()) return;
+      summaries.push(uploaded ? `video: ${videoFile.filename}` : `video "${videoFile.filename}" — upload failed`);
+      if (uploaded) mergedCount++;
+    }
+  }
+
   for (const file of picked) {
     let raw: unknown;
     try {

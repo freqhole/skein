@@ -11,7 +11,7 @@
 
 import type { Repo } from "@automerge/automerge-repo";
 import { Container, type FederatedPointerEvent, Graphics, Rectangle, Text } from "pixi.js";
-import { getLocalNodeId, guessMimeFromFilename, type PeersMap } from "../../src/file-utils/file-shared";
+import { getLocalNodeId, guessMimeFromFilename, type PeersMap, type PickedFile } from "../../src/file-utils/file-shared";
 import { pickFiles, uploadFile } from "../../src/file-utils/upload";
 import { getMediaPlaybackUrl } from "../../src/media";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
@@ -291,7 +291,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       text: iAmCreator ? "click to upload video" : "waiting for video",
       style: {
         fontFamily: FONT_FAMILY,
-        fontSize: 12,
+        fontSize: 18,
         fill: 0x9090b0,
       },
       resolution: typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2,
@@ -302,6 +302,28 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     placeholderText.eventMode = "static";
     placeholderText.cursor = iAmCreator ? "pointer" : "default";
     container.addChild(placeholderText);
+
+    // secondary entry point, right there in the empty state, so a first-time
+    // user doesn't have to go hunting through the widget actions menu for
+    // "load project folder..." — accepts a whole trek-minus-paris project
+    // directory (video + diarize/transcribe json + speaker samples) in one pick.
+    const FOLDER_LINK_FILL = 0x8a8aae;
+    const FOLDER_LINK_HOVER_FILL = 0xff33c9; // matches trek-minus-paris's --color-magenta-hover
+    const placeholderFolderLink = new Text({
+      text: "or load a project folder...",
+      style: {
+        fontFamily: FONT_FAMILY,
+        fontSize: 14,
+        fill: FOLDER_LINK_FILL,
+      },
+      resolution: typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2,
+    });
+    placeholderFolderLink.anchor.set(0.5);
+    placeholderFolderLink.x = currentWidth / 2;
+    placeholderFolderLink.y = currentHeight / 2 + 22;
+    placeholderFolderLink.eventMode = "static";
+    placeholderFolderLink.cursor = iAmCreator ? "pointer" : "default";
+    container.addChild(placeholderFolderLink);
 
     // -- cut-playback local-only prefs (overlay display + mute latency-comp ms) --
     // never part of the automerge doc — see local-prefs.ts.
@@ -460,6 +482,11 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         },
         setMessage: (message, autoClearMs) => referenceDataMessages.set(message, autoClearMs),
         fromDirectory: true,
+        // auto-init the widget's video when the picked folder has one
+        // alongside the diarize/transcribe json, instead of leaving the
+        // widget waiting for a separate manual upload afterward.
+        hasVideo: () => Boolean(ctx.doc.current.videoBlobId),
+        onVideoFound: (file) => performVideoUpload(file),
       });
     }
 
@@ -483,6 +510,9 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       const showPlaceholder = loadState !== "ready";
       placeholderBorder.visible = showPlaceholder;
       placeholderText.visible = showPlaceholder;
+      // only makes sense to offer alongside the initial "click to upload"
+      // prompt — hidden once an upload is actually in progress.
+      placeholderFolderLink.visible = showPlaceholder && iAmCreator && loadState === "empty";
     }
 
     function refresh(): void {
@@ -581,6 +611,8 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
       drawPlaceholderBorder(w, h);
       placeholderText.x = w / 2;
       placeholderText.y = h / 2;
+      placeholderFolderLink.x = w / 2;
+      placeholderFolderLink.y = h / 2 + 22;
       if (timeline) {
         timeline.container.y = timelineY(h);
         timeline.resize(Math.max(0, w - TIMELINE_INSET * 2));
@@ -1031,6 +1063,8 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         canvasElement: ctx.canvasElement,
         getReferenceSpeakers: () => ctx.doc.current.referenceSpeakers,
         getReferenceTracks: () => ctx.doc.current.referenceTracks,
+        getTranscriptSegments: () => ctx.doc.current.transcriptSegments,
+        getVideoDurationSec: () => ctx.doc.current.videoDurationSec,
         changeDoc: (fn) => ctx.doc.change(fn),
         getPeers: () => ctx.canvasStore?.peers() as PeersMap | undefined,
         onOpenChange: handleFullWidgetDialogOpenChange,
@@ -1176,11 +1210,18 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
 
     // -- upload flow ---------------------------------------------------------------
 
-    const handleUpload = async () => {
-      if (destroyed) return;
-      if (loadState !== "empty") return;
-      if (ctx.canvasStore?.isLocalViewer()) return;
-      if (!iAmCreator) return;
+    /**
+     * upload `file` as this widget's video and write the resulting blob
+     * fields to the doc. shared by `handleUpload()` (manual "click to
+     * upload video" pick) and `handleLoadReferenceDataFolder()`'s
+     * auto-detected video (see reference-data-actions.ts's `onVideoFound`).
+     * returns whether the upload succeeded.
+     */
+    async function performVideoUpload(file: PickedFile): Promise<boolean> {
+      if (destroyed) return false;
+      if (loadState !== "empty") return false;
+      if (ctx.canvasStore?.isLocalViewer()) return false;
+      if (!iAmCreator) return false;
 
       const localNodeId = await getLocalNodeId();
       const cur = ctx.doc.current;
@@ -1189,18 +1230,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         cur.uploadingBy !== localNodeId &&
         Date.now() - cur.uploadingAt < UPLOAD_LOCK_STALE_MS
       ) {
-        return;
-      }
-
-      const picked = await pickFiles();
-      if (!picked || picked.length === 0) return;
-      const file = picked[0];
-
-      const mime = file.file?.type || guessMimeFromFilename(file.filename);
-      if (!mime.startsWith("video/")) {
-        statusMessage = "please pick a video file";
-        refresh();
-        return;
+        return false;
       }
 
       loadState = "loading";
@@ -1228,7 +1258,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           },
         });
 
-        if (destroyed) return;
+        if (destroyed) return false;
 
         ctx.doc.change((d) => {
           d.videoBlobId = result.blobId;
@@ -1243,8 +1273,9 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         // flyout/property tray instead of showing generically as "stfu".
         ctx.canvasStore?.setWidgetTitle(ctx.widgetId, stripExtension(file.filename));
         void snatchController.checkVideoLocality();
+        return true;
       } catch (err) {
-        if (destroyed) return;
+        if (destroyed) return false;
         console.error("stfu widget: video upload failed:", err);
         statusMessage = "upload failed";
         loadState = "empty";
@@ -1255,13 +1286,44 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
           });
         }
         refresh();
+        return false;
       } finally {
         uploadAbort = null;
       }
+    }
+
+    const handleUpload = async () => {
+      if (destroyed) return;
+      if (loadState !== "empty") return;
+      if (ctx.canvasStore?.isLocalViewer()) return;
+      if (!iAmCreator) return;
+
+      const picked = await pickFiles();
+      if (!picked || picked.length === 0) return;
+      const file = picked[0];
+
+      const mime = file.file?.type || guessMimeFromFilename(file.filename);
+      if (!mime.startsWith("video/")) {
+        statusMessage = "please pick a video file";
+        refresh();
+        return;
+      }
+
+      await performVideoUpload(file);
     };
 
     placeholderText.on("pointertap", () => void handleUpload());
     placeholderBorder.on("pointertap", () => void handleUpload());
+    placeholderFolderLink.on("pointertap", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      void handleLoadReferenceDataFolder();
+    });
+    placeholderFolderLink.on("pointerover", () => {
+      placeholderFolderLink.style.fill = FOLDER_LINK_HOVER_FILL;
+    });
+    placeholderFolderLink.on("pointerout", () => {
+      placeholderFolderLink.style.fill = FOLDER_LINK_FILL;
+    });
 
     // -- keyboard shortcuts — see keyboard-shortcuts-handler.ts. --------------
     //

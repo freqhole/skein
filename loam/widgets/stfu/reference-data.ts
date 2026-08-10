@@ -14,7 +14,7 @@
  * into that single array by time-range overlap.
  */
 
-import { DEFAULT_REFERENCE_TRACK_ID, type ReferenceSpeaker, type TranscriptSegment } from "./types";
+import { DEFAULT_REFERENCE_TRACK_ID, type ReferenceSpeaker, type SpeakerSample, type TranscriptSegment } from "./types";
 
 // golden-angle hue spread — same constants as editor.js's
 // `computeSpeakerColors()`, offset away from the red playhead / magenta
@@ -172,6 +172,17 @@ function overlaps(aStart: number, aEnd: number, bStart: number, bEnd: number): b
   return aStart < bEnd && bStart < aEnd;
 }
 
+/** shallow-clones a speaker entry but deep-clones `samples` (and each
+ *  sample object within it) — a plain `{ ...speaker }` would otherwise carry
+ *  the *same* doc-owned array/objects into a freshly built record that gets
+ *  written back with one assignment (`d.referenceSpeakers = nextSpeakers`),
+ *  which automerge rejects ("Cannot create a reference to an existing
+ *  document object" — the same array/object can't exist at two paths in
+ *  one document). */
+function cloneReferenceSpeaker(speaker: ReferenceSpeaker): ReferenceSpeaker {
+  return { ...speaker, samples: Array.isArray(speaker.samples) ? speaker.samples.map((s) => ({ ...s })) : [] };
+}
+
 export interface MergedReferenceData {
   referenceSpeakers: Record<string, ReferenceSpeaker>;
   transcriptSegments: TranscriptSegment[];
@@ -201,7 +212,7 @@ export function mergeDiarizeData(
   for (const [label, speaker] of Object.entries(referenceSpeakers)) {
     // preserve every existing field (trackId, sample/thumbnail blob refs,
     // etc) — this merge only ever touches name/color/new-speaker creation.
-    nextSpeakers[label] = { ...speaker };
+    nextSpeakers[label] = cloneReferenceSpeaker(speaker);
   }
 
   const labels = Object.keys(parsed.ranges).sort();
@@ -212,6 +223,7 @@ export function mergeDiarizeData(
         name: label,
         color: speakerColorForIndex(colorIndex),
         trackId: DEFAULT_REFERENCE_TRACK_ID,
+        samples: [],
       };
       colorIndex++;
     }
@@ -284,7 +296,7 @@ export function mergeCombinedData(
 
 /** an uploaded sample video or thumbnail's blob metadata — matches
  *  `FileUploadResult`'s shape (see file-shared.ts), trimmed to the fields
- *  `ReferenceSpeaker`'s own `sampleVideo*`/`thumbnail*` fields need. */
+ *  a `SpeakerSample`'s own `video*`/`thumbnail*` fields need. */
 export interface UploadedSampleMedia {
   blobId: string;
   blake3: string;
@@ -293,21 +305,45 @@ export interface UploadedSampleMedia {
   size: number;
 }
 
+/** every sample clip for a speaker, newest schema (`samples` array) first,
+ *  falling back to the legacy singular fields for documents written before
+ *  `samples` existed (see reference-data-actions.ts's `loadSpeakerSampleMedia()`
+ *  and types.ts's `referenceSpeakerSchema` comments). */
+export function getSpeakerSamples(speaker: ReferenceSpeaker): SpeakerSample[] {
+  if (speaker.samples.length > 0) return speaker.samples;
+  if (!speaker.sampleVideoBlobId) return [];
+  return [
+    {
+      videoBlobId: speaker.sampleVideoBlobId,
+      videoBlake3: speaker.sampleVideoBlake3 ?? "",
+      videoMime: speaker.sampleVideoMime ?? "",
+      videoFilename: speaker.sampleVideoFilename ?? "",
+      videoSize: speaker.sampleVideoSize ?? 0,
+      thumbnailBlobId: speaker.thumbnailBlobId,
+      thumbnailBlake3: speaker.thumbnailBlake3,
+      thumbnailMime: speaker.thumbnailMime,
+      thumbnailFilename: speaker.thumbnailFilename,
+      thumbnailSize: speaker.thumbnailSize,
+    },
+  ];
+}
+
 /**
- * attach an already-uploaded sample video and/or thumbnail to a speaker,
- * creating the speaker entry (with a freshly assigned color) if one
- * doesn't exist yet — a project folder's `*_speaker_samples/` files can be
- * loaded before or after its diarize/transcribe json, in any order, same
- * as `mergeDiarizeData`/`mergeTranscribeData` above.
+ * attach a speaker's full set of uploaded sample clips (replacing whatever
+ * was there before, since a project folder's `*_speaker_samples/` files can
+ * be reloaded wholesale), creating the speaker entry (with a freshly
+ * assigned color) if one doesn't exist yet — a project folder's samples
+ * can be loaded before or after its diarize/transcribe json, in any order,
+ * same as `mergeDiarizeData`/`mergeTranscribeData` above.
  */
-export function mergeSpeakerSampleMedia(
+export function mergeSpeakerSamples(
   referenceSpeakers: Record<string, ReferenceSpeaker>,
   speakerLabel: string,
-  media: { video?: UploadedSampleMedia; thumbnail?: UploadedSampleMedia }
+  samples: SpeakerSample[]
 ): Record<string, ReferenceSpeaker> {
   const nextSpeakers: Record<string, ReferenceSpeaker> = {};
   for (const [label, speaker] of Object.entries(referenceSpeakers)) {
-    nextSpeakers[label] = { ...speaker };
+    nextSpeakers[label] = cloneReferenceSpeaker(speaker);
   }
 
   const existing = nextSpeakers[speakerLabel];
@@ -315,22 +351,24 @@ export function mergeSpeakerSampleMedia(
     name: speakerLabel,
     color: speakerColorForIndex(Object.keys(nextSpeakers).length),
     trackId: DEFAULT_REFERENCE_TRACK_ID,
+    samples: [],
   };
 
-  if (media.video) {
-    target.sampleVideoBlobId = media.video.blobId;
-    target.sampleVideoBlake3 = media.video.blake3;
-    target.sampleVideoMime = media.video.mime;
-    target.sampleVideoFilename = media.video.filename;
-    target.sampleVideoSize = media.video.size;
-  }
-  if (media.thumbnail) {
-    target.thumbnailBlobId = media.thumbnail.blobId;
-    target.thumbnailBlake3 = media.thumbnail.blake3;
-    target.thumbnailMime = media.thumbnail.mime;
-    target.thumbnailFilename = media.thumbnail.filename;
-    target.thumbnailSize = media.thumbnail.size;
-  }
+  target.samples = samples;
+  // keep the legacy singular fields pointed at sample 0 — anything still
+  // reading those directly (or an older client) sees the first sample.
+  const first = samples[0];
+  target.sampleVideoBlobId = first?.videoBlobId;
+  target.sampleVideoBlake3 = first?.videoBlake3;
+  target.sampleVideoMime = first?.videoMime;
+  target.sampleVideoFilename = first?.videoFilename;
+  target.sampleVideoSize = first?.videoSize;
+  target.thumbnailBlobId = first?.thumbnailBlobId;
+  target.thumbnailBlake3 = first?.thumbnailBlake3;
+  target.thumbnailMime = first?.thumbnailMime;
+  target.thumbnailFilename = first?.thumbnailFilename;
+  target.thumbnailSize = first?.thumbnailSize;
+
   nextSpeakers[speakerLabel] = target;
   return nextSpeakers;
 }

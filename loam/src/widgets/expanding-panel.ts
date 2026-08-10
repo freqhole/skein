@@ -81,6 +81,13 @@ export function createExpandingPanel(options: ExpandingPanelOptions): ExpandingP
   function open_(): void {
     if (open) return;
     open = true;
+    // re-append so this panel (and its backdrop) draw above whatever else
+    // has been added to `overlayParent` since construction — otherwise a
+    // panel built earlier in source order (e.g. a sub-dialog created
+    // before its parent dialog) would open underneath its parent, with its
+    // close button unreachable both visually and for pointer hit-testing.
+    overlayParent.addChild(backdrop);
+    overlayParent.addChild(panel);
     backdrop.visible = true;
     panel.visible = true;
     clampPanelPosition();

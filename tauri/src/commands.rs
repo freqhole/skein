@@ -614,6 +614,14 @@ async fn dispatch(
             list_speaker_samples(decode("list_speaker_samples", payload)?).await
         }
 
+        // list video files directly inside a directory — used by stfu's
+        // "load project folder..." action to auto-init the widget's video
+        // when one sits alongside the diarize/transcribe json, instead of
+        // making the user separately pick it by hand afterward.
+        "list_video_files_in_dir" => {
+            list_video_files_in_dir(decode("list_video_files_in_dir", payload)?).await
+        }
+
         // generate a thumbnail for a stored blob. supports image/*, application/pdf,
         // and video/* source types. returns { data: <base64>, mime } or { data: null }.
         "blob_thumbnail" => blob_thumbnail(decode("blob_thumbnail", payload)?, state).await,
@@ -2416,6 +2424,60 @@ async fn list_speaker_samples(args: ListSpeakerSamplesArgs) -> Result<Value, Dis
                 .to_string();
             files.push(json!({ "path": path.to_string_lossy(), "filename": filename }));
         }
+    }
+
+    Ok(json!({ "files": files }))
+}
+
+/// video extensions stfu can play — kept in sync with loam's
+/// `guessMimeFromFilename()` (file-shared.ts).
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "webm", "mov", "mkv", "avi", "m4v", "flv", "wmv", "3gp", "3g2", "ts", "mts", "m2ts",
+    "mpg", "mpeg", "ogv",
+];
+
+#[derive(Debug, Deserialize)]
+struct ListVideoFilesInDirArgs {
+    /// absolute path to a directory (e.g. from the native directory picker)
+    /// to scan for video files.
+    path: String,
+}
+
+/// list every video file directly inside a directory (non-recursive) —
+/// used by stfu's "load project folder..." action to auto-init the
+/// widget's video when one sits alongside the diarize/transcribe json.
+async fn list_video_files_in_dir(args: ListVideoFilesInDirArgs) -> Result<Value, DispatchError> {
+    let mut entries = tokio::fs::read_dir(&args.path).await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })?;
+
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })? {
+        let path = entry.path();
+        let ext_matches = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| VIDEO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+            .unwrap_or(false);
+        if !ext_matches {
+            continue;
+        }
+        let is_file = entry
+            .file_type()
+            .await
+            .map(|t| t.is_file())
+            .unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        files.push(json!({ "path": path.to_string_lossy(), "filename": filename }));
     }
 
     Ok(json!({ "files": files }))

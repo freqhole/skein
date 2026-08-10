@@ -49,6 +49,23 @@ export type AudioClip = z.infer<typeof audioClipSchema>;
 // transcript / diarization
 // ---------------------------------------------------------------------------
 
+/** one speaker sample clip + its thumbnail (process.py's
+ *  `{speaker}_sample_{i}{ext}` / `{speaker}_sample_{i}_thumb.jpg`) — a
+ *  speaker can have several (see `referenceSpeakerSchema.samples` below). */
+export const speakerSampleSchema = z.object({
+  videoBlobId: z.string(),
+  videoBlake3: z.string().default(""),
+  videoMime: z.string().default(""),
+  videoFilename: z.string().default(""),
+  videoSize: z.number().default(0),
+  thumbnailBlobId: z.string().optional(),
+  thumbnailBlake3: z.string().optional(),
+  thumbnailMime: z.string().optional(),
+  thumbnailFilename: z.string().optional(),
+  thumbnailSize: z.number().optional(),
+});
+export type SpeakerSample = z.infer<typeof speakerSampleSchema>;
+
 export const referenceSpeakerSchema = z.object({
   name: z.string().default(""),
   /** pixi hex color used to tint this speaker's transcript segments */
@@ -57,16 +74,18 @@ export const referenceSpeakerSchema = z.object({
    *  the reference dialog — always a valid id from `referenceTracks`
    *  (falls back to the first track's id if its own track was removed). */
   trackId: z.string().default("default"),
-  // -- speaker sample clip (process.py's `{speaker}_sample_{i}{ext}`,
-  // picked up from a `{video title}_speaker_samples/` dir alongside the
-  // rest of a project's reference data — see reference-data-actions.ts) --
+  /** every sample clip process.py generated for this speaker (see
+   *  reference-data-actions.ts's `loadSpeakerSampleMedia()`) — the reference
+   *  dialog's "watch sample" preview lets the user page through these. */
+  samples: z.array(speakerSampleSchema).default([]),
+  // -- legacy single-sample fields, kept only so documents written before
+  // `samples` existed still show their one sample (see reference-data.ts's
+  // `getSpeakerSamples()`) — new code should never write these directly.
   sampleVideoBlobId: z.string().optional(),
   sampleVideoBlake3: z.string().optional(),
   sampleVideoMime: z.string().optional(),
   sampleVideoFilename: z.string().optional(),
   sampleVideoSize: z.number().optional(),
-  // -- speaker sample thumbnail (process.py's `{speaker}_sample_{i}_thumb.jpg`,
-  // a frame grabbed from the middle of the sample clip) --
   thumbnailBlobId: z.string().optional(),
   thumbnailBlake3: z.string().optional(),
   thumbnailMime: z.string().optional(),
@@ -149,13 +168,13 @@ export const stfuSchema = z.object({
   transcriptSegments: z.array(transcriptSegmentSchema).default([]),
   /** speaker groupings shown in the reference dialog — see
    *  `DEFAULT_REFERENCE_TRACK_ID` above. */
-  referenceTracks: z.array(referenceTrackSchema).default([{ id: DEFAULT_REFERENCE_TRACK_ID, label: "" }]),
+  referenceTracks: z.array(referenceTrackSchema).default([{ id: DEFAULT_REFERENCE_TRACK_ID, label: "all speakers" }]),
 
   // -- cut timeline -------------------------------------------------------------
   /** [start, end] ranges (seconds) the user has marked for removal */
   editableSegments: z.array(z.tuple([z.number(), z.number()])).default([]),
-  cutSkipEnabled: z.boolean().default(true),
-  cutMuteEnabled: z.boolean().default(false),
+  cutSkipEnabled: z.boolean().default(false),
+  cutMuteEnabled: z.boolean().default(true),
 
   // -- audio clips track ----------------------------------------------------------
   audioClips: z.array(audioClipSchema).default([]),

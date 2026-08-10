@@ -20,19 +20,21 @@ import { getMediaPlaybackUrl } from "../../src/media";
 import { createExpandingPanel, type ExpandingPanelHandle } from "../../src/widgets/expanding-panel";
 import { createMediaDomOverlay, type MediaDomOverlayHandle } from "../../src/widgets/media-dom-overlay";
 import { createScrollableContent, type ScrollableContent } from "../../src/widgets/scrollable-content";
-import { createSkeinInput, type SkeinInputHandle } from "../../src/widgets/skein-input";
+import { createSkeinInput, FIELD_BG, type SkeinInputHandle } from "../../src/widgets/skein-input";
+import { getSpeakerSamples } from "./reference-data";
 import {
   DEFAULT_REFERENCE_TRACK_ID,
   resolveReferenceTrackId,
   type ReferenceSpeaker,
   type ReferenceTrack,
   type StfuState,
+  type TranscriptSegment,
 } from "./types";
 
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2;
 
-const DIALOG_WIDTH = 460;
+const DIALOG_WIDTH = 560;
 const DIALOG_PAD = 12;
 const HEADER_BTN_HEIGHT = 24;
 const TOP_ROW_Y = 8;
@@ -41,14 +43,32 @@ const MAX_LIST_HEIGHT = 380;
 
 const TRACK_HEADER_HEIGHT = 30;
 const TRACK_GAP = 14;
-const ROW_HEIGHT = 44;
-const ROW_GAP = 4;
-const MOVE_BUTTON_SIZE = 32;
-const THUMB_WIDTH = 44;
-const THUMB_HEIGHT = 28;
-const WATCH_BUTTON_SIZE = 22;
+// each speaker "row" is a vertically-stacked card: a wide/tall sample
+// carousel (image, paged with prev/next arrows, tap to watch the video) on
+// top of the editable name field below it.
+const CAROUSEL_HEIGHT = 170;
+const CAROUSEL_ARROW_SIZE = 32;
+// keeps the prev/next arrows clear of the inline video overlay (a real DOM
+// element that always paints over pixi-rendered content) by insetting the
+// video horizontally, rather than covering the full carousel width.
+const CAROUSEL_VIDEO_INSET = CAROUSEL_ARROW_SIZE + 14;
+const NAME_ROW_HEIGHT = 44;
+const CARD_GAP = 6; // between the carousel and the name field
+const ROW_HEIGHT = CAROUSEL_HEIGHT + CARD_GAP + NAME_ROW_HEIGHT;
+const ROW_GAP = 12;
+const MOVE_BUTTON_SIZE = 34;
 const DELETE_TRACK_BTN_WIDTH = 56;
 const DELETE_TRACK_BTN_HEIGHT = 20;
+const COPY_TRACK_BTN_WIDTH = 96;
+const COPY_TRACK_BTN_HEIGHT = 20;
+// gap kept between the track-label input and whichever header buttons
+// (copy/delete) trail it, so they never visually collide.
+const HEADER_ITEM_GAP = 10;
+// alternating shades (slightly lighter/darker than the panel's own
+// 0x222222) drawn behind each track group so the grouping reads at a
+// glance, without needing yet another border.
+const TRACK_GROUP_BG_EVEN = 0x272727;
+const TRACK_GROUP_BG_ODD = 0x202020;
 
 // "drop zone" bins shown in place of the row list while picking a
 // destination track for a speaker — one per track OTHER than its current one.
@@ -63,6 +83,10 @@ export interface ReferenceDialogOptions {
   canvasElement: HTMLCanvasElement;
   getReferenceSpeakers: () => Record<string, ReferenceSpeaker>;
   getReferenceTracks: () => ReferenceTrack[];
+  /** diarized/transcribed segments — used to compute each speaker's total
+   *  speaking time and share of the video shown in their row. */
+  getTranscriptSegments: () => TranscriptSegment[];
+  getVideoDurationSec: () => number;
   changeDoc: (fn: (d: StfuState) => void) => void;
   getPeers?: () => PeersMap | undefined;
   /** fires as the dialog (or its "watch sample" sub-dialog) opens/closes —
@@ -93,7 +117,7 @@ export interface ReferenceDialogHandle {
 // guard against it being missing/empty first.
 function ensureReferenceTracks(d: StfuState): void {
   if (!Array.isArray(d.referenceTracks) || d.referenceTracks.length === 0) {
-    d.referenceTracks = [{ id: DEFAULT_REFERENCE_TRACK_ID, label: "" }];
+    d.referenceTracks = [{ id: DEFAULT_REFERENCE_TRACK_ID, label: "all speakers" }];
   }
 }
 
@@ -166,7 +190,17 @@ function fitSpriteInBox(sprite: Sprite, boxW: number, boxH: number): void {
 }
 
 export function createReferenceDialog(options: ReferenceDialogOptions): ReferenceDialogHandle {
-  const { overlayParent, canvasElement, getReferenceSpeakers, getReferenceTracks, changeDoc, getPeers, onOpenChange } = options;
+  const {
+    overlayParent,
+    canvasElement,
+    getReferenceSpeakers,
+    getReferenceTracks,
+    getTranscriptSegments,
+    getVideoDurationSec,
+    changeDoc,
+    getPeers,
+    onOpenChange,
+  } = options;
 
   let overlayWidth = 0;
   let overlayHeight = 0;
@@ -185,7 +219,8 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
     style: { fontFamily: FONT_FAMILY, fontSize: 12, fontWeight: "700", fill: 0xffffff },
     resolution: TEXT_RESOLUTION,
   });
-  titleText.position.set(DIALOG_PAD, 10);
+  titleText.anchor.set(0, 0.5);
+  titleText.position.set(DIALOG_PAD, TOP_ROW_Y + HEADER_BTN_HEIGHT / 2);
   panel.addChild(titleText);
 
   const addTrackButton = makeSecondaryButton("+ add track", () => {
@@ -311,6 +346,7 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
   /** hides the normal row list and shows one tappable drop-zone bin per
    *  track other than `sourceTrackId` — called once a "move" tap starts. */
   function showDropZones(sourceTrackId: string): void {
+    if (activeVideoRow) closeRowVideo(activeVideoRow); // row list is about to be hidden
     const tracks = getReferenceTracks();
     const speakers = getReferenceSpeakers();
     const targets = tracks.filter((t) => t.id !== sourceTrackId);
@@ -349,11 +385,18 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
 
   interface TrackSection {
     container: Container;
+    /** alternating-shade backdrop spanning the whole group (header + rows)
+     *  so the grouping is visible at a glance. */
+    groupBg: Graphics;
     headerBg: Graphics;
     headerLabel: Text;
     input: SkeinInputHandle;
     removeButton: Container;
     removeLabel: Text;
+    /** copies every transcript segment belonging to this track's speakers
+     *  onto the cut track's segment timeline (`d.editableSegments`). */
+    copyButton: Container;
+    copyLabel: Text;
     rows: SpeakerRow[];
     /** which track this pooled section currently represents — read by the
      *  input's own `onChange` closure, updated synchronously in
@@ -362,27 +405,98 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
   }
   interface SpeakerRow {
     container: Container;
+    /** fills the whole card the same color as the name input's own
+     *  background, so the gaps around/below it don't show through as a
+     *  mismatched strip. */
+    cardBg: Graphics;
+    /** color-coded outline around the whole card (carousel + name field). */
+    rowBorder: Graphics;
+    carouselSlot: Container;
+    carouselBg: Graphics;
+    carouselSprite: Sprite;
+    /** anchor for the inline video overlay, inset from the carousel's edges
+     *  so the prev/next arrows stay visible/clickable while a video plays. */
+    videoSlot: Container;
+    prevArrow: Container;
+    nextArrow: Container;
+    indexText: Text;
+    /** total speaking time + share of the video, e.g. "2:34 (18%)" —
+     *  derived from `transcriptSegments`, refreshed alongside the rest of
+     *  the row. */
+    statsText: Text;
     moveButton: Container;
     moveBg: Graphics;
     moveLabel: Text;
-    thumbSlot: Container;
-    thumbBg: Graphics;
-    thumbSprite: Sprite;
     /** editable display name — writes to `referenceSpeakers[speaker].name`;
      *  the original diarization label (`speaker` below) is never changed. */
     nameInput: SkeinInputHandle;
-    watchButton: Container;
-    watchBg: Graphics;
-    watchLabel: Text;
     speaker: string;
+    /** which track `speaker` currently belongs to — kept in sync with
+     *  `speaker` in `refreshPanel()`, read by `moveButton`'s tap handler. */
+    currentTrackId: string;
+    /** which slide the carousel is currently showing — each sample
+     *  contributes two slides (its thumbnail, then its video; see
+     *  `sampleIndexForSlide()`/`isVideoSlide()`) — reset to 0 whenever this
+     *  pooled row gets recycled to a new speaker. */
+    carouselSlide: number;
     thumbKey: string | null;
+    /** the inline video overlay currently playing in this row's carousel
+     *  (see `playRowVideo()`/`closeRowVideo()`), or null when showing the
+     *  static thumbnail. */
+    videoOverlay: MediaDomOverlayHandle | null;
+    videoKey: string | null;
   }
 
   const trackSectionPool: TrackSection[] = [];
 
+  function makeCarouselArrowButton(glyph: string): Container {
+    const button = new Container();
+    button.eventMode = "static";
+    button.cursor = "pointer";
+    button.hitArea = new Rectangle(0, 0, CAROUSEL_ARROW_SIZE, CAROUSEL_ARROW_SIZE);
+    const bg = new Graphics()
+      .roundRect(0, 0, CAROUSEL_ARROW_SIZE, CAROUSEL_ARROW_SIZE, 4)
+      .fill({ color: 0x000000, alpha: 0.45 });
+    const label = new Text({
+      text: glyph,
+      style: { fontFamily: FONT_FAMILY, fontSize: 18, fill: 0xf0f0f0 },
+      resolution: TEXT_RESOLUTION,
+    });
+    label.anchor.set(0.5);
+    label.position.set(CAROUSEL_ARROW_SIZE / 2, CAROUSEL_ARROW_SIZE / 2);
+    button.addChild(bg, label);
+    return button;
+  }
+
   function makeSpeakerRow(parent: Container): SpeakerRow {
     const container = new Container();
     container.eventMode = "static";
+
+    const cardBg = new Graphics();
+    const rowBorder = new Graphics();
+
+    const carouselSlot = new Container();
+    carouselSlot.eventMode = "static";
+    carouselSlot.cursor = "pointer";
+    const carouselBg = new Graphics();
+    const carouselSprite = new Sprite(Texture.EMPTY);
+    carouselSprite.visible = false;
+    carouselSlot.addChild(carouselBg, carouselSprite);
+
+    const videoSlot = new Container();
+
+    const prevArrow = makeCarouselArrowButton("\u2039");
+    const nextArrow = makeCarouselArrowButton("\u203a");
+    const indexText = new Text({
+      text: "",
+      style: { fontFamily: FONT_FAMILY, fontSize: 10, fill: 0xe2e2e2 },
+      resolution: TEXT_RESOLUTION,
+    });
+    const statsText = new Text({
+      text: "",
+      style: { fontFamily: FONT_FAMILY, fontSize: 10, fill: 0xe2e2e2 },
+      resolution: TEXT_RESOLUTION,
+    });
 
     const moveButton = new Container();
     moveButton.eventMode = "static";
@@ -390,41 +504,73 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
     const moveBg = new Graphics();
     const moveLabel = new Text({
       text: "\u21c4",
-      style: { fontFamily: FONT_FAMILY, fontSize: 15, fill: 0xe2e2e2 },
+      style: { fontFamily: FONT_FAMILY, fontSize: 17, fill: 0xe2e2e2 },
       resolution: TEXT_RESOLUTION,
     });
     moveLabel.anchor.set(0.5);
     moveButton.addChild(moveBg, moveLabel);
 
-    const thumbSlot = new Container();
-    const thumbBg = new Graphics();
-    const thumbSprite = new Sprite(Texture.EMPTY);
-    thumbSprite.visible = false;
-    thumbSlot.addChild(thumbBg, thumbSprite);
-
     const row: SpeakerRow = {
       container,
+      cardBg,
+      rowBorder,
+      carouselSlot,
+      carouselBg,
+      carouselSprite,
+      videoSlot,
+      prevArrow,
+      nextArrow,
+      indexText,
+      statsText,
       moveButton,
       moveBg,
       moveLabel,
-      thumbSlot,
-      thumbBg,
-      thumbSprite,
       // assigned just below — TypeScript can't see that yet, so this object
       // is built incrementally rather than in one literal (matches
       // `makeTrackSection()`'s own input-field pattern above).
       nameInput: undefined as unknown as SkeinInputHandle,
-      watchButton: undefined as unknown as Container,
-      watchBg: undefined as unknown as Graphics,
-      watchLabel: undefined as unknown as Text,
       speaker: "",
+      currentTrackId: "",
+      carouselSlide: 0,
       thumbKey: null,
+      videoOverlay: null,
+      videoKey: null,
     };
+
+    // every handler below reads `row.*` at tap-time (not a per-refresh
+    // closure capture) — safe because a pooled row's fields are always
+    // updated in place, never replaced, so they're current by the time a
+    // user can actually tap.
+    carouselSlot.on("pointertap", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      if (!row.speaker || row.videoOverlay) return; // no speaker, or already playing
+      pageCarousel(1); // tapping the thumbnail jumps straight to that sample's video
+    });
+    const pageCarousel = (delta: number) => {
+      const speaker = row.speaker ? getReferenceSpeakers()[row.speaker] : undefined;
+      const total = slideCountFor(speaker);
+      if (total === 0) return;
+      row.carouselSlide = (row.carouselSlide + delta + total) % total;
+      row.indexText.text = total > 1 ? `${row.carouselSlide + 1} / ${total}` : "";
+      renderCarouselSlide(row, speaker);
+    };
+    prevArrow.on("pointertap", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      pageCarousel(-1);
+    });
+    nextArrow.on("pointertap", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      pageCarousel(1);
+    });
+    moveButton.on("pointertap", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      if (row.speaker) startMove(row.speaker, row.currentTrackId);
+    });
 
     const nameInput = createSkeinInput({
       canvasElement,
       width: 100,
-      height: ROW_HEIGHT - 12,
+      height: NAME_ROW_HEIGHT - 8,
       fontSize: 12,
       textColor: 0xdddddd,
       onChange: (v) => {
@@ -437,22 +583,18 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
     });
     row.nameInput = nameInput;
 
-    const watchButton = new Container();
-    watchButton.eventMode = "static";
-    watchButton.cursor = "pointer";
-    const watchBg = new Graphics();
-    const watchLabel = new Text({
-      text: "\u25b6",
-      style: { fontFamily: FONT_FAMILY, fontSize: 10, fill: 0xe2e2e2 },
-      resolution: TEXT_RESOLUTION,
-    });
-    watchLabel.anchor.set(0.5);
-    watchButton.addChild(watchBg, watchLabel);
-    row.watchButton = watchButton;
-    row.watchBg = watchBg;
-    row.watchLabel = watchLabel;
-
-    container.addChild(moveButton, thumbSlot, nameInput.input, watchButton);
+    container.addChild(
+      cardBg,
+      carouselSlot,
+      videoSlot,
+      prevArrow,
+      nextArrow,
+      indexText,
+      statsText,
+      moveButton,
+      nameInput.input,
+      rowBorder
+    );
     parent.addChild(container);
 
     return row;
@@ -462,6 +604,7 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
     const container = new Container();
     scrollable.content.addChild(container);
 
+    const groupBg = new Graphics();
     const headerBg = new Graphics();
     const headerLabel = new Text({
       text: "",
@@ -470,13 +613,17 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
     });
     const section: TrackSection = {
       container,
+      groupBg,
       headerBg,
       headerLabel,
-      // `input` is assigned just below — TypeScript can't see that yet, so
-      // this object is built incrementally rather than in one literal.
+      // `input`/`copyButton` are assigned just below — TypeScript can't see
+      // that yet, so this object is built incrementally rather than in one
+      // literal.
       input: undefined as unknown as SkeinInputHandle,
       removeButton: undefined as unknown as Container,
       removeLabel: undefined as unknown as Text,
+      copyButton: undefined as unknown as Container,
+      copyLabel: undefined as unknown as Text,
       rows: [],
       currentTrackId: "",
     };
@@ -520,7 +667,29 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
     section.removeButton = removeButton;
     section.removeLabel = removeLabel;
 
-    container.addChild(headerBg, headerLabel, input.input, removeButton);
+    const copyButton = new Container();
+    copyButton.eventMode = "static";
+    copyButton.cursor = "pointer";
+    const copyBg = new Graphics();
+    const paintCopyBg = (color: number) =>
+      copyBg.clear().roundRect(0, 0, COPY_TRACK_BTN_WIDTH, COPY_TRACK_BTN_HEIGHT, 4).fill({ color });
+    paintCopyBg(0x4d1140);
+    const copyLabel = new Text({
+      text: "copy to cuts",
+      style: { fontFamily: FONT_FAMILY, fontSize: 10, fill: 0xdddddd },
+      resolution: TEXT_RESOLUTION,
+    });
+    copyLabel.anchor.set(0.5);
+    copyLabel.position.set(COPY_TRACK_BTN_WIDTH / 2, COPY_TRACK_BTN_HEIGHT / 2);
+    copyButton.addChild(copyBg, copyLabel);
+    copyButton.hitArea = new Rectangle(0, 0, COPY_TRACK_BTN_WIDTH, COPY_TRACK_BTN_HEIGHT);
+    copyButton.on("pointerover", () => paintCopyBg(0x671758));
+    copyButton.on("pointerout", () => paintCopyBg(0x4d1140));
+    copyButton.visible = false;
+    section.copyButton = copyButton;
+    section.copyLabel = copyLabel;
+
+    container.addChild(groupBg, headerBg, headerLabel, input.input, removeButton, copyButton);
 
     return section;
   }
@@ -537,30 +706,75 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
 
   // -- thumbnail loading ---------------------------------------------------------
 
-  function loadRowThumbnail(row: SpeakerRow, speaker: ReferenceSpeaker): void {
-    const blobId = speaker.thumbnailBlobId;
-    if (!blobId) {
+  /** each sample contributes 2 carousel slides: its thumbnail, then its
+   *  video — so browsing a speaker's samples pages through image, video,
+   *  image, video, ... rather than needing a tap to reveal each video. */
+  function slideCountFor(speaker: ReferenceSpeaker | undefined): number {
+    return speaker ? getSpeakerSamples(speaker).length * 2 : 0;
+  }
+  function sampleIndexForSlide(slide: number): number {
+    return Math.floor(slide / 2);
+  }
+  function isVideoSlide(slide: number): boolean {
+    return slide % 2 === 1;
+  }
+
+  /** e.g. "2:34 (18%)" — share is omitted once no video duration is known
+   *  yet, and the whole string is blank for a speaker with no segments. */
+  function formatSpeakingStats(totalSec: number, videoDurationSec: number): string {
+    if (totalSec <= 0) return "";
+    const m = Math.floor(totalSec / 60);
+    const s = Math.round(totalSec % 60);
+    const time = `${m}:${String(s).padStart(2, "0")}`;
+    if (videoDurationSec <= 0) return time;
+    const pct = Math.round((totalSec / videoDurationSec) * 100);
+    return `${time} (${pct}%)`;
+  }
+
+  /** show whichever of the row's current slide (thumbnail or video) is due
+   *  — called on initial layout and every time `carouselSlide` changes. */
+  function renderCarouselSlide(row: SpeakerRow, speaker: ReferenceSpeaker | undefined): void {
+    if (!speaker || slideCountFor(speaker) === 0) {
+      closeRowVideo(row);
       row.thumbKey = null;
-      row.thumbSprite.visible = false;
+      row.carouselSprite.visible = false;
       return;
     }
-    const key = `${blobId}:${speaker.thumbnailBlake3 ?? ""}`;
+    const sampleIndex = sampleIndexForSlide(row.carouselSlide);
+    if (isVideoSlide(row.carouselSlide)) {
+      row.carouselSprite.visible = false;
+      void playRowVideo(row, sampleIndex);
+    } else {
+      closeRowVideo(row);
+      loadCarouselThumbnail(row, speaker, sampleIndex);
+    }
+  }
+
+  function loadCarouselThumbnail(row: SpeakerRow, speaker: ReferenceSpeaker, sampleIndex: number): void {
+    const sample = getSpeakerSamples(speaker)[sampleIndex];
+    const blobId = sample?.thumbnailBlobId;
+    if (!blobId) {
+      row.thumbKey = null;
+      row.carouselSprite.visible = false;
+      return;
+    }
+    const key = `${sampleIndex}:${blobId}:${sample.thumbnailBlake3 ?? ""}`;
     if (row.thumbKey === key) return; // already showing (or loading) this thumbnail
     row.thumbKey = key;
-    row.thumbSprite.visible = false;
+    row.carouselSprite.visible = false;
     void (async () => {
       const url = await getMediaPlaybackUrl(blobId, {
         category: "image",
-        mime: speaker.thumbnailMime,
-        blake3: speaker.thumbnailBlake3,
+        mime: sample.thumbnailMime,
+        blake3: sample.thumbnailBlake3,
         peers: getPeers?.(),
       });
       if (!url || row.thumbKey !== key) return; // row got recycled to a different speaker/thumbnail meanwhile
       try {
         const texture = await loadTexture(url);
         if (row.thumbKey !== key) return;
-        row.thumbSprite.texture = texture;
-        fitSpriteInBox(row.thumbSprite, THUMB_WIDTH, THUMB_HEIGHT);
+        row.carouselSprite.texture = texture;
+        fitSpriteInBox(row.carouselSprite, DIALOG_WIDTH - DIALOG_PAD * 2, CAROUSEL_HEIGHT);
       } catch (err) {
         console.error(`stfu widget: failed to load thumbnail for reference dialog:`, err);
       }
@@ -598,113 +812,68 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
     refreshPanel();
   }
 
-  // -- "watch sample" sub-dialog -------------------------------------------------
+  // -- inline row video playback -------------------------------------------------
+  // tapping a row's carousel plays that sample's video right there (a DOM
+  // overlay tracking the carousel's screen rect, same mechanism the old
+  // "watch sample" popup used) instead of opening a separate dialog. only
+  // one row plays at a time.
 
-  const PREVIEW_WIDTH = 360;
-  const PREVIEW_VIDEO_HEIGHT = 202; // 16:9 at 360 wide
-  const PREVIEW_PAD = 12;
+  let activeVideoRow: SpeakerRow | null = null;
 
-  const previewPanel = new Container();
-  previewPanel.eventMode = "static";
-  previewPanel.on("pointerdown", (e) => e.stopPropagation());
-
-  const previewBg = new Graphics();
-  previewPanel.addChild(previewBg);
-
-  const previewTitle = new Text({
-    text: "",
-    style: { fontFamily: FONT_FAMILY, fontSize: 12, fontWeight: "700", fill: 0xffffff },
-    resolution: TEXT_RESOLUTION,
-  });
-  previewTitle.position.set(PREVIEW_PAD, 10);
-  previewPanel.addChild(previewTitle);
-
-  const previewCloseButton = new Container();
-  previewCloseButton.eventMode = "static";
-  previewCloseButton.cursor = "pointer";
-  const previewCloseLabel = new Text({
-    text: "\u2715",
-    style: { fontFamily: FONT_FAMILY, fontSize: 12, fill: 0x999999 },
-    resolution: TEXT_RESOLUTION,
-  });
-  previewCloseLabel.anchor.set(0.5);
-  previewCloseLabel.position.set(12, 12);
-  previewCloseButton.hitArea = new Rectangle(0, 0, 24, 24);
-  previewCloseButton.addChild(previewCloseLabel);
-  previewPanel.addChild(previewCloseButton);
-  previewCloseButton.on("pointertap", (e: FederatedPointerEvent) => {
-    e.stopPropagation();
-    previewExpandingPanel.close();
-  });
-
-  const videoSlot = new Container();
-  videoSlot.position.set(PREVIEW_PAD, 36);
-  previewPanel.addChild(videoSlot);
-
-  const previewVideoAreaHeight = PREVIEW_VIDEO_HEIGHT;
-  previewBg
-    .clear()
-    .roundRect(0, 0, PREVIEW_WIDTH, 36 + previewVideoAreaHeight + PREVIEW_PAD, 8)
-    .fill({ color: 0x1a1a1a })
-    .stroke({ width: 1, color: 0x3a3a3a });
-  previewCloseButton.x = PREVIEW_WIDTH - 24;
-  previewCloseButton.y = 8;
-
-  let sampleOverlay: MediaDomOverlayHandle | null = null;
-
-  function closeSamplePreview(): void {
-    sampleOverlay?.close();
-    sampleOverlay = null;
+  function closeRowVideo(row: SpeakerRow): void {
+    row.videoOverlay?.close();
+    row.videoOverlay = null;
+    row.videoKey = null;
+    if (activeVideoRow === row) activeVideoRow = null;
   }
 
-  function centerPreviewPanel(): void {
-    const h = 36 + previewVideoAreaHeight + PREVIEW_PAD;
-    previewPanel.x = Math.max(0, (overlayWidth - PREVIEW_WIDTH) / 2);
-    previewPanel.y = Math.max(0, (overlayHeight - h) / 2);
-  }
+  async function playRowVideo(row: SpeakerRow, sampleIndex: number): Promise<void> {
+    if (!row.speaker) return;
+    const speaker = getReferenceSpeakers()[row.speaker];
+    const samples = speaker ? getSpeakerSamples(speaker) : [];
+    const sample = samples[sampleIndex];
+    if (!sample) return;
 
-  const previewExpandingPanel: ExpandingPanelHandle = createExpandingPanel({
-    overlayParent,
-    panel: previewPanel,
-    onOpenChange: (open) => {
-      if (!open) closeSamplePreview();
-      onOpenChange?.(open);
-    },
-  });
+    const key = `${row.speaker}:${sampleIndex}:${sample.videoBlobId}`;
+    row.videoKey = key;
+    if (activeVideoRow && activeVideoRow !== row) closeRowVideo(activeVideoRow);
 
-  async function openSamplePreview(speaker: ReferenceSpeaker, label: string): Promise<void> {
-    if (!speaker.sampleVideoBlobId) return;
-    previewTitle.text = label;
-    previewExpandingPanel.resize(overlayWidth, overlayHeight);
-    centerPreviewPanel();
-    previewExpandingPanel.open();
-    closeSamplePreview();
-    const url = await getMediaPlaybackUrl(speaker.sampleVideoBlobId, {
+    const url = await getMediaPlaybackUrl(sample.videoBlobId, {
       category: "video",
-      mime: speaker.sampleVideoMime,
-      blake3: speaker.sampleVideoBlake3,
+      mime: sample.videoMime,
+      blake3: sample.videoBlake3,
       peers: getPeers?.(),
     });
-    if (!url || !previewExpandingPanel.isOpen) return;
-    sampleOverlay = createMediaDomOverlay({
+    if (!url || row.videoKey !== key) return; // paged/recycled/closed meanwhile
+
+    row.videoOverlay?.close();
+    row.videoOverlay = createMediaDomOverlay({
       src: url,
-      mime: speaker.sampleVideoMime,
-      container: videoSlot,
+      mime: sample.videoMime,
+      container: row.videoSlot,
       canvasElement,
-      getSize: () => ({ width: PREVIEW_WIDTH - PREVIEW_PAD * 2, height: previewVideoAreaHeight }),
+      getSize: () => ({ width: DIALOG_WIDTH - DIALOG_PAD * 2 - CAROUSEL_VIDEO_INSET * 2, height: CAROUSEL_HEIGHT }),
       muted: false,
       loop: false,
       controls: true,
       objectFit: "contain",
     });
+    activeVideoRow = row;
   }
 
   // -- layout / refresh -----------------------------------------------------------
+
 
   function refreshPanel(): void {
     const speakers = getReferenceSpeakers();
     const tracks = getReferenceTracks();
     const labels = Object.keys(speakers).sort();
+    const videoDurationSec = getVideoDurationSec();
+    const speakingSeconds = new Map<string, number>();
+    for (const seg of getTranscriptSegments()) {
+      if (!seg.speaker) continue;
+      speakingSeconds.set(seg.speaker, (speakingSeconds.get(seg.speaker) ?? 0) + Math.max(0, seg.end - seg.start));
+    }
 
     const contentWidth = DIALOG_WIDTH - DIALOG_PAD * 2;
 
@@ -715,6 +884,9 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
     dropZonesContainer.visible = false;
     scrollable.content.visible = true;
     titleText.text = "reference speakers";
+    // pooled rows may get reassigned to a different speaker/order below —
+    // stop whatever was playing rather than risk it ending up detached.
+    if (activeVideoRow) closeRowVideo(activeVideoRow);
 
     // header buttons
     addTrackButton.container.visible = true;
@@ -746,14 +918,26 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
         section.container.visible = true;
         section.container.y = y;
 
+        const members = byTrack.get(track.id) ?? [];
         const showTrackChrome = tracks.length > 1;
+        // a lone, unnamed default track would just repeat the dialog's own
+        // "reference speakers" title — skip its header row entirely then.
+        const showHeaderLabel = !showTrackChrome && !!track.label;
+        const showHeader = showTrackChrome || showHeaderLabel;
+        const showCopyButton = showHeader && members.length > 0;
         section.input.input.visible = showTrackChrome;
         section.removeButton.visible = showTrackChrome;
-        section.headerLabel.visible = !showTrackChrome;
+        section.copyButton.visible = showCopyButton;
+        section.headerLabel.visible = showHeaderLabel;
+        section.headerBg.visible = showHeader;
 
         if (showTrackChrome) {
           section.currentTrackId = track.id;
           if (!section.input.isEditing) section.input.value = track.label;
+          // leaves room (plus a gap) for the copy/delete buttons trailing it.
+          section.input.setWidth(
+            contentWidth - DELETE_TRACK_BTN_WIDTH - HEADER_ITEM_GAP - (showCopyButton ? COPY_TRACK_BTN_WIDTH + HEADER_ITEM_GAP : 0)
+          );
           section.input.input.position.set(0, 3);
           section.removeButton.x = contentWidth - DELETE_TRACK_BTN_WIDTH;
           section.removeButton.y = (TRACK_HEADER_HEIGHT - DELETE_TRACK_BTN_HEIGHT) / 2;
@@ -779,8 +963,8 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
             });
             refreshPanel();
           });
-        } else {
-          section.headerLabel.text = track.label || "reference speakers";
+        } else if (showHeaderLabel) {
+          section.headerLabel.text = track.label;
           section.headerLabel.position.set(0, 6);
         }
 
@@ -789,57 +973,92 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
           .roundRect(0, 0, contentWidth, TRACK_HEADER_HEIGHT, 4)
           .fill({ color: 0x262626 });
 
-        const members = byTrack.get(track.id) ?? [];
+        const headerHeight = showHeader ? TRACK_HEADER_HEIGHT + 6 : 0;
+
+        // -- "copy to cuts" button: pushes this group's transcript segments
+        // onto the cut track's segment timeline (`d.editableSegments`) ------
+        if (showCopyButton) {
+          section.copyButton.x = contentWidth - (showTrackChrome ? DELETE_TRACK_BTN_WIDTH + HEADER_ITEM_GAP : 0) - COPY_TRACK_BTN_WIDTH;
+          section.copyButton.y = (TRACK_HEADER_HEIGHT - COPY_TRACK_BTN_HEIGHT) / 2;
+          section.copyButton.off("pointertap").on("pointertap", (e: FederatedPointerEvent) => {
+            e.stopPropagation();
+            const memberSet = new Set(members);
+            changeDoc((d) => {
+              const existing = new Set(d.editableSegments.map(([s, en]) => `${s}:${en}`));
+              for (const seg of d.transcriptSegments) {
+                if (!memberSet.has(seg.speaker)) continue;
+                const key = `${seg.start}:${seg.end}`;
+                if (existing.has(key)) continue;
+                existing.add(key);
+                d.editableSegments.push([seg.start, seg.end]);
+              }
+            });
+          });
+        }
+
         members.forEach((label, rowIdx) => {
           const row = rowAt(section, rowIdx);
           const speaker = speakers[label];
+          const totalSlides = slideCountFor(speaker);
+          if (row.speaker !== label) row.carouselSlide = 0; // row recycled for a new speaker
           row.speaker = label;
+          row.currentTrackId = track.id;
+          row.carouselSlide = totalSlides > 0 ? Math.min(row.carouselSlide, totalSlides - 1) : 0;
           row.container.visible = true;
-          row.container.y = TRACK_HEADER_HEIGHT + 6 + rowIdx * (ROW_HEIGHT + ROW_GAP);
+          row.container.y = headerHeight + rowIdx * (ROW_HEIGHT + ROW_GAP);
           row.container.hitArea = new Rectangle(0, 0, contentWidth, ROW_HEIGHT);
 
+          const color = speaker?.color ?? 0x60a5fa;
+
+          // -- whole-card fill (matches the name input's own bg, below) plus
+          // its color-coded outline --------------------------------------
+          row.cardBg.clear().roundRect(0, 0, contentWidth, ROW_HEIGHT, 8).fill({ color: FIELD_BG });
+          row.rowBorder.clear().roundRect(0, 0, contentWidth, ROW_HEIGHT, 8).stroke({ width: 2, color });
+
+          // -- carousel (sample thumbnail/video, paged with prev/next arrows) --
+          row.carouselSlot.x = 0;
+          row.carouselSlot.y = 0;
+          row.carouselSlot.hitArea = new Rectangle(0, 0, contentWidth, CAROUSEL_HEIGHT);
+          row.carouselBg.clear().roundRect(0, 0, contentWidth, CAROUSEL_HEIGHT, 6).fill({ color: 0x111111 });
+          renderCarouselSlide(row, speaker);
+          row.videoSlot.position.set(CAROUSEL_VIDEO_INSET, 0);
+
+          const hasMultipleSlides = totalSlides > 1;
+          row.prevArrow.visible = hasMultipleSlides;
+          row.nextArrow.visible = hasMultipleSlides;
+          row.prevArrow.position.set(8, (CAROUSEL_HEIGHT - CAROUSEL_ARROW_SIZE) / 2);
+          row.nextArrow.position.set(contentWidth - CAROUSEL_ARROW_SIZE - 8, (CAROUSEL_HEIGHT - CAROUSEL_ARROW_SIZE) / 2);
+          row.indexText.text = hasMultipleSlides ? `${row.carouselSlide + 1} / ${totalSlides}` : "";
+          row.indexText.position.set(
+            contentWidth - row.indexText.width - 10,
+            CAROUSEL_HEIGHT - row.indexText.height - 6
+          );
+          row.statsText.text = formatSpeakingStats(speakingSeconds.get(label) ?? 0, videoDurationSec);
+          row.statsText.position.set(10, CAROUSEL_HEIGHT - row.statsText.height - 6);
+
+          // -- move-to-another-track button, overlaid on the carousel's top-left corner
           row.moveButton.visible = tracks.length > 1;
           row.moveButton.hitArea = new Rectangle(0, 0, MOVE_BUTTON_SIZE, MOVE_BUTTON_SIZE);
-          row.moveButton.y = (ROW_HEIGHT - MOVE_BUTTON_SIZE) / 2;
-          row.moveBg.clear().roundRect(0, 0, MOVE_BUTTON_SIZE, MOVE_BUTTON_SIZE, 4).fill({ color: 0x3a3a3a });
+          row.moveButton.position.set(6, 6);
+          row.moveBg.clear().roundRect(0, 0, MOVE_BUTTON_SIZE, MOVE_BUTTON_SIZE, 4).fill({ color: 0x000000, alpha: 0.45 });
           row.moveLabel.position.set(MOVE_BUTTON_SIZE / 2, MOVE_BUTTON_SIZE / 2);
-          row.moveButton.off("pointertap").on("pointertap", (e: FederatedPointerEvent) => {
-            e.stopPropagation();
-            startMove(label, track.id);
-          });
 
-          const thumbX = MOVE_BUTTON_SIZE + 10;
-          row.thumbSlot.x = thumbX;
-          row.thumbSlot.y = (ROW_HEIGHT - THUMB_HEIGHT) / 2;
-          const color = speaker?.color ?? 0x60a5fa;
-          row.thumbBg.clear().roundRect(0, 0, THUMB_WIDTH, THUMB_HEIGHT, 3).fill({ color: 0x111111 }).stroke({
-            width: 1.5,
-            color,
-          });
-          if (speaker) loadRowThumbnail(row, speaker);
-          else row.thumbSprite.visible = false;
-
-          const labelX = thumbX + THUMB_WIDTH + 10;
-          const nameInputWidth = Math.max(60, contentWidth - labelX - WATCH_BUTTON_SIZE - 18);
-          row.nameInput.setWidth(nameInputWidth);
+          // -- name field, full width below the carousel — no border of its
+          // own, so it blends seamlessly into the card's matching background
+          row.nameInput.setWidth(contentWidth);
+          row.nameInput.setBorderColor(FIELD_BG);
           row.nameInput.setPlaceholder(label);
           if (!row.nameInput.isEditing) row.nameInput.value = speaker?.name || "";
-          row.nameInput.input.position.set(labelX, (ROW_HEIGHT - (ROW_HEIGHT - 12)) / 2);
-
-          row.watchButton.x = contentWidth - WATCH_BUTTON_SIZE;
-          row.watchButton.y = (ROW_HEIGHT - WATCH_BUTTON_SIZE) / 2;
-          row.watchButton.visible = !!speaker?.sampleVideoBlobId;
-          row.watchBg.clear().roundRect(0, 0, WATCH_BUTTON_SIZE, WATCH_BUTTON_SIZE, 4).fill({ color: 0x3a3a3a });
-          row.watchLabel.position.set(WATCH_BUTTON_SIZE / 2, WATCH_BUTTON_SIZE / 2);
-          row.watchButton.off("pointertap").on("pointertap", (e: FederatedPointerEvent) => {
-            e.stopPropagation();
-            if (speaker) void openSamplePreview(speaker, label);
-          });
+          row.nameInput.input.position.set(0, CAROUSEL_HEIGHT + CARD_GAP);
         });
         for (let i = members.length; i < section.rows.length; i++) section.rows[i].container.visible = false;
 
         const rowsHeight = members.length > 0 ? members.length * (ROW_HEIGHT + ROW_GAP) - ROW_GAP : 0;
-        const sectionHeight = TRACK_HEADER_HEIGHT + 6 + rowsHeight + 6;
+        const sectionHeight = headerHeight + rowsHeight + (showHeader ? 6 : 0);
+        section.groupBg
+          .clear()
+          .roundRect(-6, -6, contentWidth + 12, sectionHeight + 12, 8)
+          .fill({ color: sectionIdx % 2 === 0 ? TRACK_GROUP_BG_EVEN : TRACK_GROUP_BG_ODD });
         y += sectionHeight + TRACK_GAP;
       });
       for (let i = tracks.length; i < trackSectionPool.length; i++) trackSectionPool[i].container.visible = false;
@@ -873,6 +1092,7 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
     panel,
     onOpenChange: (open) => {
       if (open) refreshPanel();
+      else if (activeVideoRow) closeRowVideo(activeVideoRow);
       onOpenChange?.(open);
     },
   });
@@ -885,9 +1105,7 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
       overlayWidth = width;
       overlayHeight = height;
       expandingPanel.resize(width, height);
-      previewExpandingPanel.resize(width, height);
       if (expandingPanel.isOpen) refreshPanel();
-      if (previewExpandingPanel.isOpen) centerPreviewPanel();
     },
     open() {
       expandingPanel.open();
@@ -901,8 +1119,7 @@ export function createReferenceDialog(options: ReferenceDialogOptions): Referenc
     destroy() {
       scrollable.destroy();
       expandingPanel.destroy();
-      closeSamplePreview();
-      previewExpandingPanel.destroy();
+      if (activeVideoRow) closeRowVideo(activeVideoRow);
       for (const section of trackSectionPool) {
         section.input.destroy();
         for (const row of section.rows) row.nameInput.destroy();

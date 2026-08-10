@@ -19,14 +19,14 @@ function cutPlaybackPrefsKey(widgetId: string): string {
 export function loadLocalCutPrefs(widgetId: string): LocalCutPrefs {
   try {
     const raw = localStorage.getItem(cutPlaybackPrefsKey(widgetId));
-    if (!raw) return { overlayEnabled: false, muteEarlyMs: 150 };
+    if (!raw) return { overlayEnabled: true, muteEarlyMs: 150 };
     const parsed = JSON.parse(raw);
     return {
-      overlayEnabled: Boolean(parsed.overlayEnabled),
+      overlayEnabled: parsed.overlayEnabled === undefined ? true : Boolean(parsed.overlayEnabled),
       muteEarlyMs: typeof parsed.muteEarlyMs === "number" ? parsed.muteEarlyMs : 150,
     };
   } catch {
-    return { overlayEnabled: false, muteEarlyMs: 150 };
+    return { overlayEnabled: true, muteEarlyMs: 150 };
   }
 }
 
