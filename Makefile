@@ -16,6 +16,15 @@ help: ## show this help message
 DEV_DB := $(CURDIR)/tumulus/dev-data/skein-hub.db
 HUB_DEV_DB := $(CURDIR)/tumulus/hub-dev-data/skein-hub.db
 
+# `tauri-dev`'s actual RUNTIME data dir (sqlite db + blob store + iroh
+# identity) - distinct from DEV_DB above, which only affects sqlx's
+# compile-time query checks. without this, `cargo tauri dev` falls back to
+# the same OS-standard dir a real packaged build uses (see
+# `default_data_dir()` in tauri/src/lib.rs), so dev and prod would share one
+# sqlite file/iroh keypair - not what we want. tumulus/dev-data/ is already
+# gitignored, so a subdir here needs no extra .gitignore entry.
+TAURI_DEV_DATA_DIR := $(CURDIR)/tumulus/dev-data/app-data
+
 .PHONY: dev-data db-migrate tauri-dev tauri-build hub-dev hub-friend-allow hub-admin-allow deps-local deps-pub bump-tomb-deps
 
 # (re)creates the sqlite dev db tumulus's sqlx macros need. requires sqlx-cli
@@ -42,8 +51,8 @@ db-migrate: dev-data ## apply sqlx migrations to the dev dbs (dev-data + hub-dev
 	touch $(HUB_DEV_DB)
 	DATABASE_URL=sqlite:$(HUB_DEV_DB) sqlx migrate run --source tumulus/migrationz
 
-tauri-dev: dev-data ## run the tauri desktop app in dev mode
-	cd tauri && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri dev
+tauri-dev: dev-data ## run the tauri desktop app in dev mode (own data dir + iroh identity, never touches prod's)
+	cd tauri && DATABASE_URL=sqlite:$(DEV_DB) SKEIN_DATA_DIR=$(TAURI_DEV_DATA_DIR) cargo tauri dev
 
 tauri-build: dev-data ## build the tauri desktop app
 	cd tauri && DATABASE_URL=sqlite:$(DEV_DB) cargo tauri build
