@@ -3,6 +3,7 @@ import { Assets, Container, Graphics, Rectangle, Texture } from "pixi.js";
 import { log } from "@freqhole/reliquary/utils";
 import { deepUnwrapAmStrings } from "../../src/canvas/automerge-values";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
+import { resolveImagePropUrl } from "../../src/file-utils/image-prop-blob";
 import { watchDocReady } from "../../src/p2p/doc-ready";
 import { isGifDataUrl } from "../../src/widgets/gif-utils";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
@@ -544,24 +545,43 @@ export class BinRenderer {
    */
   private async loadCardTexture(url: string): Promise<Texture | null> {
     try {
+      // url may be a blob:<id> reference (see file-utils/image-prop-blob) —
+      // resolve it to an object URL; a legacy raw data: URL or external URL
+      // passes through unchanged.
+      const resolvedUrl = await resolveImagePropUrl(url);
+      if (!resolvedUrl) return null;
+
       let tex: Texture;
-      if (isGifDataUrl(url)) {
+      let isGif = isGifDataUrl(resolvedUrl);
+      // a resolved blob-store object URL always starts with "blob:" too, but
+      // its mime isn't visible in the URL string itself (unlike a data: URL)
+      // — sniff the blob's content type to still catch gifs in that case.
+      if (!isGif && resolvedUrl.startsWith("blob:") && resolvedUrl !== url) {
+        const blob = await fetch(resolvedUrl).then((r) => r.blob());
+        isGif = blob.type === "image/gif";
+        if (isGif) {
+          const bitmap = await createImageBitmap(blob);
+          tex = Texture.from(bitmap);
+        } else {
+          tex = await Assets.load<Texture>(resolvedUrl);
+        }
+      } else if (isGif) {
         // pixi's Assets loader has no gif support at all (it throws for any
         // image/gif source, static or animated) — decode just the first frame
         // via the browser's native gif decoder instead. bin cards are static
         // previews, so one frame is all that's needed here.
-        const blob = await fetch(url).then((r) => r.blob());
+        const blob = await fetch(resolvedUrl).then((r) => r.blob());
         const bitmap = await createImageBitmap(blob);
         tex = Texture.from(bitmap);
       } else {
-        tex = await Assets.load<Texture>(url);
+        tex = await Assets.load<Texture>(resolvedUrl);
       }
       // guard against invalid GPU sources that cause addressModeU / alphaMode crashes
       if (!tex || !tex.source?.style) {
         // only unload non-data: URLs — data: thumbnails are shared across consumers
-        if (!url.startsWith("data:")) {
+        if (!resolvedUrl.startsWith("data:")) {
           try {
-            Assets.unload(url);
+            Assets.unload(resolvedUrl);
           } catch {
             /* ignored */
           }

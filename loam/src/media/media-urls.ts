@@ -22,7 +22,7 @@
 import { dispatch as tauriDispatch, isTauriMode } from "../p2p/tauri-transport";
 import { log } from "@freqhole/reliquary/utils";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { resolveBlob, getBlobData } from "../storage/blob-store";
+import { resolveBlob, getBlobFile } from "../storage/blob-store";
 import { getFullBlobDataUrl } from "../file-utils/blob-io";
 
 const TAG = "media-urls";
@@ -179,10 +179,25 @@ async function createMediaBlobUrl(
 // internal: get blob URL from OPFS (browser mode)
 // ---------------------------------------------------------------------------
 
-async function getBlobUrlFromOpfs(blobId: string, blake3?: string): Promise<string | null> {
-  // check session cache first
-  const cached = sessionBlobCache.get(blobId);
-  if (cached) return cached;
+async function getBlobUrlFromOpfs(
+  blobId: string,
+  category: "audio" | "video" | "image",
+  blake3?: string
+): Promise<string | null> {
+  // images are cached forever per-blobId (see `mediaBlobSlots`'s own
+  // comment) — several thumbnails can be shown at once.
+  if (category === "image") {
+    const cached = sessionBlobCache.get(blobId);
+    if (cached) return cached;
+  } else {
+    // audio/video: reuse the current slot's URL only if it's the *same*
+    // blob — otherwise fall through and replace it below. previously this
+    // always went through `sessionBlobCache` regardless of category, which
+    // never revokes until page unload — every distinct video/audio blob
+    // ever played in a session stayed fully materialized in memory forever.
+    const slot = mediaBlobSlots[category];
+    if (slot && slot.blobId === blobId) return slot.url;
+  }
 
   try {
     // use resolveBlob (which tries blob_id, sha256, and blake3 indexes)
@@ -193,18 +208,29 @@ async function getBlobUrlFromOpfs(blobId: string, blake3?: string): Promise<stri
       return null;
     }
 
-    const data = await getBlobData(record.blob_id);
-    if (!data) {
+    // lazy File handle rather than getBlobData()'s eager `arrayBuffer()` --
+    // for a multi-hundred-MB/GB video this is the difference between the
+    // browser streaming from OPFS on demand vs. holding a full extra copy
+    // of the whole file in the JS heap for as long as the URL is alive.
+    const file = await getBlobFile(record.blob_id);
+    if (!file) {
       log.debug(TAG, "getBlobUrlFromOpfs: OPFS file missing for", record.blob_id);
       return null;
     }
 
     const mime = record.mime ?? "application/octet-stream";
-    const blob = new Blob([data], { type: mime });
+    const blob = new Blob([file], { type: mime });
     const url = URL.createObjectURL(blob);
 
     ensureBeforeUnloadCleanup();
-    sessionBlobCache.set(blobId, url);
+
+    if (category === "image") {
+      sessionBlobCache.set(blobId, url);
+    } else {
+      const prev = mediaBlobSlots[category];
+      if (prev) URL.revokeObjectURL(prev.url);
+      mediaBlobSlots[category] = { blobId, url };
+    }
     return url;
   } catch {
     return null;
@@ -344,7 +370,7 @@ export async function getMediaPlaybackUrl(
       "blake3:",
       blake3?.slice(0, 12)
     );
-    const opfsUrl = await getBlobUrlFromOpfs(blobId, blake3);
+    const opfsUrl = await getBlobUrlFromOpfs(blobId, category, blake3);
     log.debug(
       TAG,
       "getMediaPlaybackUrl: OPFS returned:",

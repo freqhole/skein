@@ -8,6 +8,8 @@ import {
   Texture,
   type FederatedPointerEvent,
 } from "pixi.js";
+import { log } from "@freqhole/reliquary/utils";
+import { resolveImagePropUrl, saveImageDataUrlAsBlobRef } from "../file-utils/image-prop-blob";
 import type { SkeinTheme } from "../theme/skein-theme";
 import { pickImageOrGifAsDataUrl } from "../widgets/gif-utils";
 
@@ -1847,7 +1849,15 @@ export class PropertyTray {
         return;
       }
       try {
-        const texture = await Assets.load<Texture>(dataUrl);
+        // dataUrl may be a blob:<id> reference (see file-utils/image-prop-blob) —
+        // resolve it to an object URL before handing it to Assets.load; a legacy
+        // raw data: URL or external URL passes through unchanged.
+        const loadUrl = await resolveImagePropUrl(dataUrl);
+        if (!loadUrl) {
+          drawPreview(fieldWidth);
+          return;
+        }
+        const texture = await Assets.load<Texture>(loadUrl);
         // race check: if another load started while we were loading, bail out
         if (currentDataUrl !== dataUrl) return;
         previewSprite = new Sprite(texture);
@@ -1949,10 +1959,19 @@ export class PropertyTray {
         cropSquare: prop.imageCropSquare ?? false,
       });
       if (dataUrl) {
+        // show the freshly picked image immediately — no need to round-trip
+        // through the blob store just to preview what we already have in hand.
         currentDataUrl = dataUrl;
-        onChange(dataUrl);
         updateSprite(dataUrl);
         layoutButtons(fieldWidth);
+        try {
+          const ref = await saveImageDataUrlAsBlobRef(dataUrl);
+          currentDataUrl = ref;
+          onChange(ref);
+        } catch (err) {
+          log.warn("property-tray", "failed to persist image as blob ref, storing raw data url:", err);
+          onChange(dataUrl);
+        }
       }
     });
 

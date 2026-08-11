@@ -2451,8 +2451,8 @@ dependencies = [
 
 [[package]]
 name = "haruspex"
-version = "0.2.11"
-source = "git+https://github.com/freqhole/tomb?tag=v0.2.11#969e1ec37cbea065367506f370efd5d50f959250"
+version = "0.2.13"
+source = "git+https://github.com/freqhole/tomb?tag=v0.2.13#3c61810837b7a250bde89bd5f9854c2133c08b5a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5524,8 +5524,8 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reliquary"
-version = "0.2.11"
-source = "git+https://github.com/freqhole/tomb?tag=v0.2.11#969e1ec37cbea065367506f370efd5d50f959250"
+version = "0.2.13"
+source = "git+https://github.com/freqhole/tomb?tag=v0.2.13#3c61810837b7a250bde89bd5f9854c2133c08b5a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6348,7 +6348,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skein"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7799,7 +7799,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tumulus"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "async-trait",

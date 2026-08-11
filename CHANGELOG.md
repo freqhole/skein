@@ -1,5 +1,12 @@
 # skein
 
+## 0.1.10
+
+### Patch Changes
+
+- e8e0e16: add tts widget
+- 00241ab: new stfu + tts widgetz
+
 ## 0.1.9
 
 ### Patch Changes

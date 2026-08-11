@@ -1,6 +1,6 @@
 [package]
 name = "tumulus"
-version = "0.1.9"
+version = "0.1.10"
 edition.workspace = true
 description = "headless hub peer for skein canvas P2P ecosystem"
 
@@ -13,10 +13,10 @@ name = "tumulus"
 path = "src/main.rs"
 
 [dependencies]
-freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.11", features = [
+freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.13", features = [
     "thumbnails",
 ] }
-haruspex = { git = "https://github.com/freqhole/tomb", tag = "v0.2.11", features = ["iroh"] }
+haruspex = { git = "https://github.com/freqhole/tomb", tag = "v0.2.13", features = ["iroh"] }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 tokio = { workspace = true }
@@ -55,7 +55,7 @@ tempfile = { workspace = true }
 # unifies with the [dependencies] haruspex entry above for test/bench builds
 # only, adding haruspex::testing (open_in_memory + per-store constructors)
 # without pulling it into the production lib build.
-haruspex = { git = "https://github.com/freqhole/tomb", tag = "v0.2.11", features = [
+haruspex = { git = "https://github.com/freqhole/tomb", tag = "v0.2.13", features = [
     "iroh",
     "test-utils",
 ] }

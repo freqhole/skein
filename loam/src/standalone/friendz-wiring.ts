@@ -1,4 +1,5 @@
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
+import type { MessagezDocLike } from "../storage/local-kv-doc";
 import type { CanvasDocument, InvitableRole } from "../canvas/canvas-doc";
 import { CanvasStore } from "../canvas/canvas-store";
 import type { ProfileStore } from "../canvas/profile-doc";
@@ -37,7 +38,7 @@ export interface FriendzWiringDeps {
   messagezWidgetId: string;
   socialDoc?: SocialDoc;
   /** optional pre-resolved messagez doc handle — when provided, skips the store lookup */
-  messagezDocHandle?: import("@automerge/automerge-repo").DocHandle<any>;
+  messagezDocHandle?: MessagezDocLike;
   /** optional \u2014 when provided, our own profile-doc pointer (id +
    *  updatedAt) is included in outgoing profile-response replies and
    *  gossip digests (docs/hub-and-profile-plan.md section 6). omitted
@@ -49,7 +50,7 @@ export interface FriendzWiringDeps {
 export interface FriendzWiringResult {
   protocol: FriendzProtocol;
   socialDoc: SocialDoc;
-  messagezDocHandle: DocHandle<any> | null;
+  messagezDocHandle: MessagezDocLike | null;
   unsubs: Array<() => void>;
   flushCanvasUpdates: () => void;
 }
@@ -168,18 +169,22 @@ export async function initFriendzWiring(
       return null;
     }
 
-    const socialHandle = await repo.find<any>(socialEntry.docId as DocumentId);
+    const socialHandle = await resolveDocReadyCached<any>(repo, socialEntry.docId as DocumentId);
+    if (!socialHandle) {
+      log.warn(TAG, "aborting: social doc did not become ready", { docId: socialEntry.docId });
+      return null;
+    }
     sDoc = docHandleAsSocialDoc(socialHandle);
   }
 
-  let messagezHandle: DocHandle<any> | null = null;
+  let messagezHandle: MessagezDocLike | null = null;
 
   if (deps.messagezDocHandle) {
     messagezHandle = deps.messagezDocHandle;
   } else {
     const messagezEntry = store.getWidget(messagezWidgetId);
     if (messagezEntry?.docId) {
-      messagezHandle = await repo.find<any>(messagezEntry.docId as DocumentId);
+      messagezHandle = await resolveDocReadyCached<any>(repo, messagezEntry.docId as DocumentId);
     }
   }
 
@@ -833,17 +838,17 @@ export async function initFriendzWiring(
 
   // narthex doc metadata sync
   {
-    const narthexHandle = await repo.find<any>(narthexDocId as DocumentId);
-    const narthexDoc = narthexHandle.doc();
+    const narthexHandle = await resolveDocReadyCached<any>(repo, narthexDocId as DocumentId);
+    const narthexDoc = narthexHandle?.doc();
 
-    if (narthexDoc) {
+    if (narthexHandle && narthexDoc) {
       // sync card props from canvas docs into narthex card metadata
       for (const [_cardId, card] of Object.entries(narthexDoc.widgets ?? {}) as any[]) {
         if (!card?.docId) continue;
 
         try {
-          const cardHandle = await repo.find<any>(card.docId as DocumentId);
-          const cardDoc = cardHandle.doc();
+          const cardHandle = await resolveDocReadyCached<any>(repo, card.docId as DocumentId);
+          const cardDoc = cardHandle?.doc();
 
           if (cardDoc) {
             const lastVisited = cardDoc.lastVisitedAt as string | undefined;
@@ -2512,7 +2517,7 @@ export interface KnockHandlersDeps {
    *  `accessRequests` outbox entry (see `requestCanvasAccess()`, boot.ts)
    *  delivered once its `canvas-knock-ack` arrives, mirroring the existing
    *  canvas-invite outbox's `onCanvasInviteAck` handling above. */
-  messagezHandle?: DocHandle<any> | null;
+  messagezHandle?: MessagezDocLike | null;
   /** the local social doc, if known — used only to gate the "new message"
    *  sound effect (see src/sfx/index.ts) on the user's
    *  `soundEffectsMessagesEnabled` preference. optional so tests exercising

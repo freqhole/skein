@@ -6,6 +6,7 @@ import type { CanvasStore } from "../src/canvas/canvas-store";
 import { createDomOverlay, type DomOverlayHandle } from "../src/widgets/dom-overlay";
 import { colorToCss } from "../src/widgets/format";
 import { pickImageAsDataUrl } from "@freqhole/reliquary/utils";
+import { resolveImagePropUrl, saveImageDataUrlAsBlobRef } from "../src/file-utils/image-prop-blob";
 import type {
   WidgetController,
   WidgetFactory,
@@ -373,7 +374,8 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
       if (canvasStore.isLocalViewer()) return;
       const url = await pickImageAsDataUrl({ maxWidth: 320, maxHeight: 200 });
       if (url) {
-        canvasStore.setPreviewUrl(url);
+        const ref = await saveImageDataUrlAsBlobRef(url);
+        canvasStore.setPreviewUrl(ref);
       }
     });
 
@@ -409,10 +411,19 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
         return;
       }
       try {
-        const texture = await Assets.load<Texture>(url);
+        // url may be a blob:<id> reference (see file-utils/image-prop-blob) —
+        // resolve it to an object URL; a legacy raw data: URL passes through
+        // unchanged.
+        const resolvedUrl = await resolveImagePropUrl(url);
+        if (destroyed) return;
+        if (!resolvedUrl) {
+          setImageText.y = 0;
+          return;
+        }
+        const texture = await Assets.load<Texture>(resolvedUrl);
         if (destroyed) return;
         previewTexture = texture;
-        loadedAssetKey = url;
+        loadedAssetKey = resolvedUrl;
 
         const maxW = currentWidth - PADDING * 2;
         const maxH = 80;

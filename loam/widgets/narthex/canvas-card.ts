@@ -1,3 +1,4 @@
+import { resolveImagePropUrl } from "../../src/file-utils/image-prop-blob";
 import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
 import { canvasRoleSchema } from "../../src/canvas/canvas-doc";
@@ -680,7 +681,14 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       if (!dataUrl) return;
 
       try {
-        const texture = await Assets.load<Texture>(dataUrl);
+        // dataUrl may be a blob:<id> reference (see file-utils/image-prop-blob)
+        // — resolve it to an object URL; a legacy raw data: URL passes
+        // through unchanged.
+        const loadUrl = await resolveImagePropUrl(dataUrl);
+        if (lastRequestedPreviewUrl !== dataUrl) return;
+        if (!loadUrl) return;
+
+        const texture = await Assets.load<Texture>(loadUrl);
         // race check — another load may have started while we were loading
         if (lastRequestedPreviewUrl !== dataUrl) return;
 

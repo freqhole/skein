@@ -21,6 +21,7 @@ pub mod hub;
 pub mod hub_repo;
 
 pub mod maintenance;
+pub mod meta_kv;
 pub mod pdf;
 pub mod protocol;
 pub mod service;

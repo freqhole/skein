@@ -1,3 +1,4 @@
+import { resolveImagePropUrl } from "../src/file-utils/image-prop-blob";
 import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
 import { isTauriMode } from "../src/p2p/tauri-transport";
@@ -211,7 +212,14 @@ export const linkWidget: WidgetFactory<typeof linkSchema> = {
       if (!url) return;
 
       try {
-        const texture = await Assets.load<Texture>(url);
+        // url may be a blob:<id> reference (see file-utils/image-prop-blob) —
+        // resolve it to an object URL; a legacy raw data: URL or external URL
+        // (e.g. an unfurled og:image) passes through unchanged.
+        const loadUrl = await resolveImagePropUrl(url);
+        if (lastRequestedPreviewUrl !== url) return;
+        if (!loadUrl) return;
+
+        const texture = await Assets.load<Texture>(loadUrl);
         if (lastRequestedPreviewUrl !== url) return;
 
         const previewH = Math.floor(h * PREVIEW_RATIO);

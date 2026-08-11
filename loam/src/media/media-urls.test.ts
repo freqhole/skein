@@ -5,12 +5,12 @@ vi.mock("../p2p/tauri-transport", () => ({
   isTauriMode: vi.fn(() => false),
 }));
 
-// mock the blob store — we control what resolveBlob and getBlobData return
+// mock the blob store — we control what resolveBlob and getBlobFile return
 const mockResolveBlob = vi.fn<(blobId: string, blake3?: string) => Promise<any | null>>();
-const mockGetBlobData = vi.fn<(blobId: string) => Promise<ArrayBuffer | null>>();
+const mockGetBlobFile = vi.fn<(blobId: string) => Promise<any | null>>();
 vi.mock("../storage/blob-store", () => ({
   resolveBlob: (...args: any[]) => mockResolveBlob(...args),
-  getBlobData: (...args: any[]) => mockGetBlobData(...args),
+  getBlobFile: (...args: any[]) => mockGetBlobFile(...args),
 }));
 
 import {
@@ -46,7 +46,7 @@ describe("media-urls", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockResolveBlob.mockReset();
-    mockGetBlobData.mockReset();
+    mockGetBlobFile.mockReset();
   });
 
   afterEach(() => {
@@ -89,12 +89,12 @@ describe("media-urls", () => {
   describe("getMediaPlaybackUrl (browser mode)", () => {
     it("resolves a blob ID via OPFS and returns a blob: URL", async () => {
       mockResolveBlob.mockResolvedValue(fakeRecord("test-blob-id-123"));
-      mockGetBlobData.mockResolvedValue(fakeData());
+      mockGetBlobFile.mockResolvedValue(fakeData());
 
       const result = await getMediaPlaybackUrl("test-blob-id-123");
 
       expect(mockResolveBlob).toHaveBeenCalledWith("test-blob-id-123", undefined);
-      expect(mockGetBlobData).toHaveBeenCalledWith("test-blob-id-123");
+      expect(mockGetBlobFile).toHaveBeenCalledWith("test-blob-id-123");
       expect(result).toMatch(/^blob:/);
     });
 
@@ -109,12 +109,12 @@ describe("media-urls", () => {
 
     it("returns null when the blob record exists but OPFS file data is missing", async () => {
       mockResolveBlob.mockResolvedValue(fakeRecord("orphan-blob"));
-      mockGetBlobData.mockResolvedValue(null);
+      mockGetBlobFile.mockResolvedValue(null);
 
       const result = await getMediaPlaybackUrl("orphan-blob");
 
       expect(mockResolveBlob).toHaveBeenCalled();
-      expect(mockGetBlobData).toHaveBeenCalledWith("orphan-blob");
+      expect(mockGetBlobFile).toHaveBeenCalledWith("orphan-blob");
       expect(result).toBeNull();
     });
 
@@ -128,7 +128,7 @@ describe("media-urls", () => {
 
     it("caches OPFS blob URLs across calls for the same blob ID", async () => {
       mockResolveBlob.mockResolvedValue(fakeRecord("cached-blob"));
-      mockGetBlobData.mockResolvedValue(fakeData());
+      mockGetBlobFile.mockResolvedValue(fakeData());
 
       const first = await getMediaPlaybackUrl("cached-blob");
       const second = await getMediaPlaybackUrl("cached-blob");
@@ -141,7 +141,7 @@ describe("media-urls", () => {
 
     it("passes the category option through (defaults to audio)", async () => {
       mockResolveBlob.mockResolvedValue(fakeRecord("video-blob", "video/mp4"));
-      mockGetBlobData.mockResolvedValue(fakeData());
+      mockGetBlobFile.mockResolvedValue(fakeData());
 
       const result = await getMediaPlaybackUrl("video-blob", {
         category: "video",
@@ -152,7 +152,7 @@ describe("media-urls", () => {
 
     it("passes blake3 through to resolveBlob for cross-peer resolution", async () => {
       mockResolveBlob.mockResolvedValue(fakeRecord("server-uuid", "audio/mpeg"));
-      mockGetBlobData.mockResolvedValue(fakeData());
+      mockGetBlobFile.mockResolvedValue(fakeData());
 
       const result = await getMediaPlaybackUrl("server-uuid", {
         blake3: "cafebabe12345678",
@@ -165,7 +165,7 @@ describe("media-urls", () => {
     it("uses correct mime type from the blob record for the created Blob", async () => {
       const record = fakeRecord("mime-test", "video/webm");
       mockResolveBlob.mockResolvedValue(record);
-      mockGetBlobData.mockResolvedValue(fakeData());
+      mockGetBlobFile.mockResolvedValue(fakeData());
 
       const result = await getMediaPlaybackUrl("mime-test");
 

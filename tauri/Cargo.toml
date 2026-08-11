@@ -1,6 +1,6 @@
 [package]
 name = "skein"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "skein desktop shell"
 
@@ -56,7 +56,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 tumulus = { path = "../tumulus" }
-freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.11" }
+freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.13" }
 
 # android only: wry's android WebViewClient.handleRequest (and skein's own
 # reqwest clients) build a rustls-backed client, which panics ("no provider
@@ -72,7 +72,7 @@ rustls = { version = "0.23", default-features = false, features = [
 image = { version = "0.25", default-features = false, features = ["png"] }
 # test-utils pulls in reliquary::testing (make_local_storage_node etc.) — only
 # activated for test builds, resolver v2 keeps it out of the release binary.
-freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.11", features = [
+freqhole-reliquary = { package = "reliquary", git = "https://github.com/freqhole/tomb", tag = "v0.2.13", features = [
     "test-utils",
 ] }
 tempfile = "3"
