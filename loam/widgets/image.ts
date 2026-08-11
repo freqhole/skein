@@ -1,6 +1,8 @@
+import { log } from "@freqhole/reliquary/utils";
 import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import { GifSource, GifSprite } from "pixi.js/gif";
 import { z } from "zod";
+import { resolveImagePropUrl, saveImageDataUrlAsBlobRef } from "../src/file-utils/image-prop-blob";
 import { isGifDataUrl, pickImageOrGifAsDataUrl } from "../src/widgets/gif-utils";
 import { createMediaOverlay, type MediaOverlayHandle } from "../src/widgets/media-overlay";
 import type {
@@ -136,8 +138,14 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
         maxHeight: 800,
       });
       if (dataUrl) {
+        let value = dataUrl;
+        try {
+          value = await saveImageDataUrlAsBlobRef(dataUrl);
+        } catch (err) {
+          log.warn("image-widget", "failed to persist image as blob ref, storing raw data url:", err);
+        }
         ctx.doc.change((draft) => {
-          draft.url = dataUrl;
+          draft.url = value;
         });
       }
     };
@@ -311,6 +319,18 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
       loadingAbort = abort;
 
       try {
+        // url may be a blob:<id> reference (see file-utils/image-prop-blob) —
+        // resolve it to an object URL; a legacy raw data: URL or external URL
+        // passes through unchanged.
+        const resolvedUrl = await resolveImagePropUrl(url);
+        if (lastRequestedUrl !== url) return;
+        if (!resolvedUrl) {
+          destroySprite();
+          loadState = "empty";
+          syncOverlayVisibility();
+          return;
+        }
+
         let texture: Texture;
         let assetKey: string;
         let newGifSource: GifSource | null = null;
@@ -321,22 +341,22 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
         // built from raw bytes via the built-in GifSource/GifSprite instead,
         // started paused (autoPlay: false) so they're static at rest and only
         // animate on hover (see handleGifHoverEnter/Leave).
-        if (url.startsWith("data:")) {
-          assetKey = url;
-          if (isGifDataUrl(url)) {
-            const buffer = await fetch(url, { signal: abort.signal }).then((r) => r.arrayBuffer());
+        if (resolvedUrl.startsWith("data:")) {
+          assetKey = resolvedUrl;
+          if (isGifDataUrl(resolvedUrl)) {
+            const buffer = await fetch(resolvedUrl, { signal: abort.signal }).then((r) => r.arrayBuffer());
             newGifSource = GifSource.from(buffer);
             texture = newGifSource.textures[0];
             newSprite = new GifSprite({ source: newGifSource, autoPlay: false });
           } else {
             // data URL — use Assets.load (PixiJS v8 compatible)
-            texture = await Assets.load<Texture>(url);
+            texture = await Assets.load<Texture>(resolvedUrl);
             newSprite = new Sprite(texture);
           }
         } else {
           // remote URL — fetch, then either build a GifSource (gif) or load
           // via Assets (everything else)
-          const response = await fetch(url, { signal: abort.signal });
+          const response = await fetch(resolvedUrl, { signal: abort.signal });
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
           }
@@ -346,7 +366,7 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
             newGifSource = GifSource.from(buffer);
             texture = newGifSource.textures[0];
             newSprite = new GifSprite({ source: newGifSource, autoPlay: false });
-            assetKey = url;
+            assetKey = resolvedUrl;
           } else {
             const blobUrl = URL.createObjectURL(blob);
             texture = await Assets.load<Texture>(blobUrl);

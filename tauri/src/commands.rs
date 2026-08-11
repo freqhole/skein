@@ -20,9 +20,10 @@ use freqhole_reliquary::identity;
 use iroh::Endpoint;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{broadcast, Mutex};
-use tumulus::{friendz, userz};
+use tumulus::{friendz, meta_kv, userz};
 
 // ---------------------------------------------------------------------------
 // cancel registry for in-flight blob downloads
@@ -183,6 +184,11 @@ pub struct AppState {
 
     pub process_started_at: Instant,
     pub app_config_path: PathBuf,
+
+    /// pool backing `meta_kv` (and, in time, any other tumulus store that
+    /// doesn't yet have its own dedicated `Store`/`Directory` wrapper).
+    /// cloned from the same pool `friendz_store`/`blobz_store` use.
+    pub pool: SqlitePool,
 }
 
 /// the "network is up" half of `AppState`: the bound iroh endpoint, our own
@@ -307,6 +313,8 @@ pub(crate) enum DispatchError {
     Friend(#[from] friendz::FriendError),
     #[error("user: {0}")]
     User(#[from] userz::UserError),
+    #[error("db: {0}")]
+    Db(#[from] sqlx::Error),
     #[error("not found")]
     NotFound,
     #[error("identity: {0}")]
@@ -471,6 +479,12 @@ async fn dispatch(
             Ok(json!({ "node_id": node_id }))
         }
         "status" => status(state).await,
+
+        // generic single-device key-value store — backs meta-db.ts's
+        // getMetaValue/setMetaValue (doc-id pointers, anon device id, the
+        // messagez/social local-kv doc state, etc) in tauri mode.
+        "meta_get_value" => meta_get_value(decode("meta_get_value", payload)?, state).await,
+        "meta_set_value" => meta_set_value(decode("meta_set_value", payload)?, state).await,
 
         // friends
         "friend_add" => friend_add(decode("friend_add", payload)?, state).await,
@@ -769,6 +783,31 @@ async fn status(state: &AppState) -> Result<Value, DispatchError> {
         uptime_s: state.process_started_at.elapsed().as_secs(),
     };
     Ok(serde_json::to_value(resp).expect("status serialize"))
+}
+
+// ---------------------------------------------------------------------------
+// meta_kv — generic single-device key-value store
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct MetaGetValueArgs {
+    key: String,
+}
+
+async fn meta_get_value(args: MetaGetValueArgs, state: &AppState) -> Result<Value, DispatchError> {
+    let value = meta_kv::get(&state.pool, &args.key).await?;
+    Ok(json!({ "value": value }))
+}
+
+#[derive(Debug, Deserialize)]
+struct MetaSetValueArgs {
+    key: String,
+    value: String,
+}
+
+async fn meta_set_value(args: MetaSetValueArgs, state: &AppState) -> Result<Value, DispatchError> {
+    meta_kv::set(&state.pool, &args.key, &args.value).await?;
+    Ok(Value::Null)
 }
 
 // ---------------------------------------------------------------------------
@@ -2639,7 +2678,7 @@ mod tests {
         let haruspex_pool = tumulus::db::open_haruspex(&data_dir)
             .await
             .expect("open haruspex db");
-        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool);
+        let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
         let userz_dir = userz::Directory::new(haruspex_pool);
 
         let state = AppState {
@@ -2653,6 +2692,7 @@ mod tests {
             transfers: freqhole_reliquary::gate::TransferRegistry::new(),
             process_started_at: Instant::now(),
             app_config_path: data_dir.join("skein-app.toml"),
+            pool,
         };
 
         (state, tmp)

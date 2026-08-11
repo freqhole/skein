@@ -172,7 +172,7 @@ async fn build_state() -> anyhow::Result<AppState> {
     let blobz_store: std::sync::Arc<dyn freqhole_reliquary::blobz::BlobStore> = std::sync::Arc::new(
         freqhole_reliquary::blobz::SqliteBlobStore::new(pool.clone(), &data_dir),
     );
-    let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool);
+    let friendz_store = friendz::Store::new(haruspex_pool.clone(), pool.clone());
     let userz_dir = userz::Directory::new(haruspex_pool);
     let app_config_path = data_dir.join(APP_CONFIG_FILENAME);
 
@@ -204,6 +204,7 @@ async fn build_state() -> anyhow::Result<AppState> {
         transfers: freqhole_reliquary::gate::TransferRegistry::new(),
         process_started_at: Instant::now(),
         app_config_path,
+        pool,
     };
 
     Ok(app_state)
