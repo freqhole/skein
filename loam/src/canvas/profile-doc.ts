@@ -26,6 +26,7 @@ import { z } from "zod";
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
 import { resolveDocReadyCached } from "../p2p/doc-ready";
+import { logDocHistoryStats } from "../p2p/doc-history-stats";
 import { canvasRoleSchema, type CanvasRole } from "./canvas-doc";
 
 // ---------------------------------------------------------------------------
@@ -444,7 +445,9 @@ export async function getMyProfileDocId(): Promise<DocumentId | null> {
 export async function ensureMyProfileDoc(repo: Repo): Promise<ProfileStore> {
   const existingId = await getMyProfileDocId();
   if (existingId) {
-    return ProfileStore.open(repo, existingId);
+    const store = await ProfileStore.open(repo, existingId);
+    logDocHistoryStats("profile", store.handle);
+    return store;
   }
   const store = ProfileStore.create(repo);
   await setMetaValue(PROFILE_DOC_KEY, store.handle.documentId);

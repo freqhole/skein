@@ -1,6 +1,9 @@
-import { Repo, type DocHandle, type DocumentId } from "@automerge/automerge-repo";
+import { Repo, type DocumentId } from "@automerge/automerge-repo";
 import { registerEndpointAdapter } from "../p2p/endpoint-control";
 import { resolveDocReadyCached } from "../p2p/doc-ready";
+import { logDocHistoryStats } from "../p2p/doc-history-stats";
+import { createLocalKvDoc, type MessagezDocLike } from "../storage/local-kv-doc";
+import { migrateLegacyAutomergeDoc } from "../storage/legacy-doc-migration";
 import { createTestRegistry } from "../../widgets/index";
 import { createNarthexRegistry } from "../../widgets/narthex/index";
 import { findTrashWidget } from "../../widgets/narthex/trash-widget";
@@ -126,6 +129,21 @@ const MESSAGEZ_DOC_KEY = "skein-messagez-doc-id";
  *  peer's own friend list can look it up without duplicating the key
  *  string or depending on this whole class. */
 export const SOCIAL_DOC_KEY = "skein-social-doc-id"; // browser mode only
+
+// social/messagez are never automerge-synced to any peer (see
+// canvas-scoped-share-policy.ts's rule 3 — neither has `.acl` or
+// `ownerCanvasId`, so sharePolicy hard-denies them for every peer,
+// including this identity's own other devices). that made them a genuine
+// CRDT-for-nothing liability: automerge's op-log only ever grows, and
+// long-running sessions eventually made these two docs so large that
+// decoding them at boot took tens of seconds (see
+// docs/lingering-fixes-2026-08-plan.md's boot-stall investigation). these
+// keys drive a one-time drain into plain JSON storage (local-kv-doc.ts) —
+// see legacy-doc-migration.ts for the drain/verify/delete sequence.
+const SOCIAL_DOC_MIGRATED_KEY = "skein-social-doc-migrated";
+const SOCIAL_DOC_STATE_KEY = "skein-social-doc-state";
+const MESSAGEZ_DOC_MIGRATED_KEY = "skein-messagez-doc-migrated";
+const MESSAGEZ_DOC_STATE_KEY = "skein-messagez-doc-state";
 const TAG = "skein.boot";
 /** cold-open fast-fail bound (see `isInitialNavigation`'s doc comment) — a
  *  doc that's already locally known resolves from storage near-instantly,
@@ -332,7 +350,7 @@ class SkeinRouter {
   private friendzProtocol: FriendzProtocol | null = null;
   private friendzDocUnsubs: Array<() => void> = [];
   private socialDoc: SocialDoc | null = null;
-  private messagezDocHandle: DocHandle<any> | null = null;
+  private messagezDocHandle: MessagezDocLike | null = null;
   /** the local peer's own profile doc (docs/hub-and-profile-plan.md section 6).
    *  created/opened once in boot() via ensureMyProfileDoc(); threaded into the
    *  social overlay's mount context so profile-tab.ts can manage the profile's
@@ -585,50 +603,86 @@ class SkeinRouter {
       }
     }
 
-    // create or find standalone social doc (browser mode only)
+    // create or find standalone social doc (browser mode only). first try
+    // the one-time automerge->local-kv drain (see legacy-doc-migration.ts);
+    // only fall back to the old automerge path if that drain hasn't
+    // succeeded yet (fresh migration failure, or mid-drain on this boot).
     if (!isTauriMode() && !this.socialDoc) {
-      const socialDocId = await getMetaValue(SOCIAL_DOC_KEY);
-      if (socialDocId) {
-        try {
-          const handle = await this.repo.find<any>(socialDocId as DocumentId);
-          this.socialDoc = docHandleAsSocialDoc(handle);
-        } catch {
-          // not available yet — will retry
+      const migrated = await migrateLegacyAutomergeDoc({
+        repo: this.repo,
+        legacyDocIdKey: SOCIAL_DOC_KEY,
+        migratedFlagKey: SOCIAL_DOC_MIGRATED_KEY,
+        localKvKey: SOCIAL_DOC_STATE_KEY,
+      }).catch((err) => {
+        log.warn(TAG, "social doc migration attempt failed:", err);
+        return false;
+      });
+
+      if (migrated) {
+        this.socialDoc = await createLocalKvDoc(SOCIAL_DOC_STATE_KEY, () => socialSchema.parse({}));
+      } else {
+        const socialDocId = await getMetaValue(SOCIAL_DOC_KEY);
+        if (socialDocId) {
+          try {
+            const handle = await this.repo.find<any>(socialDocId as DocumentId);
+            this.socialDoc = docHandleAsSocialDoc(handle);
+          } catch {
+            // not available yet — will retry
+          }
         }
-      }
-      if (!this.socialDoc) {
-        const handle = this.repo.create<any>({
-          profile: { username: "", bio: "", avatarDataUrl: "", accentColor: 0xd946ef, nodeId: "" },
-          friends: [],
-          groups: [],
-          pendingRequests: [],
-          outboundRequests: [],
-          profileVisibility: "friends",
-          friendRequestsFrom: "everyone",
-        });
-        await setMetaValue(SOCIAL_DOC_KEY, handle.documentId);
-        this.socialDoc = docHandleAsSocialDoc(handle);
+        if (!this.socialDoc) {
+          const handle = this.repo.create<any>({
+            profile: { username: "", bio: "", avatarDataUrl: "", accentColor: 0xd946ef, nodeId: "" },
+            friends: [],
+            groups: [],
+            pendingRequests: [],
+            outboundRequests: [],
+            profileVisibility: "friends",
+            friendRequestsFrom: "everyone",
+          });
+          await setMetaValue(SOCIAL_DOC_KEY, handle.documentId);
+          this.socialDoc = docHandleAsSocialDoc(handle);
+        }
       }
     }
 
-    // create or find standalone messagez doc
+    // create or find standalone messagez doc — same one-time drain pattern
+    // as the social doc above.
     if (!this.messagezDocHandle) {
-      const messagezDocId = await getMetaValue(MESSAGEZ_DOC_KEY);
-      if (messagezDocId) {
-        try {
-          this.messagezDocHandle = await this.repo.find<any>(messagezDocId as DocumentId);
-        } catch {
-          // not synced yet
+      const migrated = await migrateLegacyAutomergeDoc({
+        repo: this.repo,
+        legacyDocIdKey: MESSAGEZ_DOC_KEY,
+        migratedFlagKey: MESSAGEZ_DOC_MIGRATED_KEY,
+        localKvKey: MESSAGEZ_DOC_STATE_KEY,
+      }).catch((err) => {
+        log.warn(TAG, "messagez doc migration attempt failed:", err);
+        return false;
+      });
+
+      if (migrated) {
+        this.messagezDocHandle = await createLocalKvDoc<MessagezState>(
+          MESSAGEZ_DOC_STATE_KEY,
+          () => messagezSchema.parse({})
+        );
+      } else {
+        const messagezDocId = await getMetaValue(MESSAGEZ_DOC_KEY);
+        if (messagezDocId) {
+          try {
+            this.messagezDocHandle = await this.repo.find<any>(messagezDocId as DocumentId);
+          } catch {
+            // not synced yet
+          }
         }
-      }
-      if (!this.messagezDocHandle) {
-        this.messagezDocHandle = this.repo.create<any>({
-          invites: [],
-          shares: [],
-          deletions: [],
-          canvasInvitesFrom: "everyone",
-        });
-        await setMetaValue(MESSAGEZ_DOC_KEY, this.messagezDocHandle.documentId);
+        if (!this.messagezDocHandle) {
+          const handle = this.repo.create<any>({
+            invites: [],
+            shares: [],
+            deletions: [],
+            canvasInvitesFrom: "everyone",
+          });
+          await setMetaValue(MESSAGEZ_DOC_KEY, handle.documentId);
+          this.messagezDocHandle = handle;
+        }
       }
     }
 
@@ -1052,6 +1106,7 @@ class SkeinRouter {
       this.narthexDocId as DocumentId
     );
     if (!narthexHandle) return;
+    logDocHistoryStats("narthex", narthexHandle);
 
     const narthexStore = await CanvasStore.open(this.repo, this.narthexDocId as DocumentId);
     narthexStore.stampAdmin(effectiveId);
@@ -1068,6 +1123,7 @@ class SkeinRouter {
       if (!props?.canvasDocId || props.isRemote === true) continue;
       try {
         const store = await CanvasStore.open(this.repo, props.canvasDocId as DocumentId);
+        logDocHistoryStats(`owned canvas ${props.canvasDocId}`, store.handle);
         store.stampAdmin(effectiveId);
         if (this.localNodeId) {
           store.migrateAdminId(this.anonDeviceId, this.localNodeId);

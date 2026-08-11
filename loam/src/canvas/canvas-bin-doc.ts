@@ -36,6 +36,7 @@ import { z } from "zod";
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
 import { resolveDocReadyCached } from "../p2p/doc-ready";
+import { logDocHistoryStats } from "../p2p/doc-history-stats";
 import type { ProfileCanvasEntry } from "./profile-doc";
 
 // ---------------------------------------------------------------------------
@@ -425,7 +426,9 @@ export async function getMyCanvasBinDocId(): Promise<DocumentId | null> {
 export async function ensureMyCanvasBinDoc(repo: Repo): Promise<CanvasBinStore> {
   const existingId = await getMyCanvasBinDocId();
   if (existingId) {
-    return CanvasBinStore.open(repo, existingId);
+    const store = await CanvasBinStore.open(repo, existingId);
+    logDocHistoryStats("canvas-bin", store.handle);
+    return store;
   }
   const store = CanvasBinStore.create(repo);
   await setMetaValue(CANVAS_BIN_DOC_KEY, store.handle.documentId);
