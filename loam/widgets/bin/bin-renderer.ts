@@ -847,7 +847,15 @@ export class BinRenderer {
 
       // parse through zod if the factory has a schema
       const state = factory.schema ? factory.schema.parse(unwrapped) : unwrapped;
-      return factory.getCompactInfo(state);
+      const info = factory.getCompactInfo(state);
+      // bind state now (getBinPreview is a pure function of state + a small
+      // preview context) so bin-media.ts can call this later without ever
+      // having read/parsed the child doc itself.
+      if (factory.getBinPreview) {
+        const getBinPreview = factory.getBinPreview;
+        info.createBinPreview = (previewCtx) => getBinPreview(state, previewCtx);
+      }
+      return info;
     } catch (err) {
       log.warn("bin", "readCompactInfo: schema.parse failed for", entry.type, "falling back to type name:", err);
       return { label: factory.metadata.name };

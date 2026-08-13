@@ -50,8 +50,10 @@ function randomDoodleColor(): number {
 const pointSchema = z.object({
   x: z.number(),
   y: z.number(),
-  /** 0–1 pointer pressure, sampled when pressureEnabled is on; omitted otherwise */
+  /** 0–1 pointer pressure, sampled when pressureScale > 0; omitted otherwise */
   pressure: z.number().optional(),
+  /** pen tilt/azimuth angle in radians, sampled when angleScale > 0; omitted otherwise */
+  angle: z.number().optional(),
 });
 
 export const strokeSchema = z.object({
@@ -70,8 +72,18 @@ export const strokeSchema = z.object({
   points: z.array(pointSchema).default([]),
   /** stroke opacity 0–100; 100 = fully opaque */
   opacity: z.number().default(100),
-  /** brush shape: "circle" | "rect" | "diamond" */
+  /** brush shape: "circle" | "rect" | "diamond" | "chisel" */
   brushShape: z.string().default("circle"),
+  /** 0–100; how strongly sampled pointer pressure scales width (and, when
+   *  opacity < 100, alpha). 0 = pressure has no effect. baked into the
+   *  stroke at draw time (like width/opacity) so rendering is stable. */
+  pressureScale: z.number().default(0),
+  /** 0–100; how strongly sampled pointer angle (tilt/azimuth) rotates the
+   *  "diamond"/"chisel" brush shape. 0 = shape uses its fixed default angle. */
+  angleScale: z.number().default(0),
+  /** fixed nib angle (degrees) for the "chisel" brush when angleScale isn't
+   *  actively rotating it — adjustable by dragging the chisel header button. */
+  chiselAngle: z.number().default(-45),
   /**
    * open-ended per-tool metadata.
    * future: { fill: boolean } for shapes, { text, fontFamily, fontSize } for text,
@@ -91,12 +103,20 @@ export const doodleSchema = z.object({
   activeTool: z.string().default("pen"),
   /** pen color (0xRRGGBB) */
   penColor: z.number().default(0xd946ef),
-  /** pen width in pixels — the baseline width when pressureEnabled is on */
+  /** pen width in pixels — the baseline width when pressureScale > 0 */
   penWidth: z.number().default(3),
-  /** when true, stroke width scales with pointer pressure (penWidth is the baseline) */
-  pressureEnabled: z.boolean().default(false),
-  /** brush shape: "circle" | "rect" | "diamond" */
+  /** 0–100; how strongly pointer pressure scales stroke width/opacity.
+   *  0 = off (pressure sampling disabled entirely). */
+  pressureScale: z.number().default(0),
+  /** brush shape: "circle" | "rect" | "diamond" | "chisel" */
   brushShape: z.string().default("circle"),
+  /** 0–100; how strongly pointer angle (tilt/azimuth) rotates the
+   *  "diamond"/"chisel" brush shape. 0 = off (angle sampling disabled). */
+  angleScale: z.number().default(0),
+  /** fixed nib angle (degrees) for the "chisel" brush — the baseline used
+   *  when angleScale isn't actively rotating it; adjustable via the chisel
+   *  header button's drag scrubber. */
+  chiselAngle: z.number().default(-45),
   /** pen opacity 1–100; 100 = fully opaque */
   penOpacity: z.number().default(100),
   /** border color; -1 = transparent (no border) */
@@ -133,17 +153,60 @@ function makeId(): string {
  * paint a freehand stroke path onto a Graphics object using midpoint
  * quadratic bezier curves for smooth lines.
  * a single-point stroke is drawn as a filled shape so a tap leaves a mark.
- * supports three brush shapes: "circle" (round cap), "rect" (square cap),
- * and "diamond" (rotated square stamps along the path).
+ * supports four brush shapes: "circle" (round cap), "rect" (square cap),
+ * "diamond" (rotated square stamps along the path), and "chisel" (a flat
+ * calligraphy-nib rectangle, stamped at a fixed angle unless pointer angle
+ * data rotates it — see angleScale).
  */
-/** stamp a single brush shape (used by pressure-variable rendering below) */
-function stampShape(g: Graphics, shape: string, x: number, y: number, w: number): void {
+
+/** fixed nib angle (degrees) for "chisel" when no doc value/pointer angle
+ *  data is available — mimics a traditional calligraphy pen's constant tilt. */
+const DEFAULT_CHISEL_ANGLE_DEG = -45;
+const DEG2RAD = Math.PI / 180;
+
+/** rotate (x, y) by `angle` radians around (cx, cy) */
+function rotateAround(
+  x: number,
+  y: number,
+  cx: number,
+  cy: number,
+  angle: number
+): { x: number; y: number } {
+  if (!angle) return { x, y };
+  const dx = x - cx;
+  const dy = y - cy;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  return { x: cx + dx * cos - dy * sin, y: cy + dx * sin + dy * cos };
+}
+
+/** stamp a single brush shape (used by pressure-variable rendering below).
+ *  `angle` (radians) only affects "diamond"/"chisel" — ignored otherwise. */
+function stampShape(g: Graphics, shape: string, x: number, y: number, w: number, angle = 0): void {
   const hw = w / 2;
   if (shape === "diamond") {
-    g.moveTo(x, y - hw);
-    g.lineTo(x + hw, y);
-    g.lineTo(x, y + hw);
-    g.lineTo(x - hw, y);
+    const pts = [
+      { x, y: y - hw },
+      { x: x + hw, y },
+      { x, y: y + hw },
+      { x: x - hw, y },
+    ].map((p) => rotateAround(p.x, p.y, x, y, angle));
+    g.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) g.lineTo(pts[i].x, pts[i].y);
+    g.closePath();
+  } else if (shape === "chisel") {
+    // flat calligraphy nib — a thin rectangle much longer than it is thick,
+    // rotated around its center along the (fixed or pointer-driven) angle.
+    const hl = w / 2;
+    const ht = Math.max(0.5, w * 0.16);
+    const corners = [
+      { x: x - hl, y: y - ht },
+      { x: x + hl, y: y - ht },
+      { x: x + hl, y: y + ht },
+      { x: x - hl, y: y + ht },
+    ].map((p) => rotateAround(p.x, p.y, x, y, angle));
+    g.moveTo(corners[0].x, corners[0].y);
+    for (let i = 1; i < corners.length; i++) g.lineTo(corners[i].x, corners[i].y);
     g.closePath();
   } else if (shape === "rect") {
     g.rect(x - hw, y - hw, w, w);
@@ -156,23 +219,73 @@ function stampShape(g: Graphics, shape: string, x: number, y: number, w: number)
 const MIN_PRESSURE_SCALE = 0.35;
 
 /**
- * pressure-variable stroke rendering — stamps interpolated shapes along the
- * path with width scaled per-point from `penWidth` (the baseline). only
- * used when points carry a `pressure` sample; otherwise paintStroke falls
- * back to its constant-width path (stroke() / single stamp), unchanged.
+ * pressure/angle-variable stroke rendering — stamps interpolated shapes
+ * along the path with width (and, for non-fully-opaque strokes, alpha)
+ * scaled per-point from pressure, and "diamond"/"chisel" rotation scaled
+ * per-point from angle. only used when points carry a `pressure` or
+ * `angle` sample; otherwise paintStroke falls back to its constant path.
  */
 function paintPressureStroke(g: Graphics, stroke: DoodleStroke): void {
   const { points, color, width } = stroke;
-  const alpha = (stroke.opacity ?? 100) / 100;
+  const baseAlpha = (stroke.opacity ?? 100) / 100;
   const shape = stroke.brushShape ?? "circle";
+  const pressureScale = Math.max(0, Math.min(100, stroke.pressureScale ?? 0)) / 100;
+  const angleScale = Math.max(0, Math.min(100, stroke.angleScale ?? 0)) / 100;
+  const baseAngle = shape === "chisel" ? (stroke.chiselAngle ?? DEFAULT_CHISEL_ANGLE_DEG) * DEG2RAD : 0;
 
-  const widthAt = (p: { pressure?: number }) => {
-    const pr = Math.max(0, Math.min(1, p.pressure ?? 1));
-    const scale = MIN_PRESSURE_SCALE + (1 - MIN_PRESSURE_SCALE) * pr;
+  const effectiveMinScale = 1 - pressureScale * (1 - MIN_PRESSURE_SCALE);
+  const widthAt = (p: { pressure?: number }): number => {
+    if (typeof p.pressure !== "number") return width;
+    const pr = Math.max(0, Math.min(1, p.pressure));
+    const scale = effectiveMinScale + (1 - effectiveMinScale) * pr;
     return Math.max(0.5, width * scale);
   };
 
-  stampShape(g, shape, points[0].x, points[0].y, widthAt(points[0]));
+  // pressure also dims opacity, but only when the chosen opacity isn't
+  // already fully opaque — there's no "lighter" alpha to fall back to at 100.
+  const opacityAffectedByPressure = pressureScale > 0 && baseAlpha < 1;
+  const alphaAt = (p: { pressure?: number }): number => {
+    if (!opacityAffectedByPressure || typeof p.pressure !== "number") return baseAlpha;
+    const pr = Math.max(0, Math.min(1, p.pressure));
+    const scale = effectiveMinScale + (1 - effectiveMinScale) * pr;
+    return baseAlpha * scale;
+  };
+
+  const angleAt = (p: { angle?: number }): number => {
+    if (typeof p.angle !== "number" || angleScale <= 0) return baseAngle;
+    return baseAngle + (p.angle - baseAngle) * angleScale;
+  };
+
+  if (!opacityAffectedByPressure) {
+    // fast path: one path, one fill.
+    stampShape(g, shape, points[0].x, points[0].y, widthAt(points[0]), angleAt(points[0]));
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      const dist = Math.hypot(b.x - a.x, b.y - a.y);
+      const avgW = (widthAt(a) + widthAt(b)) / 2;
+      const step = Math.max(1, avgW * 0.35);
+      const steps = Math.max(1, Math.ceil(dist / step));
+      for (let j = 1; j <= steps; j++) {
+        const t = j / steps;
+        const x = a.x + (b.x - a.x) * t;
+        const y = a.y + (b.y - a.y) * t;
+        const w = widthAt(a) + (widthAt(b) - widthAt(a)) * t;
+        const ang = angleAt(a) + (angleAt(b) - angleAt(a)) * t;
+        stampShape(g, shape, x, y, w, ang);
+      }
+    }
+    g.fill({ color, alpha: baseAlpha });
+    return;
+  }
+
+  // opacity varies per-point — fill each stamp individually (more draw
+  // calls, only paid when pressure + non-full opacity are both in play).
+  const fillStamp = (x: number, y: number, w: number, ang: number, a: number): void => {
+    stampShape(g, shape, x, y, w, ang);
+    g.fill({ color, alpha: a });
+  };
+  fillStamp(points[0].x, points[0].y, widthAt(points[0]), angleAt(points[0]), alphaAt(points[0]));
   for (let i = 0; i < points.length - 1; i++) {
     const a = points[i];
     const b = points[i + 1];
@@ -185,10 +298,11 @@ function paintPressureStroke(g: Graphics, stroke: DoodleStroke): void {
       const x = a.x + (b.x - a.x) * t;
       const y = a.y + (b.y - a.y) * t;
       const w = widthAt(a) + (widthAt(b) - widthAt(a)) * t;
-      stampShape(g, shape, x, y, w);
+      const ang = angleAt(a) + (angleAt(b) - angleAt(a)) * t;
+      const al = alphaAt(a) + (alphaAt(b) - alphaAt(a)) * t;
+      fillStamp(x, y, w, ang, al);
     }
   }
-  g.fill({ color, alpha });
 }
 
 function paintStroke(g: Graphics, stroke: DoodleStroke): void {
@@ -197,28 +311,18 @@ function paintStroke(g: Graphics, stroke: DoodleStroke): void {
   const shape = stroke.brushShape ?? "circle";
   if (points.length === 0) return;
 
-  if (points.some((p) => typeof p.pressure === "number")) {
+  if (points.some((p) => typeof p.pressure === "number" || typeof p.angle === "number")) {
     paintPressureStroke(g, stroke);
     return;
   }
 
-  if (shape === "diamond") {
-    // stamp interpolated rotated squares along the full path so there are no
-    // gaps — spacing is 40% of width to ensure solid overlap.
-    const hw = width / 2;
+  if (shape === "diamond" || shape === "chisel") {
+    // stamp interpolated shapes along the full path so there are no gaps —
+    // spacing is 40% of width to ensure solid overlap.
+    const angle = shape === "chisel" ? (stroke.chiselAngle ?? DEFAULT_CHISEL_ANGLE_DEG) * DEG2RAD : 0;
     const step = Math.max(1, width * 0.4);
 
-    const stamp = (x: number, y: number) => {
-      g.moveTo(x, y - hw);
-      g.lineTo(x + hw, y);
-      g.lineTo(x, y + hw);
-      g.lineTo(x - hw, y);
-      g.closePath();
-    };
-
-    // always stamp the first point
-    stamp(points[0].x, points[0].y);
-
+    stampShape(g, shape, points[0].x, points[0].y, width, angle);
     for (let i = 0; i < points.length - 1; i++) {
       const ax = points[i].x,
         ay = points[i].y;
@@ -228,7 +332,7 @@ function paintStroke(g: Graphics, stroke: DoodleStroke): void {
       const steps = Math.max(1, Math.ceil(dist / step));
       for (let j = 1; j <= steps; j++) {
         const t = j / steps;
-        stamp(ax + (bx - ax) * t, ay + (by - ay) * t);
+        stampShape(g, shape, ax + (bx - ax) * t, ay + (by - ay) * t, width, angle);
       }
     }
 
@@ -263,6 +367,18 @@ function paintStroke(g: Graphics, stroke: DoodleStroke): void {
     g.lineTo(points[points.length - 1].x, points[points.length - 1].y);
   }
   g.stroke({ width, color, alpha, cap, join });
+}
+
+/** derive a stroke-orientation angle (radians) from a pointer event, for
+ *  "diamond"/"chisel" brush rotation. prefers azimuthAngle (radians,
+ *  chrome/safari-recent) and falls back to atan2(tiltY, tiltX) — a
+ *  reasonable direction proxy from tilt on devices without azimuthAngle. */
+function readPointerAngle(e: any): number | undefined {
+  if (typeof e.azimuthAngle === "number") return e.azimuthAngle;
+  if (typeof e.tiltX === "number" && typeof e.tiltY === "number" && (e.tiltX !== 0 || e.tiltY !== 0)) {
+    return Math.atan2(e.tiltY, e.tiltX);
+  }
+  return undefined;
 }
 
 /**
@@ -378,7 +494,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     description: "freehand drawing with pen and eraser",
     version: "0.1.0",
     category: "basics",
-    defaultWidth: 480,
+    defaultWidth: 640,
     defaultHeight: 340,
   },
   schema: doodleSchema,
@@ -396,13 +512,23 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     },
     { key: "penColor", label: "pen color", type: "color" as const, default: 0xd946ef },
     { key: "penWidth", label: "pen width", type: "number" as const, default: 3 },
-    { key: "pressureEnabled", label: "pressure", type: "boolean" as const, default: false },
+    { key: "pressureScale", label: "pressure", type: "number" as const, min: 0, max: 100, step: 5, default: 0 },
     {
       key: "brushShape",
       label: "brush shape",
       type: "select" as const,
-      options: ["circle", "rect", "diamond"],
+      options: ["circle", "rect", "diamond", "chisel"],
       default: "circle",
+    },
+    {
+      key: "angleScale",
+      label: "angle",
+      type: "number" as const,
+      min: 0,
+      max: 100,
+      step: 5,
+      default: 0,
+      visibleWhen: { key: "brushShape", value: ["diamond", "chisel"] },
     },
     { key: "penOpacity", label: "opacity", type: "number" as const, default: 100 },
   ],
@@ -648,7 +774,8 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     const redrawLive = () => {
       liveGfx.clear();
       if (activePoints.length === 0) return;
-      const { activeTool, penColor, penWidth, brushShape, penOpacity } = ctx.doc.current;
+      const { activeTool, penColor, penWidth, brushShape, penOpacity, pressureScale, angleScale, chiselAngle } =
+        ctx.doc.current;
       const effectiveTool = toolOverride ?? activeTool;
       const width = Math.max(1, penWidth);
       const stroke: DoodleStroke = {
@@ -658,6 +785,9 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
         width,
         opacity: penOpacity ?? 100,
         brushShape: brushShape ?? "circle",
+        pressureScale: pressureScale ?? 0,
+        angleScale: angleScale ?? 0,
+        chiselAngle: chiselAngle ?? DEFAULT_CHISEL_ANGLE_DEG,
         points: activePoints,
       };
       if (effectiveTool === "eraser") {
@@ -678,18 +808,64 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     // and pointerup are delivered to bgGfx even when the pointer leaves the
     // widget bounds mid-stroke.
 
-    // samples pointer pressure only when pressureEnabled — omitting the field
-    // otherwise keeps old/disabled strokes on paintStroke's constant-width path
+    // ── pen detection / palm-rejection (in-memory, per-mount only — never
+    // written to the automerge doc; these are local drawing-surface
+    // preferences, not shared widget state) ─────────────────────────────────
+    let penDetected = false;
+    /** when true (only togglable once a pen has been seen), only "pen"
+     *  pointerType may draw — touch/mouse are ignored entirely. */
+    let penLock = false;
+    let lastPenActivityAt = 0;
+    /** after real pen activity, ignore touch/mouse pointerdowns for this
+     *  long — keeps a resting palm/wrist from starting an accidental stroke
+     *  while drawing with a stylus. */
+    const PALM_REJECTION_MS = 700;
+
+    const notePointerType = (e: any): void => {
+      if (e.pointerType !== "pen") return;
+      lastPenActivityAt = performance.now();
+      if (!penDetected) {
+        penDetected = true;
+        ctx.setHeaderActions?.(makeHeaderActions());
+      }
+    };
+
+    const isPointerAllowed = (e: any): boolean => {
+      if (e.pointerType === "pen") return true;
+      if (penLock) return false;
+      return performance.now() - lastPenActivityAt >= PALM_REJECTION_MS;
+    };
+
+    // samples pointer pressure/angle only when pressureScale/angleScale > 0 —
+    // omitting the fields otherwise keeps old/disabled strokes on
+    // paintStroke's constant-width, unrotated path.
     const capturePoint = (e: any, lp: { x: number; y: number }) => {
-      if (!ctx.doc.current.pressureEnabled) return { x: lp.x, y: lp.y };
-      const pressure = typeof e.pressure === "number" && e.pressure > 0 ? e.pressure : 0.5;
-      return { x: lp.x, y: lp.y, pressure };
+      const { pressureScale, angleScale } = ctx.doc.current;
+      const point: { x: number; y: number; pressure?: number; angle?: number } = { x: lp.x, y: lp.y };
+      if ((pressureScale ?? 0) > 0) {
+        point.pressure = typeof e.pressure === "number" && e.pressure > 0 ? e.pressure : 0.5;
+      }
+      if ((angleScale ?? 0) > 0) {
+        const angle = readPointerAngle(e);
+        if (angle !== undefined) point.angle = angle;
+      }
+      return point;
     };
 
     bgGfx.on("pointerdown", (e: any) => {
-      if (drawing) return;
+      notePointerType(e);
       if (ctx.canvasStore?.isLocalViewer()) return;
       if (ctx.doc.current.locked) return;
+      if (!isPointerAllowed(e)) return;
+      if (drawing) {
+        // a previous stroke's pointerup/pointercancel was missed (apple
+        // pencil hover/palm-rejection/system-gesture edge cases can drop
+        // it) — finalize the stuck stroke instead of silently ignoring
+        // every pointerdown from now on (see handlePointerCancel below for
+        // the other half of this fix).
+        finalizeStroke();
+        toolOverride = null;
+      }
       e.stopPropagation();
       drawing = true;
       activePointerId = e.pointerId;
@@ -703,6 +879,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     // use globalpointermove so strokes continue tracking when pointer
     // drifts outside the bgGfx hitArea mid-stroke
     bgGfx.on("globalpointermove", (e: any) => {
+      notePointerType(e);
       if (!drawing || e.pointerId !== activePointerId) return;
       const lp = e.getLocalPosition(container);
       const last = activePoints[activePoints.length - 1];
@@ -724,7 +901,8 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
         return;
       }
 
-      const { activeTool, penColor, penWidth, brushShape, penOpacity } = ctx.doc.current;
+      const { activeTool, penColor, penWidth, brushShape, penOpacity, pressureScale, angleScale, chiselAngle } =
+        ctx.doc.current;
       const stroke: DoodleStroke = {
         id: activeStrokeId,
         tool: toolOverride ?? activeTool,
@@ -732,6 +910,9 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
         width: Math.max(1, penWidth),
         opacity: penOpacity ?? 100,
         brushShape: brushShape ?? "circle",
+        pressureScale: pressureScale ?? 0,
+        angleScale: angleScale ?? 0,
+        chiselAngle: chiselAngle ?? DEFAULT_CHISEL_ANGLE_DEG,
         points: [...activePoints],
       };
 
@@ -795,9 +976,25 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     window.addEventListener("contextmenu", handleContextMenu, true);
 
     // ── header actions: pen / eraser tool buttons ───────────────────────────
-    // guards against header refresh during opacity/width scrubber drag
+    // guards against header refresh during opacity/width/pressure/angle
+    // scrubber drags
     let isDraggingOpacity = false;
     let isDraggingWidth = false;
+    let isDraggingPressure = false;
+    let isDraggingAngle = false;
+    let isDraggingChiselAngle = false;
+
+    // header drag-scrubbers deliver raw, unscaled pixel deltas (see
+    // widget-frame.ts's createActionButton) — 1px of drag used to mean 1 unit
+    // of change, which made fine adjustments hard to land. scale deltas down
+    // and accumulate the fractional remainder so a full drag gesture still
+    // covers the same range, just spread over more pixels.
+    const DRAG_SENSITIVITY = 0.35;
+    let opacityDragAccum = 0;
+    let widthDragAccum = 0;
+    let pressureDragAccum = 0;
+    let angleDragAccum = 0;
+    let chiselAngleDragAccum = 0;
 
     // ── header colour picker (DOM input, lives as long as it's open) ─────────
     let liveColorInput: HTMLInputElement | null = null;
@@ -874,10 +1071,14 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     };
 
     const makeHeaderActions = (): HeaderAction[] => {
-      const { activeTool, brushShape, penOpacity, penWidth, locked, pressureEnabled } = ctx.doc.current;
+      const { activeTool, brushShape, penOpacity, penWidth, locked, pressureScale, angleScale } =
+        ctx.doc.current;
       const shape = brushShape ?? "circle";
       const opacity = penOpacity ?? 100;
       const width = Math.max(1, penWidth ?? 3);
+      const pressure = Math.max(0, Math.min(100, pressureScale ?? 0));
+      const angle = Math.max(0, Math.min(100, angleScale ?? 0));
+      const angleApplicable = shape === "diamond" || shape === "chisel";
       return [
         {
           id: "eraser",
@@ -984,14 +1185,59 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
           onClick: () => setShape("diamond"),
         },
         {
+          id: "shape-chisel",
+          label: "▬",
+          active: shape === "chisel",
+          // draggable like the opacity/width scrubbers — click selects the
+          // chisel brush, click+drag rotates its nib angle. the icon itself
+          // rotates live to show the current angle.
+          renderIcon: (parent: Container, size: number, color: number) => {
+            const chiselAngleDeg = Math.round(ctx.doc.current.chiselAngle ?? DEFAULT_CHISEL_ANGLE_DEG);
+            const gfx = new Graphics();
+            const barLen = size * 0.62;
+            const barThick = Math.max(2, size * 0.16);
+            gfx.roundRect(-barLen / 2, -barThick / 2, barLen, barThick, barThick * 0.3);
+            gfx.fill({ color, alpha: 0.92 });
+            gfx.x = size / 2;
+            gfx.y = size / 2;
+            gfx.rotation = chiselAngleDeg * DEG2RAD;
+            parent.addChild(gfx);
+          },
+          onClick: () => setShape("chisel"),
+          onDrag: (deltaX: number) => {
+            isDraggingChiselAngle = true;
+            chiselAngleDragAccum += deltaX * DRAG_SENSITIVITY;
+            const step = Math.trunc(chiselAngleDragAccum);
+            if (step === 0) return;
+            chiselAngleDragAccum -= step;
+            const cur = Math.round(ctx.doc.current.chiselAngle ?? DEFAULT_CHISEL_ANGLE_DEG);
+            // wrap at ±180° so dragging past the edge keeps rotating instead
+            // of clamping — an angle scrubber should spin freely.
+            const next = (((cur + step + 180) % 360) + 360) % 360 - 180;
+            if (next !== cur)
+              ctx.doc.change((d) => {
+                d.chiselAngle = next;
+              });
+          },
+          onDragEnd: () => {
+            isDraggingChiselAngle = false;
+            chiselAngleDragAccum = 0;
+            ctx.setHeaderActions?.(makeHeaderActions());
+          },
+        },
+        {
           id: "opacity",
           label: `α${opacity}`,
           getLiveLabel: () => `α${ctx.doc.current.penOpacity ?? 100}`,
           marginLeft: 8,
           onDrag: (deltaX: number) => {
             isDraggingOpacity = true;
+            opacityDragAccum += deltaX * DRAG_SENSITIVITY;
+            const step = Math.trunc(opacityDragAccum);
+            if (step === 0) return;
+            opacityDragAccum -= step;
             const cur = ctx.doc.current.penOpacity ?? 100;
-            const next = Math.max(1, Math.min(100, Math.round(cur + deltaX)));
+            const next = Math.max(1, Math.min(100, cur + step));
             if (next !== cur)
               ctx.doc.change((d) => {
                 d.penOpacity = next;
@@ -999,6 +1245,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
           },
           onDragEnd: () => {
             isDraggingOpacity = false;
+            opacityDragAccum = 0;
             ctx.setHeaderActions?.(makeHeaderActions());
           },
         },
@@ -1008,8 +1255,12 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
           getLiveLabel: () => `w${Math.max(1, ctx.doc.current.penWidth ?? 3)}`,
           onDrag: (deltaX: number) => {
             isDraggingWidth = true;
+            widthDragAccum += deltaX * DRAG_SENSITIVITY;
+            const step = Math.trunc(widthDragAccum);
+            if (step === 0) return;
+            widthDragAccum -= step;
             const cur = Math.max(1, ctx.doc.current.penWidth ?? 3);
-            const next = Math.max(1, Math.min(100, Math.round(cur + deltaX)));
+            const next = Math.max(1, Math.min(100, cur + step));
             if (next !== cur)
               ctx.doc.change((d) => {
                 d.penWidth = next;
@@ -1017,33 +1268,89 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
           },
           onDragEnd: () => {
             isDraggingWidth = false;
+            widthDragAccum = 0;
             ctx.setHeaderActions?.(makeHeaderActions());
           },
         },
-        {
-          id: "pressure",
-          label: "pressure",
-          active: pressureEnabled,
-          marginLeft: 8,
-          // downward arrow pressing onto a curved surface — pressure applied to a stroke
-          renderIcon: (parent: Container, size: number, color: number) => {
-            const cx = size * 0.5;
-            const gfx = new Graphics();
-            gfx.moveTo(cx, size * 0.16);
-            gfx.lineTo(cx, size * 0.46);
-            gfx.stroke({ width: Math.max(1.5, size * 0.11), color, alpha: 0.92, cap: "round" });
-            gfx.moveTo(cx - size * 0.17, size * 0.4);
-            gfx.lineTo(cx, size * 0.6);
-            gfx.lineTo(cx + size * 0.17, size * 0.4);
-            gfx.closePath();
-            gfx.fill({ color, alpha: 0.92 });
-            gfx.moveTo(size * 0.12, size * 0.76);
-            gfx.quadraticCurveTo(cx, size * 0.96, size * 0.88, size * 0.76);
-            gfx.stroke({ width: Math.max(1.5, size * 0.1), color, alpha: 0.92, cap: "round" });
-            parent.addChild(gfx);
-          },
-          onClick: () => setPressureEnabled(!pressureEnabled),
-        },
+        // pressure/angle scrubbers only show once a pen has actually been
+        // used this session — irrelevant clutter for mouse/touch-only users.
+        ...(penDetected
+          ? [
+              {
+                id: "pressure",
+                label: `p${pressure}`,
+                getLiveLabel: () =>
+                  `p${Math.max(0, Math.min(100, Math.round(ctx.doc.current.pressureScale ?? 0)))}`,
+                active: pressure > 0,
+                marginLeft: 8,
+                // downward arrow pressing onto a curved surface — pressure applied to a stroke
+                renderIcon: (parent: Container, size: number, color: number) => {
+                  const cx = size * 0.5;
+                  const gfx = new Graphics();
+                  gfx.moveTo(cx, size * 0.16);
+                  gfx.lineTo(cx, size * 0.46);
+                  gfx.stroke({ width: Math.max(1.5, size * 0.11), color, alpha: 0.92, cap: "round" });
+                  gfx.moveTo(cx - size * 0.17, size * 0.4);
+                  gfx.lineTo(cx, size * 0.6);
+                  gfx.lineTo(cx + size * 0.17, size * 0.4);
+                  gfx.closePath();
+                  gfx.fill({ color, alpha: 0.92 });
+                  gfx.moveTo(size * 0.12, size * 0.76);
+                  gfx.quadraticCurveTo(cx, size * 0.96, size * 0.88, size * 0.76);
+                  gfx.stroke({ width: Math.max(1.5, size * 0.1), color, alpha: 0.92, cap: "round" });
+                  parent.addChild(gfx);
+                },
+                onDrag: (deltaX: number) => {
+                  isDraggingPressure = true;
+                  pressureDragAccum += deltaX * DRAG_SENSITIVITY;
+                  const step = Math.trunc(pressureDragAccum);
+                  if (step === 0) return;
+                  pressureDragAccum -= step;
+                  const cur = Math.max(0, Math.min(100, ctx.doc.current.pressureScale ?? 0));
+                  const next = Math.max(0, Math.min(100, cur + step));
+                  if (next !== cur)
+                    ctx.doc.change((d) => {
+                      d.pressureScale = next;
+                    });
+                },
+                onDragEnd: () => {
+                  isDraggingPressure = false;
+                  pressureDragAccum = 0;
+                  ctx.setHeaderActions?.(makeHeaderActions());
+                },
+              } as HeaderAction,
+            ]
+          : []),
+        ...(penDetected && angleApplicable
+          ? [
+              {
+                id: "angle",
+                label: `∠${angle}`,
+                getLiveLabel: () =>
+                  `∠${Math.max(0, Math.min(100, Math.round(ctx.doc.current.angleScale ?? 0)))}`,
+                active: angle > 0,
+                marginLeft: 8,
+                onDrag: (deltaX: number) => {
+                  isDraggingAngle = true;
+                  angleDragAccum += deltaX * DRAG_SENSITIVITY;
+                  const step = Math.trunc(angleDragAccum);
+                  if (step === 0) return;
+                  angleDragAccum -= step;
+                  const cur = Math.max(0, Math.min(100, ctx.doc.current.angleScale ?? 0));
+                  const next = Math.max(0, Math.min(100, cur + step));
+                  if (next !== cur)
+                    ctx.doc.change((d) => {
+                      d.angleScale = next;
+                    });
+                },
+                onDragEnd: () => {
+                  isDraggingAngle = false;
+                  angleDragAccum = 0;
+                  ctx.setHeaderActions?.(makeHeaderActions());
+                },
+              } as HeaderAction,
+            ]
+          : []),
         {
           id: "undo",
           label: "↺",
@@ -1099,19 +1406,43 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
           },
           onClick: () => setLocked(!locked),
         },
+        // pen-lock is a local, in-memory-only session preference (never
+        // written to the doc) — only offered once a pen has actually been
+        // used, since it's meaningless without one.
+        ...(penDetected
+          ? [
+              {
+                id: "penLock",
+                label: penLock ? "pen only" : "any input",
+                active: penLock,
+                marginLeft: 8,
+                // pen nib silhouette — filled solid when pen-lock is active
+                renderIcon: (parent: Container, size: number, color: number) => {
+                  const gfx = new Graphics();
+                  const cx = size * 0.5;
+                  gfx.moveTo(cx, size * 0.14);
+                  gfx.lineTo(cx + size * 0.16, size * 0.42);
+                  gfx.lineTo(cx, size * 0.58);
+                  gfx.lineTo(cx - size * 0.16, size * 0.42);
+                  gfx.closePath();
+                  gfx.fill({ color, alpha: penLock ? 0.95 : 0.4 });
+                  gfx.rect(cx - size * 0.06, size * 0.58, size * 0.12, size * 0.28);
+                  gfx.fill({ color, alpha: penLock ? 0.95 : 0.4 });
+                  parent.addChild(gfx);
+                },
+                onClick: () => {
+                  penLock = !penLock;
+                  ctx.setHeaderActions?.(makeHeaderActions());
+                },
+              } as HeaderAction,
+            ]
+          : []),
       ];
     };
 
     const setLocked = (next: boolean) => {
       ctx.doc.change((d) => {
         d.locked = next;
-      });
-      ctx.setHeaderActions?.(makeHeaderActions());
-    };
-
-    const setPressureEnabled = (next: boolean) => {
-      ctx.doc.change((d) => {
-        d.pressureEnabled = next;
       });
       ctx.setHeaderActions?.(makeHeaderActions());
     };
@@ -1131,8 +1462,8 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     };
 
     // ── doc subscription ────────────────────────────────────────────────────
-    // isDraggingOpacity suppresses header refreshes while the opacity scrubber
-    // is being dragged — calling setHeaderActions mid-drag destroys the button
+    // isDragging* suppresses header refreshes while a header scrubber is
+    // being dragged — calling setHeaderActions mid-drag destroys the button
     // (and its pointer capture), so the drag breaks after a single pixel.
     const unsub = ctx.doc.on("change", (state) => {
       drawBackground();
@@ -1150,7 +1481,13 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
         liveGfx.clear();
         liveGfx.blendMode = "normal";
       }
-      if (!isDraggingOpacity && !isDraggingWidth) {
+      if (
+        !isDraggingOpacity &&
+        !isDraggingWidth &&
+        !isDraggingPressure &&
+        !isDraggingAngle &&
+        !isDraggingChiselAngle
+      ) {
         ctx.setHeaderActions?.(makeHeaderActions());
       }
     });

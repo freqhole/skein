@@ -3,7 +3,7 @@
 // bin-renderer, bin-card-builders, bin-drag, and index.
 
 import type { Container, Sprite, Texture } from "pixi.js";
-import type { CompactInfo } from "../../src/widgets/widget-types";
+import type { BinPreviewContext, BinPreviewHandle, CompactInfo } from "../../src/widgets/widget-types";
 import type { BinMode, SlotPosition } from "./bin-layout";
 
 // -----------------------------------------------------------------------
@@ -28,6 +28,10 @@ export interface RenderedCard {
   textureKey: string | null;
   /** media overlay container (play/pause icon + semi-transparent bg) — present for audio/video cards */
   mediaOverlay: Container | null;
+  /** hover-only save/reveal action button row (grid/crate/drawer modes only,
+   *  null for shelf) — suppressed while the media control bar is shown, see
+   *  bin-media.ts's setControlBarVisible(). */
+  actionButtons: Container | null;
   /** media domain hint from CompactInfo ("audio" | "video") — null for non-media cards */
   mediaDomain: string | null;
   /** blob ID for media playback — null for non-media cards */
@@ -46,6 +50,9 @@ export interface RenderedCard {
   fileSize: number | null;
   /** node IDs that have snatched this blob (for targeting peer downloads) */
   snatchedBy: string[] | null;
+  /** bound bin-preview builder from this card's CompactInfo, if the widget
+   *  factory implements getBinPreview() — see widget-types.ts. */
+  createBinPreview: ((ctx: BinPreviewContext) => BinPreviewHandle | null) | null;
 }
 
 // -----------------------------------------------------------------------

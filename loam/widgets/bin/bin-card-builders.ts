@@ -2,13 +2,10 @@
 // extracted from BinRenderer to keep modules under ~300 lines.
 
 import { Container, Graphics, Rectangle, Sprite, Text } from "pixi.js";
-import { log } from "@freqhole/reliquary/utils";
-import { checkBlobLocality } from "../../src/file-utils/blob-locality";
-import { revealBlobInFinder, saveBlobToDisk } from "../../src/file-utils/blob-io";
-import { snatchBlob } from "../../src/file-utils/snatch";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import { drawRevealIcon, drawSaveIcon } from "../../src/widgets/icons";
-import { isTransparent, type CompactInfo } from "../../src/widgets/widget-types";
+import { isTransparent, type BinPreviewContext, type BinPreviewHandle, type CompactInfo } from "../../src/widgets/widget-types";
+import { performSaveOrReveal, type ActionButtonInfo } from "./bin-save-actions";
 import {
   CRATE_FONT_SIZE,
   DEFAULT_ACCENT_COLOR,
@@ -139,17 +136,6 @@ function createActionButton(
   return btn;
 }
 
-/** info needed to create file action buttons */
-interface ActionButtonInfo {
-  blobId?: string | null;
-  filename?: string | null;
-  mime?: string | null;
-  blake3?: string | null;
-  size?: number | null;
-  domain?: string | null;
-  snatchedBy?: string[] | null;
-}
-
 /**
  * build the set of action buttons for a file card.
  * returns a container with the buttons laid out horizontally.
@@ -170,37 +156,7 @@ function buildActionButtons(
   const tooltip = isTauri ? "reveal" : "save";
 
   const btn = createActionButton(iconDraw, btnSize, tooltip, () => {
-    const blobId = String(info.blobId ?? "");
-    const filename = String(info.filename ?? "file");
-
-    void (async () => {
-      try {
-        // ensure the blob is local before saving/revealing
-        const localityInfo = await checkBlobLocality(blobId, info.blake3 ?? undefined);
-        if (localityInfo.locality !== "local") {
-          const peers = getPeers?.() ?? {};
-          await snatchBlob(
-            {
-              blobId,
-              filename,
-              mime: String(info.mime ?? ""),
-              size: info.size ?? 0,
-              blake3: String(info.blake3 ?? ""),
-              domain: String(info.domain ?? ""),
-            },
-            peers as any
-          );
-        }
-
-        if (isTauri) {
-          await revealBlobInFinder(blobId);
-        } else {
-          await saveBlobToDisk(blobId, filename);
-        }
-      } catch (err) {
-        log.warn("bin", "save/reveal failed:", err);
-      }
-    })();
+    void performSaveOrReveal(info, getPeers);
   });
   btn.x = 0;
   row.addChild(btn);
@@ -274,6 +230,7 @@ function extraCardFields(info: {
   blake3?: string;
   size?: number;
   snatchedBy?: string[];
+  createBinPreview?: (ctx: BinPreviewContext) => BinPreviewHandle | null;
 }) {
   return {
     mediaLabel: info.label ?? null,
@@ -282,6 +239,7 @@ function extraCardFields(info: {
     blake3: info.blake3 ?? null,
     fileSize: info.size ?? null,
     snatchedBy: info.snatchedBy ?? null,
+    createBinPreview: info.createBinPreview ?? null,
   };
 }
 
@@ -463,10 +421,12 @@ function buildGridCard(state: CardRenderState, ctx: CardBuildContext): RenderedC
   }
 
   // action buttons (snatch, save/reveal) — below thumbnail, hidden until hover
+  let actionButtons: Container | null = null;
   if (info.blobId) {
     const btnSize = Math.max(18, Math.min(ACTION_BTN_SIZE, Math.floor(cellSize * 0.25)));
     const actions = buildActionButtons(info, btnSize, ctx.getPeers ?? null);
     if (actions) {
+      actionButtons = actions;
       actions.x = Math.round((cellSize - actions.width) / 2);
       actions.y = cellSize - btnSize - 2;
       cellContent.addChild(actions);
@@ -530,6 +490,7 @@ function buildGridCard(state: CardRenderState, ctx: CardBuildContext): RenderedC
     thumbSprite,
     textureKey,
     mediaOverlay,
+    actionButtons,
     mediaDomain: info.domain ?? null,
     mediaBlobId: info.blobId ?? null,
     mediaMime: info.mime ?? null,
@@ -698,6 +659,7 @@ function buildShelfCard(state: CardRenderState, ctx: CardBuildContext): Rendered
     thumbSprite,
     textureKey,
     mediaOverlay,
+    actionButtons: null,
     mediaDomain: info.domain ?? null,
     mediaBlobId: info.blobId ?? null,
     mediaMime: info.mime ?? null,
@@ -806,10 +768,12 @@ function buildCrateCard(state: CardRenderState, ctx: CardBuildContext): Rendered
 
   // action buttons — at right end of row, hidden until hover
   let actionBtnsW = 0;
+  let actionButtons: Container | null = null;
   if (info.blobId) {
     const btnSize = Math.max(16, Math.min(22, slotH - 4));
     const actions = buildActionButtons(info, btnSize, ctx.getPeers ?? null);
     if (actions) {
+      actionButtons = actions;
       actionBtnsW = actions.width + 6;
       actions.x = slotW - actions.width - 4;
       actions.y = Math.round((slotH - btnSize) / 2);
@@ -875,6 +839,7 @@ function buildCrateCard(state: CardRenderState, ctx: CardBuildContext): Rendered
     thumbSprite,
     textureKey,
     mediaOverlay,
+    actionButtons,
     mediaDomain: info.domain ?? null,
     mediaBlobId: info.blobId ?? null,
     mediaMime: info.mime ?? null,
@@ -983,10 +948,12 @@ function buildDrawerCard(state: CardRenderState, ctx: CardBuildContext): Rendere
 
   // action buttons — at right end of row, hidden until hover
   let drawerActionBtnsW = 0;
+  let actionButtons: Container | null = null;
   if (info.blobId) {
     const btnSize = Math.max(18, Math.min(ACTION_BTN_SIZE, slotH - 6));
     const actions = buildActionButtons(info, btnSize, ctx.getPeers ?? null);
     if (actions) {
+      actionButtons = actions;
       drawerActionBtnsW = actions.width + 8;
       actions.x = slotW - actions.width - 6;
       actions.y = Math.round((slotH - btnSize) / 2);
@@ -1052,6 +1019,7 @@ function buildDrawerCard(state: CardRenderState, ctx: CardBuildContext): Rendere
     thumbSprite,
     textureKey,
     mediaOverlay,
+    actionButtons,
     mediaDomain: info.domain ?? null,
     mediaBlobId: info.blobId ?? null,
     mediaMime: info.mime ?? null,

@@ -4,6 +4,7 @@ import type { PendingCanvasKnock } from "../canvas/canvas-doc";
 import type { CanvasStore } from "../canvas/canvas-store";
 import type { ConnectionStateSource } from "../canvas/connection-status";
 import type { ProfileStore } from "../canvas/profile-doc";
+import type { PeersMap } from "../file-utils/file-shared";
 import type { KeyboardDriver } from "./keyboard-driver";
 
 /**
@@ -92,7 +93,9 @@ export interface HeaderAction {
    * optional drag handler — when provided the button becomes a drag scrubber.
    * called on each pointermove while the button is pressed, with the horizontal
    * delta in pixels since the last call. use for continuously-adjustable values
-   * like opacity.
+   * like opacity. works for both text-label buttons (updates `label` via
+   * `getLiveLabel`) and icon buttons (redraws via `renderIcon` on each tick,
+   * e.g. a brush icon that rotates to show a live angle).
    *
    * important: do NOT call setHeaderActions() inside onDrag — that destroys and
    * recreates the button mid-drag, breaking the interaction after a single pixel.
@@ -153,6 +156,48 @@ export interface CompactInfo {
   size?: number;
   /** node IDs that have snatched this blob (used to target peer downloads) */
   snatchedBy?: string[];
+  /**
+   * bound closure (state already captured) for building a richer bin-card
+   * preview than the generic play/pause raw-media handling — see
+   * `WidgetFactory.getBinPreview()`. populated by the bin's compact-info
+   * resolution, not by widget factories themselves.
+   */
+  createBinPreview?: (ctx: BinPreviewContext) => BinPreviewHandle | null;
+}
+
+/**
+ * everything a widget's `getBinPreview()` needs to mount its own preview
+ * media (DOM video/audio elements etc.) inside a bin card — a bin never
+ * mounts a child's full `create()` lifecycle, so this is a much smaller
+ * surface than `WidgetMountContext`.
+ */
+export interface BinPreviewContext {
+  widgetId: string;
+  /** the card's pixi container — preview media (e.g. a DOM video tracker)
+   *  positions/sizes itself against this, same as any other bin card. */
+  container: Container;
+  canvasElement: HTMLCanvasElement;
+  getSize: () => { width: number; height: number };
+  getPeers: () => PeersMap | undefined;
+}
+
+/** returned by `WidgetFactory.getBinPreview()` — the bin's media controller
+ *  drives playback through this instead of its generic raw-media handling. */
+export interface BinPreviewHandle {
+  /** true once media is actively playing (used to keep the card's play/
+   *  pause icon in sync after an async `onTap()`/`onDoubleTap()`). */
+  isPlaying: () => boolean;
+  /** tap on the card face — play if stopped/paused, pause if playing.
+   *  builds any underlying media element lazily on first call. */
+  onTap: () => Promise<void>;
+  /** double-tap on the card face — e.g. request fullscreen. */
+  onDoubleTap: () => void;
+  /** explicit "stop and clear" — tears down any mounted media element
+   *  entirely (so it stops floating over other canvas content), reverting
+   *  the card to its poster/thumbnail. `onTap()` can re-create it lazily. */
+  onStop: () => void;
+  /** full teardown when the card itself is removed from the bin. */
+  destroy: () => void;
 }
 
 /**
@@ -447,6 +492,15 @@ export interface WidgetFactory<S extends z.ZodType = z.ZodType> {
    * does not require the widget to be mounted — pure function of state.
    */
   getCompactInfo?: (state: z.infer<S>) => CompactInfo;
+  /**
+   * optional: build a richer bin-card preview than the generic play/pause
+   * raw-media handling (e.g. stfu's cut/mute/overlay effects and audio-clip
+   * playback) — still without the bin ever mounting this widget's full
+   * `create()`/timeline UI. pure function of state + a small preview
+   * context; omit to fall back to the bin's generic media handling for
+   * this widget's `getCompactInfo().domain`.
+   */
+  getBinPreview?: (state: z.infer<S>, ctx: BinPreviewContext) => BinPreviewHandle | null;
   /**
    * called when a compact card for this widget is tapped inside a bin.
    * pure function of state — the widget is not mounted when this fires.

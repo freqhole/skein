@@ -162,6 +162,12 @@ export const stfuSchema = z.object({
   /** single-flight upload lock, mirrors file.ts's uploadingBy/uploadingAt. */
   uploadingBy: z.string().default(""),
   uploadingAt: z.number().default(0),
+  /** poster/preview image data URL, generated once after upload — used as
+   *  the compact-card thumbnail (bin view) and the preview poster shown
+   *  before a bin card's video starts playing. mirrors file.ts's
+   *  `thumbnailDataUrl` field/naming so `ensureThumbnailPersisted()` (see
+   *  thumbnail-utils.ts) can be reused as-is. */
+  thumbnailDataUrl: z.string().default(""),
 
   // -- transcript / diarization ------------------------------------------------
   referenceSpeakers: z.record(z.string(), referenceSpeakerSchema).default({}),

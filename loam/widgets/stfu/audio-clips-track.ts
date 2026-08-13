@@ -43,7 +43,7 @@ const DRAG_THRESHOLD_PX = 3; // pointer movement past this counts as a drag, not
 const DRAG_OUT_VERTICAL_PX = 20;
 /** nominal display width (seconds) for a clip with no known real duration
  *  yet (durationSec 0, i.e. audio not yet recorded/generated). */
-const PENDING_DISPLAY_SEC = 10;
+const PENDING_DISPLAY_SEC = 5;
 
 type DragMode = "create" | "move" | "resize-left" | "resize-right";
 
@@ -666,16 +666,19 @@ export function createAudioClipsTrack(options: AudioClipsTrackOptions): AudioCli
       createPreviewRow?.destroy();
       createPreviewRow = null;
       const start = clampStart(finished.pendingStart, PENDING_DISPLAY_SEC);
-      commit([
-        ...getClips(),
-        {
-          id: genId(),
-          trackId: "default",
-          start,
-          durationSec: 0,
-          label: "",
-        },
-      ]);
+      const newClip: AudioClip = {
+        id: genId(),
+        trackId: "default",
+        start,
+        durationSec: 0,
+        label: "",
+      };
+      const next = [...getClips(), newClip];
+      commit(next);
+      // new clip is selected by default — focuses + reveals its row in the
+      // segments panel, matching a tapped clip's behavior.
+      setSelectedIndex(next.length - 1);
+      onClipTap?.(newClip, e.global.x, e.global.y);
       return;
     }
 
