@@ -1025,26 +1025,21 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
           label: "pressure",
           active: pressureEnabled,
           marginLeft: 8,
-          // tapered wedge (thick to thin) — visualizes a pressure-scaled stroke
+          // downward arrow pressing onto a curved surface — pressure applied to a stroke
           renderIcon: (parent: Container, size: number, color: number) => {
-            const x0 = size * 0.22,
-              y0 = size * 0.78;
-            const x1 = size * 0.78,
-              y1 = size * 0.22;
-            const thickHW = size * 0.2;
-            const thinHW = size * 0.03;
-            const dx = x1 - x0,
-              dy = y1 - y0;
-            const len = Math.hypot(dx, dy) || 1;
-            const nx = -dy / len,
-              ny = dx / len;
+            const cx = size * 0.5;
             const gfx = new Graphics();
-            gfx.moveTo(x0 + nx * thickHW, y0 + ny * thickHW);
-            gfx.lineTo(x1 + nx * thinHW, y1 + ny * thinHW);
-            gfx.lineTo(x1 - nx * thinHW, y1 - ny * thinHW);
-            gfx.lineTo(x0 - nx * thickHW, y0 - ny * thickHW);
+            gfx.moveTo(cx, size * 0.16);
+            gfx.lineTo(cx, size * 0.46);
+            gfx.stroke({ width: Math.max(1.5, size * 0.11), color, alpha: 0.92, cap: "round" });
+            gfx.moveTo(cx - size * 0.17, size * 0.4);
+            gfx.lineTo(cx, size * 0.6);
+            gfx.lineTo(cx + size * 0.17, size * 0.4);
             gfx.closePath();
             gfx.fill({ color, alpha: 0.92 });
+            gfx.moveTo(size * 0.12, size * 0.76);
+            gfx.quadraticCurveTo(cx, size * 0.96, size * 0.88, size * 0.76);
+            gfx.stroke({ width: Math.max(1.5, size * 0.1), color, alpha: 0.92, cap: "round" });
             parent.addChild(gfx);
           },
           onClick: () => setPressureEnabled(!pressureEnabled),
