@@ -1,5 +1,11 @@
 # skein
 
+## 0.1.11
+
+### Patch Changes
+
+- 71fee17: try to improve doodle widget + prop tray scale
+
 ## 0.1.10
 
 ### Patch Changes
