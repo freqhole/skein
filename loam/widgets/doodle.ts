@@ -1055,19 +1055,24 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
         }, 3000);
       });
 
-      requestAnimationFrame(() => {
-        const opened = (input as any).showPicker
-          ? (() => {
-              try {
-                (input as any).showPicker();
-                return true;
-              } catch {
-                return false;
-              }
-            })()
-          : false;
-        if (!opened) input.click();
-      });
+      // must run synchronously, in the same tick as the tap that opened
+      // this — ios/ipad safari revokes "user activation" across a
+      // requestAnimationFrame tick (or any other deferral), which silently
+      // no-ops showPicker()/click() on a color input. this used to be
+      // wrapped in requestAnimationFrame(); that's exactly why the picker
+      // was so unreliable to open on ipad even though the button itself
+      // was registering the tap fine.
+      const opened = (input as any).showPicker
+        ? (() => {
+            try {
+              (input as any).showPicker();
+              return true;
+            } catch {
+              return false;
+            }
+          })()
+        : false;
+      if (!opened) input.click();
     };
 
     const makeHeaderActions = (): HeaderAction[] => {

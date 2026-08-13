@@ -289,6 +289,8 @@ export class WidgetManager {
     const live = this.liveWidgets.get(widgetId);
     if (!live || this.focusStack.hasWidget(widgetId)) return;
 
+    const wasEmpty = this.focusStack.isEmpty;
+
     this.maximizedEscapees.clear();
 
     // save current viewport state so we can restore later
@@ -312,6 +314,15 @@ export class WidgetManager {
     // reset viewport to origin at 1x zoom
     if (this.viewport) {
       this.viewport.resetView();
+    }
+
+    // entering maximized mode for the first time (not a nested maximize of
+    // one widget over another) — lock the camera in place and get the
+    // toolbar out of the way; there's no room for it and its buttons don't
+    // apply while a single widget fills the viewport.
+    if (wasEmpty) {
+      this.viewport?.setLocked(true);
+      this.toolbar?.setVisible(false);
     }
 
     // enter maximized mode on the frame (hides chrome, disables drag)
@@ -382,9 +393,11 @@ export class WidgetManager {
         other.frame.root.visible = true;
       }
       if (this.viewport) {
+        this.viewport.setLocked(false);
         this.viewport.zoomTo(entry.savedViewport.zoom);
         this.viewport.panTo(entry.savedViewport.x, entry.savedViewport.y);
       }
+      this.toolbar?.setVisible(true);
     } else {
       // still a maximized widget underneath — show only that one
       const parent = this.focusStack.peek()!;

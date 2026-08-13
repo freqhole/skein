@@ -971,6 +971,14 @@ export class Toolbar {
     this.layout();
   }
 
+  /** show/hide the whole toolbar — used while a widget is maximized, since
+   *  there's no room for it and its buttons (add/delete/share/etc.) don't
+   *  apply while a single widget fills the viewport. */
+  setVisible(visible: boolean): void {
+    this.root.visible = visible;
+    if (!visible && this.flyoutOpen) this.toggleFlyout();
+  }
+
   /** rebuild the breadcrumb pixi elements from `this.breadcrumbs` */
   private renderBreadcrumbs(): void {
     // tear down previous crumb elements
