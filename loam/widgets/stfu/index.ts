@@ -14,6 +14,7 @@ import { Container, type FederatedPointerEvent, Graphics, Rectangle, Text } from
 import { getLocalNodeId, guessMimeFromFilename, type PeersMap, type PickedFile } from "../../src/file-utils/file-shared";
 import { pickFiles, uploadFile } from "../../src/file-utils/upload";
 import { getMediaPlaybackUrl } from "../../src/media";
+import { ensureThumbnailPersisted } from "../../src/file-utils/thumbnail-utils";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import { deleteBlob } from "../../src/storage/blob-store";
 import { createMediaDomOverlay, type MediaDomOverlayHandle } from "../../src/widgets/media-dom-overlay";
@@ -53,6 +54,8 @@ import { createSnatchController } from "./snatch-controller";
 import { createVideoTimeline, computeTimelineShellHeight, type VideoTimelineHandle } from "./video-timeline";
 import { createVoicePickerDialog, type VoicePickerDialogHandle } from "./voice-picker-dialog";
 import type {
+  BinPreviewContext,
+  BinPreviewHandle,
   CompactInfo,
   HeaderAction,
   WidgetController,
@@ -92,7 +95,125 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     filename: state.videoFilename || undefined,
     blake3: state.videoBlake3 || undefined,
     size: state.videoSize || undefined,
+    thumbnailUrl: state.thumbnailDataUrl || undefined,
   }),
+
+  /**
+   * bin-card preview — mirrors the widget's own full-mount playback (cut
+   * skip/overlay/mute effects + audio-clip playback, see
+   * `mountMediaOverlay()` below) without ever mounting the full timeline/
+   * segments UI. built lazily on first tap; state is a one-time snapshot
+   * (no live-doc-update subscription — acceptable since bin previews don't
+   * need to reflect concurrent edits while playing).
+   */
+  getBinPreview: (state: StfuState, previewCtx: BinPreviewContext): BinPreviewHandle | null => {
+    if (!state.videoBlobId) return null;
+
+    const localPrefs = loadLocalCutPrefs(previewCtx.widgetId);
+    let overlay: MediaDomOverlayHandle | null = null;
+    let cutOverlayEl: HTMLDivElement | null = null;
+    let audioClipPlayback: ReturnType<typeof createAudioClipPlayback> | null = null;
+    let onTimeUpdate: (() => void) | null = null;
+    let onPause: (() => void) | null = null;
+
+    async function ensureMounted(): Promise<MediaDomOverlayHandle | null> {
+      if (overlay) return overlay;
+
+      const src = await getMediaPlaybackUrl(state.videoBlobId, {
+        category: "video",
+        peers: previewCtx.getPeers(),
+        mime: state.videoMime || undefined,
+      });
+      if (!src || overlay) return overlay;
+
+      overlay = createMediaDomOverlay({
+        src,
+        mime: state.videoMime || undefined,
+        container: previewCtx.container,
+        canvasElement: previewCtx.canvasElement,
+        getSize: previewCtx.getSize,
+        muted: false,
+        loop: false,
+        controls: false,
+        objectFit: "contain",
+      });
+
+      cutOverlayEl = createCutOverlayElement();
+      overlay.wrapper.appendChild(cutOverlayEl);
+
+      audioClipPlayback = createAudioClipPlayback({
+        getVideo: () => overlay?.video ?? null,
+        getAudioClips: () => state.audioClips,
+        getPeers: () => previewCtx.getPeers(),
+        isDestroyed: () => overlay === null,
+      });
+
+      onTimeUpdate = () => {
+        if (!overlay) return;
+        applyCutPlaybackEffects_({
+          video: overlay.video,
+          overlayEl: cutOverlayEl,
+          editableSegments: state.editableSegments,
+          cutSkipEnabled: state.cutSkipEnabled,
+          cutMuteEnabled: state.cutMuteEnabled,
+          overlayEnabled: localPrefs.overlayEnabled,
+          muteEarlyMs: localPrefs.muteEarlyMs,
+        });
+        audioClipPlayback?.apply();
+      };
+      overlay.video.addEventListener("timeupdate", onTimeUpdate);
+
+      onPause = () => audioClipPlayback?.stop();
+      overlay.video.addEventListener("pause", onPause);
+
+      return overlay;
+    }
+
+    function teardown(): void {
+      if (overlay) {
+        if (onTimeUpdate) overlay.video.removeEventListener("timeupdate", onTimeUpdate);
+        if (onPause) overlay.video.removeEventListener("pause", onPause);
+        overlay.close();
+      }
+      audioClipPlayback?.stop();
+      audioClipPlayback = null;
+      overlay = null;
+      cutOverlayEl = null;
+      onTimeUpdate = null;
+      onPause = null;
+    }
+
+    return {
+      isPlaying: () => Boolean(overlay && !overlay.video.paused),
+      onTap: async () => {
+        const ov = await ensureMounted();
+        if (!ov) return;
+        if (ov.video.paused) {
+          try {
+            await ov.video.play();
+          } catch {
+            /* ignore playback errors (e.g. autoplay restrictions) */
+          }
+        } else {
+          ov.video.pause();
+        }
+      },
+      onDoubleTap: () => {
+        if (!overlay) return;
+        try {
+          if (overlay.video.requestFullscreen) {
+            overlay.video.requestFullscreen().catch(() => {});
+          } else if ((overlay.video as any).webkitRequestFullscreen) {
+            (overlay.video as any).webkitRequestFullscreen();
+          }
+        } catch {
+          /* ignore fullscreen errors */
+        }
+      },
+      onStop: () => teardown(),
+      destroy: () => teardown(),
+    };
+  },
 
   create(ctx: WidgetMountContext<typeof stfuSchema>): WidgetController {
     const container = new Container();
@@ -1273,6 +1394,13 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
         // flyout/property tray instead of showing generically as "stfu".
         ctx.canvasStore?.setWidgetTitle(ctx.widgetId, stripExtension(file.filename));
         void snatchController.checkVideoLocality();
+        // best-effort poster/thumbnail — used for the compact bin card and
+        // as the bin preview's poster before first play.
+        void ensureThumbnailPersisted(
+          { current: () => ctx.doc.current, change: (fn) => ctx.doc.change(fn) },
+          result.blobId,
+          { size: 200 }
+        );
         return true;
       } catch (err) {
         if (destroyed) return false;

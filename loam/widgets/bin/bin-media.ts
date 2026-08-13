@@ -16,6 +16,10 @@ import { audioManager, getMediaPlaybackUrl } from "../../src/media";
 import { getFullBlobDataUrl } from "../../src/file-utils/blob-io";
 import { createMediaOverlay as createFullscreenOverlay } from "../../src/widgets/media-overlay";
 import { createMediaDomOverlay } from "../../src/widgets/media-dom-overlay";
+import { drawSaveIcon, drawRevealIcon } from "../../src/widgets/icons";
+import { isTauriMode } from "../../src/p2p/tauri-transport";
+import { performSaveOrReveal } from "./bin-save-actions";
+import type { BinPreviewContext, BinPreviewHandle } from "../../src/widgets/widget-types";
 import { log } from "@freqhole/reliquary/utils";
 import type { RenderedCard } from "./bin-types";
 
@@ -38,6 +42,17 @@ export function isPhotoDomain(domain?: string | null): boolean {
 /** check whether a domain is handled by the media controller (audio/video/photo) */
 export function isInteractiveDomain(domain?: string | null): boolean {
   return domain === "audio" || domain === "video" || domain === "photo";
+}
+
+/**
+ * height (in the overlay's local coordinate space) reserved at the bottom
+ * of the overlay for the control bar (play/pause, fullscreen, save, stop).
+ * a real DOM `<video>` element renders on top of the entire pixi canvas,
+ * so tracked video playback must stop short of this strip (see
+ * handleVideoTap/ensurePreviewHandle) or its controls become invisible.
+ */
+export function computeControlRowHeight(overlayW: number, overlayH: number): number {
+  return Math.max(16, Math.min(26, overlayH * 0.32, overlayW * 0.32));
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +251,23 @@ export class BinMediaController {
   /** stored overlay parts per widget ID (for icon toggling) */
   private overlayParts = new Map<string, MediaOverlayParts>();
 
+  /** cached bin-preview handles for widgets implementing getBinPreview()
+   *  (see widget-types.ts) — built lazily on first tap, one per card. */
+  private previewHandles = new Map<string, BinPreviewHandle>();
+  /** widget IDs whose preview media is currently mounted (built, playing or
+   *  paused) — used by isMediaMounted() below. */
+  private previewMounted = new Set<string>();
+  /** the control bar (play/pause, fullscreen, save, stop) for each
+   *  audio/video card — shown whenever that card's media is mounted
+   *  (playing or paused), regardless of whether it's a preview-hook card
+   *  or the generic audioManager/DOM-video path. sits in a reserved strip
+   *  at the bottom of the overlay so it's never covered by the DOM
+   *  <video> element rendered on top of the pixi canvas. */
+  private controlBars = new Map<string, Container>();
+  /** the play/pause icon graphics inside each card's control bar, kept
+   *  alongside overlayParts so setCardIcon() can toggle both together. */
+  private controlBarIcons = new Map<string, { playIcon: Graphics; pauseIcon: Graphics }>();
+
   /** unsub functions for audioManager events */
   private unsubs: Array<() => void> = [];
 
@@ -309,13 +341,15 @@ export class BinMediaController {
       const isPlayingVideo =
         card.mediaDomain === "video" && this.videoTracker?.widgetId === card.widgetId;
 
-      if (isPlayingAudio || isPlayingVideo) {
-        showPauseIcon(parts);
-        overlay.visible = true;
-      } else {
-        showPlayIcon(parts);
-        overlay.visible = false;
+      const playing = isPlayingAudio || isPlayingVideo;
+      overlay.visible = playing;
+
+      const controlBar = this.buildControlBar(overlay, card);
+      if (controlBar) {
+        this.controlBars.set(card.widgetId, controlBar);
+        controlBar.visible = this.isMediaMounted(card.widgetId, card);
       }
+      this.setCardIcon(card.widgetId, playing ? "pause" : "play");
     } else {
       // photo: overlay is just the expand icon, no play/pause state
       overlay.visible = false;
@@ -325,6 +359,13 @@ export class BinMediaController {
     const onEnter = (): void => {
       if (card.container.destroyed) return;
       overlay.visible = true;
+      // the card-builder's own pointerenter (attached before this one, when
+      // the card was built) unconditionally reveals the hover "save" action
+      // button — override that back off if this card's media is mounted,
+      // since the control bar already occupies that same bottom strip.
+      if (isAudioVideo && card.actionButtons && this.isMediaMounted(card.widgetId, card)) {
+        card.actionButtons.visible = false;
+      }
     };
 
     const onLeave = (): void => {
@@ -359,6 +400,19 @@ export class BinMediaController {
     this.overlayParts.delete(widgetId);
     this.attachedCards.delete(widgetId);
 
+    const controlBar = this.controlBars.get(widgetId);
+    if (controlBar) {
+      controlBar.destroy();
+      this.controlBars.delete(widgetId);
+    }
+    this.controlBarIcons.delete(widgetId);
+    const previewHandle = this.previewHandles.get(widgetId);
+    if (previewHandle) {
+      previewHandle.destroy();
+      this.previewHandles.delete(widgetId);
+      this.previewMounted.delete(widgetId);
+    }
+
     // stop audio if this card was playing
     if (this.audioPlayingId === widgetId) {
       audioManager.stop();
@@ -389,18 +443,17 @@ export class BinMediaController {
     this.lastTapTime = now;
     this.lastTapWidgetId = widgetId;
 
-    if (isDoubleTap && card.mediaDomain === "video") {
-      this.handleVideoFullscreen();
+    if (card.mediaDomain === "photo") {
+      this.handlePhotoTap(card);
       return true;
     }
 
-    if (card.mediaDomain === "audio") {
-      this.handleAudioTap(widgetId, card);
-    } else if (card.mediaDomain === "video") {
-      this.handleVideoTap(widgetId, card);
-    } else if (card.mediaDomain === "photo") {
-      this.handlePhotoTap(card);
+    if (isDoubleTap) {
+      this.handleFullscreenTap(widgetId);
+      return true;
     }
+
+    this.handlePlayPauseTap(widgetId);
 
     return true;
   }
@@ -494,6 +547,17 @@ export class BinMediaController {
     }
     this.activePhotoOverlay = null;
 
+    for (const handle of this.previewHandles.values()) {
+      handle.destroy();
+    }
+    this.previewHandles.clear();
+    this.previewMounted.clear();
+    for (const bar of this.controlBars.values()) {
+      bar.destroy();
+    }
+    this.controlBars.clear();
+    this.controlBarIcons.clear();
+
     this.overlayParts.clear();
     this.attachedCards.clear();
   }
@@ -512,11 +576,17 @@ export class BinMediaController {
       return;
     }
 
+    // stop any preview-hook cards that might be playing
+    this.stopAllPreviewPlayback();
+
     // stop any video that might be playing
     if (this.videoTracker) {
+      const prevVideoId = this.videoTracker.widgetId;
       this.videoTracker.close();
       this.videoTracker = null;
-      this.updateVideoCardIcon(null);
+      this.setCardIcon(prevVideoId, "play");
+      this.setOverlayVisible(prevVideoId, false);
+      this.setControlBarVisible(prevVideoId, false);
     }
 
     // stop any existing audio first — this ensures the global audioManager
@@ -533,11 +603,13 @@ export class BinMediaController {
     if (prevId && prevId !== widgetId) {
       this.setCardIcon(prevId, "play");
       this.setOverlayVisible(prevId, false);
+      this.setControlBarVisible(prevId, false);
     }
 
     // show loading state (pause icon = "active")
     this.setCardIcon(widgetId, "pause");
     this.setOverlayVisible(widgetId, true);
+    this.setControlBarVisible(widgetId, true);
 
     const peers = this.getPeers();
     const ok = await audioManager.playBlob(blobId, {
@@ -550,6 +622,7 @@ export class BinMediaController {
       log.warn(TAG, "failed to play audio for card:", widgetId);
       this.audioPlayingId = null;
       this.setCardIcon(widgetId, "play");
+      this.setControlBarVisible(widgetId, false);
     }
   }
 
@@ -564,12 +637,14 @@ export class BinMediaController {
       // another controller (or external caller) took over — clear our state
       this.setCardIcon(this.audioPlayingId, "play");
       this.setOverlayVisible(this.audioPlayingId, false);
+      this.setControlBarVisible(this.audioPlayingId, false);
       this.audioPlayingId = null;
       return;
     }
 
     this.setCardIcon(this.audioPlayingId, "pause");
     this.setOverlayVisible(this.audioPlayingId, true);
+    this.setControlBarVisible(this.audioPlayingId, true);
   }
 
   private onAudioPause(): void {
@@ -581,6 +656,7 @@ export class BinMediaController {
     if (ourBlobId && !audioManager.isCurrentBlob(ourBlobId)) {
       this.setCardIcon(this.audioPlayingId, "play");
       this.setOverlayVisible(this.audioPlayingId, false);
+      this.setControlBarVisible(this.audioPlayingId, false);
       this.audioPlayingId = null;
       return;
     }
@@ -594,6 +670,7 @@ export class BinMediaController {
     if (this.audioPlayingId) {
       this.setCardIcon(this.audioPlayingId, "play");
       this.setOverlayVisible(this.audioPlayingId, false);
+      this.setControlBarVisible(this.audioPlayingId, false);
       this.audioPlayingId = null;
     }
   }
@@ -602,6 +679,7 @@ export class BinMediaController {
     if (this.audioPlayingId) {
       this.setCardIcon(this.audioPlayingId, "play");
       this.setOverlayVisible(this.audioPlayingId, false);
+      this.setControlBarVisible(this.audioPlayingId, false);
       this.audioPlayingId = null;
     }
   }
@@ -621,6 +699,7 @@ export class BinMediaController {
     if (ourBlobId && blobId !== ourBlobId) {
       this.setCardIcon(this.audioPlayingId, "play");
       this.setOverlayVisible(this.audioPlayingId, false);
+      this.setControlBarVisible(this.audioPlayingId, false);
       this.audioPlayingId = null;
     }
   }
@@ -658,7 +737,11 @@ export class BinMediaController {
       this.videoTracker = null;
       this.setCardIcon(prevId, "play");
       this.setOverlayVisible(prevId, false);
+      this.setControlBarVisible(prevId, false);
     }
+
+    // stop any preview-hook cards that might be playing
+    this.stopAllPreviewPlayback();
 
     // stop any audio
     if (this.audioPlayingId) {
@@ -667,6 +750,7 @@ export class BinMediaController {
       this.audioPlayingId = null;
       this.setCardIcon(prevId, "play");
       this.setOverlayVisible(prevId, false);
+      this.setControlBarVisible(prevId, false);
     }
 
     // resolve the media URL
@@ -683,10 +767,12 @@ export class BinMediaController {
     }
 
     // determine thumbnail area dimensions based on the card's media overlay size
-    // the overlay covers the thumbnail area, so use its dimensions
+    // the overlay covers the thumbnail area, so use its dimensions — minus
+    // the reserved control-bar strip, so the DOM <video> doesn't cover it
     const overlayBounds = card.mediaOverlay;
     const thumbW = overlayBounds ? overlayBounds.width : 100;
     const thumbH = overlayBounds ? overlayBounds.height : 100;
+    const controlRowH = computeControlRowHeight(thumbW, thumbH);
 
     this.videoTracker = createVideoTracker(
       src,
@@ -694,7 +780,7 @@ export class BinMediaController {
       card,
       this.canvasElement,
       thumbW,
-      thumbH
+      thumbH - controlRowH
     );
 
     // start playback
@@ -703,11 +789,13 @@ export class BinMediaController {
       this.setCardIcon(widgetId, "pause");
       // hide the pixi overlay while video is playing — the DOM video covers it
       this.setOverlayVisible(widgetId, false);
+      this.setControlBarVisible(widgetId, true);
     } catch (err) {
       log.warn(TAG, "video play failed:", err);
       this.videoTracker.close();
       this.videoTracker = null;
       this.setCardIcon(widgetId, "play");
+      this.setControlBarVisible(widgetId, false);
     }
   }
 
@@ -725,12 +813,331 @@ export class BinMediaController {
     }
   }
 
-  /** update the video card's icon after it's been closed */
-  private updateVideoCardIcon(widgetId: string | null): void {
-    if (widgetId) {
+  // -----------------------------------------------------------------------
+  // preview-hook handling (widgets implementing getBinPreview(), e.g. stfu)
+  // -----------------------------------------------------------------------
+
+  /** build (once) or return the cached BinPreviewHandle for a card. */
+  private ensurePreviewHandle(card: RenderedCard): BinPreviewHandle | null {
+    if (!card.createBinPreview) return null;
+    const existing = this.previewHandles.get(card.widgetId);
+    if (existing) return existing;
+
+    const overlay = card.mediaOverlay;
+    const thumbW = overlay ? overlay.width : 100;
+    const thumbH = overlay ? overlay.height : 100;
+    // reserve the control-bar strip so the widget's own DOM video overlay
+    // (see stfu's getBinPreview()) doesn't render on top of it
+    const controlRowH = computeControlRowHeight(thumbW, thumbH);
+    const previewCtx: BinPreviewContext = {
+      widgetId: card.widgetId,
+      container: card.container,
+      canvasElement: this.canvasElement,
+      getSize: () => ({ width: thumbW, height: thumbH - controlRowH }),
+      getPeers: () => this.getPeers(),
+    };
+
+    const handle = card.createBinPreview(previewCtx);
+    if (!handle) return null;
+    this.previewHandles.set(card.widgetId, handle);
+    return handle;
+  }
+
+  private async handlePreviewTap(widgetId: string, card: RenderedCard): Promise<void> {
+    const handle = this.ensurePreviewHandle(card);
+    if (!handle) return;
+
+    // stop any generic audio/video playback and any *other* preview-hook
+    // card's playback first — only one media element plays at a time.
+    if (this.videoTracker) {
+      const prevId = this.videoTracker.widgetId;
+      this.videoTracker.close();
+      this.videoTracker = null;
+      this.setCardIcon(prevId, "play");
+      this.setOverlayVisible(prevId, false);
+      this.setControlBarVisible(prevId, false);
+    }
+    if (this.audioPlayingId) {
+      const prevId = this.audioPlayingId;
+      audioManager.stop();
+      this.audioPlayingId = null;
+      this.setCardIcon(prevId, "play");
+      this.setOverlayVisible(prevId, false);
+      this.setControlBarVisible(prevId, false);
+    }
+    this.stopAllPreviewPlayback(widgetId);
+
+    await handle.onTap();
+    const playing = handle.isPlaying();
+    if (playing) {
+      this.previewMounted.add(widgetId);
+    }
+    this.setCardIcon(widgetId, playing ? "pause" : "play");
+    // hide the pixi overlay while playing — the DOM video covers it, same
+    // as the generic video-tracker path
+    this.setOverlayVisible(widgetId, !playing);
+    this.setControlBarVisible(widgetId, this.previewMounted.has(widgetId));
+  }
+
+  private handlePreviewDoubleTap(widgetId: string): void {
+    this.previewHandles.get(widgetId)?.onDoubleTap();
+  }
+
+  private handlePreviewStop(widgetId: string): void {
+    const handle = this.previewHandles.get(widgetId);
+    if (!handle) return;
+    handle.onStop();
+    this.previewMounted.delete(widgetId);
+    this.setCardIcon(widgetId, "play");
+    this.setOverlayVisible(widgetId, false);
+    this.setControlBarVisible(widgetId, false);
+  }
+
+  /** stop every mounted preview-hook card's playback, optionally excluding one. */
+  private stopAllPreviewPlayback(exceptWidgetId?: string): void {
+    for (const [id, handle] of this.previewHandles) {
+      if (id === exceptWidgetId) continue;
+      if (!this.previewMounted.has(id)) continue;
+      handle.onStop();
+      this.previewMounted.delete(id);
+      this.setCardIcon(id, "play");
+      this.setOverlayVisible(id, false);
+      this.setControlBarVisible(id, false);
+    }
+  }
+
+  /** true if a card's media (generic audio/video, or a preview-hook's own
+   *  media) is currently mounted — playing or paused-but-loaded. drives
+   *  the "stop/clear" icon's visibility. */
+  private isMediaMounted(widgetId: string, card: RenderedCard): boolean {
+    if (card.createBinPreview) return this.previewMounted.has(widgetId);
+    if (card.mediaDomain === "video") return this.videoTracker?.widgetId === widgetId;
+    if (card.mediaDomain === "audio") return this.audioPlayingId === widgetId;
+    return false;
+  }
+
+  /** handle a tap on the generic "stop/clear" icon — tears down whichever
+   *  playback mechanism (preview-hook or generic audio/video) is mounted
+   *  for this card, reverting it to its poster/thumbnail. */
+  private handleStopTap(widgetId: string): void {
+    const card = this.getCard(widgetId);
+    if (!card) return;
+
+    if (card.createBinPreview) {
+      this.handlePreviewStop(widgetId);
+      return;
+    }
+
+    if (card.mediaDomain === "video" && this.videoTracker?.widgetId === widgetId) {
+      this.videoTracker.close();
+      this.videoTracker = null;
       this.setCardIcon(widgetId, "play");
       this.setOverlayVisible(widgetId, false);
+      this.setControlBarVisible(widgetId, false);
+      return;
     }
+
+    if (card.mediaDomain === "audio" && this.audioPlayingId === widgetId) {
+      audioManager.stop();
+      this.audioPlayingId = null;
+      this.setCardIcon(widgetId, "play");
+      this.setOverlayVisible(widgetId, false);
+      this.setControlBarVisible(widgetId, false);
+    }
+  }
+
+  private setControlBarVisible(widgetId: string, visible: boolean): void {
+    const bar = this.controlBars.get(widgetId);
+    if (bar) bar.visible = visible;
+
+    // the control bar docks to the same bottom strip as the generic hover
+    // "save/reveal" action button — suppress that button while the bar is
+    // shown so it doesn't render underneath it (see bin-card-builders.ts).
+    const card = this.getCard(widgetId);
+    if (card?.actionButtons && visible) {
+      card.actionButtons.visible = false;
+    }
+  }
+
+  /** dispatch a tap on the control bar's play/pause button — mirrors the
+   *  generic card-tap dispatch in handleTap() below. */
+  private handlePlayPauseTap(widgetId: string): void {
+    const card = this.getCard(widgetId);
+    if (!card) return;
+    if (card.createBinPreview) {
+      void this.handlePreviewTap(widgetId, card);
+      return;
+    }
+    if (card.mediaDomain === "video") {
+      void this.handleVideoTap(widgetId, card);
+    } else if (card.mediaDomain === "audio") {
+      void this.handleAudioTap(widgetId, card);
+    }
+  }
+
+  /** dispatch a tap on the control bar's fullscreen button (video only). */
+  private handleFullscreenTap(widgetId: string): void {
+    const card = this.getCard(widgetId);
+    if (!card) return;
+    if (card.createBinPreview) {
+      this.handlePreviewDoubleTap(widgetId);
+      return;
+    }
+    if (card.mediaDomain === "video" && this.videoTracker?.widgetId === widgetId) {
+      this.handleVideoFullscreen();
+    }
+  }
+
+  /** dispatch a tap on the control bar's save button. */
+  private handleSaveTap(widgetId: string): void {
+    const card = this.getCard(widgetId);
+    if (!card || !card.mediaBlobId) return;
+    void performSaveOrReveal(
+      {
+        blobId: card.mediaBlobId,
+        filename: card.filename,
+        mime: card.mediaMime,
+        blake3: card.blake3,
+        size: card.fileSize,
+        domain: card.mediaDomain,
+        snatchedBy: card.snatchedBy,
+      },
+      this.getPeers
+    );
+  }
+
+  /**
+   * build the control bar (play/pause, fullscreen[video], save, stop) for
+   * an audio/video card, docked to the bottom strip of the overlay's
+   * bounds — added as a sibling of `overlay` (not a child of it, since the
+   * overlay's own `eventMode` is "none" and would swallow hit testing for
+   * anything nested inside it). shown whenever the card's media is mounted
+   * (see isMediaMounted()), whether that's a preview-hook card or the
+   * generic audioManager/DOM-video path. the reserved strip stays clear of
+   * the real DOM `<video>` element (see computeControlRowHeight()), which
+   * otherwise renders on top of the entire pixi canvas and would hide it.
+   */
+  private buildControlBar(overlay: Container, card: RenderedCard): Container | null {
+    const parent = overlay.parent;
+    if (!parent) return null;
+
+    const widgetId = card.widgetId;
+    const w = overlay.width;
+    const h = overlay.height;
+    const rowH = computeControlRowHeight(w, h);
+    const iconSize = Math.max(10, rowH * 0.6);
+    const cy = rowH / 2;
+
+    const bar = new Container();
+    bar.label = "media-control-bar";
+    bar.zIndex = 20;
+    bar.visible = false;
+    bar.x = overlay.x;
+    bar.y = overlay.y + h - rowH;
+
+    const bg = new Graphics();
+    bg.rect(0, 0, w, rowH).fill({ color: 0x000000, alpha: 0.55 });
+    bar.addChild(bg);
+
+    const isVideo = card.mediaDomain === "video" || Boolean(card.createBinPreview);
+    const canSave = Boolean(card.mediaBlobId);
+    const buttonCount = 2 + (isVideo ? 1 : 0) + (canSave ? 1 : 0);
+    const slotW = Math.min(rowH, w / buttonCount);
+    let x = (w - slotW * buttonCount) / 2;
+
+    const addHitArea = (slotX: number, onTap: () => void): void => {
+      const hit = new Graphics();
+      hit.rect(slotX, 0, slotW, rowH).fill({ color: 0x000000, alpha: 0.001 });
+      hit.eventMode = "static";
+      hit.cursor = "pointer";
+      hit.on("pointertap", (e: any) => {
+        e.stopPropagation();
+        onTap();
+      });
+      bar.addChild(hit);
+    };
+
+    // play/pause toggle
+    const cxPlay = x + slotW / 2;
+    const playIcon = new Graphics();
+    const triH = iconSize * 0.85;
+    const triW = triH * 0.866;
+    playIcon
+      .poly([
+        { x: cxPlay - triW / 3, y: cy - triH / 2 },
+        { x: cxPlay + (triW * 2) / 3, y: cy },
+        { x: cxPlay - triW / 3, y: cy + triH / 2 },
+      ])
+      .fill({ color: 0xffffff, alpha: 0.95 });
+    bar.addChild(playIcon);
+
+    const pauseIcon = new Graphics();
+    const pBarW = iconSize * 0.2;
+    const pBarH = iconSize * 0.65;
+    const pGap = iconSize * 0.14;
+    pauseIcon.rect(cxPlay - pGap - pBarW, cy - pBarH / 2, pBarW, pBarH).fill({ color: 0xffffff, alpha: 0.95 });
+    pauseIcon.rect(cxPlay + pGap, cy - pBarH / 2, pBarW, pBarH).fill({ color: 0xffffff, alpha: 0.95 });
+    pauseIcon.visible = false;
+    bar.addChild(pauseIcon);
+    this.controlBarIcons.set(widgetId, { playIcon, pauseIcon });
+    addHitArea(x, () => this.handlePlayPauseTap(widgetId));
+    x += slotW;
+
+    // fullscreen (video only)
+    if (isVideo) {
+      const cxFs = x + slotW / 2;
+      const half = iconSize * 0.3;
+      const cornerLen = half * 0.6;
+      const strokeW = Math.max(1.2, iconSize * 0.1);
+      const fsIcon = new Graphics();
+      fsIcon
+        .moveTo(cxFs - half, cy - half + cornerLen)
+        .lineTo(cxFs - half, cy - half)
+        .lineTo(cxFs - half + cornerLen, cy - half);
+      fsIcon
+        .moveTo(cxFs + half - cornerLen, cy - half)
+        .lineTo(cxFs + half, cy - half)
+        .lineTo(cxFs + half, cy - half + cornerLen);
+      fsIcon
+        .moveTo(cxFs + half, cy + half - cornerLen)
+        .lineTo(cxFs + half, cy + half)
+        .lineTo(cxFs + half - cornerLen, cy + half);
+      fsIcon
+        .moveTo(cxFs - half + cornerLen, cy + half)
+        .lineTo(cxFs - half, cy + half)
+        .lineTo(cxFs - half, cy + half - cornerLen);
+      fsIcon.stroke({ width: strokeW, color: 0xffffff, alpha: 0.95, cap: "round", join: "round" });
+      bar.addChild(fsIcon);
+      addHitArea(x, () => this.handleFullscreenTap(widgetId));
+      x += slotW;
+    }
+
+    // save / reveal
+    if (canSave) {
+      const cxSave = x + slotW / 2;
+      const saveDraw = isTauriMode() ? drawRevealIcon : drawSaveIcon;
+      const saveIcon = new Graphics();
+      saveDraw(saveIcon, cxSave - iconSize / 2, cy - iconSize / 2, iconSize, 0xffffff, 0.95);
+      bar.addChild(saveIcon);
+      addHitArea(x, () => this.handleSaveTap(widgetId));
+      x += slotW;
+    }
+
+    // stop / clear
+    {
+      const cxStop = x + slotW / 2;
+      const r = iconSize / 2;
+      const stopIcon = new Graphics();
+      const armLen = r * 0.5;
+      stopIcon.moveTo(cxStop - armLen, cy - armLen).lineTo(cxStop + armLen, cy + armLen);
+      stopIcon.moveTo(cxStop + armLen, cy - armLen).lineTo(cxStop - armLen, cy + armLen);
+      stopIcon.stroke({ width: Math.max(1.5, iconSize * 0.14), color: 0xffffff, alpha: 0.95, cap: "round" });
+      bar.addChild(stopIcon);
+      addHitArea(x, () => this.handleStopTap(widgetId));
+    }
+
+    parent.addChild(bar);
+    return bar;
   }
 
   // -----------------------------------------------------------------------
@@ -739,11 +1146,18 @@ export class BinMediaController {
 
   private setCardIcon(widgetId: string, icon: "play" | "pause"): void {
     const parts = this.overlayParts.get(widgetId);
-    if (!parts) return;
-    if (icon === "play") {
-      showPlayIcon(parts);
-    } else {
-      showPauseIcon(parts);
+    if (parts) {
+      if (icon === "play") {
+        showPlayIcon(parts);
+      } else {
+        showPauseIcon(parts);
+      }
+    }
+
+    const barIcons = this.controlBarIcons.get(widgetId);
+    if (barIcons) {
+      barIcons.playIcon.visible = icon === "play";
+      barIcons.pauseIcon.visible = icon === "pause";
     }
   }
 
