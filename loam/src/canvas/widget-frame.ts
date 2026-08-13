@@ -73,6 +73,9 @@ type HandlePosition = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 export class WidgetFrame {
   private static readonly HOVER_GRACE_MS = 450;
 
+  /** extra header-growth multiplier applied only while maximized (see headerGrowth()) */
+  private static readonly MAXIMIZED_HEADER_SCALE = 1.35;
+
   /**
    * on touch devices, at most one frame shows the touch-hover toolbar at a
    * time. tracked here so switching widgets auto-clears the previous one
@@ -94,7 +97,9 @@ export class WidgetFrame {
   private readonly border: Graphics;
   private readonly header: Container;
   private readonly headerBg: Graphics;
+  private readonly titleProgressBg: Graphics;
   private readonly headerText: Text;
+  private _titleProgress: number | null = null;
   private readonly hamburgerBtn: Container;
   private hamburgerFlyout: Container | null = null;
   private _layerPosition = 0;
@@ -234,6 +239,11 @@ export class WidgetFrame {
 
     this.headerBg = new Graphics();
     this.header.addChild(this.headerBg);
+
+    // fills in behind the title text to show playback/progress (see
+    // setTitleProgress()) — sits above headerBg, below the title itself.
+    this.titleProgressBg = new Graphics();
+    this.header.addChild(this.titleProgressBg);
 
     this.headerText = new Text({
       text: this._title || this.widgetName,
@@ -385,6 +395,17 @@ export class WidgetFrame {
     this.draw();
   }
 
+  /**
+   * fill the title text's background from 0 (transparent) to 1 (fully
+   * magenta) — e.g. audio/voice-recording widgets use this to show
+   * playback progress right behind the header title. null clears it.
+   * lightweight: only redraws the small progress rect, not the full header.
+   */
+  setTitleProgress(progress: number | null): void {
+    this._titleProgress = progress === null ? null : Math.max(0, Math.min(1, progress));
+    this.drawTitleProgress();
+  }
+
   /** update position on the stage */
   setPosition(x: number, y: number): void {
     this.root.x = x;
@@ -408,9 +429,11 @@ export class WidgetFrame {
   /** growth factor for header-related sizes — 1 at zoom >= 1 (never shrinks
    *  below the base design size), growing as the canvas zooms out so the
    *  header holds a constant on-screen size. same idea as the resize-handle
-   *  compensation below. */
+   *  compensation below. maximized mode gets an extra bump on top of this —
+   *  there's plenty of screen real estate and bigger touch targets help. */
   private headerGrowth(): number {
-    return Math.max(1, 1 / this.currentZoom);
+    const zoomGrowth = Math.max(1, 1 / this.currentZoom);
+    return this._maximized ? zoomGrowth * WidgetFrame.MAXIMIZED_HEADER_SCALE : zoomGrowth;
   }
 
   /** header band height in world-space units, compensated by headerGrowth()
@@ -448,6 +471,12 @@ export class WidgetFrame {
   /** whether this frame is currently in maximized mode */
   get maximized(): boolean {
     return this._maximized;
+  }
+
+  /** current header band height, in world-space units — lets callers (e.g.
+   *  the widget manager, when maximizing) reserve on-screen room for it. */
+  get headerHeight(): number {
+    return this.effectiveHeaderHeight();
   }
 
   /** update the frame dimensions (e.g., after store resizeWidget) */
@@ -516,6 +545,7 @@ export class WidgetFrame {
     this.drawEditOverlay();
     this.positionResizeHandles();
     this.positionButtons();
+    this.drawTitleProgress();
     this.updateBodyHitArea();
   }
 
@@ -526,11 +556,8 @@ export class WidgetFrame {
     this.header.y = -this.effectiveHeaderHeight();
 
     if (this._maximized) {
-      if (!this._hovered && this.hamburgerFlyout === null) {
-        this.headerBg.clear();
-        return;
-      }
-      // opaque header — it sits above the content, not overlaying it
+      // always shown when maximized (see updateVisualState()) — reserved
+      // screen space above the content, not overlaying it
       const w = this._width;
       const h = this.effectiveHeaderHeight();
       this.headerBg.clear();
@@ -558,6 +585,21 @@ export class WidgetFrame {
     this.headerBg.arcTo(0, 0, r, 0, r);
     this.headerBg.closePath();
     this.headerBg.fill({ color: this.theme.frameHeaderBg });
+  }
+
+  /** redraws the title-text progress fill — see setTitleProgress(). must
+   *  run after positionButtons() since it depends on the title's current
+   *  x/width (which shift with header layout and zoom growth). */
+  private drawTitleProgress(): void {
+    this.titleProgressBg.clear();
+    if (!this._titleProgress) return;
+    const growth = this.headerGrowth();
+    const pad = 4 * growth;
+    const x = this.headerText.x - pad;
+    const fullWidth = this.headerText.width + pad * 2;
+    const h = this.effectiveHeaderHeight();
+    this.titleProgressBg.rect(x, 0, fullWidth * this._titleProgress, h);
+    this.titleProgressBg.fill({ color: this.theme.accent });
   }
 
   private drawBorder(): void {
@@ -646,6 +688,10 @@ export class WidgetFrame {
    * actions that don't fit overflow into the hamburger flyout.
    */
   private positionButtons(): void {
+    if (this._maximized) {
+      this.positionButtonsMaximized();
+      return;
+    }
     const w = this._width;
     // buttons grow in world-space (via container scale) so they hold a
     // constant on-screen size when zoomed out — the layout math below uses
@@ -721,6 +767,7 @@ export class WidgetFrame {
     // buttons (headerGrowth) so it stays legible at any zoom level, then
     // clamp scale.x further if it still doesn't fit.
     const titleMaxWidth = Math.max(20 * growth, actionX - 8 * growth - 8 * growth); // 8px left padding + 8px gap
+    this.headerText.x = 8; // restores the fixed left padding (maximized mode moves this)
     this.headerText.style.wordWrap = false;
     this.headerText.scale.set(growth);
     // use a simple width clamp — pixi Text doesn't have native maxWidth,
@@ -728,6 +775,54 @@ export class WidgetFrame {
     if (this.headerText.width > titleMaxWidth) {
       this.headerText.scale.x = growth * (titleMaxWidth / this.headerText.width);
     }
+  }
+
+  /**
+   * maximized-mode header layout: packs system buttons + custom actions from
+   * the left edge, with the title following after them — this keeps the
+   * right side of the screen clear, where the app's fixed top-right nav
+   * toolbar lives (see toolbar.ts) and would otherwise overlap the header.
+   *
+   * [collapse] [maximize] [close] [hamburger]  [custom actions...]  title text
+   */
+  private positionButtonsMaximized(): void {
+    const growth = this.headerGrowth();
+    const btnSize = (this.theme.frameHeaderHeight - 8) * growth;
+    const btnSlot = btnSize + 4 * growth;
+    const pad = 8 * growth;
+
+    // same relative order as normal mode (reading left to right), just
+    // packed from the left edge instead of the right — collapseBtn is
+    // always hidden while maximized, so it's a no-op here.
+    const systemButtons = [this.collapseBtn, this.maximizeBtn, this.closeBtn, this.hamburgerBtn];
+    let x = pad;
+    for (const btn of systemButtons) {
+      if (!btn.visible) continue;
+      btn.scale.set(growth);
+      btn.x = x;
+      btn.y = 4 * growth;
+      x += btnSlot;
+    }
+
+    // custom actions follow, left to right. maximized headers have plenty
+    // of room before reaching the title, so there's no overflow handling.
+    const ACTION_GAP = 4 * growth;
+    for (let i = 0; i < this.customActions.length; i++) {
+      const action = this.customActions[i];
+      const container = this.customActionContainers[i];
+      if (action.marginLeft) x += action.marginLeft * growth;
+      container.x = x;
+      container.y = 4 * growth;
+      container.scale.set(growth);
+      container.visible = true;
+      x += this.measureActionWidth(action) + ACTION_GAP;
+    }
+    this.overflowActions = [];
+
+    // title comes last, after every other control
+    this.headerText.style.wordWrap = false;
+    this.headerText.scale.set(growth);
+    this.headerText.x = x + 4 * growth;
   }
 
   /** measure the display width of a custom action button, at its grown
@@ -1508,10 +1603,10 @@ export class WidgetFrame {
 
   private updateVisualState(): void {
     if (this._maximized) {
-      // on touch devices, treat selection as hover so the header is accessible
-      // (there's no cursor to trigger pointerenter on touch)
-      const showHeader =
-        this._hovered || (isTouchDevice() && this._selected) || this.hamburgerFlyout !== null;
+      // always shown when maximized — otherwise it renders above y=0 (off
+      // the visible viewport) and users have no way to reach it; the
+      // widget manager reserves headerHeight of on-screen room for this.
+      const showHeader = true;
 
       // explicit hitArea so hover events fire even when widget content
       // has no interactive pixi elements (e.g., image widget, label)

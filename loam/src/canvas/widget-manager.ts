@@ -317,13 +317,17 @@ export class WidgetManager {
     // enter maximized mode on the frame (hides chrome, disables drag)
     live.frame.setMaximized(true);
 
-    // position frame at origin and resize to fill viewport
+    // position frame at origin, reserving room at the top for the header
+    // (now always shown while maximized — see widget-frame.ts) so it
+    // doesn't overlay the content or land above the visible viewport.
     const { width, height } = this.getViewportSize();
-    live.frame.setPosition(0, 0);
-    live.frame.updateSize(width, height);
+    const hdr = live.frame.headerHeight;
+    const contentHeight = Math.max(0, height - hdr);
+    live.frame.setPosition(0, hdr);
+    live.frame.updateSize(width, contentHeight);
     if (live.ctrl.resize) {
       try {
-        live.ctrl.resize(width, height);
+        live.ctrl.resize(width, contentHeight);
       } catch (err) {
         console.warn(`widget ${widgetId} threw during maximize resize:`, err);
       }
@@ -638,6 +642,9 @@ export class WidgetManager {
       setHeaderActions: (actions) => {
         frame.setCustomActions(actions);
       },
+      setTitleProgress: (progress) => {
+        frame.setTitleProgress(progress);
+      },
     };
 
     let ctrl: WidgetController;
@@ -661,6 +668,9 @@ export class WidgetManager {
     // apply initial header actions if the widget declared any
     if (ctrl.headerActions) {
       frame.setCustomActions(ctrl.headerActions);
+    }
+    if (ctrl.titleProgress != null) {
+      frame.setTitleProgress(ctrl.titleProgress);
     }
 
     // add the widget's container into the frame's content area

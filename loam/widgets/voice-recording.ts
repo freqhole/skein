@@ -590,7 +590,9 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       const tick = (): void => {
         if (recState !== "playing") return;
         playRafId = requestAnimationFrame(tick);
-        if (!audioEl || !playbackEnvelope) return;
+        if (!audioEl) return;
+        ctx.setTitleProgress?.(audioEl.currentTime / Math.max(0.001, ctx.doc.current.duration));
+        if (!playbackEnvelope) return;
         const idx = Math.floor(audioEl.currentTime * ENVELOPE_HZ);
         const rms = playbackEnvelope[Math.min(idx, playbackEnvelope.length - 1)] ?? 0;
         const target = volumeToRawOpenness(rms);
@@ -879,6 +881,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           stopPlayAnim();
           refresh();
           ctx.setHeaderActions?.(makeHeaderActions());
+          ctx.setTitleProgress?.(0);
         };
       }
 
@@ -902,6 +905,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       startPlayAnim();
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
+      ctx.setTitleProgress?.(audioEl.currentTime / Math.max(0.001, ctx.doc.current.duration));
     };
 
     const pausePlayback = (): void => {
@@ -972,6 +976,7 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
       });
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
+      ctx.setTitleProgress?.(null);
     };
 
     // -- event handlers --
