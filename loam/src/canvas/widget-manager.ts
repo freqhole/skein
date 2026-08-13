@@ -770,6 +770,16 @@ export class WidgetManager {
       onShiftSelect: () => {
         this.inputRouter.toggleWidgetInSelection(widgetId);
       },
+      onDeselect: () => {
+        this.inputRouter.selectWidget(null);
+      },
+      onTogglePropTray: () => {
+        if (this.inputRouter.selectedWidgetId === widgetId) {
+          this.inputRouter.selectWidget(null);
+        } else {
+          this.inputRouter.selectWidget(widgetId);
+        }
+      },
       onMove: (x: number, y: number) => {
         if (this.store.isLocalViewer()) return;
         this.store.moveWidget(widgetId, x, y);

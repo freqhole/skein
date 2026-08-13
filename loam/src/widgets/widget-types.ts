@@ -93,7 +93,9 @@ export interface HeaderAction {
    * optional drag handler — when provided the button becomes a drag scrubber.
    * called on each pointermove while the button is pressed, with the horizontal
    * delta in pixels since the last call. use for continuously-adjustable values
-   * like opacity.
+   * like opacity. works for both text-label buttons (updates `label` via
+   * `getLiveLabel`) and icon buttons (redraws via `renderIcon` on each tick,
+   * e.g. a brush icon that rotates to show a live angle).
    *
    * important: do NOT call setHeaderActions() inside onDrag — that destroys and
    * recreates the button mid-drag, breaking the interaction after a single pixel.

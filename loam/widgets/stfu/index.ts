@@ -82,7 +82,7 @@ export const stfuWidget: WidgetFactory<typeof stfuSchema> = {
     description: "video/audio cut-timeline editor",
     version: "0.1.0",
     category: "media",
-    defaultWidth: 480,
+    defaultWidth: 640,
     defaultHeight: 480,
   },
   schema: stfuSchema,

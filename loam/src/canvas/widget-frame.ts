@@ -24,6 +24,14 @@ export interface WidgetFrameCallbacks {
   onCollapse: (collapsed: boolean) => void;
   onMaximize?: () => void;
   onRestore?: () => void;
+  /** maximized mode only: toggle the side property tray open/closed for
+   *  this widget — there's no empty canvas to click away to while a widget
+   *  fills the whole viewport, so this button gives an explicit way in. */
+  onTogglePropTray?: () => void;
+  /** deselect this widget. used by the maximized-mode content click-away
+   *  blocker (see contentClickAwayBlocker) to close the property tray when
+   *  the user clicks into the widget's own content instead of the tray. */
+  onDeselect?: () => void;
   /** z-order: bring this widget to the front of all others */
   onBringToFront?: () => void;
   /** z-order: move this widget one layer forward */
@@ -107,6 +115,7 @@ export class WidgetFrame {
   private readonly collapseBtn: Container;
   private readonly maximizeBtn: Container;
   private readonly closeBtn: Container;
+  private readonly propTrayBtn: Container;
   private _closable = false;
   private readonly contentMask: Graphics;
   private readonly editOverlay: Graphics;
@@ -136,6 +145,10 @@ export class WidgetFrame {
 
   // invisible hit area covering the full frame for body-drag in multi-select
   private readonly bodyHitArea: Graphics;
+
+  // invisible blocker shown over content only while maximized and selected
+  // (i.e. the property tray is open) — see updateVisualState()
+  private readonly contentClickAwayBlocker: Graphics;
 
   // resize state
   private resizing = false;
@@ -278,12 +291,33 @@ export class WidgetFrame {
     this.hamburgerBtn = this.createHeaderButton("\u2261", theme);
     this.header.addChild(this.hamburgerBtn);
 
+    // property-tray toggle button — maximized mode only. lets users open and
+    // close the side property tray explicitly, since there's no empty canvas
+    // to click away to while a widget fills the whole viewport. positioned
+    // after the maximize/restore and hamburger buttons (see positionButtonsMaximized()).
+    this.propTrayBtn = this.createHeaderButton("\u25e8", theme);
+    this.propTrayBtn.visible = false;
+    this.header.addChild(this.propTrayBtn);
+
     // invisible hit area for body-drag when multi-selected.
     // sits behind the content container so it catches clicks on the
     // widget body area. only interactive when _multiSelected is true.
     this.bodyHitArea = new Graphics();
     this.bodyHitArea.eventMode = "none";
     this.root.addChild(this.bodyHitArea);
+
+    // invisible click-away blocker for the maximized-mode property tray —
+    // constructed here but only parented into contentContainer on demand
+    // (see updateVisualState()) so it can be bumped to the top of the
+    // content stack and reliably win the hit test over real widget content.
+    this.contentClickAwayBlocker = new Graphics();
+    this.contentClickAwayBlocker.eventMode = "none";
+    this.contentClickAwayBlocker.visible = false;
+    this.contentClickAwayBlocker.cursor = "default";
+    this.contentClickAwayBlocker.on("pointerdown", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      this.callbacks.onDeselect?.();
+    });
 
     // content container (below the header)
     this.contentContainer = new Container();
@@ -660,6 +694,7 @@ export class WidgetFrame {
     const y = 0;
     const showChrome = this.isChromeVisible();
     const r = showChrome ? this.theme.frameCornerRadius : 0;
+    this.contentClickAwayBlocker.hitArea = new Rectangle(0, y, this._width, this._height);
     this.contentMask.clear();
     if (r > 0) {
       // when chrome is visible, use rounded bottom corners matching the frame
@@ -688,6 +723,11 @@ export class WidgetFrame {
    * actions that don't fit overflow into the hamburger flyout.
    */
   private positionButtons(): void {
+    // re-center the title vertically whenever the effective header height
+    // changes (zoom growth, or the extra MAXIMIZED_HEADER_SCALE bump) — it's
+    // only set once at construction time otherwise, which drifts out of
+    // vertical center as the header grows taller.
+    this.headerText.y = this.effectiveHeaderHeight() / 2;
     if (this._maximized) {
       this.positionButtonsMaximized();
       return;
@@ -794,7 +834,13 @@ export class WidgetFrame {
     // same relative order as normal mode (reading left to right), just
     // packed from the left edge instead of the right — collapseBtn is
     // always hidden while maximized, so it's a no-op here.
-    const systemButtons = [this.collapseBtn, this.maximizeBtn, this.closeBtn, this.hamburgerBtn];
+    const systemButtons = [
+      this.collapseBtn,
+      this.maximizeBtn,
+      this.closeBtn,
+      this.hamburgerBtn,
+      this.propTrayBtn,
+    ];
     let x = pad;
     for (const btn of systemButtons) {
       if (!btn.visible) continue;
@@ -1182,6 +1228,15 @@ export class WidgetFrame {
       e.stopPropagation();
       this.callbacks.onClose();
     });
+
+    // property tray toggle button (maximized mode only)
+    const propTrayBg = this.propTrayBtn.getChildAt(0) as Graphics;
+    propTrayBg.eventMode = "static";
+    propTrayBg.cursor = "pointer";
+    propTrayBg.on("pointertap", (e: FederatedPointerEvent) => {
+      e.stopPropagation();
+      this.callbacks.onTogglePropTray?.();
+    });
   }
 
   private createHeaderButton(label: string, theme: SkeinTheme): Container {
@@ -1226,20 +1281,54 @@ export class WidgetFrame {
       const bg = new Graphics();
       bg.roundRect(0, 0, totalWidth, btnHeight, 3);
       bg.fill({ color: action.active ? this.theme.accent : this.theme.frameBorder });
+      // explicit hitArea, not implicit containsPoint — precise pointers (apple
+      // pencil) missed the fill shape at these small sizes; a plain rect over
+      // the button's full declared bounds is exact and reliable.
+      bg.hitArea = new Rectangle(0, 0, totalWidth, btnHeight);
       bg.eventMode = action.disabled ? "none" : "static";
-      bg.cursor = action.disabled ? "default" : "pointer";
+      bg.cursor = action.disabled ? "default" : action.onDrag ? "ew-resize" : "pointer";
       bg.on("pointertap", (e: FederatedPointerEvent) => {
         e.stopPropagation();
         action.onClick?.({ x: e.globalX, y: e.globalY });
       });
-
-      container.addChild(bg);
 
       const iconContainer = new Container();
       iconContainer.eventMode = "none";
       iconContainer.x = 4;
       iconContainer.y = 0;
       action.renderIcon(iconContainer, iconSize, iconColor);
+
+      // drag scrubber support — same gesture as the text-label buttons below,
+      // but redraws the icon (via renderIcon) instead of updating label text,
+      // so e.g. a rotating brush icon can reflect a live angle while dragging.
+      if (action.onDrag) {
+        let dragging = false;
+        let lastDragX = 0;
+        bg.on("pointerdown", (e: FederatedPointerEvent) => {
+          dragging = true;
+          lastDragX = e.globalX;
+        });
+        bg.on("globalpointermove", (e: FederatedPointerEvent) => {
+          if (!dragging) return;
+          const delta = e.globalX - lastDragX;
+          if (Math.abs(delta) >= 1) {
+            lastDragX = e.globalX;
+            action.onDrag!(delta);
+            iconContainer.removeChildren();
+            action.renderIcon!(iconContainer, iconSize, iconColor);
+          }
+        });
+        bg.on("pointerup", () => {
+          dragging = false;
+          action.onDragEnd?.();
+        });
+        bg.on("pointerupoutside", () => {
+          dragging = false;
+          action.onDragEnd?.();
+        });
+      }
+
+      container.addChild(bg);
       container.addChild(iconContainer);
 
       return container;
@@ -1272,6 +1361,9 @@ export class WidgetFrame {
       const bg = new Graphics();
       bg.roundRect(0, 0, totalWidth, btnHeight, 3);
       bg.fill({ color: action.active ? this.theme.accent : this.theme.frameBorder });
+      // explicit hitArea, not implicit containsPoint — see the icon-button
+      // branch above for why.
+      bg.hitArea = new Rectangle(0, 0, totalWidth, btnHeight);
       bg.eventMode = action.disabled ? "none" : "static";
       bg.cursor = action.disabled ? "default" : action.onDrag ? "ew-resize" : "pointer";
       bg.on("pointertap", (e: FederatedPointerEvent) => {
@@ -1633,6 +1725,7 @@ export class WidgetFrame {
       this.collapseBtn.visible = false; // collapse doesn't make sense when maximized
       this.maximizeBtn.visible = showHeader && !!this.callbacks.onMaximize;
       this.closeBtn.visible = showHeader && this._closable;
+      this.propTrayBtn.visible = showHeader && !!this.callbacks.onTogglePropTray;
 
       // custom actions follow header
       for (const c of this.customActionContainers) {
@@ -1659,8 +1752,26 @@ export class WidgetFrame {
       this.headerBg.eventMode = showHeader ? "static" : "none";
       this.headerBg.cursor = showHeader ? "default" : "auto";
 
+      // property tray click-away: while maximized and selected (the tray is
+      // open), block and dismiss content clicks — re-parenting bumps it to
+      // the top of contentContainer so it wins the hit test over real
+      // content regardless of add order.
+      if (this._selected) {
+        this.contentContainer.addChild(this.contentClickAwayBlocker);
+        this.contentClickAwayBlocker.eventMode = "static";
+        this.contentClickAwayBlocker.visible = true;
+      } else {
+        this.contentClickAwayBlocker.eventMode = "none";
+        this.contentClickAwayBlocker.visible = false;
+      }
+
       return;
     }
+
+    // click-away blocker and prop-tray button only apply in maximized mode
+    this.contentClickAwayBlocker.eventMode = "none";
+    this.contentClickAwayBlocker.visible = false;
+    this.propTrayBtn.visible = false;
 
     // collapsed widgets always show chrome (no content to hover over)
     const showChrome = this.isChromeVisible();
