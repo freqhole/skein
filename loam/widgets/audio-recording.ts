@@ -882,6 +882,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
         playbackElapsed = audioEl.currentTime;
         updateTexts();
         drawWave(capturedSamples, playbackElapsed / dur);
+        ctx.setTitleProgress?.(playbackElapsed / dur);
       };
       playRafId = requestAnimationFrame(tick);
     };
@@ -1164,6 +1165,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           stopPlayAnim();
           refresh();
           ctx.setHeaderActions?.(makeHeaderActions());
+          ctx.setTitleProgress?.(0);
         };
       }
 
@@ -1187,6 +1189,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       startPlayAnim();
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
+      ctx.setTitleProgress?.(playbackElapsed / Math.max(0.001, ctx.doc.current.duration));
     };
 
     /** send a friend request to the peer holding this recording, then
@@ -1255,6 +1258,7 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
 
       refresh();
       ctx.setHeaderActions?.(makeHeaderActions());
+      ctx.setTitleProgress?.(null);
     };
 
     // ── button click handler ─────────────────────────────────────────────────

@@ -267,6 +267,11 @@ export interface WidgetMountContext<S extends z.ZodType = z.ZodType> {
    *  call this whenever the action labels or set of actions changes (e.g. item
    *  count updated, snatch progress). provided by the widget manager at mount time. */
   setHeaderActions?: (actions: HeaderAction[]) => void;
+  /** fill the header title text's background from 0 (transparent) to 1 (fully
+   *  accent-colored) — e.g. audio/voice-recording widgets use this to show
+   *  playback progress right behind the title. pass null to clear it.
+   *  provided by the widget manager at mount time. */
+  setTitleProgress?: (progress: number | null) => void;
   /** pending knocks on every OTHER admin canvas — see
    *  `OtherCanvasKnocksSource`'s doc comment. only wired in for the
    *  messagez widget's overlay mount (boot.ts); undefined for other
@@ -344,6 +349,8 @@ export interface WidgetController {
   /** optional initial header actions to inject into the frame header bar.
    *  these are set once at mount time; use ctx.setHeaderActions() for dynamic updates. */
   headerActions?: HeaderAction[];
+  /** optional initial title-progress fill (0–1) — see ctx.setTitleProgress(). */
+  titleProgress?: number | null;
   /** optional action buttons shown in the property tray when this widget is selected.
    *  used for widget-specific operations like "tidy" in the bin widget. */
   widgetActions?: WidgetAction[];

@@ -47,7 +47,12 @@ function randomDoodleColor(): number {
 // schema
 // ---------------------------------------------------------------------------
 
-const pointSchema = z.object({ x: z.number(), y: z.number() });
+const pointSchema = z.object({
+  x: z.number(),
+  y: z.number(),
+  /** 0–1 pointer pressure, sampled when pressureEnabled is on; omitted otherwise */
+  pressure: z.number().optional(),
+});
 
 export const strokeSchema = z.object({
   /** session-unique id used for local undo tracking */
@@ -86,8 +91,10 @@ export const doodleSchema = z.object({
   activeTool: z.string().default("pen"),
   /** pen color (0xRRGGBB) */
   penColor: z.number().default(0xd946ef),
-  /** pen width in pixels */
+  /** pen width in pixels — the baseline width when pressureEnabled is on */
   penWidth: z.number().default(3),
+  /** when true, stroke width scales with pointer pressure (penWidth is the baseline) */
+  pressureEnabled: z.boolean().default(false),
   /** brush shape: "circle" | "rect" | "diamond" */
   brushShape: z.string().default("circle"),
   /** pen opacity 1–100; 100 = fully opaque */
@@ -129,11 +136,71 @@ function makeId(): string {
  * supports three brush shapes: "circle" (round cap), "rect" (square cap),
  * and "diamond" (rotated square stamps along the path).
  */
+/** stamp a single brush shape (used by pressure-variable rendering below) */
+function stampShape(g: Graphics, shape: string, x: number, y: number, w: number): void {
+  const hw = w / 2;
+  if (shape === "diamond") {
+    g.moveTo(x, y - hw);
+    g.lineTo(x + hw, y);
+    g.lineTo(x, y + hw);
+    g.lineTo(x - hw, y);
+    g.closePath();
+  } else if (shape === "rect") {
+    g.rect(x - hw, y - hw, w, w);
+  } else {
+    g.circle(x, y, Math.max(0.5, hw));
+  }
+}
+
+/** baseline*pressure floor — a very light touch still leaves a visible mark */
+const MIN_PRESSURE_SCALE = 0.35;
+
+/**
+ * pressure-variable stroke rendering — stamps interpolated shapes along the
+ * path with width scaled per-point from `penWidth` (the baseline). only
+ * used when points carry a `pressure` sample; otherwise paintStroke falls
+ * back to its constant-width path (stroke() / single stamp), unchanged.
+ */
+function paintPressureStroke(g: Graphics, stroke: DoodleStroke): void {
+  const { points, color, width } = stroke;
+  const alpha = (stroke.opacity ?? 100) / 100;
+  const shape = stroke.brushShape ?? "circle";
+
+  const widthAt = (p: { pressure?: number }) => {
+    const pr = Math.max(0, Math.min(1, p.pressure ?? 1));
+    const scale = MIN_PRESSURE_SCALE + (1 - MIN_PRESSURE_SCALE) * pr;
+    return Math.max(0.5, width * scale);
+  };
+
+  stampShape(g, shape, points[0].x, points[0].y, widthAt(points[0]));
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+    const dist = Math.hypot(b.x - a.x, b.y - a.y);
+    const avgW = (widthAt(a) + widthAt(b)) / 2;
+    const step = Math.max(1, avgW * 0.35);
+    const steps = Math.max(1, Math.ceil(dist / step));
+    for (let j = 1; j <= steps; j++) {
+      const t = j / steps;
+      const x = a.x + (b.x - a.x) * t;
+      const y = a.y + (b.y - a.y) * t;
+      const w = widthAt(a) + (widthAt(b) - widthAt(a)) * t;
+      stampShape(g, shape, x, y, w);
+    }
+  }
+  g.fill({ color, alpha });
+}
+
 function paintStroke(g: Graphics, stroke: DoodleStroke): void {
   const { points, color, width } = stroke;
   const alpha = (stroke.opacity ?? 100) / 100;
   const shape = stroke.brushShape ?? "circle";
   if (points.length === 0) return;
+
+  if (points.some((p) => typeof p.pressure === "number")) {
+    paintPressureStroke(g, stroke);
+    return;
+  }
 
   if (shape === "diamond") {
     // stamp interpolated rotated squares along the full path so there are no
@@ -329,6 +396,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     },
     { key: "penColor", label: "pen color", type: "color" as const, default: 0xd946ef },
     { key: "penWidth", label: "pen width", type: "number" as const, default: 3 },
+    { key: "pressureEnabled", label: "pressure", type: "boolean" as const, default: false },
     {
       key: "brushShape",
       label: "brush shape",
@@ -610,6 +678,14 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     // and pointerup are delivered to bgGfx even when the pointer leaves the
     // widget bounds mid-stroke.
 
+    // samples pointer pressure only when pressureEnabled — omitting the field
+    // otherwise keeps old/disabled strokes on paintStroke's constant-width path
+    const capturePoint = (e: any, lp: { x: number; y: number }) => {
+      if (!ctx.doc.current.pressureEnabled) return { x: lp.x, y: lp.y };
+      const pressure = typeof e.pressure === "number" && e.pressure > 0 ? e.pressure : 0.5;
+      return { x: lp.x, y: lp.y, pressure };
+    };
+
     bgGfx.on("pointerdown", (e: any) => {
       if (drawing) return;
       if (ctx.canvasStore?.isLocalViewer()) return;
@@ -620,7 +696,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       activeStrokeId = makeId();
       activePoints = [];
       const lp = e.getLocalPosition(container);
-      activePoints.push({ x: lp.x, y: lp.y });
+      activePoints.push(capturePoint(e, lp));
       redrawLive();
     });
 
@@ -634,7 +710,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       const dy = lp.y - last.y;
       // skip micro-movements (< 2px) to keep point counts manageable
       if (dx * dx + dy * dy < 4) return;
-      activePoints.push({ x: lp.x, y: lp.y });
+      activePoints.push(capturePoint(e, lp));
       redrawLive();
     });
 
@@ -798,7 +874,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     };
 
     const makeHeaderActions = (): HeaderAction[] => {
-      const { activeTool, brushShape, penOpacity, penWidth, locked } = ctx.doc.current;
+      const { activeTool, brushShape, penOpacity, penWidth, locked, pressureEnabled } = ctx.doc.current;
       const shape = brushShape ?? "circle";
       const opacity = penOpacity ?? 100;
       const width = Math.max(1, penWidth ?? 3);
@@ -945,6 +1021,35 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
           },
         },
         {
+          id: "pressure",
+          label: "pressure",
+          active: pressureEnabled,
+          marginLeft: 8,
+          // tapered wedge (thick to thin) — visualizes a pressure-scaled stroke
+          renderIcon: (parent: Container, size: number, color: number) => {
+            const x0 = size * 0.22,
+              y0 = size * 0.78;
+            const x1 = size * 0.78,
+              y1 = size * 0.22;
+            const thickHW = size * 0.2;
+            const thinHW = size * 0.03;
+            const dx = x1 - x0,
+              dy = y1 - y0;
+            const len = Math.hypot(dx, dy) || 1;
+            const nx = -dy / len,
+              ny = dx / len;
+            const gfx = new Graphics();
+            gfx.moveTo(x0 + nx * thickHW, y0 + ny * thickHW);
+            gfx.lineTo(x1 + nx * thinHW, y1 + ny * thinHW);
+            gfx.lineTo(x1 - nx * thinHW, y1 - ny * thinHW);
+            gfx.lineTo(x0 - nx * thickHW, y0 - ny * thickHW);
+            gfx.closePath();
+            gfx.fill({ color, alpha: 0.92 });
+            parent.addChild(gfx);
+          },
+          onClick: () => setPressureEnabled(!pressureEnabled),
+        },
+        {
           id: "undo",
           label: "↺",
           marginLeft: 8,
@@ -1005,6 +1110,13 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     const setLocked = (next: boolean) => {
       ctx.doc.change((d) => {
         d.locked = next;
+      });
+      ctx.setHeaderActions?.(makeHeaderActions());
+    };
+
+    const setPressureEnabled = (next: boolean) => {
+      ctx.doc.change((d) => {
+        d.pressureEnabled = next;
       });
       ctx.setHeaderActions?.(makeHeaderActions());
     };
