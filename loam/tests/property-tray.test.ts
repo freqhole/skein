@@ -196,6 +196,67 @@ test("property tray is positioned to the right of the selected widget", async ({
   expect(pos.y).toBe(52);
 });
 
+test("property tray stays a constant on-screen size when the viewport zooms", async ({
+  canvasPage,
+}) => {
+  const { page } = await canvasPage();
+  await setLocalRole(page, "member");
+
+  await page.evaluate(() => {
+    const skein = (window as any).__skein;
+    skein.store.addWidget({
+      id: "w1",
+      type: "label",
+      x: 100,
+      y: 80,
+      width: 200,
+      height: 120,
+      zIndex: 1,
+      props: {},
+      collapsed: false,
+      docId: null,
+      parentId: null,
+    });
+  });
+  await page.waitForTimeout(300);
+
+  await page.evaluate(() => {
+    (window as any).__skein.inputRouter.selectWidget("w1");
+  });
+  await page.waitForTimeout(100);
+
+  const before = await page.evaluate(() => {
+    const skein = (window as any).__skein;
+    const tray = skein.propertyTray.root;
+    return { scaleX: tray.scale.x, x: tray.x, y: tray.y };
+  });
+  expect(before.scaleX).toBe(1);
+
+  const after = await page.evaluate(() => {
+    const skein = (window as any).__skein;
+    skein.viewport.zoomTo(0.5);
+    const tray = skein.propertyTray.root;
+    return {
+      scaleX: tray.scale.x,
+      x: tray.x,
+      y: tray.y,
+      worldScale: skein.world.scale.x,
+    };
+  });
+
+  expect(after.worldScale).toBeCloseTo(0.5, 2);
+  // tray root scale cancels out the world's zoom, so its own content always
+  // renders at a constant on-screen size regardless of viewport zoom.
+  expect(after.scaleX).toBeCloseTo(2, 5);
+  // position offsets (gap=8, frameHeaderHeight=28) are constant *screen*
+  // pixels, so at 0.5x zoom they double in world units:
+  // x = 100 + 200 + 8*2 = 316, y = 80 - 28*2 = 24
+  expect(before.x).toBe(308);
+  expect(before.y).toBe(52);
+  expect(after.x).toBe(316);
+  expect(after.y).toBe(24);
+});
+
 test("property tray repositions when widget is moved", async ({ canvasPage }) => {
   const { page } = await canvasPage();
   await setLocalRole(page, "member");

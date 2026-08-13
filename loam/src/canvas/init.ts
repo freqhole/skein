@@ -491,6 +491,13 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
   // once the drag commits on release, not on every intermediate move.
   const unsubTrayLiveMove = widgetManager.onLiveMove(() => propertyTray.repositionIfNeeded());
 
+  // keep the tray's on-screen size constant regardless of
+  // viewport zoom (it lives in world space so it pans with the widget, but
+  // its buttons/text shouldn't shrink to unusable sizes when zoomed out —
+  // see PropertyTray.setZoom()).
+  propertyTray.setZoom(viewport.zoom);
+  const unsubTrayZoom = viewport.onZoomChange((zoom) => propertyTray.setZoom(zoom));
+
   // step 14: track local cursor movement and broadcast via presence manager.
   // skipped on the narthex — no cursor broadcasting needed on the home screen.
   const canvasEl = app.canvas as HTMLCanvasElement;
@@ -552,6 +559,7 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
         resizeRaf = null;
       }
       unsubTrayLiveMove();
+      unsubTrayZoom();
       unsubViewportPersist?.();
       if (viewportSaveTimer !== null) {
         clearTimeout(viewportSaveTimer);
