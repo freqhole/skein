@@ -1,5 +1,12 @@
 # skein
 
+## 0.1.12
+
+### Patch Changes
+
+- 8218d9f: handle stfu + videoz inna bin
+- 39fe4e3: try to improve doodle widget input; add new pen shape; improve pen pointerType input
+
 ## 0.1.11
 
 ### Patch Changes
