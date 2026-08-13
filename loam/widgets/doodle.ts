@@ -482,6 +482,9 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
     let activePointerId: number | null = null;
     let activePoints: Array<{ x: number; y: number }> = [];
     let activeStrokeId = "";
+    /** per-touch override, set by the long-press/eraser gesture below — null
+     *  means "use the tray's activeTool" (the normal case). */
+    let toolOverride: "eraser" | null = null;
 
     // ── undo/redo (local session only — does not undo peers' strokes) ───────
     //
@@ -578,17 +581,18 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       liveGfx.clear();
       if (activePoints.length === 0) return;
       const { activeTool, penColor, penWidth, brushShape, penOpacity } = ctx.doc.current;
+      const effectiveTool = toolOverride ?? activeTool;
       const width = Math.max(1, penWidth);
       const stroke: DoodleStroke = {
         id: activeStrokeId,
-        tool: activeTool,
+        tool: effectiveTool,
         color: penColor,
         width,
         opacity: penOpacity ?? 100,
         brushShape: brushShape ?? "circle",
         points: activePoints,
       };
-      if (activeTool === "eraser") {
+      if (effectiveTool === "eraser") {
         liveGfx.blendMode = "erase";
         paintStroke(liveGfx, { ...stroke, color: 0xffffff });
       } else {
@@ -634,11 +638,10 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       redrawLive();
     });
 
-    const commitStroke = (e: any) => {
-      if (!drawing || (e && e.pointerId !== activePointerId)) return;
-      drawing = false;
-      activePointerId = null;
-
+    // finalizes whatever's in activePoints into a committed stroke, without
+    // touching `drawing`/`activePointerId` — shared by commitStroke and the
+    // mid-stroke pen/eraser split in handleContextMenu below.
+    const finalizeStroke = () => {
       if (activePoints.length === 0) {
         liveGfx.clear();
         liveGfx.blendMode = "normal";
@@ -648,7 +651,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       const { activeTool, penColor, penWidth, brushShape, penOpacity } = ctx.doc.current;
       const stroke: DoodleStroke = {
         id: activeStrokeId,
-        tool: activeTool,
+        tool: toolOverride ?? activeTool,
         color: penColor,
         width: Math.max(1, penWidth),
         opacity: penOpacity ?? 100,
@@ -677,8 +680,43 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       activeStrokeId = "";
     };
 
+    const commitStroke = (e: any) => {
+      if (!drawing || (e && e.pointerId !== activePointerId)) return;
+      drawing = false;
+      activePointerId = null;
+      finalizeStroke();
+      toolOverride = null;
+    };
+
     bgGfx.on("pointerup", commitStroke);
     bgGfx.on("pointerupoutside", commitStroke);
+
+    // pixi's federated event system never forwards native "pointercancel"
+    // (apple pencil hover/palm-rejection/system-gesture handling on iPad can
+    // fire this instead of pointerup mid-stroke) — without this, `drawing`
+    // gets stuck true forever and every subsequent pointerdown is ignored.
+    // listen natively and reuse commitStroke's own pointerId guard.
+    const handlePointerCancel = (e: PointerEvent) => commitStroke(e);
+    window.addEventListener("pointercancel", handlePointerCancel, true);
+
+    // apple pencil's long-press ("right click") surfaces as a native
+    // contextmenu event on ipados safari, still mid-touch — use it as a
+    // hold-to-erase gesture. splits whatever pen points were drawn so far
+    // into their own committed stroke, then continues the same touch as a
+    // new eraser stroke seeded from the same point (no visible gap). reverts
+    // to the tray's chosen tool on release, via commitStroke's toolOverride reset.
+    const handleContextMenu = (e: MouseEvent) => {
+      if (!drawing) return;
+      e.preventDefault();
+      if (toolOverride === "eraser") return;
+      const last = activePoints[activePoints.length - 1];
+      finalizeStroke();
+      toolOverride = "eraser";
+      activeStrokeId = makeId();
+      activePoints = last ? [last] : [];
+      redrawLive();
+    };
+    window.addEventListener("contextmenu", handleContextMenu, true);
 
     // ── header actions: pen / eraser tool buttons ───────────────────────────
     // guards against header refresh during opacity/width scrubber drag
@@ -1001,6 +1039,7 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
         activePointerId = null;
         activePoints = [];
         activeStrokeId = "";
+        toolOverride = null;
         liveGfx.clear();
         liveGfx.blendMode = "normal";
       }
@@ -1035,6 +1074,8 @@ export const doodleWidget: WidgetFactory<typeof doodleSchema> = {
       destroy() {
         destroyed = true;
         document.removeEventListener("keydown", handleKeyDown);
+        window.removeEventListener("pointercancel", handlePointerCancel, true);
+        window.removeEventListener("contextmenu", handleContextMenu, true);
         if (colorCleanupTimer !== null) clearTimeout(colorCleanupTimer);
         if (liveColorInput && document.body.contains(liveColorInput)) {
           document.body.removeChild(liveColorInput);

@@ -133,6 +133,11 @@ export class PropertyTray {
   private resizeStartGlobalX = 0;
   private resizeStartWidth = 0;
 
+  /** current viewport zoom, kept in sync via setZoom() so the tray can
+   *  counter-scale itself and render at a constant on-screen size instead
+   *  of shrinking/growing with the world (see setZoom() below). */
+  private currentZoom = 1;
+
   constructor(
     world: Container,
     theme: SkeinTheme,
@@ -583,18 +588,39 @@ export class PropertyTray {
   }
 
   private positionNextTo(frameX: number, frameY: number, frameWidth: number): void {
+    // the tray's own dimensions (trayWidth, gaps, header height) are all
+    // meant to be constant *screen* pixels (see setZoom()), but frameX/
+    // frameWidth are genuine world-space coordinates — convert screen-pixel
+    // offsets into world units so the tray still lands in the right spot.
+    const invZoom = 1 / this.currentZoom;
+
     // when the widget is maximized, the tray would normally be positioned
     // off-screen (to the right of the full-viewport widget). instead,
     // overlay it inside the viewport on the right side.
     if (this.widgetManager.isMaximized) {
-      const margin = 8;
-      this.root.x = Math.round(frameX + frameWidth - this.trayWidth - margin);
+      const margin = 8 * invZoom;
+      this.root.x = Math.round(frameX + frameWidth - this.trayWidth * invZoom - margin);
       this.root.y = Math.round(frameY + margin);
       return;
     }
 
-    this.root.x = Math.round(frameX + frameWidth + TRAY_GAP);
-    this.root.y = Math.round(frameY - this.theme.frameHeaderHeight);
+    this.root.x = Math.round(frameX + frameWidth + TRAY_GAP * invZoom);
+    this.root.y = Math.round(frameY - this.theme.frameHeaderHeight * invZoom);
+  }
+
+  /**
+   * the tray lives in the world container so it pans with the selected
+   * widget, but it should never get harder to read/tap just because the
+   * canvas is zoomed out — counter-scale it by 1/zoom so its rendered
+   * (screen) size stays constant regardless of viewport zoom, same idea as
+   * WidgetFrame's resize-handle compensation. call whenever the viewport's
+   * zoom changes (see init.ts's viewport.onZoomChange wiring).
+   */
+  setZoom(zoom: number): void {
+    if (this.currentZoom === zoom) return;
+    this.currentZoom = zoom;
+    this.root.scale.set(1 / zoom);
+    this.repositionIfNeeded();
   }
 
   /**

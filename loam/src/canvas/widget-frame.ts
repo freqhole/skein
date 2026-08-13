@@ -229,7 +229,7 @@ export class WidgetFrame {
     // cover widget content. sits at negative y so the content stays
     // at y=0 (no position shift).
     this.header = new Container();
-    this.header.y = -theme.frameHeaderHeight;
+    this.header.y = -this.effectiveHeaderHeight();
     this.root.addChild(this.header);
 
     this.headerBg = new Graphics();
@@ -246,7 +246,7 @@ export class WidgetFrame {
     });
     this.headerText.x = 8;
     this.headerText.anchor.set(0, 0.5);
-    this.headerText.y = theme.frameHeaderHeight / 2;
+    this.headerText.y = this.effectiveHeaderHeight() / 2;
     this.headerText.eventMode = "none";
     this.header.addChild(this.headerText);
 
@@ -396,12 +396,27 @@ export class WidgetFrame {
     this.root.zIndex = zIndex;
   }
 
-  /** sync the current viewport zoom so resize handles can compensate their
-   *  world-space size to stay easily clickable at any zoom level. */
+  /** sync the current viewport zoom so the header (band, buttons, title)
+   *  and resize handles can grow in world-space to hold a constant
+   *  on-screen size, instead of shrinking with the rest of the world. */
   setZoom(zoom: number): void {
     if (this.currentZoom === zoom) return;
     this.currentZoom = zoom;
-    this.positionResizeHandles();
+    this.draw();
+  }
+
+  /** growth factor for header-related sizes — 1 at zoom >= 1 (never shrinks
+   *  below the base design size), growing as the canvas zooms out so the
+   *  header holds a constant on-screen size. same idea as the resize-handle
+   *  compensation below. */
+  private headerGrowth(): number {
+    return Math.max(1, 1 / this.currentZoom);
+  }
+
+  /** header band height in world-space units, compensated by headerGrowth()
+   *  so its on-screen thickness stays constant regardless of zoom. */
+  private effectiveHeaderHeight(): number {
+    return this.theme.frameHeaderHeight * this.headerGrowth();
   }
 
   /** set collapsed state */
@@ -505,6 +520,11 @@ export class WidgetFrame {
   }
 
   private drawHeader(): void {
+    // keep the header anchored flush against content (y=0) as its grown
+    // height changes with zoom — otherwise the extra height spills down
+    // into content instead of extending up and away from the widget.
+    this.header.y = -this.effectiveHeaderHeight();
+
     if (this._maximized) {
       if (!this._hovered && this.hamburgerFlyout === null) {
         this.headerBg.clear();
@@ -512,14 +532,14 @@ export class WidgetFrame {
       }
       // opaque header — it sits above the content, not overlaying it
       const w = this._width;
-      const h = this.theme.frameHeaderHeight;
+      const h = this.effectiveHeaderHeight();
       this.headerBg.clear();
       this.headerBg.rect(0, 0, w, h);
       this.headerBg.fill({ color: this.theme.frameHeaderBg });
       return;
     }
     const w = this._width;
-    const h = this.theme.frameHeaderHeight;
+    const h = this.effectiveHeaderHeight();
     const showChrome = this.isChromeVisible();
     const r = showChrome ? this.theme.frameCornerRadius : 0;
 
@@ -547,7 +567,7 @@ export class WidgetFrame {
       return;
     }
     const w = this._width;
-    const hdr = this.theme.frameHeaderHeight;
+    const hdr = this.effectiveHeaderHeight();
     const showChrome = this.isChromeVisible();
     const r = showChrome ? this.theme.frameCornerRadius : 0;
 
@@ -627,8 +647,12 @@ export class WidgetFrame {
    */
   private positionButtons(): void {
     const w = this._width;
-    const btnSize = this.theme.frameHeaderHeight - 8;
-    const btnSlot = btnSize + 4; // width of one system button slot
+    // buttons grow in world-space (via container scale) so they hold a
+    // constant on-screen size when zoomed out — the layout math below uses
+    // their grown footprint so slots don't overlap; see headerGrowth().
+    const growth = this.headerGrowth();
+    const btnSize = (this.theme.frameHeaderHeight - 8) * growth;
+    const btnSlot = btnSize + 4 * growth; // width of one system button slot
 
     // position system buttons from right to left, skipping hidden ones.
     // closeBtn sits between the hamburger flyout and the maximize button.
@@ -637,13 +661,14 @@ export class WidgetFrame {
     let visibleSystemCount = 0;
     for (const btn of systemButtons) {
       if (!btn.visible) continue;
+      btn.scale.set(growth);
       btnX -= btnSlot;
       btn.x = btnX;
-      btn.y = 4;
+      btn.y = 4 * growth;
       visibleSystemCount++;
     }
     const systemButtonsWidth = visibleSystemCount * btnSlot;
-    const titleMinWidth = 60;
+    const titleMinWidth = 60 * growth;
     const availableForActions = w - titleMinWidth - systemButtonsWidth;
 
     // walk custom actions left-to-right, measuring which fit.
@@ -669,8 +694,8 @@ export class WidgetFrame {
     // 4px right margin before system buttons, 3px gap between each action button.
     // action.marginLeft creates extra space to the LEFT of that button (group separator):
     // the gap between button[i-1] and button[i] = ACTION_GAP + button[i].marginLeft.
-    const ACTION_GAP = 4;
-    const actionsRightEdge = w - systemButtonsWidth - 4;
+    const ACTION_GAP = 4 * growth;
+    const actionsRightEdge = w - systemButtonsWidth - 4 * growth;
     let actionX = actionsRightEdge;
 
     // position in reverse so rightmost fitting action is nearest to system buttons
@@ -680,10 +705,11 @@ export class WidgetFrame {
       const btnWidth = this.measureActionWidth(action);
       actionX -= btnWidth;
       container.x = actionX;
-      container.y = 4;
+      container.y = 4 * growth;
+      container.scale.set(growth);
       container.visible = true;
       // gap to next button on the left: base gap + this button's left margin
-      if (i > 0) actionX -= ACTION_GAP + (action.marginLeft ?? 0);
+      if (i > 0) actionX -= ACTION_GAP + (action.marginLeft ?? 0) * growth;
     }
 
     // hide overflow action containers
@@ -691,30 +717,33 @@ export class WidgetFrame {
       this.customActionContainers[i].visible = false;
     }
 
-    // clip title text so it doesn't overlap actions
-    const titleMaxWidth = Math.max(20, actionX - 8 - 8); // 8px left padding + 8px gap
+    // clip title text so it doesn't overlap actions. grow it like the
+    // buttons (headerGrowth) so it stays legible at any zoom level, then
+    // clamp scale.x further if it still doesn't fit.
+    const titleMaxWidth = Math.max(20 * growth, actionX - 8 * growth - 8 * growth); // 8px left padding + 8px gap
     this.headerText.style.wordWrap = false;
+    this.headerText.scale.set(growth);
     // use a simple width clamp — pixi Text doesn't have native maxWidth,
     // but we can use the content mask on the header or set the text scale
     if (this.headerText.width > titleMaxWidth) {
-      this.headerText.scale.x = titleMaxWidth / this.headerText.width;
-    } else {
-      this.headerText.scale.x = 1;
+      this.headerText.scale.x = growth * (titleMaxWidth / this.headerText.width);
     }
   }
 
-  /** measure the display width of a custom action button */
+  /** measure the display width of a custom action button, at its grown
+   *  (headerGrowth-compensated) on-screen footprint. */
   private measureActionWidth(action: HeaderAction): number {
+    const growth = this.headerGrowth();
     if (action.renderIcon) {
       // icon buttons are square (btnHeight) + 4px padding each side
-      const btnHeight = this.theme.frameHeaderHeight - 8;
-      return btnHeight + 8;
+      const btnHeight = (this.theme.frameHeaderHeight - 8) * growth;
+      return btnHeight + 8 * growth;
     }
     // use shortLabel for sizing when available (icon buttons are narrower)
-    const charWidth = this.theme.fontSizeSmall * 0.6;
+    const charWidth = this.theme.fontSizeSmall * growth * 0.6;
     const displayLabel = action.shortLabel ?? action.label;
     const textWidth = displayLabel.length * charWidth;
-    const padding = 24; // 12px each side
+    const padding = 24 * growth; // 12px each side
     return textWidth + padding;
   }
 
@@ -769,7 +798,7 @@ export class WidgetFrame {
     // tiny, hard-to-click targets when the canvas is zoomed out.
     const s = Math.max(this.theme.resizeHandleSize, this.theme.resizeHandleSize / this.currentZoom);
     const w = this._width;
-    const hdr = this.theme.frameHeaderHeight;
+    const hdr = this.effectiveHeaderHeight();
     const totalH = this._collapsed ? hdr : hdr + this._height;
     const top = -hdr;
 
@@ -943,7 +972,7 @@ export class WidgetFrame {
       return;
     }
 
-    const hdr = this.theme.frameHeaderHeight;
+    const hdr = this.effectiveHeaderHeight();
     const totalH = this._collapsed ? hdr : hdr + this._height;
     // draw an invisible rect covering the full frame area (including header above)
     this.bodyHitArea.rect(0, -hdr, this._width, totalH);
@@ -1244,7 +1273,7 @@ export class WidgetFrame {
     // panel container positioned below the hamburger button
     const panel = new Container();
     panel.x = this.hamburgerBtn.x;
-    panel.y = this.theme.frameHeaderHeight + 2;
+    panel.y = this.effectiveHeaderHeight() + 2;
     flyout.addChild(panel);
 
     // calculate panel height
@@ -1488,15 +1517,15 @@ export class WidgetFrame {
       // has no interactive pixi elements (e.g., image widget, label)
       this.root.hitArea = new Rectangle(
         0,
-        -this.theme.frameHeaderHeight,
+        -this.effectiveHeaderHeight(),
         this._width,
-        this._height + this.theme.frameHeaderHeight
+        this._height + this.effectiveHeaderHeight()
       );
 
       this.header.visible = showHeader;
       if (showHeader) {
         // header sits above the content, at its normal position
-        this.header.y = -this.theme.frameHeaderHeight;
+        this.header.y = -this.effectiveHeaderHeight();
         this.header.alpha = 1;
         this.positionButtons();
         // update maximize/restore icon
@@ -1542,7 +1571,7 @@ export class WidgetFrame {
     const showChrome = this.isChromeVisible();
 
     // restore header position and opacity (may have been changed during maximize hover)
-    this.header.y = -this.theme.frameHeaderHeight;
+    this.header.y = -this.effectiveHeaderHeight();
     this.header.alpha = 1;
 
     // clear explicit hitArea — let pixi auto-detect from children
