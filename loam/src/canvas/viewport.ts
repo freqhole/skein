@@ -30,6 +30,13 @@ export class Viewport {
   private lastPinchDist: number | null = null;
   private lastPinchCenter: { x: number; y: number } | null = null;
 
+  // when locked, user-driven gestures (wheel, middle-mouse pan, touch pinch)
+  // are ignored — used while a widget is maximized so the camera stays put
+  // and the maximized frame doesn't drift out from under the user. does not
+  // affect programmatic control (panTo/panBy/zoomTo/zoomAtPoint/resetView),
+  // which the maximize/restore flow itself still needs to use.
+  private locked = false;
+
   // zoom change listeners
   private zoomListeners: Array<(zoom: number) => void> = [];
 
@@ -66,6 +73,11 @@ export class Viewport {
   /** whether a middle-mouse pan is currently active */
   get isPanning(): boolean {
     return this.panning;
+  }
+
+  /** lock/unlock user-driven pan+zoom gestures (see `locked` for details) */
+  setLocked(locked: boolean): void {
+    this.locked = locked;
   }
 
   /**
@@ -178,6 +190,7 @@ export class Viewport {
   }
 
   private onWheel = (e: WheelEvent): void => {
+    if (this.locked) return;
     // if a widget's internal scroll handler already claimed this event, don't pan/zoom
     if ((e as any)._skeinWidgetScroll) return;
 
@@ -211,6 +224,7 @@ export class Viewport {
   }
 
   private onPointerDown = (e: PointerEvent): void => {
+    if (this.locked) return;
     if (e.button !== 1) return; // middle mouse only
     e.preventDefault();
     this.panning = true;
@@ -243,6 +257,7 @@ export class Viewport {
   }
 
   private onTouchStart = (e: TouchEvent): void => {
+    if (this.locked) return;
     if (e.touches.length === 2) {
       e.preventDefault();
       this.lastPinchDist = touchDistance(e.touches);

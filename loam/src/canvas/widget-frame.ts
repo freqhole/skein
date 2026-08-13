@@ -1049,6 +1049,12 @@ export class WidgetFrame {
     this.headerBg.on("pointerdown", (e: FederatedPointerEvent) => {
       e.stopPropagation();
 
+      // while maximized, the header no longer selects the widget or starts
+      // a drag — there's a dedicated propTrayBtn for opening the property
+      // tray now, and dragging a maximized frame (pinned to fill the
+      // viewport) doesn't make sense.
+      if (this._maximized) return;
+
       // shift-click toggles multi-selection; regular click does single-select
       if (e.shiftKey && this.callbacks.onShiftSelect) {
         this.callbacks.onShiftSelect();
@@ -1303,9 +1309,11 @@ export class WidgetFrame {
       // so e.g. a rotating brush icon can reflect a live angle while dragging.
       if (action.onDrag) {
         let dragging = false;
+        let hasDragged = false;
         let lastDragX = 0;
         bg.on("pointerdown", (e: FederatedPointerEvent) => {
           dragging = true;
+          hasDragged = false;
           lastDragX = e.globalX;
         });
         bg.on("globalpointermove", (e: FederatedPointerEvent) => {
@@ -1313,6 +1321,7 @@ export class WidgetFrame {
           const delta = e.globalX - lastDragX;
           if (Math.abs(delta) >= 1) {
             lastDragX = e.globalX;
+            hasDragged = true;
             action.onDrag!(delta);
             iconContainer.removeChildren();
             action.renderIcon!(iconContainer, iconSize, iconColor);
@@ -1320,11 +1329,18 @@ export class WidgetFrame {
         });
         bg.on("pointerup", () => {
           dragging = false;
-          action.onDragEnd?.();
+          // only fire onDragEnd if a real drag happened — a plain tap (no
+          // movement) has nothing to end, and for buttons that also have
+          // onClick (e.g. the chisel shape selector), onDragEnd often
+          // rebuilds the header actions (see doodle.ts), which destroys
+          // this button before pixi's own pointertap can fire onClick on it.
+          if (hasDragged) action.onDragEnd?.();
+          hasDragged = false;
         });
         bg.on("pointerupoutside", () => {
           dragging = false;
-          action.onDragEnd?.();
+          if (hasDragged) action.onDragEnd?.();
+          hasDragged = false;
         });
       }
 
@@ -1374,9 +1390,11 @@ export class WidgetFrame {
       // drag scrubber support — used for continuously-adjustable values
       if (action.onDrag) {
         let dragging = false;
+        let hasDragged = false;
         let lastDragX = 0;
         bg.on("pointerdown", (e: FederatedPointerEvent) => {
           dragging = true;
+          hasDragged = false;
           lastDragX = e.globalX;
         });
         bg.on("globalpointermove", (e: FederatedPointerEvent) => {
@@ -1384,6 +1402,7 @@ export class WidgetFrame {
           const delta = e.globalX - lastDragX;
           if (Math.abs(delta) >= 1) {
             lastDragX = e.globalX;
+            hasDragged = true;
             action.onDrag!(delta);
             // update label text in-place so the user sees live value changes
             // without recreating the button (which would break the drag)
@@ -1393,11 +1412,15 @@ export class WidgetFrame {
         });
         bg.on("pointerup", () => {
           dragging = false;
-          action.onDragEnd?.();
+          // see the icon-button branch above for why this is gated on an
+          // actual drag having happened, not just any pointerup.
+          if (hasDragged) action.onDragEnd?.();
+          hasDragged = false;
         });
         bg.on("pointerupoutside", () => {
           dragging = false;
-          action.onDragEnd?.();
+          if (hasDragged) action.onDragEnd?.();
+          hasDragged = false;
         });
       }
 
