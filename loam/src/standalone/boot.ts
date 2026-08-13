@@ -281,6 +281,19 @@ class SkeinRouter {
   // put the canvas hash back) — the confirmed root cause of the flaky
   // narthex reload e2e AND a real ux bug.
   private pendingNavToNarthex = false;
+  // serializes onHashChange() decision cycles. onHashChange() is invoked
+  // fire-and-forget from the "hashchange" listener and does real async work
+  // (e.g. `await getStoredIdentity()`) BEFORE `navigating` ever gets set —
+  // without this, two hashchange events fired in quick succession (e.g. a
+  // test/user navigating home immediately after creating a canvas) can each
+  // start their own onHashChange() call while the other is still suspended
+  // on an early await, both reading `navigating === false` and both racing
+  // to act. `hashChangeInFlight` ensures only one decision cycle actually
+  // runs at a time; a hashchange arriving mid-cycle just sets
+  // `queuedHashChange` and returns, and the in-flight cycle loops once more
+  // afterward to react to the LATEST hash rather than a stale one.
+  private hashChangeInFlight = false;
+  private queuedHashChange = false;
   /** cross-canvas navigation history (narthex excluded — narthex always
    *  resets this to empty via navigateToNarthex()), used to build the
    *  toolbar's ancestor breadcrumbs (see widget-manager.ts's
@@ -885,8 +898,28 @@ class SkeinRouter {
     await this.onHashChange();
   }
 
-  /** determine the target from the hash and navigate */
+  /** determine the target from the hash and navigate. serializes decision
+   *  cycles (see `hashChangeInFlight`/`queuedHashChange`'s doc comments) —
+   *  a hashchange arriving while a cycle is already running just queues a
+   *  re-check rather than starting a second, concurrent decision cycle that
+   *  could race the first one's own early awaits. */
   private async onHashChange(): Promise<void> {
+    if (this.hashChangeInFlight) {
+      this.queuedHashChange = true;
+      return;
+    }
+    this.hashChangeInFlight = true;
+    try {
+      do {
+        this.queuedHashChange = false;
+        await this.processHashChange();
+      } while (this.queuedHashChange);
+    } finally {
+      this.hashChangeInFlight = false;
+    }
+  }
+
+  private async processHashChange(): Promise<void> {
     const hash = window.location.hash.slice(1);
     const isColdOpen = this.isInitialNavigation;
     this.isInitialNavigation = false;
@@ -1153,8 +1186,10 @@ class SkeinRouter {
 
       this.destroyCurrent();
 
-      // clear hash for the narthex (clean URL)
-      if (window.location.hash) {
+      // clear hash for the narthex (clean URL) — but only when no newer
+      // navigation decision is already queued (see the symmetric guard in
+      // `navigateToCanvas()`'s hash self-correction for why).
+      if (!this.queuedHashChange && window.location.hash) {
         history.replaceState(null, "", window.location.pathname);
       }
 
@@ -1733,10 +1768,22 @@ class SkeinRouter {
 
       this.destroyCurrent();
 
-      // ensure the hash is set (for reload persistence)
-      if (window.location.hash.slice(1) !== docId) {
-        history.replaceState(null, "", `#${docId}`);
-      }
+      // NOTE: this used to have a "ensure the hash is set (for reload
+      // persistence)" self-correction here (`if (window.location.hash.slice(1)
+      // !== docId) history.replaceState(...)`). every caller reaches
+      // navigateToCanvas() via onHashChange() reading `window.location.hash`
+      // fresh right before calling it (or, for the share-link join path,
+      // joinCanvasFromNarthex() itself sets `window.location.hash =
+      // decoded.docId` before navigateToCanvas() ever runs) — so the hash
+      // is ALWAYS already correct at the point this async function was
+      // invoked, and the *only* time it could differ by the time we reach
+      // this line is a genuine newer hashchange that arrived during one of
+      // the earlier `await`s above (e.g. navigating home right after
+      // creating a canvas). self-correcting in that case doesn't fix
+      // anything real — it just stomps the newer, legitimate navigation
+      // intent back to this stale one, which was the actual mechanism
+      // behind the flaky narthex-reload e2e (see `hashChangeInFlight`'s
+      // doc comment for the full race). removed rather than guarded.
 
       log.debug(TAG, "navigating to canvas:", docId);
 
