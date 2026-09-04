@@ -1555,22 +1555,22 @@ async fn canvas_usage(hub_repo: &HubRepo, blobz: &Arc<dyn BlobStore>) -> Vec<Can
             };
             let canvas_id = doc_id.clone();
             let wdoc_id = placeholder.widget_doc_id.clone();
-            let widget_ref = tokio::task::spawn_blocking(move || {
+            let widget_refs = tokio::task::spawn_blocking(move || {
                 read_widget_state(&whandle, &canvas_id, &wdoc_id)
             })
             .await
-            .ok()
-            .flatten();
+            .unwrap_or_default();
 
-            let Some(wref) = widget_ref else { continue };
-            if wref.blake3.is_empty() {
-                continue;
-            }
+            for wref in widget_refs {
+                if wref.blake3.is_empty() {
+                    continue;
+                }
 
-            // only count blobs already in the local store
-            if let Ok(Some(blob)) = blobz.get(&wref.blake3).await {
-                blob_count += 1;
-                total_bytes += blob.size;
+                // only count blobs already in the local store
+                if let Ok(Some(blob)) = blobz.get(&wref.blake3).await {
+                    blob_count += 1;
+                    total_bytes += blob.size;
+                }
             }
         }
 
@@ -1624,66 +1624,67 @@ async fn canvas_blobs_for(
         };
         let cid = canvas_doc_id.to_string();
         let wid = placeholder.widget_doc_id.clone();
-        let wref = tokio::task::spawn_blocking(move || read_widget_state(&whandle, &cid, &wid))
+        let wrefs = tokio::task::spawn_blocking(move || read_widget_state(&whandle, &cid, &wid))
             .await
-            .ok()
-            .flatten();
-        let Some(wref) = wref else { continue };
-        if wref.blake3.is_empty() {
-            continue;
-        }
+            .unwrap_or_default();
 
-        // skip if we already have a blobz-resolved entry for this blake3.
-        if by_blake3.contains_key(&wref.blake3) {
-            continue;
-        }
+        for wref in wrefs {
+            if wref.blake3.is_empty() {
+                continue;
+            }
 
-        let blob_any = blobz.get_any(&wref.blake3).await.ok().flatten();
-        let (size, filename, mime, external, soft_deleted) = if let Some(b) = blob_any {
-            let is_soft_deleted = blobz.get(&wref.blake3).await.ok().flatten().is_none();
-            (
-                b.size,
-                b.filename.or_else(|| {
+            // skip if we already have a blobz-resolved entry for this blake3.
+            if by_blake3.contains_key(&wref.blake3) {
+                continue;
+            }
+
+            let blob_any = blobz.get_any(&wref.blake3).await.ok().flatten();
+            let (size, filename, mime, external, soft_deleted) = if let Some(b) = blob_any {
+                let is_soft_deleted = blobz.get(&wref.blake3).await.ok().flatten().is_none();
+                (
+                    b.size,
+                    b.filename.or_else(|| {
+                        if wref.filename.is_empty() {
+                            None
+                        } else {
+                            Some(wref.filename.clone())
+                        }
+                    }),
+                    b.mime,
+                    b.external,
+                    is_soft_deleted,
+                )
+            } else {
+                // never snatched — use widget doc metadata, size 0
+                (
+                    0,
                     if wref.filename.is_empty() {
                         None
                     } else {
                         Some(wref.filename.clone())
-                    }
-                }),
-                b.mime,
-                b.external,
-                is_soft_deleted,
-            )
-        } else {
-            // never snatched — use widget doc metadata, size 0
-            (
-                0,
-                if wref.filename.is_empty() {
-                    None
-                } else {
-                    Some(wref.filename.clone())
-                },
-                if wref.mime.is_empty() {
-                    None
-                } else {
-                    Some(wref.mime.clone())
-                },
-                false,
-                false,
-            )
-        };
+                    },
+                    if wref.mime.is_empty() {
+                        None
+                    } else {
+                        Some(wref.mime.clone())
+                    },
+                    false,
+                    false,
+                )
+            };
 
-        by_blake3.insert(
-            wref.blake3.clone(),
-            BlobUsageSummary {
-                blake3: wref.blake3,
-                filename,
-                mime,
-                size,
-                external,
-                soft_deleted,
-            },
-        );
+            by_blake3.insert(
+                wref.blake3.clone(),
+                BlobUsageSummary {
+                    blake3: wref.blake3,
+                    filename,
+                    mime,
+                    size,
+                    external,
+                    soft_deleted,
+                },
+            );
+        }
     }
 
     let mut result: Vec<BlobUsageSummary> = by_blake3.into_values().collect();

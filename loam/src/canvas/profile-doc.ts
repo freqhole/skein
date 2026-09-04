@@ -24,6 +24,7 @@
 
 import { z } from "zod";
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
+import { log } from "@freqhole/reliquary/utils";
 import { getMetaValue, setMetaValue } from "../storage/meta-db";
 import { resolveDocReadyCached } from "../p2p/doc-ready";
 import { logDocHistoryStats } from "../p2p/doc-history-stats";
@@ -165,8 +166,11 @@ export class ProfileStore {
     // bare repo.find() defaults to allowableStates=["ready"], which blocks on
     // networkSubsystem.whenReady() when the doc isn't already in local storage
     // — use resolveDocReadyCached() like every other doc access instead.
-    const handle = await resolveDocReadyCached<ProfileDocument>(repo, docId);
+    // resolveDocReadyCached() itself logs the detailed failure (elapsed
+    // time) — this is just the concrete symptom point.
+    const handle = await resolveDocReadyCached<ProfileDocument>(repo, docId, { context: "ProfileStore.open" });
     if (!handle) {
+      log.warn("profile-doc", `open(${docId}): resolveDocReadyCached returned null — see doc-ready's own warning above for why`);
       throw new Error(`profile doc ${docId} did not become ready`);
     }
     return new ProfileStore(repo, handle);

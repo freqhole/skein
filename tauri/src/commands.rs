@@ -9,7 +9,7 @@
 //! current action list and what's stubbed.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Instant;
@@ -210,6 +210,12 @@ pub struct AppConfig {
     pub profile_visibility: String,
     #[serde(default = "default_friend_requests_from")]
     pub friend_requests_from: String,
+    /// auto re-encode a video to h264/even-dimensions at ingest time (see
+    /// `blob_transcode_video_if_needed`) — on by default since an odd
+    /// width/non-h264 source can silently fail to render on some
+    /// tauri/WKWebView GPU backends (see `transcode.rs`'s doc comment).
+    #[serde(default = "default_transcode_video_enabled")]
+    pub transcode_video_enabled: bool,
 }
 
 fn default_profile_visibility() -> String {
@@ -220,11 +226,16 @@ fn default_friend_requests_from() -> String {
     "everyone".to_string()
 }
 
+fn default_transcode_video_enabled() -> bool {
+    true
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             profile_visibility: default_profile_visibility(),
             friend_requests_from: default_friend_requests_from(),
+            transcode_video_enabled: default_transcode_video_enabled(),
         }
     }
 }
@@ -639,6 +650,19 @@ async fn dispatch(
         // generate a thumbnail for a stored blob. supports image/*, application/pdf,
         // and video/* source types. returns { data: <base64>, mime } or { data: null }.
         "blob_thumbnail" => blob_thumbnail(decode("blob_thumbnail", payload)?, state).await,
+
+        // probe a video blob and, if its codec isn't h264 or it has an odd
+        // width/height, re-encode it to h264/even-dimensions and register
+        // the result as a new blob (see `transcode.rs`). returns
+        // `{ transcoded: false }` when the source already qualifies, or
+        // `{ transcoded: true, blob: BlobDto }` after re-encoding.
+        "blob_transcode_video_if_needed" => {
+            blob_transcode_video_if_needed(
+                decode("blob_transcode_video_if_needed", payload)?,
+                state,
+            )
+            .await
+        }
 
         // link widget unfurl — fetch a URL server-side (no CORS restriction,
         // unlike the browser-mode fallback in loam/src/widgets/link-unfurl.ts)
@@ -2561,6 +2585,111 @@ async fn blob_thumbnail(args: BlobThumbnailArgs, state: &AppState) -> Result<Val
         })?;
 
     Ok(result)
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobTranscodeVideoArgs {
+    blake3: String,
+    /// when set, records the new (transcoded) blob as also referenced by
+    /// this canvas doc — mirrors `blob_add_canvas_ref`'s own semantics, so
+    /// callers don't need a separate round-trip just to keep the widget's
+    /// reference-counting/cleanup logic accurate for the new blob.
+    canvas_doc_id: Option<String>,
+}
+
+/// probe a video blob and, if it isn't already h264 with even dimensions,
+/// re-encode it and register the result as a brand-new blob (the original
+/// is left untouched — callers decide whether/how to swap references).
+/// respects `AppConfig::transcode_video_enabled` (a no-op, returning
+/// `{ transcoded: false }`, when the user has disabled it).
+async fn blob_transcode_video_if_needed(
+    args: BlobTranscodeVideoArgs,
+    state: &AppState,
+) -> Result<Value, DispatchError> {
+    let cfg = AppConfig::load(&state.app_config_path);
+    if !cfg.transcode_video_enabled {
+        return Ok(json!({ "transcoded": false }));
+    }
+
+    let blob = state
+        .storage
+        .blobz
+        .get(&args.blake3)
+        .await?
+        .ok_or(DispatchError::NotFound)?;
+
+    let path = state.storage.blobz.path_for(&blob);
+
+    let probe = crate::transcode::probe_video(&path).await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })?;
+
+    if !crate::transcode::needs_transcode(&probe) {
+        return Ok(json!({ "transcoded": false }));
+    }
+
+    let work_dir = std::env::temp_dir().join(format!(
+        "skein_transcode_{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    tokio::fs::create_dir_all(&work_dir).await.map_err(|e| {
+        DispatchError::Blob(freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()))
+    })?;
+    let output_path = work_dir.join("transcoded.mp4");
+
+    let transcode_result = crate::transcode::transcode_to_h264(&path, &output_path).await;
+    if let Err(e) = transcode_result {
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+        return Err(DispatchError::Blob(
+            freqhole_reliquary::blobz::BlobStoreError::Io(e.to_string()),
+        ));
+    }
+
+    let filename = blob
+        .filename
+        .as_deref()
+        .map(|f| {
+            let stem = Path::new(f)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(f);
+            format!("{stem}.mp4")
+        })
+        .unwrap_or_else(|| "transcoded.mp4".to_string());
+
+    let new_blob = state
+        .storage
+        .blobz
+        .adopt_local_file(
+            &output_path,
+            NewBlobMeta {
+                filename: Some(filename),
+                mime: Some("video/mp4".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(DispatchError::Blob)?;
+
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Some(canvas_doc_id) = args.canvas_doc_id.as_deref() {
+        state
+            .storage
+            .blobz
+            .add_canvas_ref(&new_blob.blake3, canvas_doc_id)
+            .await?;
+    }
+
+    prewarm_fs_store(state, &new_blob).await;
+
+    Ok(json!({
+        "transcoded": true,
+        "blob": BlobDto::from(new_blob),
+    }))
 }
 
 /// render every page of a document (pdf, postscript, or plain text) to

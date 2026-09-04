@@ -727,14 +727,48 @@ async function uploadFileUnqueued(
     );
   }
 
+  let finalBlobId = meta.blake3;
+  let finalBlake3 = meta.blake3;
+  let finalSize = meta.size;
+  let finalMime = resolvedMime;
+
+  // auto-transcode odd-dimension/non-h264 video at ingest time — see
+  // `transcode.rs`'s doc comment (a confirmed WebGL video-texture upload
+  // bug on some tauri/WKWebView backends, plus wider cross-platform
+  // playback compatibility). rust-side gated on `AppConfig.
+  // transcode_video_enabled` too (default on); this call is a safe no-op
+  // (`{transcoded:false}`) when disabled, unsupported, or already fine.
+  if (resolvedMime.startsWith("video/")) {
+    try {
+      const transcodeResult = (await dispatch("blob_transcode_video_if_needed", {
+        blake3: meta.blake3,
+      })) as {
+        transcoded: boolean;
+        blob?: { blake3: string; mime: string | null; size: number };
+      };
+      if (transcodeResult.transcoded && transcodeResult.blob) {
+        finalBlobId = transcodeResult.blob.blake3;
+        finalBlake3 = transcodeResult.blob.blake3;
+        finalSize = transcodeResult.blob.size;
+        finalMime = transcodeResult.blob.mime || finalMime;
+        log.debug(TAG, `video ${meta.blake3.slice(0, 8)}... transcoded to h264 -> ${finalBlobId.slice(0, 8)}...`);
+      }
+    } catch (err) {
+      // best-effort — playback of the untranscoded original is still
+      // possible (works fine on most non-WKWebView platforms), so a
+      // transcode failure shouldn't fail the whole upload.
+      log.debug(TAG, "video transcode-if-needed failed (non-fatal):", err);
+    }
+  }
+
   return {
-    blobId: meta.blake3,
+    blobId: finalBlobId,
     domain,
     jobId: null,
     sha256: "",
-    blake3: meta.blake3,
-    size: meta.size,
-    mime: resolvedMime,
+    blake3: finalBlake3,
+    size: finalSize,
+    mime: finalMime,
     existing: false,
     thumbnailDataUrl,
   };

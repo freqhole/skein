@@ -169,7 +169,7 @@ export async function initFriendzWiring(
       return null;
     }
 
-    const socialHandle = await resolveDocReadyCached<any>(repo, socialEntry.docId as DocumentId);
+    const socialHandle = await resolveDocReadyCached<any>(repo, socialEntry.docId as DocumentId, { context: "friendz-wiring: social doc" });
     if (!socialHandle) {
       log.warn(TAG, "aborting: social doc did not become ready", { docId: socialEntry.docId });
       return null;
@@ -184,7 +184,7 @@ export async function initFriendzWiring(
   } else {
     const messagezEntry = store.getWidget(messagezWidgetId);
     if (messagezEntry?.docId) {
-      messagezHandle = await resolveDocReadyCached<any>(repo, messagezEntry.docId as DocumentId);
+      messagezHandle = await resolveDocReadyCached<any>(repo, messagezEntry.docId as DocumentId, { context: "friendz-wiring: messagez doc" });
     }
   }
 
@@ -836,9 +836,16 @@ export async function initFriendzWiring(
     }
   });
 
-  // narthex doc metadata sync
+  // narthex doc metadata sync — best-effort, non-blocking: a null
+  // narthexHandle/cardHandle here just skips the sync below, it never
+  // throws or holds up boot (unlike ProfileStore.open()'s own hard
+  // failure) — a timeout logged with this context is NOT what's stalling
+  // boot, even though it may share the same underlying "no peer has
+  // synced this doc's content yet" root cause as a real boot-blocking one.
   {
-    const narthexHandle = await resolveDocReadyCached<any>(repo, narthexDocId as DocumentId);
+    const narthexHandle = await resolveDocReadyCached<any>(repo, narthexDocId as DocumentId, {
+      context: "friendz-wiring: narthex metadata sync (non-blocking)",
+    });
     const narthexDoc = narthexHandle?.doc();
 
     if (narthexHandle && narthexDoc) {
@@ -847,7 +854,9 @@ export async function initFriendzWiring(
         if (!card?.docId) continue;
 
         try {
-          const cardHandle = await resolveDocReadyCached<any>(repo, card.docId as DocumentId);
+          const cardHandle = await resolveDocReadyCached<any>(repo, card.docId as DocumentId, {
+            context: "friendz-wiring: narthex card canvas doc (non-blocking)",
+          });
           const cardDoc = cardHandle?.doc();
 
           if (cardDoc) {

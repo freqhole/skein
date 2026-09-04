@@ -61,6 +61,7 @@ export async function migrateLegacyAutomergeDoc(opts: MigrateLegacyDocOptions): 
 
   const handle = await resolveDocReadyCached<unknown>(repo, legacyId as DocumentId, {
     timeoutMs: MIGRATION_RESOLVE_TIMEOUT_MS,
+    context: `legacy-doc-migration: ${legacyDocIdKey}`,
   });
   if (!handle) {
     log.warn(TAG, `migration for ${legacyDocIdKey}: legacy doc never became ready, will retry next boot`);

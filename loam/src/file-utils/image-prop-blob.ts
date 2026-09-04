@@ -14,7 +14,9 @@
 // ---------------------------------------------------------------------------
 
 import { log } from "@freqhole/reliquary/utils";
-import { storeBlob, getBlobObjectURL } from "../storage/blob-store";
+import { storeBlob } from "../storage/blob-store";
+import { getMediaPlaybackUrl } from "../media/media-urls";
+import { dispatch, isTauriMode } from "../p2p/tauri-transport";
 import { base64ToBytes } from "./file-shared";
 
 const TAG = "image-prop-blob";
@@ -31,9 +33,26 @@ export async function saveImageDataUrlAsBlobRef(dataUrl: string): Promise<string
   const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl);
   if (!match) return dataUrl;
   const [, mime, b64] = match;
+  const filename = `preview.${mime.split("/")[1] || "bin"}`;
+
+  if (isTauriMode()) {
+    // the browser blob worker's blake3 hasher has no midden module bundled
+    // in tauri builds (always degrades to "" — see mic-recorder.ts's own
+    // comment on the same issue), which made every image/doodle capture
+    // collide on the same empty-string blob id via storeBlob() below.
+    // route through the rust-side blob_insert command instead (same
+    // pattern mic-recorder.ts already uses for audio), which computes a
+    // real blake3 hash.
+    const response = (await dispatch("blob_insert", { filename, mime, data: b64 })) as {
+      blake3: string;
+    };
+    log.debug(TAG, "[ANIMANIAC-DBG] blob_insert ->", response.blake3.slice(0, 12));
+    return `${BLOB_REF_PREFIX}${response.blake3}`;
+  }
+
   const bytes = base64ToBytes(b64);
   const record = await storeBlob(bytes.buffer as ArrayBuffer, {
-    filename: `preview.${mime.split("/")[1] || "bin"}`,
+    filename,
     mime,
     blob_type: "preview",
   });
@@ -48,10 +67,20 @@ export async function resolveImagePropUrl(value: string): Promise<string> {
   if (!value || !isImageBlobRef(value)) return value;
   const blobId = value.slice(BLOB_REF_PREFIX.length);
   try {
-    const url = await getBlobObjectURL(blobId);
-    return url ?? "";
+    const url = await getMediaPlaybackUrl(blobId, { category: "image" });
+    if (!url) {
+      // a clean `null` (not a thrown error) means the blob simply isn't
+      // present in THIS device/build's own local store yet — a data-
+      // locality issue (e.g. captured on a different peer/build, not yet
+      // snatched/synced here), not necessarily a bug. was silent before;
+      // log it so a platform-specific "works in browser, not in tauri"
+      // report has something concrete to go on.
+      log.warn(TAG, "[ANIMANIAC-DBG] image blob ref not found locally:", blobId.slice(0, 12));
+      return "";
+    }
+    return url;
   } catch (err) {
-    log.warn(TAG, "failed to resolve image blob ref:", blobId.slice(0, 12), err);
+    log.warn(TAG, "[ANIMANIAC-DBG] failed to resolve image blob ref:", blobId.slice(0, 12), err);
     return "";
   }
 }

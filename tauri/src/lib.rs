@@ -12,6 +12,7 @@ mod epub_repair;
 mod pdf;
 mod streams;
 mod thumbnail;
+mod transcode;
 mod tts;
 mod unfurl;
 

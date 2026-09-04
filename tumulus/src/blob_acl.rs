@@ -119,14 +119,19 @@ impl CanvasResolver {
                 };
                 let canvas_id = doc_id.clone();
                 let widget_doc_id = placeholder.widget_doc_id.clone();
-                let blake3 = tokio::task::spawn_blocking(move || {
-                    read_widget_state(&whandle, &canvas_id, &widget_doc_id).map(|r| r.blake3)
+                let blake3_hash_owned = blake3_hash.to_string();
+                // a widget doc may carry more than one blob reference (an
+                // animaniac doc's `clips[]` shape) — match against ANY of
+                // them, not just a single value.
+                let blake3_matches = tokio::task::spawn_blocking(move || {
+                    read_widget_state(&whandle, &canvas_id, &widget_doc_id)
+                        .into_iter()
+                        .any(|r| r.blake3 == blake3_hash_owned)
                 })
                 .await
-                .ok()
-                .flatten();
+                .unwrap_or(false);
 
-                if blake3.as_deref() == Some(blake3_hash) {
+                if blake3_matches {
                     matches.push(doc_id.clone());
                     break;
                 }

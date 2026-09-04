@@ -1,4 +1,5 @@
 import { WidgetRegistry } from "../src/widgets/widget-registry";
+import { registerAnimaniacWidget } from "./animaniac/index";
 import { registerBinWidget } from "./bin/index";
 import { audioRecordingWidget } from "./audio-recording";
 import { voiceRecordingWidget } from "./voice-recording";
@@ -60,5 +61,6 @@ export function createTestRegistry(): WidgetRegistry {
   registry.register(canvasWizardWidget);
   registry.register(canvasLinkPickerWidget);
   registerBinWidget(registry);
+  registerAnimaniacWidget(registry);
   return registry;
 }

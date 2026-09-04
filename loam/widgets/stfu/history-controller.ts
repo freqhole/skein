@@ -7,7 +7,7 @@
  * out of index.ts to keep that file from growing further.
  */
 
-import { createUndoHistory, type UndoHistory } from "./undo-history";
+import { createUndoHistory, type UndoHistory } from "../../src/widgets/undo-history";
 import type { EditableSegment } from "./cut-segments-track";
 import type { AudioClip, StfuState } from "./types";
 
