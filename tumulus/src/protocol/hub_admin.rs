@@ -1555,9 +1555,11 @@ async fn canvas_usage(hub_repo: &HubRepo, blobz: &Arc<dyn BlobStore>) -> Vec<Can
             };
             let canvas_id = doc_id.clone();
             let wdoc_id = placeholder.widget_doc_id.clone();
-            let widget_refs = tokio::task::spawn_blocking(move || read_widget_state(&whandle, &canvas_id, &wdoc_id))
-                .await
-                .unwrap_or_default();
+            let widget_refs = tokio::task::spawn_blocking(move || {
+                read_widget_state(&whandle, &canvas_id, &wdoc_id)
+            })
+            .await
+            .unwrap_or_default();
 
             for wref in widget_refs {
                 if wref.blake3.is_empty() {

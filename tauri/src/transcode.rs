@@ -99,7 +99,7 @@ pub async fn probe_video(path: &Path) -> Result<VideoProbe, TranscodeError> {
 /// odd width/height (a known trigger for a WebGL video-texture upload bug
 /// on some tauri/WKWebView backends — see module doc comment).
 pub fn needs_transcode(probe: &VideoProbe) -> bool {
-    probe.codec_name != "h264" || probe.width % 2 != 0 || probe.height % 2 != 0
+    probe.codec_name != "h264" || !probe.width.is_multiple_of(2) || !probe.height.is_multiple_of(2)
 }
 
 /// re-encode `input` to h264/aac/yuv420p with even width+height, writing to
