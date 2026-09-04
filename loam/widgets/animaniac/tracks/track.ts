@@ -62,12 +62,13 @@ export interface TrackOptions {
   onClipsChange: (next: Clip[]) => void;
   onSelectionChange?: (clip: Clip | null) => void;
   /** lets a move drag reassign this clip to a DIFFERENT track (this row
-   *  doesn't know other rows exist) — return `true` if handled, matching
+   *  doesn't know other rows exist), or drag it out of animaniac entirely
+   *  onto the bare canvas — return `true` if handled, matching
    *  `track-item-interaction.ts`'s own `onMoveOutOfRow` contract. */
-  onMoveOutOfRow?: (clip: Clip, span: Span, globalY: number) => boolean;
+  onMoveOutOfRow?: (clip: Clip, span: Span, globalY: number, globalX: number) => boolean;
   /** live ghost-preview hook, fired continuously during a move drag — see
    *  `track-item-interaction.ts`'s own `onDraggingMove` contract. */
-  onDraggingMove?: (clip: Clip, span: Span | null, globalY: number) => void;
+  onDraggingMove?: (clip: Clip, span: Span | null, globalY: number, globalX: number) => void;
   /** whether this clip's own backing media blob isn't local yet — drawn
    *  as a dashed border instead of solid (see snatch-controller.ts). */
   isClipRemote?: (clip: Clip) => boolean;

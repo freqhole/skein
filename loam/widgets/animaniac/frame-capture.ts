@@ -135,7 +135,11 @@ export async function resolveCapturedClip(
   trackId: string,
   start: number,
   newId: () => string = () => crypto.randomUUID(),
-  previewSize?: { width: number; height: number }
+  previewSize?: { width: number; height: number },
+  /** the source widget's own on-canvas width/height at drag time — only
+   *  used by the "doodle" branch (see `sourceDoodle`'s own doc comment in
+   *  `types.ts`); every other branch ignores it. */
+  sourceSize?: { width: number; height: number }
 ): Promise<Clip | null> {
   switch (sourceType) {
     case "doodle": {
@@ -158,6 +162,25 @@ export async function resolveCapturedClip(
         imageUrl,
         durationSec: 1,
         snatchedBy: [],
+        // full source state, purely so a later drag-out-to-canvas restore
+        // (clip-restore.ts) can rebuild an actual re-editable doodle
+        // widget instead of just this flattened snapshot — never read by
+        // the compositor itself.
+        sourceDoodle: {
+          strokes,
+          bgColor,
+          penColor: num(sourceState.penColor, 0xd946ef),
+          penWidth: num(sourceState.penWidth, 3),
+          pressureScale: num(sourceState.pressureScale, 0),
+          brushShape: str(sourceState.brushShape, "circle"),
+          angleScale: num(sourceState.angleScale, 0),
+          chiselAngle: num(sourceState.chiselAngle, -45),
+          penOpacity: num(sourceState.penOpacity, 100),
+          borderColor: num(sourceState.borderColor, 0xa855f7),
+          borderWidth: num(sourceState.borderWidth, 1),
+          width: sourceSize?.width ?? 640,
+          height: sourceSize?.height ?? 340,
+        },
       };
     }
 

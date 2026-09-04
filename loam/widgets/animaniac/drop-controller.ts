@@ -277,7 +277,7 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
           const { trackId, start } = target;
           log.debug("animaniac.drop", "onDrop: hit", { entryType: entry.type, trackId, start });
 
-          void resolveCapturedClip(entry.type, sourceState, trackId, start, undefined, getPreviewSize()).then((clip) => {
+          void resolveCapturedClip(entry.type, sourceState, trackId, start, undefined, getPreviewSize(), { width: entry.width, height: entry.height }).then((clip) => {
             if (!clip) {
               // resolveCapturedClip() is deliberately pure/unlogged (see its
               // own doc comment) — log the relevant sourceState fields HERE
