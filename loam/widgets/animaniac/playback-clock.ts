@@ -11,8 +11,15 @@ export interface PlaybackClockOptions {
   getDurationSec: () => number;
   /** fires on every tick while playing (and once immediately after `seek()`/
    *  `pause()`/`play()`) with the current time — this is what
-   *  `compositor.ts`/`mouth-sync.ts` subscribe to. */
-  onTick: (t: number) => void;
+   *  `compositor.ts`/`mouth-sync.ts` subscribe to. `seeked` is true only for
+   *  a discrete jump (an explicit `seek()` call, or the very first tick
+   *  after a fresh `play()`) as opposed to normal incremental frame-to-
+   *  frame advancement — consumers driving a real `<audio>`/`<video>`
+   *  element should only force a `currentTime` write when `seeked` is true
+   *  (see audio-playback.ts's/compositor.ts's own comments on why: writing
+   *  `currentTime` on every regular tick glitches audibly, especially on
+   *  tauri's wkwebview). */
+  onTick: (t: number, seeked: boolean) => void;
   /** injectable for testing — defaults to the real `requestAnimationFrame`. */
   raf?: (cb: (now: number) => void) => number;
   cancelRaf?: (handle: number) => void;
@@ -54,6 +61,10 @@ export function createPlaybackClock(options: PlaybackClockOptions): PlaybackCloc
   function tick(): void {
     if (!playing) return;
     const nowMs = now();
+    // no previous frame recorded means this is the first tick since a fresh
+    // `play()` — treat it as a discrete jump too (the element may need an
+    // initial sync to wherever the clock was left/seeked to).
+    const isResume = lastFrameAt === null;
     const deltaSec = lastFrameAt === null ? 0 : (nowMs - lastFrameAt) / 1000;
     lastFrameAt = nowMs;
     const next = currentTime + deltaSec;
@@ -61,12 +72,12 @@ export function createPlaybackClock(options: PlaybackClockOptions): PlaybackCloc
     if (duration > 0 && next >= duration) {
       currentTime = duration;
       playing = false;
-      onTick(currentTime);
+      onTick(currentTime, isResume);
       return; // stop at the end rather than looping — matches every other
       // media-driven timeline in this codebase (no auto-loop behavior)
     }
     currentTime = next;
-    onTick(currentTime);
+    onTick(currentTime, isResume);
     rafHandle = raf(tick);
   }
 
@@ -82,7 +93,7 @@ export function createPlaybackClock(options: PlaybackClockOptions): PlaybackCloc
       playing = false;
       if (rafHandle !== null) cancelRaf(rafHandle);
       rafHandle = null;
-      onTick(currentTime);
+      onTick(currentTime, false);
     },
     togglePlay() {
       if (playing) this.pause();
@@ -94,7 +105,7 @@ export function createPlaybackClock(options: PlaybackClockOptions): PlaybackCloc
     seek(t: number) {
       currentTime = clampToDuration(t);
       lastFrameAt = null;
-      onTick(currentTime);
+      onTick(currentTime, true);
     },
     getCurrentTime() {
       return currentTime;

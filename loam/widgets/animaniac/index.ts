@@ -155,7 +155,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         syncTracks();
         for (const inst of trackInstances.values()) inst.refresh();
         camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
-        compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying());
+        compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       },
       onHistoryChanged: () => toolbar.refreshUndoRedo(),
     });
@@ -240,7 +240,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       });
       history.push();
       camera.setDuration(computeDisplayDurationSec(nextClips));
-      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying());
+      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       updatePreviewHintVisibility();
     }
 
@@ -393,11 +393,11 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     // -- playback clock: drives the compositor + mouth-sync + playhead ------
     const playbackClock: PlaybackClock = createPlaybackClock({
       getDurationSec: () => camera.getView().duration,
-      onTick: (t) => {
+      onTick: (t, seeked) => {
         camera.setCurrentTime(t);
         if (prefs.autoScrollEnabled) camera.scrollTimeIntoView(t);
-        compositor.update(t, playbackClock.isPlaying());
-        audioPlayback.update(t, playbackClock.isPlaying());
+        compositor.update(t, playbackClock.isPlaying(), seeked);
+        audioPlayback.update(t, playbackClock.isPlaying(), seeked);
         updatePlayhead();
       },
     });
@@ -443,7 +443,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         history.push();
         for (const inst of trackInstances.values()) inst.refresh();
         camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
-        compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying());
+        compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
         updatePreviewHintVisibility();
       },
     });
@@ -466,7 +466,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     const offDocChange = ctx.doc.on("change", () => {
       syncTracks();
       camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
-      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying());
+      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       updatePreviewHintVisibility();
     });
 

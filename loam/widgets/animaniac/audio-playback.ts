@@ -43,14 +43,18 @@ export interface AudioPlaybackOptions {
 export interface AudioPlaybackHandle {
   /** call on every playback tick with the current absolute timeline time
    *  and whether playback is running (a seek while paused shouldn't start
-   *  any element playing). */
-  update(t: number, playing: boolean): void;
+   *  any element playing). `seeked` should be true only for a discrete
+   *  jump (explicit seek / a fresh resume) — see `update()`'s own comment
+   *  for why this matters. */
+  update(t: number, playing: boolean, seeked: boolean): void;
   destroy(): void;
 }
 
 interface PoolEntry {
   el: HTMLAudioElement | null;
   resolving: boolean;
+  /** true once `el.currentTime` has been set at least once — see `update()`. */
+  synced: boolean;
 }
 
 export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybackHandle {
@@ -60,7 +64,7 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
   function ensureEntry(clip: Clip): PoolEntry {
     let entry = pool.get(clip.id);
     if (entry) return entry;
-    entry = { el: null, resolving: false };
+    entry = { el: null, resolving: false, synced: false };
     pool.set(clip.id, entry);
     const blobId = audioBlobIdOf(clip);
     if (blobId && !entry.resolving) {
@@ -79,7 +83,7 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
     return entry;
   }
 
-  function update(t: number, playing: boolean): void {
+  function update(t: number, playing: boolean, seeked: boolean): void {
     const active = activeClipsAt(getClips().filter(isAudioBearingClip), t);
     const activeIds = new Set(active.map((c) => c.id));
 
@@ -95,9 +99,19 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
       if (!entry.el) continue; // still resolving the blob URL, or nothing to play yet (e.g. ungenerated tts)
       const localElapsed = t - clip.start;
       const target = sourceOffsetSec(clip) + localElapsed;
-      // only nudge currentTime when it's drifted more than a small
-      // tolerance, so a playing element isn't fighting a seek every tick.
-      if (Math.abs(entry.el.currentTime - target) > 0.2) entry.el.currentTime = target;
+      // only force a currentTime write on a discrete jump (`seeked`, or the
+      // very first sync for this element) — NOT on every regular playback
+      // tick. setting .currentTime on an already-playing <audio> element
+      // forces an internal reseek, which glitches audibly (worse on tauri's
+      // wkwebview than chromium) if done ~60 times/sec; every other audio
+      // path in this codebase (voice-recording.ts, stfu/audio-clip-
+      // playback.ts, file.ts's plain player) seeks once then lets the
+      // element's own native clock run untouched — this used to fight that
+      // native clock every tick instead.
+      if (!entry.synced || seeked) {
+        entry.el.currentTime = target;
+        entry.synced = true;
+      }
       if (playing && entry.el.paused) void entry.el.play().catch(() => {});
       if (!playing && !entry.el.paused) entry.el.pause();
     }

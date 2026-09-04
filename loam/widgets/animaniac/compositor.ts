@@ -42,8 +42,11 @@ export interface CompositorHandle {
   /** call on every playback tick (from `playback-clock.ts`'s `onTick`) with
    *  the current absolute timeline time and whether playback is running
    *  (drives whether video-segment `<video>` elements are playing or
-   *  paused — a seek while paused shouldn't start them). */
-  update(t: number, playing: boolean): void;
+   *  paused — a seek while paused shouldn't start them). `seeked` should be
+   *  true only for a discrete jump (explicit seek / a fresh resume / an
+   *  edit-driven re-render outside the normal tick loop) — see
+   *  `applyVideoTime()`'s own comment for why this matters. */
+  update(t: number, playing: boolean, seeked: boolean): void;
   destroy(): void;
 }
 
@@ -52,6 +55,9 @@ interface PoolEntry {
   /** the clip's own local elapsed time this entry was last drawn at — only
    *  used to avoid redundant video-element seeks (see `applyVideoTime()`). */
   video?: HTMLVideoElement;
+  /** true once this entry's `<video>` has had its `currentTime` set at
+   *  least once — see `applyVideoTime()`. */
+  videoSynced?: boolean;
   destroy(): void;
 }
 
@@ -191,19 +197,26 @@ export function createCompositor(options: CompositorOptions): CompositorHandle {
   }
 
   /** keeps a video-segment clip's underlying `<video>` element's play state
-   *  and seek position in sync with the timeline — only nudges
-   *  `currentTime` when it's drifted more than a small tolerance, so a
-   *  playing video isn't fighting a `seek()` call every single tick. */
-  function applyVideoTime(entry: PoolEntry, clip: Extract<Clip, { kind: "video-segment" }>, localElapsed: number, playing: boolean): void {
+   *  and seek position in sync with the timeline. `currentTime` is only
+   *  force-written on a discrete jump (`seeked`, or the element's first
+   *  sync) — NOT on every regular playback tick. writing `currentTime` on
+   *  an already-playing media element forces an internal reseek, which
+   *  glitches audibly (worse on tauri's wkwebview than chromium) if done
+   *  ~60 times/sec; every other media path in this codebase (voice-
+   *  recording.ts, stfu/audio-clip-playback.ts, file.ts's plain player)
+   *  seeks once then lets the element's own native clock run untouched. */
+  function applyVideoTime(entry: PoolEntry, clip: Extract<Clip, { kind: "video-segment" }>, localElapsed: number, playing: boolean, seeked: boolean): void {
     const video = entry.video;
     if (!video) return;
-    const target = clip.sourceInSec + localElapsed;
-    if (Math.abs(video.currentTime - target) > 0.2) video.currentTime = target;
+    if (!entry.videoSynced || seeked) {
+      video.currentTime = clip.sourceInSec + localElapsed;
+      entry.videoSynced = true;
+    }
     if (playing && video.paused) void video.play().catch(() => {});
     if (!playing && !video.paused) video.pause();
   }
 
-  function update(t: number, playing: boolean): void {
+  function update(t: number, playing: boolean, seeked: boolean): void {
     const tracks = getTracks();
     const clips = getClips();
     const active = activeClipsAt(clips, t).filter(isVisualClip);
@@ -244,7 +257,7 @@ export function createCompositor(options: CompositorOptions): CompositorHandle {
       entry.node.rotation = transform.rotation;
       entry.node.alpha = transform.opacity;
 
-      if (clip.kind === "video-segment") applyVideoTime(entry, clip, localElapsed, playing);
+      if (clip.kind === "video-segment") applyVideoTime(entry, clip, localElapsed, playing, seeked);
     });
 
     // -- voice-recording mouths: separate pool, keyed off the AUDIO clip
