@@ -214,7 +214,7 @@ export class CanvasBinStore {
     // bare repo.find() defaults to allowableStates=["ready"], which blocks on
     // networkSubsystem.whenReady() when the doc isn't already in local storage
     // — use resolveDocReadyCached() like every other doc access instead.
-    const handle = await resolveDocReadyCached<CanvasBinDocument>(repo, docId);
+    const handle = await resolveDocReadyCached<CanvasBinDocument>(repo, docId, { context: "CanvasBinStore.open" });
     if (!handle) {
       throw new Error(`canvas-bin doc ${docId} did not become ready`);
     }

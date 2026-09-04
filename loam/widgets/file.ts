@@ -4,6 +4,7 @@ import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
 import { getMediaPlaybackUrl } from "../src/media";
 import { isTauriMode } from "../src/p2p/tauri-transport";
 import { getLocalNodeId, type PeersMap, type PickedFile, type ThumbnailOptions } from "../src/file-utils/file-shared";
+import { probeMediaDuration } from "../src/file-utils/media-duration";
 import { formatFileSize } from "../src/widgets/format";
 import { addBlobCanvasRef, removeBlobCanvasRef } from "../src/file-utils/blob-canvas-refs";
 import { checkBlobLocality, freeUpLocalBlobCopy, getLocalBlobByteSize } from "../src/file-utils/blob-locality";
@@ -60,6 +61,12 @@ export const fileSchema = z.object({
   size: z.number().default(0),
   /** blake3 content hash (for P2P verified fetch) */
   blake3: z.string().default(""),
+  /** audio/video length in seconds — best-effort, probed right after upload
+   *  (see src/file-utils/media-duration.ts); 0 for every other domain, or
+   *  if the probe failed, or for a widget uploaded before this field
+   *  existed. lets a generic file widget be captured as an animaniac
+   *  audio-segment/video-segment (see widgets/animaniac/frame-capture.ts). */
+  duration: z.number().default(0),
   /** embedded thumbnail as a data URL (written after upload/snatch for instant render) */
   thumbnailDataUrl: z.string().default(""),
   /** list of node IDs that have snatched (or uploaded) this blob.
@@ -85,6 +92,37 @@ export const fileSchema = z.object({
 });
 
 export type FileState = z.infer<typeof fileSchema>;
+
+/** resolves a playback URL for the freshly-uploaded blob and probes its
+ *  duration (see src/file-utils/media-duration.ts), then hands the result
+ *  to `writeDuration` — shared by both upload call sites (the standalone
+ *  widget's own upload flow and the auto-bin child-upload flow), which
+ *  otherwise differ in how they write to their doc (`ctx.doc.change` vs. a
+ *  raw `DocHandle.change`). no-ops (never calls `writeDuration`) for any
+ *  non-audio/video domain, or if the probe fails/returns 0 — non-fatal,
+ *  same "best effort, don't hold up the upload-complete UI" spirit as the
+ *  thumbnail fetch right next to each call site. */
+async function probeAndWriteDuration(
+  blobId: string,
+  domain: string,
+  mime: string,
+  blake3: string,
+  writeDuration: (duration: number) => void
+): Promise<void> {
+  if (domain !== "audio" && domain !== "video") return;
+  try {
+    const url = await getMediaPlaybackUrl(blobId, {
+      category: domain === "video" ? "video" : "audio",
+      mime: mime || undefined,
+      blake3: blake3 || undefined,
+    });
+    if (!url) return;
+    const duration = await probeMediaDuration(url, domain);
+    if (duration > 0) writeDuration(duration);
+  } catch (err) {
+    log.warn("file-widget", "duration probe failed (non-fatal):", err);
+  }
+}
 
 /** `classifyDomain()` (src/storage/blob-store.ts) never returns "" — it
  *  falls back to the generic "file" bucket for anything it can't
@@ -1641,6 +1679,14 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
               });
             }
 
+            // best-effort audio/video duration probe — non-blocking, doesn't
+            // hold up the thumbnail fetch below.
+            void probeAndWriteDuration(result.blobId, result.domain, result.mime, result.blake3 ?? "", (duration) => {
+              childDocHandle.change((draft: any) => {
+                draft.duration = duration;
+              });
+            });
+
             // video/audio/pdf thumbnails need ffmpeg/magick, so they're never
             // ready synchronously at upload time. a bin never mounts its
             // children's full widget lifecycle (it only reads the persisted
@@ -1973,6 +2019,15 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
               });
             }
           }
+
+          // best-effort audio/video duration probe — non-blocking, doesn't
+          // hold up thumbnail/upload-complete UI below.
+          void probeAndWriteDuration(result.blobId, result.domain, result.mime, result.blake3 ?? "", (duration) => {
+            if (destroyed || ctx.doc.current.blobId !== result.blobId) return;
+            ctx.doc.change((draft) => {
+              draft.duration = duration;
+            });
+          });
 
           // use the embedded thumbnail if the upload produced one, otherwise
           // fall back to the async thumbnail fetch from grimoire/peers

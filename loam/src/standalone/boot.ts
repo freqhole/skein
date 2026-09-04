@@ -707,7 +707,13 @@ class SkeinRouter {
       try {
         this.profileStore = await ensureMyProfileDoc(this.repo);
       } catch (err) {
-        log.warn(TAG, "failed to ensure profile doc:", err);
+        // doc-ready.ts's own warning (logged just before this) has no
+        // access to the app's actual peer-connectivity tracker — log it
+        // here instead, tied directly to the failure, so it's clear
+        // whether this is "genuinely zero peers connected" (a P2P/network
+        // problem) vs. "peers connected but none have this doc" (a sync/
+        // discovery problem).
+        log.warn(TAG, "failed to ensure profile doc:", err, "connection summary:", this.connectionStateSource.getConnectionSummary());
       }
     }
 

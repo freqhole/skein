@@ -28,6 +28,7 @@
 // ---------------------------------------------------------------------------
 
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
+import { log } from "@freqhole/reliquary/utils";
 
 const DEFAULT_ALLOWABLE_STATES = ["ready", "unavailable", "requesting", "loading"] as const;
 
@@ -196,22 +197,54 @@ export function markUnavailable(docId: string): void {
  * (default 2 minutes), and bounded to `opts.timeoutMs` (default 15s, not
  * automerge-repo's own ~60-120s default) otherwise. records a fresh
  * success/failure against the cache on every real attempt.
+ *
+ * unlike `watchDocReady()` (deliberately silent — see its own doc comment,
+ * it powers many long-lived background watchers where per-call logging
+ * would spam the console), this bounded one-shot wrapper DOES log —
+ * timeouts here are rarer, caller-initiated, and exactly the kind of thing
+ * worth being able to trace (e.g. "why did my profile doc never load").
+ *
+ * pass `opts.context` (a short human-readable label for THIS call site,
+ * e.g. "ProfileStore.open" or "friendz-wiring: narthex metadata sync") so
+ * the log line identifies which caller a given docId belongs to — this
+ * module has ~10 call sites across the app, all resolving different docs
+ * for different reasons, and the docId alone doesn't say which is which.
  */
 export async function resolveDocReadyCached<T>(
   repo: Repo,
   docId: DocumentId,
-  opts?: { timeoutMs?: number; cooldownMs?: number; signal?: AbortSignal }
+  opts?: { timeoutMs?: number; cooldownMs?: number; signal?: AbortSignal; context?: string }
 ): Promise<DocHandle<T> | null> {
-  if (isRecentlyUnavailable(docId, opts?.cooldownMs)) return null;
+  const label = opts?.context ? `resolveDocReadyCached(${docId}) [${opts.context}]` : `resolveDocReadyCached(${docId})`;
+  if (isRecentlyUnavailable(docId, opts?.cooldownMs)) {
+    log.debug("doc-ready", `${label}: skipped, still in failure cooldown`);
+    return null;
+  }
 
+  const startedAt = Date.now();
+  const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const handle = await resolveDocReady<T>(repo, docId, {
-    timeoutMs: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    timeoutMs,
     signal: opts?.signal,
   });
+  const elapsedMs = Date.now() - startedAt;
   if (handle) {
     markResolved(docId);
+    log.debug("doc-ready", `${label}: ready after ${elapsedMs}ms, state=${handle.state}`);
   } else {
     markUnavailable(docId);
+    // NOTE: automerge-repo's NetworkSubsystem has no synchronous "current
+    // peer count" getter (only `"peer"`/`"peer-disconnected"` events) — a
+    // previous version of this log guessed at a `networkSubsystem.peers`
+    // property that doesn't exist, always printing "unknown". this module
+    // has no access to the app's own peer-tracking (`IrohNetworkAdapter`'s
+    // `getConnectionSummary()`, wired up in boot.ts) — callers that have
+    // it (boot.ts does) should log their own connection summary alongside
+    // a failure here instead of this module guessing.
+    log.warn(
+      "doc-ready",
+      `${label}: did NOT become ready after ${elapsedMs}ms (timeoutMs=${timeoutMs}) — either no reachable peer currently holds this doc, or none have connected yet`
+    );
   }
   return handle;
 }

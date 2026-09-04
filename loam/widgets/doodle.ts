@@ -436,24 +436,30 @@ function computeStrokesBounds(
  * reuses paintStroke/makeStrokeNode directly so the thumbnail always
  * matches the live rendering exactly (same stroke geometry, brush shapes,
  * eraser blend mode).
+ *
+ * exported (not just used for the bin-card thumbnail above) so animaniac's
+ * `frame-capture.ts` can render a doodle-frame clip from another widget's
+ * doc data alone — no live mounted pixi container needed, since this
+ * operates purely on `strokes`/`bgColor` read straight off the doc.
  */
-async function renderDoodleSnapshot(
+export async function renderDoodleSnapshot(
   strokes: DoodleStroke[],
-  bgColor: number
+  bgColor: number,
+  size: number = DOODLE_SNAPSHOT_SIZE
 ): Promise<string | null> {
   const bounds = computeStrokesBounds(strokes);
   if (!bounds) return null;
 
   const contentW = Math.max(1, bounds.maxX - bounds.minX);
   const contentH = Math.max(1, bounds.maxY - bounds.minY);
-  const available = DOODLE_SNAPSHOT_SIZE - DOODLE_SNAPSHOT_PADDING * 2;
+  const available = size - DOODLE_SNAPSHOT_PADDING * 2;
   const scale = Math.min(available / contentW, available / contentH, 1);
 
   const stage = new Container();
 
   if (!isTransparent(bgColor)) {
     const bg = new Graphics();
-    bg.rect(0, 0, DOODLE_SNAPSHOT_SIZE, DOODLE_SNAPSHOT_SIZE).fill({ color: bgColor });
+    bg.rect(0, 0, size, size).fill({ color: bgColor });
     stage.addChild(bg);
   }
 
@@ -461,8 +467,8 @@ async function renderDoodleSnapshot(
   // this layer only, matching the live widget's rendering architecture.
   const strokeLayer = new Container();
   strokeLayer.isRenderGroup = true;
-  strokeLayer.x = DOODLE_SNAPSHOT_SIZE / 2 - ((bounds.minX + bounds.maxX) / 2) * scale;
-  strokeLayer.y = DOODLE_SNAPSHOT_SIZE / 2 - ((bounds.minY + bounds.maxY) / 2) * scale;
+  strokeLayer.x = size / 2 - ((bounds.minX + bounds.maxX) / 2) * scale;
+  strokeLayer.y = size / 2 - ((bounds.minY + bounds.maxY) / 2) * scale;
   strokeLayer.scale.set(scale);
   for (const stroke of strokes) {
     strokeLayer.addChild(makeStrokeNode(stroke));
@@ -471,7 +477,7 @@ async function renderDoodleSnapshot(
 
   // rendered at 3x resolution so the thumbnail stays sharp when the canvas
   // is zoomed in well past 100%
-  const dataUrl = await renderSnapshot(stage, DOODLE_SNAPSHOT_SIZE, DOODLE_SNAPSHOT_SIZE, "webp", 3);
+  const dataUrl = await renderSnapshot(stage, size, size, "webp", 3);
   stage.destroy({ children: true });
   return dataUrl;
 }

@@ -1,0 +1,215 @@
+/**
+ * "drag an existing skein widget onto animaniac" cross-widget drop
+ * handling — mirrors `stfu/audio-clip-drag.ts`'s dropTarget mechanics
+ * (pointer-position-based, no HTML5 DnD), generalized over every clip kind
+ * via `frame-capture.ts`'s `resolveCapturedClip()` instead of one
+ * hardcoded audio-only capture.
+ *
+ * the WHOLE widget is the drop zone (not just its track rows) — dropping
+ * anywhere inside animaniac's own bounds highlights it with a magenta
+ * border. if the drop point lands on a specific track row whose kind
+ * matches the dragged content, it's placed there at that row's own
+ * hit-tested time; otherwise (dropped on the toolbar/ruler/preview area,
+ * or on a row of the WRONG kind) it falls back to the first track of the
+ * matching kind, placed at the current end of the timeline.
+ *
+ * `onDrop()`'s capture step is async (a doodle-frame capture needs to
+ * `await` a snapshot render + blob promotion) but `DropTargetHandler.
+ * onDrop()` itself must return a plain `boolean` synchronously — this
+ * returns `true` as soon as a valid type+target is confirmed (claiming the
+ * drop) and does the actual clip-push + source-widget removal once the
+ * async capture resolves in the background. if capture resolves to `null`
+ * (nothing capturable, e.g. an empty doodle), the source widget is simply
+ * left where it was dropped rather than silently vanishing.
+ */
+
+import type { DocumentId, Repo } from "@automerge/automerge-repo";
+import { Container, Graphics } from "pixi.js";
+import { log } from "@freqhole/reliquary/utils";
+import type { CanvasStore } from "../../src/canvas/canvas-store";
+import type { DropTargetHandler } from "../../src/widgets/widget-types";
+import type { WidgetRegistry } from "../../src/widgets/widget-registry";
+import type { TrackCameraView, TrackRowContainers } from "../../src/widgets/timeline/timeline-types";
+import { expectedTrackKindFor, isCapturableWidgetType, resolveCapturedClip } from "./frame-capture";
+import { computeTimelineDuration } from "./track-model";
+import { AUDIO_CLIP_KINDS, VISUAL_CLIP_KINDS, type AnimaniacState, type Clip, type Track } from "./types";
+
+export interface AnimaniacDropControllerOptions {
+  store: CanvasStore | null;
+  repo: Repo | null;
+  registry: WidgetRegistry | null;
+  /** animaniac's own root container — the drop zone + hover-border host. */
+  container: Container;
+  findWorldContainer: () => Container;
+  getSize: () => { width: number; height: number };
+  getTracks: () => Track[];
+  getClips: () => Clip[];
+  /** the track's own row containers, once mounted — null if that track's
+   *  row isn't currently laid out (e.g. hidden). */
+  getTrackRow: (trackId: string) => TrackRowContainers | null;
+  camera: Pick<TrackCameraView, "screenXToTime">;
+  changeDoc: (fn: (d: AnimaniacState) => void) => void;
+  /** called after a clip is actually added — refresh the relevant track +
+   *  push an undo-history entry. */
+  onClipAdded: () => void;
+}
+
+export interface AnimaniacDropControllerHandle {
+  dropTarget: DropTargetHandler | undefined;
+  destroy(): void;
+}
+
+function clipKindMatchesTrack(kind: string, trackKind: Track["kind"]): boolean {
+  if (trackKind === "visual") return (VISUAL_CLIP_KINDS as readonly string[]).includes(kind);
+  return (AUDIO_CLIP_KINDS as readonly string[]).includes(kind);
+}
+
+export function createAnimaniacDropController(options: AnimaniacDropControllerOptions): AnimaniacDropControllerHandle {
+  const { store, repo, registry, container, findWorldContainer, getSize, getTracks, getClips, getTrackRow, camera, changeDoc, onClipAdded } =
+    options;
+
+  const hoverBorder = new Graphics();
+  hoverBorder.eventMode = "none";
+  hoverBorder.visible = false;
+  container.addChild(hoverBorder);
+
+  function setHovering(hovering: boolean): void {
+    hoverBorder.visible = hovering;
+    if (!hovering) return;
+    const { width, height } = getSize();
+    hoverBorder
+      .clear()
+      .rect(1, 1, Math.max(0, width - 2), Math.max(0, height - 2))
+      .stroke({ width: 3, color: 0xd946ef });
+  }
+
+  /** converts a world-space point into animaniac's own root container's
+   *  local frame — used both for the whole-widget hitTest and to decide
+   *  whether a drop landed inside the widget at all. */
+  function toWidgetLocal(worldX: number, worldY: number): { x: number; y: number } {
+    return container.toLocal({ x: worldX, y: worldY }, findWorldContainer());
+  }
+
+  function isInsideWidget(worldX: number, worldY: number): boolean {
+    const { width, height } = getSize();
+    const local = toWidgetLocal(worldX, worldY);
+    return local.x >= 0 && local.x <= width && local.y >= 0 && local.y <= height;
+  }
+
+  /** finds which track row (if any) contains this world-space point, along
+   *  with the point converted into that row's own local frame. */
+  function hitTestTrack(worldX: number, worldY: number): { track: Track; localX: number; localY: number } | null {
+    const world = findWorldContainer();
+    for (const track of getTracks()) {
+      if (track.hidden) continue;
+      const row = getTrackRow(track.id);
+      if (!row) continue;
+      const local = row.hitArea.toLocal({ x: worldX, y: worldY }, world);
+      const hitRect = row.hitArea.hitArea as { contains?: (x: number, y: number) => boolean } | null;
+      if (hitRect?.contains?.(local.x, local.y)) return { track, localX: local.x, localY: local.y };
+    }
+    return null;
+  }
+
+  function readDroppedState(entryType: string, docId: string | null): Record<string, unknown> | null {
+    if (!repo || !registry || !docId || !isCapturableWidgetType(entryType)) return null;
+    const factory = registry.get(entryType);
+    if (!factory?.schema) return null;
+    try {
+      const handle = repo.handles[docId as DocumentId];
+      const rawDoc = handle?.doc();
+      if (!rawDoc) return null;
+      return factory.schema.parse(rawDoc) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  /** resolves the target track + timeline position for a drop: prefer a
+   *  specific row hit (if its kind matches), else fall back to the first
+   *  track of the matching kind, placed at the current end of the
+   *  timeline (per the user's "if it's not dropped in a specific place,
+   *  just place it at the end" request). */
+  function resolveDropTarget(
+    worldX: number,
+    worldY: number,
+    expectedKind: "visual" | "audio"
+  ): { trackId: string; start: number } | null {
+    const hit = hitTestTrack(worldX, worldY);
+    if (hit && hit.track.kind === expectedKind) {
+      return { trackId: hit.track.id, start: Math.max(0, camera.screenXToTime(hit.localX)) };
+    }
+    const fallbackTrack = getTracks().find((t) => t.kind === expectedKind && !t.hidden);
+    if (!fallbackTrack) return null;
+    return { trackId: fallbackTrack.id, start: computeTimelineDuration(getClips()) };
+  }
+
+  const dropTarget: DropTargetHandler | undefined = store
+    ? {
+        hitTest(worldX: number, worldY: number): boolean {
+          return isInsideWidget(worldX, worldY);
+        },
+
+        onHover(): void {
+          setHovering(true);
+        },
+
+        onLeave(): void {
+          setHovering(false);
+        },
+
+        onDrop(draggedWidgetId: string, worldX: number, worldY: number): boolean {
+          setHovering(false);
+          const entry = store.getWidget(draggedWidgetId);
+          if (!entry || !isCapturableWidgetType(entry.type)) {
+            log.debug("animaniac.drop", "onDrop: dragged widget not capturable", { entryType: entry?.type });
+            return false;
+          }
+          const sourceState = readDroppedState(entry.type, entry.docId);
+          if (!sourceState) {
+            log.debug("animaniac.drop", "onDrop: could not read dropped widget's doc state", { entryType: entry.type, docId: entry.docId });
+            return false;
+          }
+          const expectedKind = expectedTrackKindFor(entry.type, sourceState);
+          if (!expectedKind) {
+            log.debug("animaniac.drop", "onDrop: could not determine target track kind", { entryType: entry.type });
+            return false;
+          }
+          const target = resolveDropTarget(worldX, worldY, expectedKind);
+          if (!target) {
+            log.debug("animaniac.drop", "onDrop: no track of the required kind exists", { expectedKind });
+            return false;
+          }
+          const { trackId, start } = target;
+          log.debug("animaniac.drop", "onDrop: hit", { entryType: entry.type, trackId, start });
+
+          void resolveCapturedClip(entry.type, sourceState, trackId, start).then((clip) => {
+            if (!clip) {
+              log.debug("animaniac.drop", "onDrop: resolveCapturedClip returned null (nothing capturable yet)", { entryType: entry.type });
+              return;
+            }
+            if (!clipKindMatchesTrack(clip.kind, expectedKind)) {
+              log.debug("animaniac.drop", "onDrop: clip kind doesn't match track kind, rejected", { clipKind: clip.kind, expectedKind });
+              return;
+            }
+            changeDoc((d) => {
+              d.clips.push(clip);
+            });
+            onClipAdded();
+            store.removeWidget(draggedWidgetId);
+            log.debug("animaniac.drop", "onDrop: captured", { clipKind: clip.kind, trackId });
+          });
+
+          return true;
+        },
+      }
+    : undefined;
+
+  return {
+    dropTarget,
+    destroy() {
+      hoverBorder.destroy();
+    },
+  };
+}
+
