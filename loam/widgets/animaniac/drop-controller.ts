@@ -111,22 +111,26 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
     }
     const entry = store.getWidget(draggedWidgetId);
     if (!entry || !isCapturableWidgetType(entry.type)) {
+      log.debug("animaniac.drop", "[ANIMANIAC-DBG] showPlaceholder: not capturable", entry?.type);
       hidePlaceholder();
       return;
     }
     const sourceState = readDroppedState(entry.type, entry.docId);
     if (!sourceState) {
+      log.debug("animaniac.drop", "[ANIMANIAC-DBG] showPlaceholder: no sourceState", entry.type, entry.docId);
       hidePlaceholder();
       return;
     }
     const expectedKind = expectedTrackKindFor(entry.type, sourceState);
     if (!expectedKind) {
+      log.debug("animaniac.drop", "[ANIMANIAC-DBG] showPlaceholder: expectedTrackKindFor returned null", entry.type, sourceState);
       hidePlaceholder();
       return;
     }
     const target = resolveDropTarget(worldX, worldY);
     const row = target ? getTrackRow(target.trackId) : null;
     if (!target || !row) {
+      log.debug("animaniac.drop", "[ANIMANIAC-DBG] showPlaceholder: no target/row", "target:", target, "hasRow:", !!row);
       hidePlaceholder();
       return;
     }
@@ -175,15 +179,33 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
   }
 
   function readDroppedState(entryType: string, docId: string | null): Record<string, unknown> | null {
-    if (!repo || !registry || !docId || !isCapturableWidgetType(entryType)) return null;
+    if (!repo || !registry || !docId || !isCapturableWidgetType(entryType)) {
+      log.debug("animaniac.drop", "[ANIMANIAC-DBG] readDroppedState: bailing", {
+        entryType,
+        docId,
+        hasRepo: !!repo,
+        hasRegistry: !!registry,
+        isCapturable: isCapturableWidgetType(entryType),
+      });
+      return null;
+    }
     const factory = registry.get(entryType);
-    if (!factory?.schema) return null;
+    if (!factory?.schema) {
+      log.debug("animaniac.drop", "[ANIMANIAC-DBG] readDroppedState: no registered factory/schema for type", entryType);
+      return null;
+    }
     try {
       const handle = repo.handles[docId as DocumentId];
       const rawDoc = handle?.doc();
-      if (!rawDoc) return null;
-      return factory.schema.parse(rawDoc) as Record<string, unknown>;
-    } catch {
+      if (!rawDoc) {
+        log.debug("animaniac.drop", "[ANIMANIAC-DBG] readDroppedState: no handle/doc yet for docId", docId, "hasHandle:", !!handle);
+        return null;
+      }
+      const parsed = factory.schema.parse(rawDoc) as Record<string, unknown>;
+      log.debug("animaniac.drop", "[ANIMANIAC-DBG] readDroppedState: parsed ok", entryType, Object.keys(parsed));
+      return parsed;
+    } catch (err) {
+      log.debug("animaniac.drop", "[ANIMANIAC-DBG] readDroppedState: schema.parse threw", entryType, err);
       return null;
     }
   }
@@ -199,6 +221,14 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
       return { trackId: hit.track.id, start: Math.max(0, camera.screenXToTime(hit.localX)) };
     }
     const fallbackTrack = getTracks().find((t) => !t.hidden);
+    log.debug(
+      "animaniac.drop",
+      "[ANIMANIAC-DBG] resolveDropTarget: no row hit, falling back",
+      "tracks:",
+      getTracks().map((t) => ({ id: t.id, hidden: t.hidden })),
+      "fallback:",
+      fallbackTrack?.id
+    );
     if (!fallbackTrack) return null;
     return { trackId: fallbackTrack.id, start: computeTimelineDuration(getClips()) };
   }
@@ -211,6 +241,8 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
 
         onHover(worldX: number, worldY: number, draggedWidgetId: string): void {
           setHovering(true);
+          const entry = store.getWidget(draggedWidgetId);
+          log.debug("animaniac.drop", "[ANIMANIAC-DBG] onHover:", draggedWidgetId, "entryType:", entry?.type);
           showPlaceholder(worldX, worldY, draggedWidgetId);
         },
 
@@ -247,7 +279,21 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
 
           void resolveCapturedClip(entry.type, sourceState, trackId, start, undefined, getPreviewSize()).then((clip) => {
             if (!clip) {
-              log.debug("animaniac.drop", "onDrop: resolveCapturedClip returned null (nothing capturable yet)", { entryType: entry.type });
+              // resolveCapturedClip() is deliberately pure/unlogged (see its
+              // own doc comment) — log the relevant sourceState fields HERE
+              // instead so a "why did this return null" question is
+              // answerable from this one log line without touching that
+              // module (e.g. a not-yet-generated tts clip has no
+              // audioBlobId yet; a fresh audio-recording may have duration
+              // 0 until its own probe finishes).
+              log.debug("animaniac.drop", "[ANIMANIAC-DBG] onDrop: resolveCapturedClip returned null (nothing capturable yet)", {
+                entryType: entry.type,
+                blobId: sourceState.blobId,
+                domain: sourceState.domain,
+                duration: sourceState.duration,
+                videoBlobId: sourceState.videoBlobId,
+                videoDurationSec: sourceState.videoDurationSec,
+              });
               return;
             }
             // items on a single track must not overlap each other (see

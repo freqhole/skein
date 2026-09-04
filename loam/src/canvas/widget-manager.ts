@@ -1,5 +1,6 @@
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics } from "pixi.js";
+import { log } from "@freqhole/reliquary/utils";
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { KeyboardDriver } from "../widgets/keyboard-driver";
 import { createWidgetDoc } from "../widgets/widget-doc";
@@ -998,6 +999,9 @@ export class WidgetManager {
       prev?.ctrl.dropTarget?.onLeave();
     }
 
+    if (foundTarget !== this.activeDropTarget) {
+      log.debug("widget-manager.drop", "[DROP-DBG] active drop target changed:", this.activeDropTarget, "->", foundTarget, "draggedId:", draggedId, "draggedType:", draggedLive.entry.type);
+    }
     this.activeDropTarget = foundTarget;
   }
 
@@ -1006,12 +1010,25 @@ export class WidgetManager {
    * onto an active drop target. returns true if the drop was consumed.
    */
   private tryDropOnTarget(draggedId: string): boolean {
-    if (!this.activeDropTarget) return false;
+    if (!this.activeDropTarget) {
+      log.debug("widget-manager.drop", "[DROP-DBG] tryDropOnTarget: no active drop target at release", draggedId);
+      return false;
+    }
 
     const targetLive = this.liveWidgets.get(this.activeDropTarget);
     const draggedLive = this.liveWidgets.get(draggedId);
 
     if (!targetLive?.ctrl.dropTarget || !draggedLive) {
+      log.debug(
+        "widget-manager.drop",
+        "[DROP-DBG] tryDropOnTarget: missing target/dragged live widget",
+        "targetId:",
+        this.activeDropTarget,
+        "hasTargetDropTarget:",
+        !!targetLive?.ctrl.dropTarget,
+        "hasDraggedLive:",
+        !!draggedLive
+      );
       this.activeDropTarget = null;
       return false;
     }
@@ -1023,6 +1040,16 @@ export class WidgetManager {
     const wy = this.lastDragPointer?.y ?? draggedLive.frame.root.y + draggedLive.entry.height / 2;
 
     const consumed = targetLive.ctrl.dropTarget.onDrop(draggedId, wx, wy);
+    log.debug(
+      "widget-manager.drop",
+      "[DROP-DBG] tryDropOnTarget: onDrop",
+      "draggedType:",
+      draggedLive.entry.type,
+      "targetType:",
+      targetLive.entry.type,
+      "consumed:",
+      consumed
+    );
 
     // if the primary drop was consumed and there are other selected widgets
     // in the batch drag, drop those too (multi-drop into bin)
