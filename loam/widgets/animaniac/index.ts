@@ -215,10 +215,27 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     const rulerContainer = new Container();
     rulerContainer.eventMode = "static";
     timelineContainer.addChild(rulerContainer);
-    rulerContainer.on("pointerdown", (e) => {
+    // click-and-drag to scrub: seeking starts immediately on pointerdown (so
+    // a plain click still works) and continues tracking the pointer while
+    // held, so the user can "dial in" the right time by dragging rather
+    // than being stuck with wherever they first clicked.
+    let scrubbing = false;
+    function seekToLocalX(e: FederatedPointerEvent): void {
       const local = e.getLocalPosition(rulerContainer);
       playbackClock.seek(camera.screenXToTime(local.x));
+    }
+    rulerContainer.on("pointerdown", (e: FederatedPointerEvent) => {
+      scrubbing = true;
+      seekToLocalX(e);
     });
+    rulerContainer.on("globalpointermove", (e: FederatedPointerEvent) => {
+      if (scrubbing) seekToLocalX(e);
+    });
+    const stopScrubbing = (): void => {
+      scrubbing = false;
+    };
+    rulerContainer.on("pointerup", stopScrubbing);
+    rulerContainer.on("pointerupoutside", stopScrubbing);
     const ruler: TimelineRulerHandle = createTimelineRuler({ container: rulerContainer });
 
     const scrollbarContainer = new Container();
@@ -278,6 +295,10 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         camera,
         getDuration: () => camera.getView().duration,
         isSnapEnabled: () => prefs.snapEnabled,
+        // clips always snap to the very start of the timeline (besides
+        // other clips' own edges, already handled by the interaction
+        // engine) — makes it easy to drag a clip flush against t=0.
+        getSnapTimes: () => [0],
         getClips: () => ctx.doc.current.clips,
         onClipsChange,
       };

@@ -15,10 +15,12 @@
  * out from under it), rather than rebuilt every tick.
  */
 
-import { Container, Graphics, Sprite, Text, Texture } from "pixi.js";
+import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
+import { log } from "@freqhole/reliquary/utils";
 import type { PeersMap } from "../../src/file-utils/file-shared";
 import { resolveImagePropUrl } from "../../src/file-utils/image-prop-blob";
 import { getMediaPlaybackUrl } from "../../src/media";
+import { isGifDataUrl } from "../../src/widgets/gif-utils";
 import { MouthRenderer, type Mood, type TeethStyle } from "../voice-recording-mouth";
 import { createMouthEnvelopeCache, opennessAtElapsed, type MouthEnvelopeCache } from "./mouth-sync";
 import { activeClipsAt, clipsForTrack, sortedTracks } from "./track-model";
@@ -114,14 +116,69 @@ export function createCompositor(options: CompositorOptions): CompositorHandle {
   }
 
   /** shared by doodle-frame/image — both resolve to a plain image `Sprite`
-   *  from an `imageUrl` (a `blob:<id>` ref or external URL). */
+   *  from an `imageUrl` (a `blob:<id>` ref or external URL). NOTE: pixi's
+   *  `Sprite.from(url)`/`Texture.from(url)` for a STRING id is a
+   *  synchronous CACHE-ONLY lookup (pixi's own `textureFrom()`: `if
+   *  (typeof id === "string") return Cache.Cache.get(id);`) — it never
+   *  fetches/decodes anything, so a brand-new blob: URL (never previously
+   *  loaded) silently resolves to an EMPTY/invisible texture with no
+   *  error. `Assets.load()` alone isn't enough either though — its own
+   *  extension/data-url sniffing (`loadTextures.js`'s `test()`) never
+   *  matches a bare blob: URL (no recognizable extension, not a data:
+   *  URL), so it silently picks the wrong parser and resolves to
+   *  something with no usable `.source` — see `loadImageTexture()` below
+   *  for the actual fix (decode via `createImageBitmap()` for any
+   *  blob-store URL, bypassing pixi's resolver entirely). */
+  async function loadImageTexture(imageUrl: string): Promise<Texture | null> {
+    const resolvedUrl = await resolveImagePropUrl(imageUrl);
+    if (!resolvedUrl) return null;
+    try {
+      // a resolved blob-store object URL always starts with "blob:" but
+      // carries no recognizable extension or mime type in the url string
+      // itself (unlike a data: URL) — pixi's own `Assets.load()` extension/
+      // data-url sniffing (loadTextures.js's `test()`) never matches a bare
+      // blob: URL, so it silently falls through to a non-texture parser and
+      // resolves to something whose `.source` is missing (no error, no
+      // rejected promise — just an invisible sprite). decode via the
+      // browser's own `createImageBitmap()` instead, which handles any
+      // raster format (including just the first frame of an animated gif,
+      // which pixi's Assets loader can't parse at all), bypassing pixi's
+      // resolver/parser selection entirely for this case.
+      const isBlobStoreUrl = resolvedUrl.startsWith("blob:") && resolvedUrl !== imageUrl;
+      let tex: Texture;
+      if (isGifDataUrl(resolvedUrl) || isBlobStoreUrl) {
+        const blob = await fetch(resolvedUrl).then((r) => r.blob());
+        tex = Texture.from(await createImageBitmap(blob));
+      } else {
+        tex = await Assets.load<Texture>(resolvedUrl);
+      }
+      // guard against invalid GPU sources that cause addressModeU/alphaMode
+      // crashes (mirrors bin/bin-renderer.ts's loadCardTexture()).
+      if (!tex || !tex.source?.style) {
+        if (!resolvedUrl.startsWith("data:")) {
+          try {
+            Assets.unload(resolvedUrl);
+          } catch {
+            /* ignored */
+          }
+        }
+        log.warn("animaniac", "loadImageTexture: loaded texture has no usable GPU source", imageUrl.slice(0, 32));
+        return null;
+      }
+      return tex;
+    } catch (err) {
+      log.warn("animaniac", "loadImageTexture failed:", err);
+      return null;
+    }
+  }
+
   function makeImageEntry(imageUrl: string): PoolEntry {
     const node = new Container();
     container.addChild(node);
     const entry: PoolEntry = { node, destroy: () => node.destroy({ children: true }) };
-    void resolveImagePropUrl(imageUrl).then((url) => {
-      if (!url || node.destroyed) return;
-      const sprite = Sprite.from(url);
+    void loadImageTexture(imageUrl).then((texture) => {
+      if (!texture || node.destroyed) return;
+      const sprite = new Sprite(texture);
       sprite.anchor.set(0.5);
       node.addChild(sprite);
     });
