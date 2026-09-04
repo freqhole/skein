@@ -2,7 +2,9 @@
  * animaniac's unified pixi compositor — mounts a `Sprite`/`Text` for every
  * currently-active visual clip (doodle-frame/image/label/video-segment),
  * positions/scales/rotates/fades it via `resolveTransformAt()`, and
- * z-orders by track (`sortedTracks()`) then array position within a track.
+ * z-orders to match the track list's own visual order (the track at the
+ * TOP of the list is drawn on top here too — see `update()`'s own z-order
+ * comment) then array position within a track.
  *
  * video-segment clips are just another `Sprite` here too (pixi.js's
  * built-in `VideoSource`, `Texture.from(videoElement)`) — NOT a DOM
@@ -383,6 +385,11 @@ export function createCompositor(options: CompositorOptions): CompositorHandle {
   function applyVideoTime(entry: PoolEntry, clip: Extract<Clip, { kind: "video-segment" }>, localElapsed: number, playing: boolean, seeked: boolean): void {
     const video = entry.video;
     if (!video) return;
+    // `clip.muted` only gets applied at video-element CREATION time
+    // otherwise (see `makeVideoEntry()`) — the element is pooled/reused
+    // across frames, so a mute toggled after mount (the timeline's own
+    // "mute"/"unmute" action) never reached the still-playing element.
+    if (video.muted !== clip.muted) video.muted = clip.muted;
     if (!entry.videoSynced || seeked) {
       video.currentTime = clip.sourceInSec + localElapsed;
       entry.videoSynced = true;
@@ -417,12 +424,20 @@ export function createCompositor(options: CompositorOptions): CompositorHandle {
       }
     }
 
-    // z-order: visual tracks in ascending `order`, then array position
-    // within each track as a stable tiebreak — matches track-model.ts's
-    // own `sortedTracks()`/`clipsForTrack()` helpers so there's exactly
-    // one place this ordering is defined.
+    // z-order: matches the TRACK LIST's own visual order (see index.ts's
+    // `syncTracks()`/`timeline-rows.ts`'s `layout()`, which lay out
+    // `sortedTracks()`'s ascending-`order` result top-to-bottom) — the
+    // track at the TOP of that list is drawn on TOP here too, so
+    // `sortedTracks()`'s own ascending order is walked in REVERSE (the
+    // bottom-of-list track's clips are pushed first / drawn first / end
+    // up at the back; the top-of-list track's clips are pushed last /
+    // drawn last / end up in front). array position within a track is a
+    // stable tiebreak, matching track-model.ts's own `clipsForTrack()`.
+    // `active` is already visual-clip-only (see above), so a track
+    // holding a mix of visual/audio clips only contributes its visual
+    // ones here.
     const orderedClips: Clip[] = [];
-    for (const track of sortedTracks(tracks.filter((tr) => tr.kind === "visual" && !tr.hidden))) {
+    for (const track of sortedTracks(tracks.filter((tr) => !tr.hidden)).reverse()) {
       orderedClips.push(...clipsForTrack(active, track.id));
     }
 

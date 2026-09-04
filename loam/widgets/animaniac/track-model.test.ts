@@ -135,18 +135,18 @@ describe("computeDisplayDurationSec", () => {
 });
 
 describe("track CRUD", () => {
-  const visual1: Track = { id: "visual-1", kind: "visual", label: "visual", order: 0, muted: false, hidden: false };
-  const audio1: Track = { id: "audio-1", kind: "audio", label: "audio", order: 0, muted: false, hidden: false };
+  const visual1: Track = { id: "visual-1", label: "visual", order: 0, muted: false, hidden: false };
+  const audio1: Track = { id: "audio-1", label: "audio", order: 0, muted: false, hidden: false };
 
-  it("sortedTracks groups visual before audio, ordered within each group", () => {
+  it("sortedTracks orders by order then id", () => {
     const visual2: Track = { ...visual1, id: "visual-2", order: 1 };
     const result = sortedTracks([audio1, visual2, visual1]);
-    expect(result.map((t) => t.id)).toEqual(["visual-1", "visual-2", "audio-1"]);
+    expect(result.map((t) => t.id)).toEqual(["audio-1", "visual-1", "visual-2"]);
   });
 
-  it("nextTrackOrder picks one past the current max for that kind", () => {
-    expect(nextTrackOrder([visual1], "visual")).toBe(1);
-    expect(nextTrackOrder([], "audio")).toBe(0);
+  it("nextTrackOrder picks one past the current max", () => {
+    expect(nextTrackOrder([visual1])).toBe(1);
+    expect(nextTrackOrder([])).toBe(0);
   });
 
   it("addTrack appends, updateTrack patches by id", () => {

@@ -72,19 +72,17 @@ export function computeDisplayDurationSec(
   return Math.max(minDurationSec, computeTimelineDuration(clips) + bufferSec);
 }
 
-/** tracks in their intended render/list order — visual tracks by ascending
- *  `order` (lower first, i.e. drawn first / furthest back) then audio
- *  tracks, each group stable-sorted by `order` then `id` as a tiebreak so
- *  the result is deterministic across peers even if two tracks share an
- *  `order` value. */
+/** tracks in their intended render/list order — ascending `order` (lower
+ *  first, i.e. drawn first / furthest back for visual clips), stable-
+ *  sorted by `order` then `id` as a tiebreak so the result is
+ *  deterministic across peers even if two tracks share an `order` value. */
 export function sortedTracks(tracks: readonly Track[]): Track[] {
   const byOrder = (a: Track, b: Track) => a.order - b.order || a.id.localeCompare(b.id);
-  return [...tracks.filter((t) => t.kind === "visual").sort(byOrder), ...tracks.filter((t) => t.kind === "audio").sort(byOrder)];
+  return [...tracks].sort(byOrder);
 }
 
-export function nextTrackOrder(tracks: readonly Track[], kind: Track["kind"]): number {
-  const same = tracks.filter((t) => t.kind === kind);
-  return same.length === 0 ? 0 : Math.max(...same.map((t) => t.order)) + 1;
+export function nextTrackOrder(tracks: readonly Track[]): number {
+  return tracks.length === 0 ? 0 : Math.max(...tracks.map((t) => t.order)) + 1;
 }
 
 export function addTrack(tracks: readonly Track[], track: Track): Track[] {

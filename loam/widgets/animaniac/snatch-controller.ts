@@ -111,6 +111,14 @@ export function clipBlobInfo(clip: Clip): SnatchBlobInfo | null {
 export interface SnatchControllerOptions {
   widgetId: string;
   getDocState: () => AnimaniacState;
+  /** persist a doc mutation \u2014 used to write this peer's own node id into
+   *  the snatched clip's `snatchedBy` list (see `markClipSnatched()`), the
+   *  same "record who has this blob" convention file.ts/voice-recording.ts
+   *  already use, mirrored per-clip here (see tumulus/src/snatch.rs). */
+  changeDoc: (fn: (d: AnimaniacState) => void) => void;
+  /** this peer's own node id \u2014 empty string (a no-op guard in
+   *  `markClipSnatched()`) before an identity exists yet. */
+  getLocalNodeId: () => string;
   getPeers: () => PeersMap | undefined;
   isPeerOnline?: (nodeId: string) => boolean;
   isDestroyed: () => boolean;
@@ -166,7 +174,7 @@ const AUTO_SNATCH_RETRY_MS = 20_000;
 const CATCHUP_RESCAN_DELAYS_MS = [2_000, 6_000, 15_000];
 
 export function createSnatchController(options: SnatchControllerOptions): SnatchControllerHandle {
-  const { widgetId, getDocState, getPeers, isPeerOnline, isDestroyed, onStateChange } = options;
+  const { widgetId, getDocState, changeDoc, getLocalNodeId, getPeers, isPeerOnline, isDestroyed, onStateChange } = options;
   log.debug("animaniac.snatch", "[ANIMANIAC-DBG] createSnatchController:", widgetId, "autoSnatchEnabled=", loadAutoSnatchEnabled(widgetId));
 
   let state: SnatchState = "idle";
@@ -194,6 +202,22 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
     if (fraction < 0) return;
     const prev = blobProgress.get(blobId) ?? 0;
     if (fraction > prev) blobProgress.set(blobId, fraction);
+  }
+
+  /** records that this peer now has `blobId` locally by writing its own
+   *  node id into the OWNING clip's `snatchedBy` list \u2014 lets any other
+   *  peer (or the hub, via tumulus/src/snatch.rs's own per-clip mirror of
+   *  this) discover this peer as a source without a live ephemeral ping.
+   *  a no-op if no identity exists yet, or no clip currently carries this
+   *  blobId (e.g. it was deleted mid-download). */
+  function markClipSnatched(blobId: string): void {
+    const localNodeId = getLocalNodeId();
+    if (!localNodeId) return;
+    changeDoc((d) => {
+      const clip = d.clips.find((c) => clipBlobInfo(c)?.blobId === blobId);
+      if (!clip || !("snatchedBy" in clip)) return;
+      if (!clip.snatchedBy.includes(localNodeId)) clip.snatchedBy.push(localNodeId);
+    });
   }
 
   /** derives `state` from `remoteBlobs.size` alone — callers are
@@ -287,7 +311,10 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
       if (isDestroyed()) return;
       log.debug("animaniac.snatch", "[ANIMANIAC-DBG] snatchOne result:", blob.blobId.slice(0, 12), result ? "ok" : "failed/not found");
       blobProgress.delete(blob.blobId);
-      if (result !== null) remoteBlobs.delete(blob.blobId);
+      if (result !== null) {
+        remoteBlobs.delete(blob.blobId);
+        markClipSnatched(blob.blobId);
+      }
       recomputeState();
       onStateChange();
     } catch (err) {
@@ -369,6 +396,7 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
         blobProgress.delete(b.blobId);
         if (results[i] !== null) {
           remoteBlobs.delete(b.blobId);
+          markClipSnatched(b.blobId);
           successCount++;
         }
       });

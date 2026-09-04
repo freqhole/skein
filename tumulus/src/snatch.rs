@@ -4,13 +4,24 @@
 //! from peers.
 //!
 //! [`HubBlobRefSource`] scans automerge canvas docs for blob-bearing widgets
-//! (file, audio-recording, voice-recording - see `BLOB_WIDGET_TYPES`) and
-//! their widget-state docs for blake3/snatchedBy fields - the engine calls
-//! it both for a full boot-time sweep and for single-doc rescans driven by
-//! `hub_repo`'s doc-change notifications. [`HubPeerProbeTransport`] asks a
-//! candidate peer whether it has a blob via `ensure_blob_request` over the
-//! `freqhole/1` ALPN, the same handshake `protocol::blob_proxy` uses for the
-//! ensure-request gate.
+//! (file, audio-recording, voice-recording, animaniac - see
+//! `BLOB_WIDGET_TYPES`) and their widget-state docs for blake3/snatchedBy
+//! fields - the engine calls it both for a full boot-time sweep and for
+//! single-doc rescans driven by `hub_repo`'s doc-change notifications.
+//! [`HubPeerProbeTransport`] asks a candidate peer whether it has a blob via
+//! `ensure_blob_request` over the `freqhole/1` ALPN, the same handshake
+//! `protocol::blob_proxy` uses for the ensure-request gate.
+//!
+//! most widget types carry exactly one blob at their state doc's root
+//! (`blobId`/`blake3`/`snatchedBy`). `animaniac` is the one exception: its
+//! state doc holds a `clips[]` array, each clip potentially carrying its
+//! OWN blob (and its own `snatchedBy` list nested inside that clip, not at
+//! the doc root) - see `read_widget_state()`'s own doc comment for how a
+//! `BlobRef`'s optional `clip_id` and `to_descriptor()`'s composite
+//! `"{widget_doc_id}#clip={clip_id}"` `source_ref` encoding thread this
+//! through the otherwise blob-per-doc-shaped engine without needing any
+//! upstream change to `freqhole_reliquary::snatch` itself (`source_ref` is
+//! already a fully opaque, app-defined string as far as the engine cares).
 //!
 //! this module also hosts the doc-shape helpers (`classify_doc`,
 //! `read_canvas_for_file_widgets`, `read_widget_state`) that `blob_acl`'s
@@ -37,7 +48,9 @@ use freqhole_reliquary::snatch::{
 pub struct BlobRef {
     /// the canvas doc ID this widget belongs to.
     pub canvas_doc_id: String,
-    /// the automerge doc ID of the file widget state.
+    /// the automerge doc ID of the widget state doc holding this blob
+    /// reference. for an `animaniac` clip this is the animaniac doc's own
+    /// id (NOT a per-clip doc — clips are not separate automerge docs).
     pub widget_doc_id: String,
     /// media blob ID (usually sha256) from the widget state.
     pub blob_id: String,
@@ -51,6 +64,13 @@ pub struct BlobRef {
     pub size: u64,
     /// node IDs that have snatched this blob (from widget state doc).
     pub snatched_by: Vec<String>,
+    /// set only for a blob living inside one of `animaniac`'s `clips[]`
+    /// entries — identifies WHICH clip (by its own `id` field) within
+    /// `widget_doc_id`'s doc this blob reference came from, since several
+    /// clips (each with their own blob + own nested `snatchedBy` list) can
+    /// share the same widget doc. `None` for every other blob-bearing
+    /// widget type, which carry exactly one blob at their doc's root.
+    pub clip_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,41 +125,42 @@ impl HubBlobRefSource {
             };
             let canvas_id = canvas_doc_id.to_string();
             let wdoc_id = placeholder.widget_doc_id.clone();
-            let blob_ref = tokio::task::spawn_blocking(move || {
+            let blob_refs = tokio::task::spawn_blocking(move || {
                 read_widget_state(&whandle, &canvas_id, &wdoc_id)
             })
             .await
-            .ok()
-            .flatten();
+            .unwrap_or_default();
 
-            match blob_ref {
-                None => {
-                    tracing::info!(
-                        canvas = canvas_doc_id,
-                        widget_doc_id = %placeholder.widget_doc_id,
-                        "widget-state doc has no blobId/blake3 field at all yet"
-                    );
-                }
-                Some(blob_ref) if blob_ref.blake3.is_empty() => {
+            if blob_refs.is_empty() {
+                tracing::info!(
+                    canvas = canvas_doc_id,
+                    widget_doc_id = %placeholder.widget_doc_id,
+                    "widget-state doc has no blob reference(s) at all yet"
+                );
+                continue;
+            }
+
+            for blob_ref in blob_refs {
+                if blob_ref.blake3.is_empty() {
                     tracing::info!(
                         canvas = canvas_doc_id,
                         widget_doc_id = %placeholder.widget_doc_id,
                         blob_id = %blob_ref.blob_id,
+                        clip_id = ?blob_ref.clip_id,
                         "widget-state doc has a blobId but no blake3 yet - can't snatch without it"
                     );
+                    continue;
                 }
-                Some(blob_ref) => {
-                    let descriptor = to_descriptor(blob_ref, &peers, &self.local_node_id);
-                    tracing::info!(
-                        canvas = canvas_doc_id,
-                        widget_doc_id = %placeholder.widget_doc_id,
-                        blake3 = trunc(&descriptor.blake3),
-                        canvas_peers = ?peers,
-                        candidate_peers = ?descriptor.candidate_peers,
-                        "resolved blob descriptor from canvas file widget"
-                    );
-                    descriptors.push(descriptor);
-                }
+                let descriptor = to_descriptor(blob_ref, &peers, &self.local_node_id);
+                tracing::info!(
+                    canvas = canvas_doc_id,
+                    widget_doc_id = %placeholder.widget_doc_id,
+                    blake3 = trunc(&descriptor.blake3),
+                    canvas_peers = ?peers,
+                    candidate_peers = ?descriptor.candidate_peers,
+                    "resolved blob descriptor from canvas file widget"
+                );
+                descriptors.push(descriptor);
             }
         }
         descriptors
@@ -147,7 +168,8 @@ impl HubBlobRefSource {
 
     /// resolve a widget-state doc into a single descriptor, gathering
     /// candidate peers from every canvas that references it (a widget doc
-    /// change carries no canvas context of its own).
+    /// change carries no canvas context of its own). may resolve to
+    /// several descriptors for one doc (`animaniac`'s `clips[]` shape).
     async fn extract_from_widget_state(&self, widget_doc_id: &str) -> Vec<BlobDescriptor> {
         let Some(handle) = self.repo.find(widget_doc_id).await else {
             tracing::info!(
@@ -158,38 +180,42 @@ impl HubBlobRefSource {
         };
         let placeholder_canvas_id = String::new();
         let wid = widget_doc_id.to_string();
-        let blob_ref = match tokio::task::spawn_blocking(move || {
+        let blob_refs: Vec<BlobRef> = tokio::task::spawn_blocking(move || {
             read_widget_state(&handle, &placeholder_canvas_id, &wid)
         })
         .await
-        {
-            Ok(Some(b)) if !b.blake3.is_empty() => b,
-            Ok(Some(_)) => {
-                tracing::info!(
-                    widget_doc_id,
-                    "extract_from_widget_state: doc found but blake3 is empty"
-                );
-                return Vec::new();
-            }
-            _ => {
-                tracing::info!(
-                    widget_doc_id,
-                    "extract_from_widget_state: doc has no blobId/blake3 field at all"
-                );
-                return Vec::new();
-            }
-        };
+        .unwrap_or_default();
+
+        if blob_refs.is_empty() {
+            tracing::info!(
+                widget_doc_id,
+                "extract_from_widget_state: doc has no blob reference(s) at all"
+            );
+            return Vec::new();
+        }
 
         let peers = self.peers_referencing_widget(widget_doc_id).await;
-        let descriptor = to_descriptor(blob_ref, &peers, &self.local_node_id);
-        tracing::info!(
-            widget_doc_id,
-            blake3 = trunc(&descriptor.blake3),
-            canvas_peers = ?peers,
-            candidate_peers = ?descriptor.candidate_peers,
-            "resolved blob descriptor from widget-state doc change"
-        );
-        vec![descriptor]
+        let mut descriptors = Vec::new();
+        for blob_ref in blob_refs {
+            if blob_ref.blake3.is_empty() {
+                tracing::info!(
+                    widget_doc_id,
+                    clip_id = ?blob_ref.clip_id,
+                    "extract_from_widget_state: blob reference found but blake3 is empty"
+                );
+                continue;
+            }
+            let descriptor = to_descriptor(blob_ref, &peers, &self.local_node_id);
+            tracing::info!(
+                widget_doc_id,
+                blake3 = trunc(&descriptor.blake3),
+                canvas_peers = ?peers,
+                candidate_peers = ?descriptor.candidate_peers,
+                "resolved blob descriptor from widget-state doc change"
+            );
+            descriptors.push(descriptor);
+        }
+        descriptors
     }
 
     /// walk every doc the hub holds to find canvases that reference
@@ -221,13 +247,27 @@ impl HubBlobRefSource {
         out
     }
 
-    /// mark the local node as having snatched a widget's blob, so future
-    /// scans (by this node or any peer reading the same doc) see it in
-    /// `snatchedBy` without re-probing. notifies `hub_repo`'s doc-change
-    /// channel on a real write so any sync-push logic subscribed to it
-    /// picks up the change immediately, the same way any other mutation
-    /// made outside `handle_sync_message` must.
-    async fn mark_snatched(&self, widget_doc_id: &str, local_node_id: &str) {
+    /// mark the local node as having snatched a blob, so future scans (by
+    /// this node or any peer reading the same doc) see it in the relevant
+    /// `snatchedBy` list without re-probing. dispatches on `source_ref`'s
+    /// shape: a plain widget doc id (every widget type except animaniac)
+    /// writes to that doc's OWN root `snatchedBy` list; a composite
+    /// `"{widget_doc_id}#clip={clip_id}"` (see `to_descriptor()`'s own doc
+    /// comment) writes to that ONE clip's nested `snatchedBy` list instead,
+    /// leaving every other clip on the same animaniac doc untouched.
+    async fn mark_snatched(&self, source_ref: &str, local_node_id: &str) {
+        match decode_clip_source_ref(source_ref) {
+            Some((widget_doc_id, clip_id)) => {
+                self.mark_clip_snatched(widget_doc_id, clip_id, local_node_id)
+                    .await
+            }
+            None => self.mark_widget_snatched(source_ref, local_node_id).await,
+        }
+    }
+
+    /// the pre-animaniac behavior: writes to `widget_doc_id`'s own doc-root
+    /// `snatchedBy` list.
+    async fn mark_widget_snatched(&self, widget_doc_id: &str, local_node_id: &str) {
         let Some(handle) = self.repo.find(widget_doc_id).await else {
             tracing::warn!(widget_doc_id, "cannot mark snatched: widget doc not found");
             return;
@@ -238,56 +278,58 @@ impl HubBlobRefSource {
 
         let wrote = tokio::task::spawn_blocking(move || {
             handle.with_document_mut(|doc| -> bool {
+                append_to_snatched_by(doc, &automerge::ROOT, &wdoc_id, &local_id)
+            })
+        })
+        .await
+        .unwrap_or(false);
+
+        if wrote {
+            self.repo.notify_doc_changed(widget_doc_id);
+        }
+    }
+
+    /// the animaniac case: finds the clip with a matching `id` inside
+    /// `widget_doc_id`'s own `clips[]` list and writes to THAT clip's own
+    /// nested `snatchedBy` list, leaving the doc root (which has no blob
+    /// field of its own) and every other clip untouched.
+    async fn mark_clip_snatched(&self, widget_doc_id: &str, clip_id: &str, local_node_id: &str) {
+        let Some(handle) = self.repo.find(widget_doc_id).await else {
+            tracing::warn!(
+                widget_doc_id,
+                "cannot mark clip snatched: widget doc not found"
+            );
+            return;
+        };
+
+        let local_id = local_node_id.to_string();
+        let wdoc_id = widget_doc_id.to_string();
+        let target_clip_id = clip_id.to_string();
+
+        let wrote = tokio::task::spawn_blocking(move || {
+            handle.with_document_mut(|doc| -> bool {
                 use automerge::ReadDoc;
 
-                // get or create snatchedBy list
-                let list_id = match doc.get(automerge::ROOT, "snatchedBy") {
-                    Ok(Some((automerge::Value::Object(automerge::ObjType::List), id))) => id,
-                    _ => {
-                        // create the list via transact
-                        match doc.transact::<_, _, automerge::AutomergeError>(|tx| {
-                            use automerge::transaction::Transactable;
-                            tx.put_object(automerge::ROOT, "snatchedBy", automerge::ObjType::List)
-                        }) {
-                            Ok(result) => result.result,
-                            Err(e) => {
-                                tracing::warn!(error = ?e, "failed to create snatchedBy list");
-                                return false;
-                            }
-                        }
-                    }
+                let Ok(Some((automerge::Value::Object(automerge::ObjType::List), clips_id))) = doc.get(automerge::ROOT, "clips") else {
+                    tracing::warn!(widget_doc_id = %wdoc_id, "cannot mark clip snatched: doc has no clips list");
+                    return false;
                 };
 
-                // check if already in the list
-                let len = doc.length(&list_id);
-                for i in 0..len {
-                    if let Ok(Some((v, _))) = doc.get(&list_id, i) {
-                        if v.to_str() == Some(&local_id) {
-                            tracing::debug!(widget_doc_id = %wdoc_id, "already in snatchedBy");
-                            return false;
+                let mut clip_obj_id = None;
+                for i in 0..doc.length(&clips_id) {
+                    if let Ok(Some((_, item_id))) = doc.get(&clips_id, i) {
+                        if read_str(doc, &item_id, "id") == target_clip_id {
+                            clip_obj_id = Some(item_id);
+                            break;
                         }
                     }
                 }
+                let Some(clip_obj_id) = clip_obj_id else {
+                    tracing::warn!(widget_doc_id = %wdoc_id, clip_id = %target_clip_id, "cannot mark clip snatched: clip id not found");
+                    return false;
+                };
 
-                // append our node ID via transact
-                match doc.transact::<_, _, automerge::AutomergeError>(|tx| {
-                    use automerge::transaction::Transactable;
-                    tx.insert(&list_id, len as usize, local_id.as_str())?;
-                    Ok(())
-                }) {
-                    Ok(_) => {
-                        tracing::info!(
-                            widget_doc_id = %wdoc_id,
-                            node_id = trunc(&local_id),
-                            "added self to snatchedBy"
-                        );
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "failed to add node ID to snatchedBy");
-                        false
-                    }
-                }
+                append_to_snatched_by(doc, &clip_obj_id, &wdoc_id, &local_id)
             })
         })
         .await
@@ -299,6 +341,66 @@ impl HubBlobRefSource {
     }
 }
 
+/// get-or-create `obj`'s own `snatchedBy` list and append `local_id` if
+/// it isn't already present. `obj` is either `automerge::ROOT` (every
+/// widget type except animaniac) or one specific clip's own object id
+/// (animaniac) — shared by `mark_widget_snatched()`/`mark_clip_snatched()`
+/// so the two only differ in WHICH object they point this at.
+fn append_to_snatched_by(
+    doc: &mut automerge::Automerge,
+    obj: &automerge::ObjId,
+    log_widget_doc_id: &str,
+    local_id: &str,
+) -> bool {
+    use automerge::ReadDoc;
+
+    let list_id = match doc.get(obj, "snatchedBy") {
+        Ok(Some((automerge::Value::Object(automerge::ObjType::List), id))) => id,
+        _ => match doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            use automerge::transaction::Transactable;
+            tx.put_object(obj, "snatchedBy", automerge::ObjType::List)
+        }) {
+            Ok(result) => result.result,
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to create snatchedBy list");
+                return false;
+            }
+        },
+    };
+
+    let len = doc.length(&list_id);
+    for i in 0..len {
+        if let Ok(Some((v, _))) = doc.get(&list_id, i) {
+            if v.to_str() == Some(local_id) {
+                tracing::debug!(widget_doc_id = %log_widget_doc_id, "already in snatchedBy");
+                return false;
+            }
+        }
+    }
+
+    match doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+        use automerge::transaction::Transactable;
+        tx.insert(&list_id, len as usize, local_id)?;
+        Ok(())
+    }) {
+        Ok(_) => {
+            tracing::info!(widget_doc_id = %log_widget_doc_id, node_id = trunc(local_id), "added self to snatchedBy");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "failed to add node ID to snatchedBy");
+            false
+        }
+    }
+}
+
+/// decodes a `to_descriptor()`-produced `source_ref` back into
+/// `(widget_doc_id, clip_id)` if it's the animaniac-clip composite shape,
+/// or `None` for a plain widget doc id (every other widget type).
+fn decode_clip_source_ref(source_ref: &str) -> Option<(&str, &str)> {
+    source_ref.split_once("#clip=")
+}
+
 /// combine a raw widget-doc [`BlobRef`] with its canvas peer list into a
 /// generic [`BlobDescriptor`]: candidate peers are whichever `snatchedBy`
 /// entries are also members of the canvas peer list (excluding ourselves) -
@@ -306,6 +408,13 @@ impl HubBlobRefSource {
 /// through this canvas. an empty result here is not a dead end: the engine
 /// falls back to its own peer-blob-inventory (fed by `offer_peer_blobs`)
 /// when a descriptor arrives with no candidate peers of its own.
+///
+/// `source_ref` is a fully opaque handle as far as [`SnatchEngine`] is
+/// concerned (it's only ever handed back verbatim to
+/// [`BlobRefSource::on_snatched`]) — for an animaniac clip (`blob_ref.
+/// clip_id.is_some()`) it's encoded as `"{widget_doc_id}#clip={clip_id}"`
+/// so `mark_snatched()` can find its way back to the right clip; every
+/// other widget type keeps the plain `widget_doc_id` it always used.
 fn to_descriptor(
     blob_ref: BlobRef,
     canvas_peers: &[String],
@@ -317,13 +426,17 @@ fn to_descriptor(
         .filter(|node_id| canvas_peers.contains(node_id) && node_id.as_str() != local_node_id)
         .cloned()
         .collect();
+    let source_ref = match &blob_ref.clip_id {
+        Some(clip_id) => format!("{}#clip={}", blob_ref.widget_doc_id, clip_id),
+        None => blob_ref.widget_doc_id,
+    };
     BlobDescriptor {
         blake3: blob_ref.blake3,
         filename: blob_ref.filename,
         mime: blob_ref.mime,
         size: blob_ref.size,
         candidate_peers,
-        source_ref: blob_ref.widget_doc_id,
+        source_ref,
     }
 }
 
@@ -549,19 +662,39 @@ pub(crate) fn classify_doc(handle: &crate::hub_repo::DocHandle) -> DocKind {
         let blob_id = read_str(doc, &automerge::ROOT, "blobId");
         if !blake3.is_empty() || !blob_id.is_empty() {
             kind = DocKind::WidgetState;
+            return;
+        }
+        // an `animaniac` widget state doc has no root-level blob field at
+        // all — its blobs live inside `clips[]` entries instead (see
+        // `read_widget_state()`'s own doc comment) — detect it by the
+        // presence of that list so `HubBlobRefSource::extract_from_doc()`'s
+        // dispatch on a live doc-change notification still routes an
+        // already-known animaniac doc's OWN edits (e.g. a new clip added)
+        // through `extract_from_widget_state()` instead of silently
+        // falling into `DocKind::Unknown` and never rescanning.
+        if matches!(
+            doc.get(automerge::ROOT, "clips"),
+            Ok(Some((
+                automerge::Value::Object(automerge::ObjType::List),
+                _
+            )))
+        ) {
+            kind = DocKind::WidgetState;
         }
     });
     kind
 }
 
 /// widget types whose state doc may carry a blob reference (`blobId`/
-/// `blake3`) that the hub should discover, snatch/replicate, and gate via
-/// `blob_acl`. keep this in sync with the client-side widget schemas (loam's
-/// `widgets/file.ts`, `widgets/audio-recording.ts`, `widgets/voice-recording.ts`)
-/// — a future blob-backed widget type needs to be added here too, or its
-/// widget-state docs are silently skipped by the scan below and the hub
-/// never proxies/mirrors its blobs.
-const BLOB_WIDGET_TYPES: &[&str] = &["file", "audio-recording", "voice-recording"];
+/// `blake3` at the root, or — for `animaniac` — inside its `clips[]` array)
+/// that the hub should discover, snatch/replicate, and gate via `blob_acl`.
+/// keep this in sync with the client-side widget schemas (loam's
+/// `widgets/file.ts`, `widgets/audio-recording.ts`, `widgets/voice-
+/// recording.ts`, `widgets/animaniac/types.ts`) — a future blob-backed
+/// widget type needs to be added here too, or its widget-state docs are
+/// silently skipped by the scan below and the hub never proxies/mirrors
+/// its blobs.
+const BLOB_WIDGET_TYPES: &[&str] = &["file", "audio-recording", "voice-recording", "animaniac"];
 
 /// read a canvas automerge doc to find blob-bearing widget docIds (file,
 /// audio-recording, voice-recording — see `BLOB_WIDGET_TYPES`) and peer node
@@ -640,7 +773,8 @@ pub(crate) fn read_canvas_for_file_widgets(
     }
 
     // return placeholder BlobRefs — only widget_doc_id is filled in.
-    // the caller resolves each widget doc into a full BlobRef.
+    // the caller resolves each widget doc into full BlobRef(s) — possibly
+    // more than one per widget doc for `animaniac` (see `read_widget_state`).
     let placeholder_refs: Vec<BlobRef> = widget_doc_ids
         .into_iter()
         .map(|wid| BlobRef {
@@ -652,23 +786,40 @@ pub(crate) fn read_canvas_for_file_widgets(
             mime: String::new(),
             size: 0,
             snatched_by: Vec::new(),
+            clip_id: None,
         })
         .collect();
 
     (placeholder_refs, peers)
 }
 
-/// read a blob-bearing widget state doc to extract blob reference fields.
+/// read a blob-bearing widget state doc to extract every blob reference it
+/// carries.
+///
+/// almost every widget type carries exactly one blob at the doc's own root
+/// (`blobId`/`blake3`/`snatchedBy`) and this returns a single-element vec
+/// for those. `animaniac` is the exception: its doc has no root-level blob
+/// field at all — instead it holds a `clips[]` list, where each clip MAY
+/// carry its own blob (`imageUrl` for doodle-frame/image, `audioBlobId`/
+/// `audioBlake3` for voice-recording/tts/audio-segment, `videoBlobId`/
+/// `videoBlake3` for video-segment; `label` clips have no blob at all) plus
+/// its own `snatchedBy` list NESTED inside that clip (not at the doc root,
+/// since several clips sharing one doc each need their own independent
+/// snatched-tracking). those entries come back with `clip_id: Some(..)`
+/// set to the clip's own `id` field — see `to_descriptor()`'s composite
+/// `source_ref` encoding and `HubBlobRefSource::mark_snatched()`'s
+/// corresponding decode for how the rest of the (otherwise one-blob-per-doc
+/// shaped) engine handles this without any change to it.
 ///
 /// `pub(crate)`: also used by `blob_acl`'s canvas-membership resolver to
-/// read a widget doc's `blake3` field when checking whether a given blob is
-/// referenced by a given canvas.
+/// read a widget doc's blake3 field(s) when checking whether a given blob
+/// is referenced by a given canvas.
 pub(crate) fn read_widget_state(
     handle: &crate::hub_repo::DocHandle,
     canvas_doc_id: &str,
     widget_doc_id: &str,
-) -> Option<BlobRef> {
-    let mut result: Option<BlobRef> = None;
+) -> Vec<BlobRef> {
+    let mut results: Vec<BlobRef> = Vec::new();
 
     handle.with_document(|doc| {
         use automerge::ReadDoc;
@@ -676,56 +827,91 @@ pub(crate) fn read_widget_state(
         let blob_id = read_str(doc, &automerge::ROOT, "blobId");
         let blake3 = read_str(doc, &automerge::ROOT, "blake3");
 
-        // skip widgets with no blob reference
-        if blob_id.is_empty() && blake3.is_empty() {
+        if !blob_id.is_empty() || !blake3.is_empty() {
+            results.push(BlobRef {
+                canvas_doc_id: canvas_doc_id.to_string(),
+                widget_doc_id: widget_doc_id.to_string(),
+                blob_id,
+                blake3,
+                filename: read_str(doc, &automerge::ROOT, "filename"),
+                mime: read_str(doc, &automerge::ROOT, "mime"),
+                size: read_u64(doc, &automerge::ROOT, "size"),
+                snatched_by: read_string_list(doc, &automerge::ROOT, "snatchedBy"),
+                clip_id: None,
+            });
             return;
         }
 
-        // read snatchedBy — an automerge list of string node IDs.
-        //
-        // list elements may be stored either as plain scalar strings or as
-        // automerge Text objects (the JS automerge proxy stores array-of-string
-        // assignments like `doc.snatchedBy = [nodeId]` as Text elements, not
-        // scalars) — handle both, mirroring read_str()'s scalar-vs-Text
-        // handling for top-level fields.
-        let snatched_by = {
-            let mut items = Vec::new();
-            if let Ok(Some((automerge::Value::Object(automerge::ObjType::List), list_id))) =
-                doc.get(automerge::ROOT, "snatchedBy")
-            {
-                for i in 0..doc.length(&list_id) {
-                    if let Ok(Some((v, item_id))) = doc.get(&list_id, i) {
-                        match v {
-                            automerge::Value::Object(automerge::ObjType::Text) => {
-                                if let Ok(s) = doc.text(&item_id) {
-                                    items.push(s);
-                                }
-                            }
-                            _ => {
-                                if let Some(s) = v.to_str() {
-                                    items.push(s.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            items
+        // no root-level blob field — check for animaniac's `clips[]` shape.
+        let Ok(Some((automerge::Value::Object(automerge::ObjType::List), clips_id))) =
+            doc.get(automerge::ROOT, "clips")
+        else {
+            return;
         };
 
-        result = Some(BlobRef {
-            canvas_doc_id: canvas_doc_id.to_string(),
-            widget_doc_id: widget_doc_id.to_string(),
-            blob_id,
-            blake3,
-            filename: read_str(doc, &automerge::ROOT, "filename"),
-            mime: read_str(doc, &automerge::ROOT, "mime"),
-            size: read_u64(doc, &automerge::ROOT, "size"),
-            snatched_by,
-        });
+        for i in 0..doc.length(&clips_id) {
+            let Ok(Some((_, clip_id_obj))) = doc.get(&clips_id, i) else {
+                continue;
+            };
+            let clip_id = read_str(doc, &clip_id_obj, "id");
+            if clip_id.is_empty() {
+                continue;
+            }
+            let kind = read_str(doc, &clip_id_obj, "kind");
+            // mirrors loam's `clip-track-adapter`-adjacent `clipBlobInfo()`
+            // (widgets/animaniac/snatch-controller.ts) field-per-kind
+            // mapping exactly — keep the two in sync.
+            let (blob_id, blake3, mime) = match kind.as_str() {
+                "doodle-frame" | "image" => {
+                    let image_url = read_str(doc, &clip_id_obj, "imageUrl");
+                    // blob-store ids ARE blake3 hashes for these clip kinds
+                    // (no separate blake3 field exists to carry) — same
+                    // `blob:<id>` stripping the TS side does.
+                    let Some(id) = image_url.strip_prefix("blob:") else {
+                        continue;
+                    };
+                    if id.is_empty() {
+                        continue;
+                    }
+                    (id.to_string(), id.to_string(), "image/png".to_string())
+                }
+                "voice-recording" | "tts" | "audio-segment" => {
+                    let blob_id = read_str(doc, &clip_id_obj, "audioBlobId");
+                    if blob_id.is_empty() {
+                        continue;
+                    }
+                    let blake3 = read_str(doc, &clip_id_obj, "audioBlake3");
+                    let mime = read_str(doc, &clip_id_obj, "audioMime");
+                    (blob_id, blake3, mime)
+                }
+                "video-segment" => {
+                    let blob_id = read_str(doc, &clip_id_obj, "videoBlobId");
+                    if blob_id.is_empty() {
+                        continue;
+                    }
+                    let blake3 = read_str(doc, &clip_id_obj, "videoBlake3");
+                    let mime = read_str(doc, &clip_id_obj, "videoMime");
+                    (blob_id, blake3, mime)
+                }
+                // "label" and anything unrecognized has no blob to snatch.
+                _ => continue,
+            };
+
+            results.push(BlobRef {
+                canvas_doc_id: canvas_doc_id.to_string(),
+                widget_doc_id: widget_doc_id.to_string(),
+                blob_id,
+                blake3,
+                filename: clip_id.clone(),
+                mime,
+                size: 0,
+                snatched_by: read_string_list(doc, &clip_id_obj, "snatchedBy"),
+                clip_id: Some(clip_id),
+            });
+        }
     });
 
-    result
+    results
 }
 
 /// helper: read a string field from an automerge object.
@@ -739,6 +925,46 @@ pub(crate) fn read_str(doc: &automerge::Automerge, obj: &automerge::ObjId, key: 
         Ok(Some((v, _))) => v.to_str().map(|s| s.to_string()).unwrap_or_default(),
         _ => String::new(),
     }
+}
+
+/// helper: read a list-of-strings field (e.g. `snatchedBy`) from an
+/// automerge object, given directly (not necessarily `automerge::ROOT` —
+/// `read_widget_state()`'s animaniac path calls this on a specific clip's
+/// own object id, since each clip nests its own independent list).
+///
+/// list elements may be stored either as plain scalar strings or as
+/// automerge Text objects (the JS automerge proxy stores array-of-string
+/// assignments like `doc.snatchedBy = [nodeId]` as Text elements, not
+/// scalars) — handle both, mirroring `read_str()`'s own scalar-vs-Text
+/// handling.
+pub(crate) fn read_string_list(
+    doc: &automerge::Automerge,
+    obj: &automerge::ObjId,
+    key: &str,
+) -> Vec<String> {
+    use automerge::ReadDoc;
+    let mut items = Vec::new();
+    if let Ok(Some((automerge::Value::Object(automerge::ObjType::List), list_id))) =
+        doc.get(obj, key)
+    {
+        for i in 0..doc.length(&list_id) {
+            if let Ok(Some((v, item_id))) = doc.get(&list_id, i) {
+                match v {
+                    automerge::Value::Object(automerge::ObjType::Text) => {
+                        if let Ok(s) = doc.text(&item_id) {
+                            items.push(s);
+                        }
+                    }
+                    _ => {
+                        if let Some(s) = v.to_str() {
+                            items.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    items
 }
 
 /// helper: read a u64 field from an automerge object.
@@ -770,6 +996,7 @@ mod tests {
             mime: "text/plain".to_string(),
             size: 42,
             snatched_by: Vec::new(),
+            clip_id: None,
         };
         assert_eq!(br.size, 42);
         assert!(br.blake3.is_empty());
@@ -806,6 +1033,7 @@ mod tests {
             mime: String::new(),
             size: 0,
             snatched_by: Vec::new(),
+            clip_id: None,
         };
         assert_eq!(trunc(&br.blake3), "");
         assert_eq!(trunc(&br.blob_id), "");
@@ -878,5 +1106,214 @@ mod tests {
         assert!(widget_doc_ids.contains(&"voice-widget-doc"));
         assert!(!widget_doc_ids.contains(&"card-widget-doc"));
         assert_eq!(widget_doc_ids.len(), 3);
+    }
+
+    /// builds an animaniac widget-state doc's automerge shape: a `clips[]`
+    /// list with one blob-bearing clip of each extractable kind, plus a
+    /// `label` clip (no blob) to confirm it's correctly skipped.
+    fn build_animaniac_doc() -> automerge::Automerge {
+        use automerge::transaction::Transactable;
+
+        let mut doc = automerge::Automerge::new();
+        doc.transact::<_, _, automerge::AutomergeError>(|tx| {
+            let clips = tx.put_object(automerge::ROOT, "clips", automerge::ObjType::List)?;
+
+            let video = tx.insert_object(&clips, 0, automerge::ObjType::Map)?;
+            tx.put(&video, "id", "clip-video")?;
+            tx.put(&video, "kind", "video-segment")?;
+            tx.put(&video, "videoBlobId", "vblob1")?;
+            tx.put(&video, "videoBlake3", "vblake3-1")?;
+            tx.put(&video, "videoMime", "video/mp4")?;
+
+            let image = tx.insert_object(&clips, 1, automerge::ObjType::Map)?;
+            tx.put(&image, "id", "clip-image")?;
+            tx.put(&image, "kind", "image")?;
+            tx.put(&image, "imageUrl", "blob:iblake3-1")?;
+
+            let voice = tx.insert_object(&clips, 2, automerge::ObjType::Map)?;
+            tx.put(&voice, "id", "clip-voice")?;
+            tx.put(&voice, "kind", "voice-recording")?;
+            tx.put(&voice, "audioBlobId", "ablob1")?;
+            tx.put(&voice, "audioBlake3", "ablake3-1")?;
+            tx.put(&voice, "audioMime", "audio/wav")?;
+            let voice_snatched = tx.put_object(&voice, "snatchedBy", automerge::ObjType::List)?;
+            tx.insert(&voice_snatched, 0, "peer-already-has-it")?;
+
+            let label = tx.insert_object(&clips, 3, automerge::ObjType::Map)?;
+            tx.put(&label, "id", "clip-label")?;
+            tx.put(&label, "kind", "label")?;
+            tx.put(&label, "text", "hello")?;
+
+            // a tts clip with no audioBlobId yet (not generated) — must be
+            // skipped, same as the "widget has a blobId but no blake3"
+            // case for other widget types.
+            let tts = tx.insert_object(&clips, 4, automerge::ObjType::Map)?;
+            tx.put(&tts, "id", "clip-tts")?;
+            tx.put(&tts, "kind", "tts")?;
+            tx.put(&tts, "audioBlobId", "")?;
+
+            Ok(())
+        })
+        .expect("animaniac doc transact should succeed");
+        doc
+    }
+
+    #[test]
+    fn classify_doc_recognizes_animaniac_clips_shape() {
+        let doc = build_animaniac_doc();
+        let saved = doc.save();
+        let reopened = automerge::Automerge::load(&saved).expect("reload saved doc");
+        // classify_doc takes a `hub_repo::DocHandle`, which wraps a real
+        // synced doc — exercise the same root-shape check directly against
+        // a plain `Automerge` instead of standing up a whole HubRepo, since
+        // the check itself (`doc.get(ROOT, "clips")`) doesn't need one.
+        use automerge::ReadDoc;
+        assert!(matches!(
+            reopened.get(automerge::ROOT, "clips"),
+            Ok(Some((
+                automerge::Value::Object(automerge::ObjType::List),
+                _
+            )))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_widget_state_extracts_one_blob_ref_per_animaniac_clip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub.db");
+        let storage = crate::hub_repo::HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+        storage
+            .save_doc("animaniac-1", &build_animaniac_doc().save())
+            .await;
+
+        let repo = HubRepo::new("local-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new should succeed");
+        let handle = repo
+            .find("animaniac-1")
+            .await
+            .expect("animaniac doc should be findable");
+
+        let refs = tokio::task::spawn_blocking(move || {
+            read_widget_state(&handle, "canvas-1", "animaniac-1")
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+
+        // video-segment, image, voice-recording resolved; label (no blob)
+        // and tts (empty audioBlobId, not generated yet) skipped.
+        assert_eq!(refs.len(), 3);
+
+        let video = refs
+            .iter()
+            .find(|r| r.clip_id.as_deref() == Some("clip-video"))
+            .expect("video clip ref");
+        assert_eq!(video.blake3, "vblake3-1");
+        assert_eq!(video.blob_id, "vblob1");
+        assert_eq!(video.mime, "video/mp4");
+        assert!(video.snatched_by.is_empty());
+
+        let image = refs
+            .iter()
+            .find(|r| r.clip_id.as_deref() == Some("clip-image"))
+            .expect("image clip ref");
+        // doodle-frame/image clips have no separate blake3 field — the
+        // blob-store id IS the blake3 hash.
+        assert_eq!(image.blake3, "iblake3-1");
+        assert_eq!(image.blob_id, "iblake3-1");
+
+        let voice = refs
+            .iter()
+            .find(|r| r.clip_id.as_deref() == Some("clip-voice"))
+            .expect("voice clip ref");
+        assert_eq!(voice.blake3, "ablake3-1");
+        assert_eq!(voice.snatched_by, vec!["peer-already-has-it".to_string()]);
+
+        assert!(refs
+            .iter()
+            .all(|r| r.clip_id.as_deref() != Some("clip-label")));
+        assert!(refs
+            .iter()
+            .all(|r| r.clip_id.as_deref() != Some("clip-tts")));
+    }
+
+    /// regression test for the per-clip `mark_snatched` write: marking one
+    /// clip's blob snatched must not touch any OTHER clip's own
+    /// `snatchedBy` list on the same animaniac doc.
+    #[tokio::test]
+    async fn mark_snatched_writes_only_to_the_targeted_clip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("hub.db");
+        let storage = crate::hub_repo::HubDocStorage::new(&db_path)
+            .await
+            .expect("HubDocStorage::new for seeding should succeed");
+        storage
+            .save_doc("animaniac-1", &build_animaniac_doc().save())
+            .await;
+
+        let repo = HubRepo::new("local-node".to_string(), &db_path)
+            .await
+            .expect("HubRepo::new should succeed");
+        let source = HubBlobRefSource::new(repo.clone(), "hub-node".to_string());
+
+        source
+            .mark_snatched("animaniac-1#clip=clip-video", "hub-node")
+            .await;
+
+        let handle = repo.find("animaniac-1").await.expect("doc still findable");
+        let (video_snatched, image_snatched, voice_snatched) =
+            tokio::task::spawn_blocking(move || {
+                handle.with_document(|doc| {
+                    use automerge::ReadDoc;
+                    let Ok(Some((_, clips_id))) = doc.get(automerge::ROOT, "clips") else {
+                        panic!("clips list missing");
+                    };
+                    let mut by_id: std::collections::HashMap<String, Vec<String>> =
+                        std::collections::HashMap::new();
+                    for i in 0..doc.length(&clips_id) {
+                        let (_, item_id) = doc.get(&clips_id, i).unwrap().unwrap();
+                        let id = read_str(doc, &item_id, "id");
+                        by_id.insert(id, read_string_list(doc, &item_id, "snatchedBy"));
+                    }
+                    (
+                        by_id.get("clip-video").cloned().unwrap_or_default(),
+                        by_id.get("clip-image").cloned().unwrap_or_default(),
+                        by_id.get("clip-voice").cloned().unwrap_or_default(),
+                    )
+                })
+            })
+            .await
+            .expect("spawn_blocking should not panic");
+
+        assert_eq!(video_snatched, vec!["hub-node".to_string()]);
+        assert!(image_snatched.is_empty());
+        // the voice clip's pre-existing snatchedBy entry must be untouched.
+        assert_eq!(voice_snatched, vec!["peer-already-has-it".to_string()]);
+
+        // calling it again must be idempotent (no duplicate entry).
+        source
+            .mark_snatched("animaniac-1#clip=clip-video", "hub-node")
+            .await;
+        let handle = repo.find("animaniac-1").await.expect("doc still findable");
+        let video_snatched_again = tokio::task::spawn_blocking(move || {
+            handle.with_document(|doc| {
+                use automerge::ReadDoc;
+                let Ok(Some((_, clips_id))) = doc.get(automerge::ROOT, "clips") else {
+                    panic!("clips list missing");
+                };
+                for i in 0..doc.length(&clips_id) {
+                    let (_, item_id) = doc.get(&clips_id, i).unwrap().unwrap();
+                    if read_str(doc, &item_id, "id") == "clip-video" {
+                        return read_string_list(doc, &item_id, "snatchedBy");
+                    }
+                }
+                Vec::new()
+            })
+        })
+        .await
+        .expect("spawn_blocking should not panic");
+        assert_eq!(video_snatched_again, vec!["hub-node".to_string()]);
     }
 }

@@ -260,6 +260,29 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
     return { start, end };
   }
 
+  /** resolves a "move" drag's pending span into a valid (non-negative,
+   *  non-overlapping-if-`preventOverlap`) resting span while ALWAYS
+   *  preserving the item's own duration — unlike `clampSpan()` (which
+   *  independently clamps `start`/`end`, appropriate for a resize, where
+   *  the two edges are meant to move independently). applying plain
+   *  `clampSpan()` to a move's pending span whose `start` went negative
+   *  (e.g. dragging an item sitting at `start: 0` further left) clamped
+   *  `start` up to `0` without touching `end`, silently shrinking the
+   *  item's live-preview duration — `clip-track-adapter.ts`'s `withSpan()`
+   *  then misread that shrunk span as a RESIZE (only one edge moved) and
+   *  trimmed the clip's own source range instead of leaving it parked at
+   *  the wall, so the item visually looked "stuck"/broken mid-drag even
+   *  though the eventual commit (which already used this same resolve
+   *  logic) landed correctly. */
+  function resolveMoveSpan(pending: Span, excludeId: string | null): Span {
+    if (!preventOverlap) return pending;
+    const dur = pending.end - pending.start;
+    const leftBound = overlapLeftBound(excludeId, pending.start);
+    const rightBound = overlapRightBound(excludeId, pending.end);
+    const clampedStart = Math.max(leftBound, Math.min(rightBound - dur, pending.start));
+    return { start: clampedStart, end: clampedStart + dur };
+  }
+
   function spanToScreen(span: Span): { left: number; right: number } {
     const x1 = camera.timeToScreenX(span.start);
     const x2 = camera.timeToScreenX(span.end);
@@ -425,7 +448,7 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
 
     const g = drag.id ? rows.get(drag.id) : undefined;
     if (g && drag.item) {
-      const clamped = clampSpan(drag.pending);
+      const clamped = clampSpan(drag.mode === "move" ? resolveMoveSpan(drag.pending, drag.id) : drag.pending);
       const { left, right } = spanToScreen(clamped);
       const region = drag.mode === "resize-left" || drag.mode === "resize-right" ? drag.mode : null;
       drawItem(g, adapter.withSpan(drag.item, clamped), { left, right, hovered: true, hoveredRegion: region, selected: true });
@@ -468,16 +491,14 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
       return;
     }
     let resolvedPending = finished.pending;
-    if (finished.mode === "move" && preventOverlap) {
+    if (finished.mode === "move") {
       // resolve into whichever gap the item actually landed in (anchored to
       // the DROP position, not drag-start) — this is what lets a move drag
       // actually reorder past a neighbor instead of being walled in at its
-      // original position.
-      const dur = resolvedPending.end - resolvedPending.start;
-      const leftBound = overlapLeftBound(finished.id, resolvedPending.start);
-      const rightBound = overlapRightBound(finished.id, resolvedPending.end);
-      const clampedStart = Math.max(leftBound, Math.min(rightBound - dur, resolvedPending.start));
-      resolvedPending = { start: clampedStart, end: clampedStart + dur };
+      // original position. same duration-preserving resolve the live
+      // preview above already used, so the final commit never surprises
+      // the user with a different result than what they were shown.
+      resolvedPending = resolveMoveSpan(resolvedPending, finished.id);
     }
     if (finished.mode === "move" && onMoveOutOfRow?.(items[idx], clampSpan(resolvedPending), finished.lastGlobalY)) {
       // caller moved this item to a different track's own clips array —

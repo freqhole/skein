@@ -123,7 +123,12 @@ function drawDashedRoundRect(g: Graphics, x: number, y: number, w: number, h: nu
  *  isn't local yet" cue (see snatch-controller.ts's own locality tracking).
  *  `progress` (0..1, only meaningful while `remote`) fills the background
  *  from a faint tint up to full opacity left-to-right as the blob
- *  downloads. */
+ *  downloads. `mutedLook` reuses the same faint-fill + dashed-border
+ *  treatment for a DIFFERENT reason (a clip whose own audio is muted) —
+ *  mutually exclusive with `remote` (a not-yet-local clip's locality cue
+ *  always wins; caller is expected to only pass `mutedLook` when `!remote`).
+ *  unlike `remote`, there's no progress fill — the faint tint alone is the
+ *  whole cue. */
 export function drawTrackItemBody(
   g: Graphics,
   left: number,
@@ -135,23 +140,27 @@ export function drawTrackItemBody(
   selected: boolean,
   marginY = DEFAULT_MARGIN_Y,
   remote = false,
-  progress = 0
+  progress = 0,
+  mutedLook = false
 ): void {
   g.clear();
   const width = Math.max(1, right - left);
   const top = marginY;
   const height = rowHeight - marginY * 2;
   const baseFill = hovered ? colors.fillHover : colors.fill;
+  const dimmed = remote || mutedLook;
   if (remote) {
     g.roundRect(left, top, width, height, 3).fill({ color: baseFill, alpha: 0.18 });
     const filledWidth = Math.max(0, Math.min(width, width * progress));
     if (filledWidth > 0) {
       g.roundRect(left, top, filledWidth, height, 3).fill({ color: baseFill });
     }
+  } else if (mutedLook) {
+    g.roundRect(left, top, width, height, 3).fill({ color: baseFill, alpha: 0.18 });
   } else {
     g.roundRect(left, top, width, height, 3).fill({ color: baseFill });
   }
-  if (remote) {
+  if (dimmed) {
     drawDashedRoundRect(g, left, top, width, height, 3, colors.stroke, 1);
   } else {
     g.roundRect(left, top, width, height, 3).stroke({ color: colors.stroke, width: 1 });

@@ -10,13 +10,13 @@
  * modules (types/track-model/transform/clip-track-adapter/playback-clock/
  * compositor/frame-capture/drop-controller/history/tracks/*) specifically
  * so this file itself never grows anywhere near stfu's own 1591-line
- * `index.ts`. known v1 limitations, tracked in docs/animaniac-media-
- * segments-plan.md's checklist, not silently swept under the rug: no UI to
- * add/remove tracks yet (schema defaults to one visual + one audio track),
- * no live mouth-animation rendering yet (mouth-sync.ts's pure logic exists
- * and is tested, not yet hooked into the compositor), track rows don't
- * scroll if they overflow the widget's own height, and there's no
- * keyboard-shortcut layer yet.
+ * `index.ts`. tracks are unified (any clip kind can live on any track,
+ * added via the "+track" button) — known v1 limitations, tracked in
+ * docs/animaniac-media-segments-plan.md's checklist, not silently swept
+ * under the rug: no live mouth-animation rendering yet (mouth-sync.ts's
+ * pure logic exists and is tested, not yet hooked into the compositor),
+ * track rows don't scroll if they overflow the widget's own height, and
+ * there's no keyboard-shortcut layer yet.
  */
 
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
@@ -52,12 +52,10 @@ import { createHistoryController, type HistoryControllerHandle } from "./history
 import { loadLocalAnimaniacPrefs, saveLocalAnimaniacPrefs } from "./local-prefs";
 import { createAnimaniacDropController } from "./drop-controller";
 import { createSnatchController, isAnimaniacNewBlobMessage, clipBlobInfo } from "./snatch-controller";
-import { clipEnd, computeDisplayDurationSec, nextTrackOrder, removeTrack as removeTrackFromArrays, sortedTracks } from "./track-model";
-import { createAudioTrack, AUDIO_TRACK_ROW_HEIGHT, type AudioTrackHandle } from "./tracks/audio-track";
-import { createVisualTrack, VISUAL_TRACK_ROW_HEIGHT, type VisualTrackHandle } from "./tracks/visual-track";
-import { createShadowClips, type ShadowClipSpan, type ShadowClipsHandle } from "./tracks/shadow-clips";
+import { computeDisplayDurationSec, nextTrackOrder, removeTrack as removeTrackFromArrays, sortedTracks } from "./track-model";
+import { createTrack, TRACK_ROW_HEIGHT, type TrackHandle } from "./tracks/track";
 import { renderAudioMixdown } from "./export/audio-mixdown";
-import { animaniacSchema, VISUAL_CLIP_KINDS, type AnimaniacState, type Clip, type Track } from "./types";
+import { animaniacSchema, type AnimaniacState, type Clip, type Track } from "./types";
 
 export { animaniacSchema };
 export type { AnimaniacState };
@@ -81,56 +79,6 @@ const TIMELINE_MIN_HEIGHT = 140;
 // EXTRA zoom-out headroom (more empty timeline space past the last clip,
 // for shuffling long clips around), not part of stfu's own default set.
 const ZOOM_LEVELS = [0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256];
-
-type TrackHandle = AudioTrackHandle | VisualTrackHandle;
-
-const TRACK_ADD_BUTTON_WIDTH = 34;
-const TRACK_ADD_BUTTON_HEIGHT = 20;
-
-/** small speaker glyph (audio) or camera glyph (video), drawn from plain
- *  Graphics primitives — no icon font/asset needed for two simple shapes. */
-function drawTrackAddIcon(g: Graphics, kind: "audio" | "video", cx: number, cy: number, color: number): void {
-  if (kind === "audio") {
-    g.rect(cx - 5, cy - 3, 3, 6).fill({ color });
-    g.poly([cx - 2, cy - 3, cx + 4, cy - 6, cx + 4, cy + 6, cx - 2, cy + 3]).fill({ color });
-    return;
-  }
-  g.roundRect(cx - 6, cy - 4, 12, 8, 1.5).fill({ color });
-  g.roundRect(cx - 2, cy - 6, 4, 2.5, 0.5).fill({ color });
-  g.circle(cx, cy, 2.2).fill({ color: 0x1a1a2e });
-}
-
-/** "+" plus a small speaker/camera glyph — replaces the old "+audio"/
- *  "+video" text buttons, which don't fit the label column's own narrow
- *  reserved width (see their mount site's own comment). */
-function makeTrackAddButton(kind: "audio" | "video", onClick: () => void): Container {
-  const c = new Container();
-  const bg = new Graphics();
-  const icon = new Graphics();
-  const plus = new Text({ text: "+", style: { fontSize: 12, fill: 0xd8f4fb, fontWeight: "bold" } });
-  const w = TRACK_ADD_BUTTON_WIDTH;
-  const h = TRACK_ADD_BUTTON_HEIGHT;
-  const draw = (hover: boolean) => {
-    bg.clear();
-    bg.roundRect(0, 0, w, h, 4).fill({ color: hover ? 0x3a3a52 : 0x2a2a3e });
-  };
-  draw(false);
-  plus.anchor.set(0, 0.5);
-  plus.x = 3;
-  plus.y = h / 2;
-  icon.clear();
-  drawTrackAddIcon(icon, kind, w - 12, h / 2, 0xd8f4fb);
-  c.addChild(bg, plus, icon);
-  c.eventMode = "static";
-  c.cursor = "pointer";
-  c.on("pointerover", () => draw(true));
-  c.on("pointerout", () => draw(false));
-  c.on("pointertap", (e) => {
-    e.stopPropagation();
-    onClick();
-  });
-  return c;
-}
 
 export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
   type: "animaniac",
@@ -237,16 +185,38 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     // track row's own selection, and with the preview transform editor's
     // own click-to-select — see `setSelectedClipId()`) ----------------------
     let selectedClipId: string | null = null;
+    // guards against the reentrant `onSelectionChange(null)` call
+    // `clearSelection()` fires below (see `setSelectedClipId()`'s own
+    // comment) — without it, that reentrant call clobbers `selectedClipId`
+    // back to null before this function's own caller ever sees the new
+    // selection, and the mute button (which reads `selectedClipId`) never
+    // shows up.
+    let isUpdatingSelection = false;
 
     function setSelectedClipId(id: string | null): void {
-      if (selectedClipId === id) return;
-      selectedClipId = id;
-      const clip = id ? ctx.doc.current.clips.find((c) => c.id === id) : null;
-      // keep the owning track row's own selection in sync too, so a clip
-      // selected via the preview editor also shows selected on the
-      // timeline (and vice versa, via onSelectionChange below).
-      if (clip) trackInstances.get(clip.trackId)?.selectId(id!);
-      previewTransformEditor.refresh();
+      if (isUpdatingSelection || selectedClipId === id) return;
+      isUpdatingSelection = true;
+      try {
+        selectedClipId = id;
+        const clip = id ? ctx.doc.current.clips.find((c) => c.id === id) : null;
+        // only one clip may ever be selected across the WHOLE widget at a
+        // time — each track's own interaction engine previously kept its
+        // own independent selection with nothing clearing a DIFFERENT
+        // track's stale one, so selecting a clip on track B left track A's
+        // previously-selected clip visually selected too.
+        for (const [trackId, inst] of trackInstances) {
+          if (clip && trackId === clip.trackId) continue;
+          inst.clearSelection();
+        }
+        // keep the owning track row's own selection in sync too, so a clip
+        // selected via the preview editor also shows selected on the
+        // timeline (and vice versa, via onSelectionChange below).
+        if (clip) trackInstances.get(clip.trackId)?.selectId(id!);
+        previewTransformEditor.refresh();
+        updateTimelineActionBar();
+      } finally {
+        isUpdatingSelection = false;
+      }
     }
 
     /** writes a finished preview-editor drag's new x/y/scaleX/scaleY into
@@ -268,9 +238,8 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       previewTransformEditor.refresh();
     }
 
-    /** deletes a clip by id (used by both the timeline/preview-editor's
-     *  "delete selected" shortcut and the visual-track shadow bar for a
-     *  voice-recording's mouth timing — see tracks/shadow-clips.ts). */
+    /** deletes a clip by id — wired to the timeline/preview-editor's
+     *  "delete selected" shortcut. */
     function removeClipById(id: string): void {
       ctx.doc.change((d) => {
         const idx = d.clips.findIndex((c) => c.id === id);
@@ -292,25 +261,24 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       if (selectedClipId) removeClipById(selectedClipId);
     }
 
-    /** mutes a video-segment's own embedded audio, WITHOUT removing the
-     *  clip itself — wired as the audio-track shadow bar's own "delete"
-     *  action (see tracks/shadow-clips.ts); the bar just disappears next
-     *  refresh since it's only shown for `!muted` video-segment clips. */
-    function muteVideoClip(id: string): void {
+    /** toggles a video-segment clip's own embedded audio on/off, WITHOUT
+     *  removing the clip itself — wired to the timeline action bar's
+     *  "mute"/"unmute" button, shown only while a video-segment clip is
+     *  selected (see `updateTimelineActionBar()`). */
+    function toggleMuteVideoClip(id: string): void {
       ctx.doc.change((d) => {
         const clip = d.clips.find((c) => c.id === id);
-        if (clip && clip.kind === "video-segment") clip.muted = true;
+        if (clip && clip.kind === "video-segment") clip.muted = !clip.muted;
       });
       history.push();
       refreshAllTracks();
+      updateTimelineActionBar();
       compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
     }
 
-    /** adds a new, empty track of the given kind, appended after every
-     *  existing track of that same kind — wired to the "add visual/audio
-     *  track" widgetActions below (property-tray menu items). */
-    function addNewTrack(kind: "visual" | "audio"): void {
-      const track: Track = { id: crypto.randomUUID(), kind, label: "", order: nextTrackOrder(ctx.doc.current.tracks, kind), muted: false, hidden: false };
+    /** adds a new, empty track, appended after every existing track. */
+    function addNewTrack(): void {
+      const track: Track = { id: crypto.randomUUID(), label: "", order: nextTrackOrder(ctx.doc.current.tracks), muted: false, hidden: false };
       ctx.doc.change((d) => {
         d.tracks.push(track);
       });
@@ -374,6 +342,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
         compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
         previewTransformEditor.refresh();
+        updateTimelineActionBar();
       },
       onHistoryChanged: () => toolbar.refreshUndoRedo(),
     });
@@ -412,38 +381,53 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       },
     });
 
-    // "+audio"/"+video" track buttons — an animaniac-specific concept
-    // stfu's own timeline doesn't share, so added directly here (not
-    // inside timeline-chrome.ts). mounted in the label column's own
-    // otherwise-empty space at the ruler's row (see layoutTimeline()) —
-    // not the toolbar row, which is already crowded with zoom/undo/snap/
-    // autoscroll/play. icon buttons (not text) — "+video"/"+audio" text
-    // labels don't fit the label column's own narrow width.
-    const addVideoTrackBtn = makeTrackAddButton("video", () => addNewTrack("visual"));
-    const addAudioTrackBtn = makeTrackAddButton("audio", () => addNewTrack("audio"));
-    timelineContainer.addChild(addVideoTrackBtn, addAudioTrackBtn);
+    // "+track" — an animaniac-specific concept stfu's own timeline doesn't
+    // share, so added directly here (not inside timeline-chrome.ts).
+    // mounted in the label column's own otherwise-empty space at the
+    // ruler's row (see layoutTimeline()) — not the toolbar row, which is
+    // already crowded with zoom/undo/snap/autoscroll/play. a single
+    // button now that tracks are unified (any clip kind can live on any
+    // track) — replaces the old separate "+video"/"+audio" icon buttons.
+    const addTrackBtn = makeTextButton("+track", () => addNewTrack());
+    timelineContainer.addChild(addTrackBtn);
 
-    // play/pause + snatch-all, anchored to the left of the toolbar's own
-    // autoscroll button (via `getTrailingGroupLeftX()`) — a second, more-
-    // reachable entry point alongside the widget frame's own header
-    // action, since that header action can silently overflow into the
-    // frame's hamburger flyout on a narrower widget (see widget-frame.ts's
-    // own overflow behavior) — and simply easier to notice/find than a
-    // header button in practice. a single glyph (not the word "play"/
-    // "pause") for play so it stays compact; snatch-all is ALWAYS visible
-    // (never conditionally hidden — a no-op click when everything's
-    // already local is harmless), just relabeled by updateHeaderActions().
+    // play/pause + mute (for the selected clip, when it's a video-segment),
+    // anchored to the left of the toolbar's own autoscroll button (via
+    // `getTrailingGroupLeftX()`) — a second, more-reachable entry point
+    // alongside the widget frame's own header action, since that header
+    // action can silently overflow into the frame's hamburger flyout on a
+    // narrower widget (see widget-frame.ts's own overflow behavior) — and
+    // simply easier to notice/find than a header button in practice. a
+    // single glyph (not the word "play"/"pause") for play so it stays
+    // compact. "snatch all" deliberately stays ONLY in the widget's own
+    // header action (see updateHeaderActions()) — this row is instead
+    // the selected-clip's own action bar (currently just mute/unmute).
     const toolbarPlayBtn = makeTextButton("\u25b6", () => handlePlayToggle());
-    const toolbarSnatchBtn = makeTextButton("snatch all", () => void snatchController.handleSnatchAll());
-    toolbarContainer.addChild(toolbarPlayBtn, toolbarSnatchBtn);
+    const toolbarMuteBtn = makeTextButton("mute", () => {
+      if (selectedClipId) toggleMuteVideoClip(selectedClipId);
+    });
+    toolbarMuteBtn.visible = false;
+    toolbarContainer.addChild(toolbarPlayBtn, toolbarMuteBtn);
 
-    /** positions the toolbar's own play/snatch-all buttons to the left of
+    /** positions the toolbar's own play/mute buttons to the left of
      *  autoscroll — recomputed whenever either button's own width changes
      *  (a label change) or the widget resizes. */
     function layoutTrailingButtons(): void {
       const leftOfAutoscroll = toolbar.getTrailingGroupLeftX();
       toolbarPlayBtn.x = Math.max(0, leftOfAutoscroll - TOOLBAR_GROUP_GAP - toolbarPlayBtn.buttonWidth);
-      toolbarSnatchBtn.x = Math.max(0, toolbarPlayBtn.x - TOOLBAR_GROUP_GAP - toolbarSnatchBtn.buttonWidth);
+      toolbarMuteBtn.x = toolbarMuteBtn.visible ? Math.max(0, toolbarPlayBtn.x - TOOLBAR_GROUP_GAP - toolbarMuteBtn.buttonWidth) : toolbarMuteBtn.x;
+    }
+
+    /** shows/hides + relabels the timeline's own selected-clip action bar
+     *  (currently just mute/unmute) — a video-segment clip has an
+     *  embedded-audio toggle; every other clip kind has nothing to show
+     *  here. called from `setSelectedClipId()` and after a mute toggle. */
+    function updateTimelineActionBar(): void {
+      const clip = selectedClipId ? ctx.doc.current.clips.find((c) => c.id === selectedClipId) : undefined;
+      const showMute = clip?.kind === "video-segment";
+      toolbarMuteBtn.visible = showMute;
+      if (showMute) toolbarMuteBtn.setLabel?.(clip!.muted ? "unmute" : "mute");
+      layoutTrailingButtons();
     }
 
     function onWheelPan(e: FederatedWheelEvent): void {
@@ -536,81 +520,9 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     // -- per-track row instances (rebuilt whenever ctx.doc.current.tracks changes) --
     const trackInstances = new Map<string, TrackHandle>();
 
-    // -- "shadow" bars for clips whose data lives on a DIFFERENT track kind
-    // (a video-segment's own embedded audio; a voice-recording's talking-
-    // mouth timing) but should also be visible+deletable on this one — see
-    // tracks/shadow-clips.ts's own doc comment for why this isn't built on
-    // the full drag/resize interaction engine. always shown on the FIRST
-    // non-hidden track of the *other* kind; rebuilt lazily (not on every
-    // refresh) only when that target track actually changes.
-    const AUDIO_SHADOW_COLORS = { fill: 0x2a2a4a, fillHover: 0x3a3a6a, stroke: 0xd946ef };
-    const VISUAL_SHADOW_COLORS = { fill: 0x2a3a2a, fillHover: 0x3a5a3a, stroke: 0x45c9e6 };
-    let audioShadowRowId: string | null = null;
-    let audioShadowHandle: ShadowClipsHandle | null = null;
-    let visualShadowRowId: string | null = null;
-    let visualShadowHandle: ShadowClipsHandle | null = null;
-
-    function ensureAudioShadowHandle(target: Track | undefined): void {
-      if (!target) {
-        audioShadowHandle?.destroy();
-        audioShadowHandle = null;
-        audioShadowRowId = null;
-        return;
-      }
-      if (audioShadowHandle && audioShadowRowId === target.id) return;
-      audioShadowHandle?.destroy();
-      audioShadowHandle = null;
-      let row;
-      try {
-        row = rowStack.getRow(target.id);
-      } catch {
-        audioShadowRowId = null; // row not laid out yet — retry next refresh
-        return;
-      }
-      audioShadowRowId = target.id;
-      audioShadowHandle = createShadowClips({
-        row,
-        camera,
-        rowHeight: AUDIO_TRACK_ROW_HEIGHT,
-        colors: AUDIO_SHADOW_COLORS,
-        getSelectedId: () => selectedClipId,
-        onSelect: setSelectedClipId,
-        onDelete: (id) => muteVideoClip(id),
-      });
-    }
-
-    function ensureVisualShadowHandle(target: Track | undefined): void {
-      if (!target) {
-        visualShadowHandle?.destroy();
-        visualShadowHandle = null;
-        visualShadowRowId = null;
-        return;
-      }
-      if (visualShadowHandle && visualShadowRowId === target.id) return;
-      visualShadowHandle?.destroy();
-      visualShadowHandle = null;
-      let row;
-      try {
-        row = rowStack.getRow(target.id);
-      } catch {
-        visualShadowRowId = null;
-        return;
-      }
-      visualShadowRowId = target.id;
-      visualShadowHandle = createShadowClips({
-        row,
-        camera,
-        rowHeight: VISUAL_TRACK_ROW_HEIGHT,
-        colors: VISUAL_SHADOW_COLORS,
-        getSelectedId: () => selectedClipId,
-        onSelect: setSelectedClipId,
-        onDelete: (id) => removeClipById(id),
-      });
-    }
-
     /** whether `clip`'s own backing media blob isn't local yet — drives
-     *  the dashed-border cue on both native track bars and shadow bars.
-     *  false for a clip kind with no blob field (label) at all. */
+     *  the dashed-border cue on track bars. false for a clip kind with no
+     *  blob field (label) at all. */
     function isClipRemote(clip: Clip): boolean {
       const blob = clipBlobInfo(clip);
       return !!blob && snatchController.isBlobRemote(blob.blobId);
@@ -623,33 +535,19 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       return blob ? snatchController.getBlobProgress(blob.blobId) : 0;
     }
 
-    function refreshShadowClips(): void {
-      const tracks = ctx.doc.current.tracks;
-      const clips = ctx.doc.current.clips;
-      const liveTracks = sortedTracks(tracks);
-
-      ensureAudioShadowHandle(liveTracks.find((t) => t.kind === "audio" && !t.hidden));
-      if (audioShadowHandle) {
-        const spans: ShadowClipSpan[] = clips
-          .filter((c) => c.kind === "video-segment" && !c.muted)
-          .map((c) => ({ id: c.id, start: c.start, end: clipEnd(c), label: "audio", remote: isClipRemote(c), progress: clipProgress(c) }));
-        audioShadowHandle.refresh(spans);
-      }
-
-      ensureVisualShadowHandle(liveTracks.find((t) => t.kind === "visual" && !t.hidden));
-      if (visualShadowHandle) {
-        const spans: ShadowClipSpan[] = clips
-          .filter((c) => c.kind === "voice-recording")
-          .map((c) => ({ id: c.id, start: c.start, end: clipEnd(c), label: "mouth", remote: isClipRemote(c), progress: clipProgress(c) }));
-        visualShadowHandle.refresh(spans);
-      }
+    /** a video-segment clip whose own embedded audio is muted — drives the
+     *  same faint/dashed "not fully present" visual cue `isClipRemote`
+     *  drives, for a different reason (see track-item-render.ts's own
+     *  `mutedLook` doc comment). every other clip kind is never "muted"
+     *  this way — mute only applies to a video's own embedded audio. */
+    function isClipMuted(clip: Clip): boolean {
+      return clip.kind === "video-segment" && clip.muted;
     }
 
-    /** redraws every track row AND the cross-strip shadow bars — call
-     *  whenever the clip list or camera view changes. */
+    /** redraws every track row — call whenever the clip list or camera
+     *  view changes. */
     function refreshAllTracks(): void {
       for (const inst of trackInstances.values()) inst.refresh();
-      refreshShadowClips();
     }
 
     function onClipsChange(nextClips: Clip[]): void {
@@ -661,16 +559,11 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       previewTransformEditor.refresh();
       updatePreviewHintVisibility();
-      // a same-track move/resize commit already redraws its own row
-      // internally (track-item-interaction.ts) — only the shadow bars on
-      // the OTHER strip (e.g. a video-segment's audio-track counterpart)
-      // need an explicit nudge to reflect the edit.
-      refreshShadowClips();
     }
 
     function syncTracks(): void {
       const tracks = sortedTracks(ctx.doc.current.tracks);
-      rowStack.setRows(tracks.map((t) => ({ id: t.id, height: t.kind === "visual" ? VISUAL_TRACK_ROW_HEIGHT : AUDIO_TRACK_ROW_HEIGHT })));
+      rowStack.setRows(tracks.map((t) => ({ id: t.id, height: TRACK_ROW_HEIGHT })));
 
       const liveIds = new Set(tracks.map((t) => t.id));
       for (const [id, inst] of trackInstances) {
@@ -684,7 +577,6 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         trackInstances.set(track.id, mountTrack(track));
       }
       layoutTimeline();
-      refreshShadowClips();
     }
 
     /** does `globalY` (a pixi FederatedPointerEvent's own `.global.y`,
@@ -707,21 +599,18 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     }
 
     /** shared by `moveClipToTrackAtGlobalY()` and the live ghost preview
-     *  below — finds whichever OTHER same-kind track's row currently
-     *  contains `globalY`, or undefined if the pointer isn't over a valid
-     *  cross-track drop target. */
+     *  below — finds whichever OTHER track's row currently contains
+     *  `globalY`, or undefined if the pointer isn't over a valid
+     *  cross-track drop target. any track accepts any clip kind, so
+     *  there's no more kind-matching to do here. */
     function findCrossTrackTargetAtGlobalY(clip: Clip, globalY: number): Track | undefined {
-      const wantedKind: Track["kind"] = (VISUAL_CLIP_KINDS as readonly string[]).includes(clip.kind) ? "visual" : "audio";
-      return sortedTracks(ctx.doc.current.tracks).find(
-        (t) => t.id !== clip.trackId && t.kind === wantedKind && !t.hidden && trackRowContainsGlobalY(t.id, globalY)
-      );
+      return sortedTracks(ctx.doc.current.tracks).find((t) => t.id !== clip.trackId && !t.hidden && trackRowContainsGlobalY(t.id, globalY));
     }
 
-    /** moves a clip to whichever OTHER track (of the same visual/audio
-     *  kind) the pointer ended up over at the end of a move drag — wired
-     *  as `onMoveOutOfRow` for both track kinds in `mountTrack()` below.
-     *  returns false (drag falls back to a normal same-track move) if the
-     *  pointer didn't land on a different, kind-matching track. */
+    /** moves a clip to whichever OTHER track the pointer ended up over at
+     *  the end of a move drag — wired as `onMoveOutOfRow` in `mountTrack()`
+     *  below. returns false (drag falls back to a normal same-track move)
+     *  if the pointer didn't land on a different track. */
     function moveClipToTrackAtGlobalY(clip: Clip, span: Span, globalY: number): boolean {
       const target = findCrossTrackTargetAtGlobalY(clip, globalY);
       if (!target) return false;
@@ -780,7 +669,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     function mountTrack(track: Track): TrackHandle {
       const row = rowStack.getRow(track.id);
       const rowLabel = new Text({
-        text: (track.label || track.kind).toUpperCase(),
+        text: (track.label || "track").toUpperCase(),
         style: { fontSize: 9, fill: 0x888888, letterSpacing: 0.3 },
       });
       rowLabel.anchor.set(0, 0.5);
@@ -826,8 +715,9 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         },
         isClipRemote: (clip: Clip) => isClipRemote(clip),
         getClipProgress: (clip: Clip) => clipProgress(clip),
+        isClipMuted: (clip: Clip) => isClipMuted(clip),
       };
-      return track.kind === "visual" ? createVisualTrack(common) : createAudioTrack(common);
+      return createTrack(common);
     }
 
     function redrawChrome(): void {
@@ -864,12 +754,10 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       const rowsStartY = TOOLBAR_HEIGHT + ROW_GAP;
       rowStack.layout(rowsStartY, rowWidth);
       const rulerY = rowsStartY + rowStack.getStackHeight() + ROW_GAP;
-      // "+video"/"+audio" live in the label column's own otherwise-empty
-      // space, at the ruler's row (see their own construction comment).
-      addVideoTrackBtn.x = 4;
-      addVideoTrackBtn.y = rulerY;
-      addAudioTrackBtn.x = addVideoTrackBtn.x + TRACK_ADD_BUTTON_WIDTH + 4;
-      addAudioTrackBtn.y = rulerY;
+      // "+track" lives in the label column's own otherwise-empty space,
+      // at the ruler's row (see its own construction comment).
+      addTrackBtn.x = 4;
+      addTrackBtn.y = rulerY;
       rulerContainer.x = TRACK_LABEL_COLUMN_WIDTH;
       rulerContainer.y = rulerY;
       // an explicit hitArea is required for a reliable click-to-seek: with
@@ -969,14 +857,18 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       onPlayingChange: () => updateHeaderActions(),
     });
 
-    /** plain play/pause toggle — media snatching is a SEPARATE concern
-     *  (see the dedicated "snatch all" header action below), not
-     *  conflated with playback: mount-time locality checks, bounded
-     *  catch-up rescans, the auto-snatch-once-opted-in retry timer, and
-     *  ephemeral "new blob" pings already keep media in sync without
-     *  needing a play press to kick anything off. */
+    /** play/pause toggle — also fires a background "snatch all" attempt
+     *  the moment playback actually starts, so a clip that's gone remote
+     *  since the last mount-time/catch-up scan (e.g. its local copy got
+     *  purged) doesn't just silently fail to render/play. cheap to call
+     *  unconditionally: `handleSnatchAll()`'s own early-return checks
+     *  (already-snatching/checking, no remote blobs, no peers) are a few
+     *  synchronous state/map checks with no network I/O — real download
+     *  work only happens when there's actually something to fetch, which
+     *  is exactly the case this exists for. never fires on pause. */
     function handlePlayToggle(): void {
       playbackClock.togglePlay();
+      if (playbackClock.isPlaying()) void snatchController.handleSnatchAll();
     }
 
     function updateHeaderActions(): void {
@@ -1020,14 +912,14 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       );
       ctx.setHeaderActions?.(actions);
 
-      // mirror the same play/snatch-all state into animaniac's OWN
-      // toolbar (not just the widget frame's header action) — a header
-      // action can silently overflow into the frame's hamburger flyout on
-      // a narrower widget (see widget-frame.ts's own overflow behavior),
-      // so this is the more reliably-visible copy. always visible, same
-      // reasoning as the header action above.
+      // mirror the same play state into animaniac's OWN toolbar (not just
+      // the widget frame's header action) — a header action can silently
+      // overflow into the frame's hamburger flyout on a narrower widget
+      // (see widget-frame.ts's own overflow behavior), so this is the
+      // more reliably-visible copy. "snatch all" deliberately stays ONLY
+      // in the header action above — the timeline's own toolbar row is
+      // reserved for the selected-clip action bar instead (mute/unmute).
       toolbarPlayBtn.setLabel?.(playbackClock.isPlaying() ? "\u23f8" : "\u25b6");
-      toolbarSnatchBtn.setLabel?.(snatchLabel);
       layoutTrailingButtons();
     }
 
@@ -1039,12 +931,13 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     const snatchController = createSnatchController({
       widgetId: ctx.widgetId,
       getDocState: () => ctx.doc.current,
+      changeDoc: (fn) => ctx.doc.change(fn),
+      getLocalNodeId: () => ctx.canvasStore?.localNodeId ?? "",
       getPeers,
       isPeerOnline: ctx.canvasStore ? (nodeId: string) => ctx.canvasStore!.isPeerOnline(nodeId) : undefined,
       isDestroyed: () => destroyed,
       onStateChange: () => {
         updateHeaderActions();
-        refreshShadowClips();
         for (const inst of trackInstances.values()) inst.refresh();
       },
     });
@@ -1117,6 +1010,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       previewTransformEditor.refresh();
       updatePreviewHintVisibility();
+      updateTimelineActionBar();
     });
 
     // -- keyboard shortcuts: space (play/pause), delete/backspace (delete
@@ -1181,8 +1075,6 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         previewTransformEditor.destroy();
         for (const inst of trackInstances.values()) inst.destroy();
         trackInstances.clear();
-        audioShadowHandle?.destroy();
-        visualShadowHandle?.destroy();
         rowStack.destroy();
         toolbar.destroy();
         ruler.destroy();

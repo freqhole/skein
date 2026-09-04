@@ -64,6 +64,7 @@ describe("resolveCapturedClip", () => {
       keyframes: [{ t: 0, x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1, easing: "linear" }],
       imageUrl: "blob:abc123",
       durationSec: 1,
+      snatchedBy: [],
     });
   });
 

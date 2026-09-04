@@ -47,15 +47,11 @@ export type Keyframe = z.infer<typeof keyframeSchema>;
 // tracks
 // ---------------------------------------------------------------------------
 
-export const trackKindSchema = z.enum(["visual", "audio"]);
-export type TrackKind = z.infer<typeof trackKindSchema>;
-
 export const trackSchema = z.object({
   id: z.string(),
-  kind: trackKindSchema,
   label: z.string().default(""),
-  /** z-order among visual tracks (higher = drawn on top of lower); ignored
-   *  for audio tracks (mixing has no z-order — see `export/audio-mixdown.ts`). */
+  /** z-order among tracks (higher = drawn on top of lower, for visual
+   *  clips — ignored for a track's audio clips, mixing has no z-order). */
   order: z.number().default(0),
   muted: z.boolean().default(false),
   hidden: z.boolean().default(false),
@@ -89,6 +85,13 @@ export const doodleFrameClipSchema = clipBaseSchema.extend({
   /** how long this frame stays visible before the next visual-track clip
    *  takes over. */
   durationSec: z.number().default(1),
+  /** node ids known to have this clip's own blob locally — mirrors
+   *  file.ts/voice-recording.ts's own `snatchedBy` field, but nested per-
+   *  clip here since one animaniac doc can carry many independent blobs
+   *  (see tumulus/src/snatch.rs's own per-clip extraction). lets a peer
+   *  (or the hub, after it finishes snatching) discover who else to ask
+   *  for this blob without a live ephemeral ping. */
+  snatchedBy: z.array(z.string()).default([]),
 });
 export type DoodleFrameClip = z.infer<typeof doodleFrameClipSchema>;
 
@@ -99,6 +102,7 @@ export const imageClipSchema = clipBaseSchema.extend({
   kind: z.literal("image"),
   imageUrl: z.string(),
   durationSec: z.number().default(1),
+  snatchedBy: z.array(z.string()).default([]),
 });
 export type ImageClip = z.infer<typeof imageClipSchema>;
 
@@ -128,6 +132,8 @@ export const voiceRecordingClipSchema = clipBaseSchema.extend({
   mouthMood: z.enum(["frown", "neutral", "smile"]).default("neutral"),
   teethStyle: z.enum(["straight", "curved"]).default("straight"),
   cupidBowAmount: z.number().default(4),
+  /** see `doodleFrameClipSchema.snatchedBy`'s own doc comment. */
+  snatchedBy: z.array(z.string()).default([]),
 });
 export type VoiceRecordingClip = z.infer<typeof voiceRecordingClipSchema>;
 
@@ -142,6 +148,7 @@ export const ttsClipSchema = clipBaseSchema.extend({
   ttsVoiceName: z.string().default(""),
   ttsVoiceLang: z.string().default(""),
   ttsRate: z.number().default(1),
+  snatchedBy: z.array(z.string()).default([]),
 });
 export type TtsClip = z.infer<typeof ttsClipSchema>;
 
@@ -156,6 +163,7 @@ export const audioSegmentClipSchema = clipBaseSchema.extend({
   sourceInSec: z.number().default(0),
   sourceOutSec: z.number(),
   label: z.string().default(""),
+  snatchedBy: z.array(z.string()).default([]),
 });
 export type AudioSegmentClip = z.infer<typeof audioSegmentClipSchema>;
 
@@ -172,11 +180,14 @@ export const videoSegmentClipSchema = clipBaseSchema.extend({
   sourceInSec: z.number().default(0),
   sourceOutSec: z.number(),
   /** whether the video's own embedded audio plays — default false (audio
-   *  audible) so a dropped-in video's soundtrack is present by default,
-   *  shown as a "shadow" segment on the first audio track (see
-   *  `tracks/shadow-clips.ts`); deleting that segment sets this to
-   *  `true` instead of removing the clip. */
+   *  audible) so a dropped-in video's soundtrack is present by default.
+   *  toggled via the timeline's own selected-clip "mute"/"unmute" action
+   *  (see index.ts's `toggleMuteVideoClip()`), rendered with the same
+   *  faint/dashed visual cue a not-yet-local clip gets (see track-item-
+   *  render.ts's `drawTrackItemBody()`'s own `mutedLook` option). */
   muted: z.boolean().default(false),
+  /** see `doodleFrameClipSchema.snatchedBy`'s own doc comment. */
+  snatchedBy: z.array(z.string()).default([]),
 });
 export type VideoSegmentClip = z.infer<typeof videoSegmentClipSchema>;
 
@@ -191,14 +202,13 @@ export const clipSchema = z.discriminatedUnion("kind", [
 ]);
 export type Clip = z.infer<typeof clipSchema>;
 
-/** clip kinds with a visual footprint (rendered by `compositor.ts`) —
- *  belong on a `"visual"` track. */
+/** clip kinds with a visual footprint (rendered by `compositor.ts`). */
 export const VISUAL_CLIP_KINDS = ["doodle-frame", "image", "label", "video-segment"] as const;
 /** clip kinds with an audio footprint (scheduled by `export/audio-
  *  mixdown.ts` and, during live playback, `mouth-sync.ts`/an `<audio>`
- *  element) — belong on an `"audio"` track. a video-segment clip is
- *  visual-only here even when `muted: false`; see docs/animaniac-media-
- *  segments-plan.md's "still-open" note on mixing its own audio in later. */
+ *  element). a video-segment clip is visual-only here even when
+ *  `muted: false`; see docs/animaniac-media-segments-plan.md's
+ *  "still-open" note on mixing its own audio in later. */
 export const AUDIO_CLIP_KINDS = ["voice-recording", "tts", "audio-segment"] as const;
 
 // ---------------------------------------------------------------------------
@@ -206,10 +216,7 @@ export const AUDIO_CLIP_KINDS = ["voice-recording", "tts", "audio-segment"] as c
 // ---------------------------------------------------------------------------
 
 export const animaniacSchema = z.object({
-  tracks: z.array(trackSchema).default([
-    { id: "visual-1", kind: "visual", label: "visual", order: 0, muted: false, hidden: false },
-    { id: "audio-1", kind: "audio", label: "audio", order: 0, muted: false, hidden: false },
-  ]),
+  tracks: z.array(trackSchema).default([{ id: "track-1", label: "", order: 0, muted: false, hidden: false }]),
   clips: z.array(clipSchema).default([]),
 });
 export type AnimaniacState = z.infer<typeof animaniacSchema>;

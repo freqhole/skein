@@ -33,7 +33,7 @@
 import { Container, Graphics, Rectangle, type FederatedPointerEvent } from "pixi.js";
 import { activeClipsAt, clipsForTrack, sortedTracks } from "./track-model";
 import { resolveTransformAt } from "./transform";
-import type { Clip, Track } from "./types";
+import { VISUAL_CLIP_KINDS, type Clip, type Track } from "./types";
 
 const HANDLE_SIZE = 9;
 const MIN_SCALE = 0.05;
@@ -127,9 +127,18 @@ interface DragState {
 function visibleClipsTopmostFirst(clips: Clip[], tracks: Track[], t: number): Clip[] {
   const active = activeClipsAt(clips, t).filter(isPreviewableClip);
   const mouths = active.filter((c) => c.kind === "voice-recording");
+  // a track may now hold a mix of visual + voice-recording clips (tracks
+  // are unified, see docs/animaniac-plan.md) — mouths are already pulled
+  // out above and drawn on their own always-on-top layer, so exclude them
+  // here to avoid drawing/hit-testing them twice.
+  const visual = active.filter((c) => (VISUAL_CLIP_KINDS as readonly string[]).includes(c.kind));
   const visualOrdered: Clip[] = [];
-  for (const track of sortedTracks(tracks.filter((tr) => tr.kind === "visual" && !tr.hidden))) {
-    visualOrdered.push(...clipsForTrack(active, track.id));
+  // same track-iteration order as compositor.ts's own z-order build (the
+  // top-of-track-list track ends up drawn topmost) — walked in REVERSE of
+  // `sortedTracks()`'s ascending-`order` result, see that module's own
+  // comment for why.
+  for (const track of sortedTracks(tracks.filter((tr) => !tr.hidden)).reverse()) {
+    visualOrdered.push(...clipsForTrack(visual, track.id));
   }
   return [...mouths, ...visualOrdered.reverse()];
 }

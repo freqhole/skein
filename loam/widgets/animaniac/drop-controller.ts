@@ -7,11 +7,10 @@
  *
  * the WHOLE widget is the drop zone (not just its track rows) — dropping
  * anywhere inside animaniac's own bounds highlights it with a magenta
- * border. if the drop point lands on a specific track row whose kind
- * matches the dragged content, it's placed there at that row's own
- * hit-tested time; otherwise (dropped on the toolbar/ruler/preview area,
- * or on a row of the WRONG kind) it falls back to the first track of the
- * matching kind, placed at the current end of the timeline.
+ * border. tracks are unified (any clip kind can live on any track), so a
+ * drop always lands wherever the pointer hit-tested a track row; otherwise
+ * (dropped on the toolbar/ruler/preview area) it falls back to the first
+ * non-hidden track, placed at the current end of the timeline.
  *
  * `onDrop()`'s capture step is async (a doodle-frame capture needs to
  * `await` a snapshot render + blob promotion) but `DropTargetHandler.
@@ -33,7 +32,7 @@ import type { TrackCameraView, TrackRowContainers } from "../../src/widgets/time
 import { expectedTrackKindFor, isCapturableWidgetType, resolveCapturedClip } from "./frame-capture";
 import { clipBlobInfo, makeAnimaniacNewBlobMessage } from "./snatch-controller";
 import { computeTimelineDuration, clipDurationSec, clipEnd, clipsForTrack } from "./track-model";
-import { AUDIO_CLIP_KINDS, VISUAL_CLIP_KINDS, type AnimaniacState, type Clip, type Track } from "./types";
+import { type AnimaniacState, type Clip, type Track } from "./types";
 
 export interface AnimaniacDropControllerOptions {
   store: CanvasStore | null;
@@ -68,11 +67,6 @@ export interface AnimaniacDropControllerOptions {
 export interface AnimaniacDropControllerHandle {
   dropTarget: DropTargetHandler | undefined;
   destroy(): void;
-}
-
-function clipKindMatchesTrack(kind: string, trackKind: Track["kind"]): boolean {
-  if (trackKind === "visual") return (VISUAL_CLIP_KINDS as readonly string[]).includes(kind);
-  return (AUDIO_CLIP_KINDS as readonly string[]).includes(kind);
 }
 
 export function createAnimaniacDropController(options: AnimaniacDropControllerOptions): AnimaniacDropControllerHandle {
@@ -130,7 +124,7 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
       hidePlaceholder();
       return;
     }
-    const target = resolveDropTarget(worldX, worldY, expectedKind);
+    const target = resolveDropTarget(worldX, worldY);
     const row = target ? getTrackRow(target.trackId) : null;
     if (!target || !row) {
       hidePlaceholder();
@@ -195,20 +189,16 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
   }
 
   /** resolves the target track + timeline position for a drop: prefer a
-   *  specific row hit (if its kind matches), else fall back to the first
-   *  track of the matching kind, placed at the current end of the
-   *  timeline (per the user's "if it's not dropped in a specific place,
-   *  just place it at the end" request). */
-  function resolveDropTarget(
-    worldX: number,
-    worldY: number,
-    expectedKind: "visual" | "audio"
-  ): { trackId: string; start: number } | null {
+   *  specific row hit, else fall back to the first non-hidden track,
+   *  placed at the current end of the timeline (per the user's "if it's
+   *  not dropped in a specific place, just place it at the end" request).
+   *  any track accepts any clip kind (tracks are unified). */
+  function resolveDropTarget(worldX: number, worldY: number): { trackId: string; start: number } | null {
     const hit = hitTestTrack(worldX, worldY);
-    if (hit && hit.track.kind === expectedKind) {
+    if (hit) {
       return { trackId: hit.track.id, start: Math.max(0, camera.screenXToTime(hit.localX)) };
     }
-    const fallbackTrack = getTracks().find((t) => t.kind === expectedKind && !t.hidden);
+    const fallbackTrack = getTracks().find((t) => !t.hidden);
     if (!fallbackTrack) return null;
     return { trackId: fallbackTrack.id, start: computeTimelineDuration(getClips()) };
   }
@@ -247,9 +237,9 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
             log.debug("animaniac.drop", "onDrop: could not determine target track kind", { entryType: entry.type });
             return false;
           }
-          const target = resolveDropTarget(worldX, worldY, expectedKind);
+          const target = resolveDropTarget(worldX, worldY);
           if (!target) {
-            log.debug("animaniac.drop", "onDrop: no track of the required kind exists", { expectedKind });
+            log.debug("animaniac.drop", "onDrop: no track exists", { expectedKind });
             return false;
           }
           const { trackId, start } = target;
@@ -260,17 +250,12 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
               log.debug("animaniac.drop", "onDrop: resolveCapturedClip returned null (nothing capturable yet)", { entryType: entry.type });
               return;
             }
-            if (!clipKindMatchesTrack(clip.kind, expectedKind)) {
-              log.debug("animaniac.drop", "onDrop: clip kind doesn't match track kind, rejected", { clipKind: clip.kind, expectedKind });
-              return;
-            }
             // items on a single track must not overlap each other (see
             // track-item-interaction.ts's own preventOverlap option, used
-            // by tracks/audio-track.ts + tracks/visual-track.ts for
-            // interactive drags) — a drop lands wherever the pointer was
-            // released with no collision check of its own, so re-place it
-            // at the end of THIS track's own clips if it would overlap one
-            // already there.
+            // by tracks/track.ts for interactive drags) — a drop lands
+            // wherever the pointer was released with no collision check of
+            // its own, so re-place it at the end of THIS track's own clips
+            // if it would overlap one already there.
             const existingOnTrack = clipsForTrack(getClips(), trackId);
             const newEnd = clip.start + clipDurationSec(clip);
             const overlaps = existingOnTrack.some((other) => clip.start < clipEnd(other) && newEnd > other.start);

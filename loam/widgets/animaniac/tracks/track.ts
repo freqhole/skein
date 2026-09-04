@@ -1,20 +1,34 @@
 /**
- * visual track row adapter — same shape as `audio-track.ts` but for
- * doodle-frame/image/label/video-segment clips. see that file's own doc
- * comment for the shared design (id-keyed generic engine, no
- * create-by-drag, `mergeTrackClips()` reassembly pattern).
+ * a single unified track row adapter — any clip kind (doodle-frame/image/
+ * label/video-segment/voice-recording/tts/audio-segment) can live on any
+ * track, so there's no more per-track "visual"/"audio" split (see
+ * docs/animaniac-plan.md's decision to unify track kinds). replaces the
+ * former separate `visual-track.ts`/`audio-track.ts` — coloring/labeling
+ * now branches on the CLIP's own kind rather than the track's.
  */
 
 import { Graphics, Text } from "pixi.js";
 import { createTrackItemInteraction, type Span, type TrackItemInteractionHandle } from "../../../src/widgets/timeline/track-item-interaction";
-import { drawTrackItemBody } from "../../../src/widgets/timeline/track-item-render";
+import { drawTrackItemBody, type TrackItemColors } from "../../../src/widgets/timeline/track-item-render";
 import type { TrackCameraView, TrackRowContainers } from "../../../src/widgets/timeline/timeline-types";
 import { clipTrackAdapter } from "../clip-track-adapter";
-import type { Clip, LabelClip } from "../types";
+import type { AudioSegmentClip, Clip, LabelClip, TtsClip } from "../types";
 
-export const VISUAL_TRACK_ROW_HEIGHT = 40;
+export const TRACK_ROW_HEIGHT = 40;
 
-const VISUAL_CLIP_COLORS = { fill: 0x3a1a3a, fillHover: 0x5a2a5a, stroke: 0xd946ef };
+const VISUAL_CLIP_COLORS: TrackItemColors = { fill: 0x3a1a3a, fillHover: 0x5a2a5a, stroke: 0xd946ef };
+const AUDIO_CLIP_COLORS: TrackItemColors = { fill: 0x1a3a4a, fillHover: 0x2a5a6a, stroke: 0x45c9e6 };
+
+function colorsForClip(clip: Clip): TrackItemColors {
+  switch (clip.kind) {
+    case "voice-recording":
+    case "tts":
+    case "audio-segment":
+      return AUDIO_CLIP_COLORS;
+    default:
+      return VISUAL_CLIP_COLORS;
+  }
+}
 
 function labelFor(clip: Clip): string {
   switch (clip.kind) {
@@ -26,12 +40,18 @@ function labelFor(clip: Clip): string {
       return (clip as LabelClip).text || "label";
     case "video-segment":
       return "video";
+    case "tts":
+      return (clip as TtsClip).ttsText || "tts";
+    case "voice-recording":
+      return "voice";
+    case "audio-segment":
+      return (clip as AudioSegmentClip).label || "audio";
     default:
       return "";
   }
 }
 
-export interface VisualTrackOptions {
+export interface TrackOptions {
   trackId: string;
   row: TrackRowContainers;
   camera: TrackCameraView;
@@ -54,23 +74,29 @@ export interface VisualTrackOptions {
   /** 0..1 live download progress for a remote clip — fills the dashed
    *  border's faint background up to full opacity as it downloads. */
   getClipProgress?: (clip: Clip) => number;
+  /** a video-segment clip whose own embedded audio is muted — drawn with
+   *  the same faint/dashed treatment as a not-yet-local remote clip (a
+   *  different reason, same "this isn't fully present" visual language). */
+  isClipMuted?: (clip: Clip) => boolean;
 }
 
-export type VisualTrackHandle = Pick<TrackItemInteractionHandle<Clip>, "refresh" | "getSelected" | "deleteSelected" | "clearSelection" | "selectId" | "destroy">;
+export type TrackHandle = Pick<TrackItemInteractionHandle<Clip>, "refresh" | "getSelected" | "deleteSelected" | "clearSelection" | "selectId" | "destroy">;
 
+/** clips belonging to this track only — any kind, no restriction. */
 function clipsForThisTrack(all: Clip[], trackId: string): Clip[] {
-  return all.filter(
-    (c) => c.trackId === trackId && (c.kind === "doodle-frame" || c.kind === "image" || c.kind === "label" || c.kind === "video-segment")
-  );
+  return all.filter((c) => c.trackId === trackId);
 }
 
+/** replaces every clip belonging to `trackId` with `next`, leaving every
+ *  other track's clips (and ordering, for the ones that stay) untouched. */
 function mergeTrackClips(all: Clip[], trackId: string, next: Clip[]): Clip[] {
   const others = all.filter((c) => c.trackId !== trackId);
   return [...others, ...next];
 }
 
-export function createVisualTrack(options: VisualTrackOptions): VisualTrackHandle {
-  const { trackId, row, camera, getDuration, isSnapEnabled, getSnapTimes, getClips, onClipsChange, onSelectionChange, onMoveOutOfRow, onDraggingMove, isClipRemote, getClipProgress } = options;
+export function createTrack(options: TrackOptions): TrackHandle {
+  const { trackId, row, camera, getDuration, isSnapEnabled, getSnapTimes, getClips, onClipsChange, onSelectionChange, onMoveOutOfRow, onDraggingMove, isClipRemote, getClipProgress, isClipMuted } =
+    options;
 
   const labels = new WeakMap<Graphics, Text>();
 
@@ -93,22 +119,24 @@ export function createVisualTrack(options: VisualTrackOptions): VisualTrackHandl
     onChange: (nextForTrack) => onClipsChange(mergeTrackClips(getClips(), trackId, nextForTrack)),
     onSelectionChange,
     drawItem(g: Graphics, item: Clip, state) {
+      const remote = isClipRemote?.(item) ?? false;
       drawTrackItemBody(
         g,
         state.left,
         state.right,
-        VISUAL_TRACK_ROW_HEIGHT,
-        VISUAL_CLIP_COLORS,
+        TRACK_ROW_HEIGHT,
+        colorsForClip(item),
         state.hovered,
         state.hoveredRegion,
         state.selected,
         undefined,
-        isClipRemote?.(item),
-        getClipProgress?.(item)
+        remote,
+        getClipProgress?.(item),
+        !remote && (isClipMuted?.(item) ?? false)
       );
-      // real thumbnails (a rendered doodle/image/video frame preview) are a
-      // follow-up — a plain kind/text label is enough to distinguish clips
-      // for the phase-1 static-cel-playback goal.
+      // real thumbnails (a rendered doodle/image/video frame preview, or a
+      // waveform for audio) are a follow-up — a plain kind/text label is
+      // enough to distinguish clips for now.
       let label = labels.get(g);
       if (!label) {
         label = new Text({ text: "", style: { fontSize: 10, fill: 0xf5d0fe } });
@@ -118,7 +146,7 @@ export function createVisualTrack(options: VisualTrackOptions): VisualTrackHandl
       }
       label.text = labelFor(item).slice(0, 40);
       label.x = state.left + 6;
-      label.y = VISUAL_TRACK_ROW_HEIGHT / 2;
+      label.y = TRACK_ROW_HEIGHT / 2;
     },
   });
 }

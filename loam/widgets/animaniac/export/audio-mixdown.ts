@@ -94,12 +94,14 @@ async function decodeClipAudio(
   }
 }
 
-/** renders every audio-bearing clip on every non-muted/non-hidden audio
- *  track into one mixed-down WAV. */
+/** renders every audio-bearing clip on every non-muted/non-hidden track
+ *  into one mixed-down WAV (tracks are unified — any track may hold a mix
+ *  of visual and audio-bearing clips, `isAudioBearing()` below already
+ *  narrows to the right clip kinds). */
 export async function renderAudioMixdown(options: AudioMixdownOptions): Promise<AudioMixdownResult> {
   const { tracks, clips, getPeers, sampleRate = DEFAULT_SAMPLE_RATE, onProgress } = options;
 
-  const audibleTrackIds = new Set(tracks.filter((t) => t.kind === "audio" && !t.muted && !t.hidden).map((t) => t.id));
+  const audibleTrackIds = new Set(tracks.filter((t) => !t.muted && !t.hidden).map((t) => t.id));
   const audioClips = clips.filter((c): c is AudioBearingClip => isAudioBearing(c) && audibleTrackIds.has(c.trackId));
 
   const durationSec = audioClips.reduce((max, c) => Math.max(max, c.start + clipDurationSec(c)), 0);

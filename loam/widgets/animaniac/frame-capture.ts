@@ -9,12 +9,10 @@
  * this module is split into a PURE half (`resolveCapturedClip()` — given
  * an already-read, schema-parsed source widget's state, decide what clip
  * (if any) to create) and leaves the pixi/pointer "which track row was
- * this dropped onto" wiring to the track UI modules (`tracks/visual-
- * track.ts`/`tracks/audio-track.ts`), which don't exist yet — see
- * docs/animaniac-media-segments-plan.md's checklist. splitting it this way
- * means the "which widget type maps to which clip kind" logic (the part
- * most likely to need adjusting as new widget types appear) is testable
- * without any pixi/drag-gesture scaffolding at all.
+ * this dropped onto" wiring to `drop-controller.ts`/`tracks/track.ts`.
+ * splitting it this way means the "which widget type maps to which clip
+ * kind" logic (the part most likely to need adjusting as new widget types
+ * appear) is testable without any pixi/drag-gesture scaffolding at all.
  *
  * reads the source widget generically via the registry's own schema (the
  * same `factory.schema.parse(rawDoc)` pattern `audio-clip-drag.ts` already
@@ -159,6 +157,7 @@ export async function resolveCapturedClip(
         keyframes: containKeyframes({ width: DOODLE_CAPTURE_SIZE, height: DOODLE_CAPTURE_SIZE }, previewSize),
         imageUrl,
         durationSec: 1,
+        snatchedBy: [],
       };
     }
 
@@ -173,6 +172,7 @@ export async function resolveCapturedClip(
         keyframes: containKeyframes(await probeImageNaturalSize(url), previewSize),
         imageUrl: url,
         durationSec: 1,
+        snatchedBy: [],
       };
     }
 
@@ -210,6 +210,7 @@ export async function resolveCapturedClip(
         mouthMood: enumVal(sourceState.mouthMood, ["frown", "neutral", "smile"] as const, "neutral"),
         teethStyle: enumVal(sourceState.teethStyle, ["straight", "curved"] as const, "straight"),
         cupidBowAmount: num(sourceState.cupidBowAmount, 4),
+        snatchedBy: [],
       };
     }
 
@@ -230,6 +231,7 @@ export async function resolveCapturedClip(
         ttsVoiceName: str(sourceState.ttsVoiceName),
         ttsVoiceLang: str(sourceState.ttsVoiceLang),
         ttsRate: num(sourceState.ttsRate, 1),
+        snatchedBy: [],
       };
     }
 
@@ -253,6 +255,7 @@ export async function resolveCapturedClip(
         sourceInSec: 0,
         sourceOutSec: duration,
         label: str(sourceState.filename),
+        snatchedBy: [],
       };
     }
 
@@ -279,6 +282,7 @@ export async function resolveCapturedClip(
           sourceInSec: 0,
           sourceOutSec: duration,
           label: str(sourceState.filename),
+          snatchedBy: [],
         };
       }
       if (domain === "video") {
@@ -294,6 +298,7 @@ export async function resolveCapturedClip(
           sourceInSec: 0,
           sourceOutSec: duration,
           muted: false,
+          snatchedBy: [],
         };
       }
       return null;
@@ -318,6 +323,7 @@ export async function resolveCapturedClip(
         sourceInSec: 0,
         sourceOutSec: videoDurationSec,
         muted: false,
+        snatchedBy: [],
       };
     }
 

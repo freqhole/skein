@@ -2,8 +2,7 @@
  * adapts animaniac's `Clip` union to the generic `TrackItemAdapter<T>`
  * shape `timeline/track-item-interaction.ts` operates on (see
  * `timeline-types.ts`) — the missing piece between the shared engine and
- * animaniac's own track UI modules (`tracks/visual-track.ts`/`tracks/
- * audio-track.ts`, not yet built).
+ * animaniac's own unified track UI module (`tracks/track.ts`).
  *
  * `withSpan()` is the interesting part: the generic engine only ever hands
  * back a new `{start, end}` span, with no explicit "which edge moved"
