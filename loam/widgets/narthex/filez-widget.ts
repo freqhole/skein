@@ -1182,9 +1182,23 @@ export const filezWidget: WidgetFactory<typeof filezSchema> = {
             blake3: item.blake3,
             x: local.x - CREATE_FILE_WIDGET_DEFAULT_WIDTH / 2,
             y: local.y - CREATE_FILE_WIDGET_DEFAULT_HEIGHT / 2,
-          }).catch((err) => {
-            log.warn(TAG, `drag-out: failed to create file widget from blob ${item.blobId}:`, err);
-          });
+          })
+            .then((widgetId) => {
+              // the widget's own drop target contract (DropTargetHandler)
+              // needs a real, already-existing widget id — there's no
+              // widget at all until the line above creates one, so (unlike
+              // bin-drag.ts, which drags an existing widget out) this
+              // always creates the standalone file widget FIRST, then
+              // immediately offers it to whatever's at the drop point.
+              // e.g. dropping straight onto animaniac's timeline captures
+              // it as a clip and deletes this just-created widget as part
+              // of consuming the drop; otherwise it just stays put as a
+              // normal file widget.
+              store.tryDropOnWidgetAt(widgetId, local.x, local.y);
+            })
+            .catch((err) => {
+              log.warn(TAG, `drag-out: failed to create file widget from blob ${item.blobId}:`, err);
+            });
         }
         cleanup();
         activeDragCleanup = null;

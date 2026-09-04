@@ -55,10 +55,12 @@ interface DragState<T> {
   startSpan: Span;
   pending: Span;
   moved: boolean;
-  /** last seen `e.global.y` during the drag — used by `onMoveOutOfRow` at
-   *  release time to let the caller check whether the pointer ended up
-   *  over a different track's row (cross-track move). */
+  /** last seen `e.global.y`/`e.global.x` during the drag — used by
+   *  `onMoveOutOfRow` at release time to let the caller check whether the
+   *  pointer ended up over a different track's row (cross-track move), or
+   *  outside the whole widget entirely (drag-out-to-canvas). */
   lastGlobalY: number;
+  lastGlobalX: number;
 }
 
 export interface TrackItemInteractionOptions<T> {
@@ -107,7 +109,7 @@ export interface TrackItemInteractionOptions<T> {
    *  engine then skips its own normal same-track commit entirely (the
    *  item no longer belongs in `getItems()`'s array). return `false`/
    *  `undefined` for a normal same-track move. */
-  onMoveOutOfRow?: (item: T, span: Span, globalY: number) => boolean;
+  onMoveOutOfRow?: (item: T, span: Span, globalY: number, globalX: number) => boolean;
   /** called continuously (on every pointer-move) during an in-progress
    *  "move" drag, with the item's own live (unsnapped-to-a-track) [start,
    *  end] and the pointer's current global Y — lets the caller draw/
@@ -116,7 +118,7 @@ export interface TrackItemInteractionOptions<T> {
    *  but for an item already on one of this widget's own tracks. called
    *  with `null` once the drag ends (committed or not) so the caller can
    *  hide its ghost — always paired, never left dangling. */
-  onDraggingMove?: (item: T, span: Span | null, globalY: number) => void;
+  onDraggingMove?: (item: T, span: Span | null, globalY: number, globalX: number) => void;
   /** builds a brand-new item from a create-drag's clamped [start,end] —
    *  required when `allowCreateByDrag` is true (also used to render the
    *  live create-preview, so the preview looks exactly like the real
@@ -371,6 +373,7 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
         pending: span,
         moved: false,
         lastGlobalY: e.global.y,
+        lastGlobalX: e.global.x,
       };
       return;
     }
@@ -386,12 +389,14 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
       pending: { start: t, end: t },
       moved: false,
       lastGlobalY: e.global.y,
+      lastGlobalX: e.global.x,
     };
   }
 
   function onGlobalPointerMove(e: FederatedPointerEvent): void {
     if (!drag) return;
     drag.lastGlobalY = e.global.y;
+    drag.lastGlobalX = e.global.x;
     const deltaPx = e.global.x - drag.startClientX;
     if (!drag.moved && Math.abs(deltaPx) <= dragThresholdPx) return;
     drag.moved = true;
@@ -455,7 +460,7 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
     }
 
     if (drag.mode === "move" && drag.item) {
-      onDraggingMove?.(drag.item, drag.pending, drag.lastGlobalY);
+      onDraggingMove?.(drag.item, drag.pending, drag.lastGlobalY, drag.lastGlobalX);
     }
   }
 
@@ -463,7 +468,7 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
     if (!drag) return;
     const finished = drag;
     drag = null;
-    if (finished.mode === "move" && finished.item) onDraggingMove?.(finished.item, null, finished.lastGlobalY);
+    if (finished.mode === "move" && finished.item) onDraggingMove?.(finished.item, null, finished.lastGlobalY, finished.lastGlobalX);
 
     if (!finished.moved) {
       refresh();
@@ -500,7 +505,7 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
       // the user with a different result than what they were shown.
       resolvedPending = resolveMoveSpan(resolvedPending, finished.id);
     }
-    if (finished.mode === "move" && onMoveOutOfRow?.(items[idx], clampSpan(resolvedPending), finished.lastGlobalY)) {
+    if (finished.mode === "move" && onMoveOutOfRow?.(items[idx], clampSpan(resolvedPending), finished.lastGlobalY, finished.lastGlobalX)) {
       // caller moved this item to a different track's own clips array —
       // this row's own commit must NOT also write it back (it no longer
       // belongs in `getItems()`'s array at all); just clear selection/

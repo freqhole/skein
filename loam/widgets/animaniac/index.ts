@@ -45,12 +45,14 @@ import { createTimelineRuler, type TimelineRulerHandle } from "../../src/widgets
 import { createTimelineScrollbar, type TimelineScrollbarHandle } from "../../src/widgets/timeline/timeline-scrollbar";
 import { createTimelinePlayhead, type TimelinePlayheadHandle } from "../../src/widgets/timeline/timeline-playhead";
 import { createCompositor, type CompositorHandle } from "./compositor";
+import { createDomVideoOverlay, type DomVideoOverlayHandle } from "./dom-video-overlay";
 import { createPreviewTransformEditor, type PreviewTransformEditorHandle, type TransformPatch } from "./preview-transform-editor";
 import { createAudioPlayback, type AudioPlaybackHandle } from "./audio-playback";
 import { createPlaybackClock, type PlaybackClock } from "./playback-clock";
 import { createHistoryController, type HistoryControllerHandle } from "./history";
-import { loadLocalAnimaniacPrefs, saveLocalAnimaniacPrefs } from "./local-prefs";
+import { loadLocalAnimaniacPrefs, saveLocalAnimaniacPrefs, isDomVideoOverlayEnabled } from "./local-prefs";
 import { createAnimaniacDropController } from "./drop-controller";
+import { restoreWidgetFromClip } from "./clip-restore";
 import { createSnatchController, isAnimaniacNewBlobMessage, clipBlobInfo } from "./snatch-controller";
 import { computeDisplayDurationSec, nextTrackOrder, removeTrack as removeTrackFromArrays, sortedTracks } from "./track-model";
 import { createTrack, TRACK_ROW_HEIGHT, type TrackHandle } from "./tracks/track";
@@ -179,7 +181,28 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       getTracks: () => ctx.doc.current.tracks,
       getClips: () => ctx.doc.current.clips,
       getPeers,
+      domVideoMode: () => isDomVideoOverlayEnabled(),
     });
+
+    const domVideoOverlay: DomVideoOverlayHandle = createDomVideoOverlay({
+      previewClipLayer,
+      canvasElement: ctx.canvasElement,
+      getPreviewSize: () => ({ width: currentWidth, height: currentPreviewHeight }),
+      getTracks: () => ctx.doc.current.tracks,
+      getClips: () => ctx.doc.current.clips,
+      compositor,
+    });
+
+    /** every call site that used to call `compositor.update()` directly now
+     *  goes through here instead, so a video-segment clip's real `<video>`
+     *  element (see `dom-video-overlay.ts`) always stays in sync with
+     *  whatever the pixi transform just did — including a live drag-
+     *  transform, an edit, or a normal playback tick. */
+    function renderFrame(t: number, playing: boolean, seeked: boolean): void {
+      compositor.update(t, playing, seeked);
+      if (isDomVideoOverlayEnabled()) domVideoOverlay.update(t);
+      else domVideoOverlay.clear();
+    }
 
     // -- currently selected clip (kept in sync bidirectionally with each
     // track row's own selection, and with the preview transform editor's
@@ -234,7 +257,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         if (patch.rotation !== undefined) kf.rotation = patch.rotation;
       });
       history.push();
-      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+      renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       previewTransformEditor.refresh();
     }
 
@@ -249,7 +272,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       history.push();
       refreshAllTracks();
       camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
-      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+      renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       previewTransformEditor.refresh();
       updatePreviewHintVisibility();
     }
@@ -273,7 +296,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       history.push();
       refreshAllTracks();
       updateTimelineActionBar();
-      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+      renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
     }
 
     /** adds a new, empty track, appended after every existing track. */
@@ -299,7 +322,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       history.push();
       syncTracks();
       camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
-      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+      renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       previewTransformEditor.refresh();
       updatePreviewHintVisibility();
     }
@@ -340,7 +363,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         syncTracks();
         refreshAllTracks();
         camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
-        compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+        renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
         previewTransformEditor.refresh();
         updateTimelineActionBar();
       },
@@ -556,7 +579,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       });
       history.push();
       camera.setDuration(computeDisplayDurationSec(nextClips));
-      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+      renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       previewTransformEditor.refresh();
       updatePreviewHintVisibility();
     }
@@ -607,25 +630,93 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       return sortedTracks(ctx.doc.current.tracks).find((t) => t.id !== clip.trackId && !t.hidden && trackRowContainsGlobalY(t.id, globalY));
     }
 
-    /** moves a clip to whichever OTHER track the pointer ended up over at
-     *  the end of a move drag — wired as `onMoveOutOfRow` in `mountTrack()`
-     *  below. returns false (drag falls back to a normal same-track move)
-     *  if the pointer didn't land on a different track. */
-    function moveClipToTrackAtGlobalY(clip: Clip, span: Span, globalY: number): boolean {
-      const target = findCrossTrackTargetAtGlobalY(clip, globalY);
-      if (!target) return false;
-      ctx.doc.change((d) => {
-        const c = d.clips.find((x) => x.id === clip.id);
-        if (!c) return;
-        c.trackId = target.id;
-        c.start = span.start;
+    // the pan/zoom-affected world container that hosts every widget frame
+    // — walked up lazily (bin-drag.ts's own `getWorld()` pattern: this
+    // widget's own root `container` sits at
+    // `container → frame.contentContainer → frame.root → world`, so 3
+    // parent hops up from `container` reaches it) since animaniac isn't an
+    // overlay-mounted widget and so never gets `ctx.world` wired in (see
+    // `widget-types.ts`'s own doc comment on that field).
+    let worldRef: Container | null = null;
+    function getWorld(): Container {
+      if (!worldRef) {
+        let current: Container = container;
+        for (let i = 0; i < 3 && current.parent; i++) current = current.parent;
+        worldRef = current;
+      }
+      return worldRef;
+    }
+
+    /** drags a clip off the entire animaniac widget (not just onto a
+     *  different track row within it) onto the bare canvas — restores it
+     *  as a standalone widget (see `clip-restore.ts`'s own best-effort
+     *  mapping) at the drop point, then removes the clip. returns false
+     *  (drag falls back to a normal same-track move) if there's no
+     *  store/registry to create a widget with. */
+    function dragClipOutToCanvas(clip: Clip, globalX: number, globalY: number): boolean {
+      if (!store || !registry) return false;
+      const restored = restoreWidgetFromClip(clip);
+      const factory = registry.get(restored.type);
+      const width = restored.width ?? factory?.metadata.defaultWidth ?? 200;
+      const height = restored.height ?? factory?.metadata.defaultHeight ?? 150;
+      const world = getWorld();
+      const worldPos = world.toLocal({ x: globalX, y: globalY });
+      const zIndex = 1 + Math.max(0, ...store.allWidgets().map((w) => w.zIndex || 0));
+      store.addWidget({
+        id: crypto.randomUUID(),
+        type: restored.type,
+        x: worldPos.x - width / 2,
+        y: worldPos.y - height / 2,
+        width,
+        height,
+        zIndex,
+        props: restored.props,
+        collapsed: false,
+        docId: null,
+        parentId: null,
       });
+      ctx.doc.change((d) => {
+        const idx = d.clips.findIndex((c) => c.id === clip.id);
+        if (idx !== -1) d.clips.splice(idx, 1);
+      });
+      if (selectedClipId === clip.id) setSelectedClipId(null);
       history.push();
       refreshAllTracks();
       camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
-      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+      renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       previewTransformEditor.refresh();
+      updatePreviewHintVisibility();
       return true;
+    }
+
+    /** moves a clip to whichever OTHER track the pointer ended up over at
+     *  the end of a move drag, or — if the pointer ended up outside the
+     *  whole widget's own screen bounds — drags it out onto the bare
+     *  canvas as a restored standalone widget. wired as `onMoveOutOfRow`
+     *  in `mountTrack()` below. returns false (drag falls back to a
+     *  normal same-track move) if neither applies (e.g. dropped in the
+     *  gap between rows, still inside the widget). */
+    function moveClipToTrackAtGlobalY(clip: Clip, span: Span, globalY: number, globalX: number): boolean {
+      const target = findCrossTrackTargetAtGlobalY(clip, globalY);
+      if (target) {
+        ctx.doc.change((d) => {
+          const c = d.clips.find((x) => x.id === clip.id);
+          if (!c) return;
+          c.trackId = target.id;
+          c.start = span.start;
+        });
+        history.push();
+        refreshAllTracks();
+        camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
+        renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+        previewTransformEditor.refresh();
+        return true;
+      }
+      const bounds = container.getBounds();
+      if (globalX < bounds.x || globalX > bounds.x + bounds.width || globalY < bounds.y || globalY > bounds.y + bounds.height) {
+        return dragClipOutToCanvas(clip, globalX, globalY);
+      }
+      return false;
     }
 
     // live ghost segment shown in the TARGET row while a clip is being
@@ -637,17 +728,56 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     crossTrackGhost.eventMode = "none";
     crossTrackGhost.visible = false;
 
+    // live "drop here to send back to the canvas" indicator, shown once
+    // the pointer leaves the widget's own bounds during a clip move drag —
+    // mirrors bin-drag.ts's own floating drag ghost label.
+    const dragOutGhost = new Container();
+    dragOutGhost.eventMode = "none";
+    dragOutGhost.visible = false;
+    const dragOutGhostBg = new Graphics();
+    dragOutGhost.addChild(dragOutGhostBg);
+    const dragOutGhostText = new Text({ text: "", style: { fontSize: 10, fill: 0xe0e0e0 } });
+    dragOutGhostText.x = 6;
+    dragOutGhostText.y = 5;
+    dragOutGhost.addChild(dragOutGhostText);
+
+    function hideDragOutGhost(): void {
+      dragOutGhost.visible = false;
+      dragOutGhost.parent?.removeChild(dragOutGhost);
+    }
+
+    function showDragOutGhost(clip: Clip, globalX: number, globalY: number): void {
+      const world = getWorld();
+      const local = world.toLocal({ x: globalX, y: globalY });
+      const label = `\u2192 ${restoreWidgetFromClip(clip).type}`;
+      dragOutGhostText.text = label;
+      const w = dragOutGhostText.width + 12;
+      const h = dragOutGhostText.height + 10;
+      dragOutGhostBg.clear().roundRect(0, 0, w, h, 4).fill({ color: 0x2a2a2a, alpha: 0.85 }).stroke({ width: 1, color: 0xd946ef });
+      dragOutGhost.x = local.x + 12;
+      dragOutGhost.y = local.y + 12;
+      world.addChild(dragOutGhost);
+      dragOutGhost.visible = true;
+    }
+
     function hideCrossTrackGhost(): void {
       crossTrackGhost.visible = false;
       crossTrackGhost.parent?.removeChild(crossTrackGhost);
     }
 
-    function showCrossTrackGhost(clip: Clip, span: Span, globalY: number): void {
+    function showCrossTrackGhost(clip: Clip, span: Span, globalY: number, globalX: number): void {
       const target = findCrossTrackTargetAtGlobalY(clip, globalY);
       if (!target) {
         hideCrossTrackGhost();
+        const bounds = container.getBounds();
+        if (globalX < bounds.x || globalX > bounds.x + bounds.width || globalY < bounds.y || globalY > bounds.y + bounds.height) {
+          showDragOutGhost(clip, globalX, globalY);
+        } else {
+          hideDragOutGhost();
+        }
         return;
       }
+      hideDragOutGhost();
       let row;
       try {
         row = rowStack.getRow(target.id);
@@ -708,10 +838,13 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         // preview (and vice versa — see setSelectedClipId()'s own
         // reciprocal selectId() call).
         onSelectionChange: (clip: Clip | null) => setSelectedClipId(clip?.id ?? null),
-        onMoveOutOfRow: (clip: Clip, span: Span, globalY: number) => moveClipToTrackAtGlobalY(clip, span, globalY),
-        onDraggingMove: (clip: Clip, span: Span | null, globalY: number) => {
-          if (span) showCrossTrackGhost(clip, span, globalY);
-          else hideCrossTrackGhost();
+        onMoveOutOfRow: (clip: Clip, span: Span, globalY: number, globalX: number) => moveClipToTrackAtGlobalY(clip, span, globalY, globalX),
+        onDraggingMove: (clip: Clip, span: Span | null, globalY: number, globalX: number) => {
+          if (span) showCrossTrackGhost(clip, span, globalY, globalX);
+          else {
+            hideCrossTrackGhost();
+            hideDragOutGhost();
+          }
         },
         isClipRemote: (clip: Clip) => isClipRemote(clip),
         getClipProgress: (clip: Clip) => clipProgress(clip),
@@ -845,7 +978,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       onTick: (t, seeked) => {
         camera.setCurrentTime(t);
         if (prefs.autoScrollEnabled) camera.scrollTimeIntoView(t);
-        compositor.update(t, playbackClock.isPlaying(), seeked);
+        renderFrame(t, playbackClock.isPlaying(), seeked);
         audioPlayback.update(t, playbackClock.isPlaying(), seeked);
         previewTransformEditor.refresh();
         updatePlayhead();
@@ -983,7 +1116,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         history.push();
         refreshAllTracks();
         camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
-        compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+        renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
         previewTransformEditor.refresh();
         updatePreviewHintVisibility();
       },
@@ -1007,7 +1140,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     const offDocChange = ctx.doc.on("change", () => {
       syncTracks();
       camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
-      compositor.update(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+      renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       previewTransformEditor.refresh();
       updatePreviewHintVisibility();
       updateTimelineActionBar();
@@ -1072,6 +1205,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         playbackClock.destroy();
         audioPlayback.destroy();
         compositor.destroy();
+        domVideoOverlay.destroy();
         previewTransformEditor.destroy();
         for (const inst of trackInstances.values()) inst.destroy();
         trackInstances.clear();

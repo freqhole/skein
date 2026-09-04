@@ -58,6 +58,7 @@ import { dispatch, isTauriMode, TauriStreamNode } from "../p2p/tauri-transport";
 import { setPandocFormatsAvailable } from "../file-utils/upload";
 import { checkSayAvailable } from "../../widgets/tts/voices";
 import { freeUpLocalBlobCopy, checkBlobLocality } from "../file-utils/blob-locality";
+import { backfillMissingFileDurations } from "../file-utils/backfill-file-durations";
 import { pauseSnatchDownload } from "../file-utils/snatch";
 import {
   getBlobCanvasRefs,
@@ -1293,6 +1294,11 @@ class SkeinRouter {
       }
       canvas.toolbar.refreshRoleGating();
       (window as any).__skein = canvas;
+      // one-shot console helper: re-probes `duration` for any `file` widget
+      // (audio/video domain) on this canvas still stuck at 0 from before
+      // create-file-widget.ts started probing it upfront — see that
+      // module's own doc comment. run via `window.__skeinBackfillFileDurations()`.
+      (window as any).__skeinBackfillFileDurations = () => backfillMissingFileDurations(canvas.store);
 
       // when a canvas-card is deleted from the narthex, clean up the linked
       // canvas document and all its per-widget docs from IndexedDB.
@@ -2626,6 +2632,11 @@ class SkeinRouter {
         });
       }
       (window as any).__skein = canvas;
+      // one-shot console helper: re-probes `duration` for any `file` widget
+      // (audio/video domain) on this canvas still stuck at 0 from before
+      // create-file-widget.ts started probing it upfront — see that
+      // module's own doc comment. run via `window.__skeinBackfillFileDurations()`.
+      (window as any).__skeinBackfillFileDurations = () => backfillMissingFileDurations(canvas.store);
 
       // expose a share helper for quick testing via browser console
       (window as any).__skein.share = async () => {

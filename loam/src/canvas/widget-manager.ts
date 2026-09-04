@@ -1,5 +1,6 @@
 import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { Container, Graphics } from "pixi.js";
+import { log } from "@freqhole/reliquary/utils";
 import type { SkeinTheme } from "../theme/skein-theme";
 import type { KeyboardDriver } from "../widgets/keyboard-driver";
 import { createWidgetDoc } from "../widgets/widget-doc";
@@ -178,6 +179,7 @@ export class WidgetManager {
     this.keyboard = keyboard;
     this.canvasElement = canvasElement;
     this.stageBg = stageBg;
+    store.setDropTargetResolver((draggedId, worldX, worldY) => this.tryDropWidgetAt(draggedId, worldX, worldY));
   }
 
   /** register a hook that fires before a widget is permanently removed.
@@ -965,6 +967,34 @@ export class WidgetManager {
   }
 
   /**
+   * single-shot "is the drop point over some live widget's own drop
+   * target" check, usable OUTSIDE the normal widget-frame-drag tracking
+   * this class does for its own `checkDropTargetHover()`/
+   * `tryDropOnTarget()` above (which both require the dragged widget to
+   * already be a tracked, live top-level frame in `liveWidgets` — not
+   * true for e.g. a bin's own drag-out-of-bin gesture, where the item is
+   * still just bin-list data at the moment of release). registered onto
+   * `CanvasStore` at construction time (see `setDropTargetResolver()`) so
+   * a caller with only a `CanvasStore` reference (no direct access to
+   * this manager) can still reach it — see `bin-drag.ts`'s own use.
+   * returns true if some live widget's drop target claimed AND consumed
+   * the drop; false otherwise (including "nothing hit-tested"), so the
+   * caller can safely fall back to its own default drop behavior.
+   */
+  tryDropWidgetAt(draggedId: string, worldX: number, worldY: number): boolean {
+    for (const [targetId, live] of this.liveWidgets) {
+      if (targetId === draggedId) continue;
+      if (!live.ctrl.dropTarget) continue;
+      if (!live.ctrl.dropTarget.hitTest(worldX, worldY)) continue;
+      const consumed = live.ctrl.dropTarget.onDrop(draggedId, worldX, worldY);
+      log.debug("widget-manager.drop", "[DROP-DBG] tryDropWidgetAt (single-shot):", "draggedId:", draggedId, "targetType:", live.entry.type, "consumed:", consumed);
+      live.ctrl.dropTarget.onLeave();
+      if (consumed) return true;
+    }
+    return false;
+  }
+
+  /**
    * during a frame drag, check if the dragged widget is hovering over
    * any live widget that implements a drop target. if so, forward hover
    * events for visual feedback (e.g. bin slot highlighting).
@@ -998,6 +1028,9 @@ export class WidgetManager {
       prev?.ctrl.dropTarget?.onLeave();
     }
 
+    if (foundTarget !== this.activeDropTarget) {
+      log.debug("widget-manager.drop", "[DROP-DBG] active drop target changed:", this.activeDropTarget, "->", foundTarget, "draggedId:", draggedId, "draggedType:", draggedLive.entry.type);
+    }
     this.activeDropTarget = foundTarget;
   }
 
@@ -1006,12 +1039,25 @@ export class WidgetManager {
    * onto an active drop target. returns true if the drop was consumed.
    */
   private tryDropOnTarget(draggedId: string): boolean {
-    if (!this.activeDropTarget) return false;
+    if (!this.activeDropTarget) {
+      log.debug("widget-manager.drop", "[DROP-DBG] tryDropOnTarget: no active drop target at release", draggedId);
+      return false;
+    }
 
     const targetLive = this.liveWidgets.get(this.activeDropTarget);
     const draggedLive = this.liveWidgets.get(draggedId);
 
     if (!targetLive?.ctrl.dropTarget || !draggedLive) {
+      log.debug(
+        "widget-manager.drop",
+        "[DROP-DBG] tryDropOnTarget: missing target/dragged live widget",
+        "targetId:",
+        this.activeDropTarget,
+        "hasTargetDropTarget:",
+        !!targetLive?.ctrl.dropTarget,
+        "hasDraggedLive:",
+        !!draggedLive
+      );
       this.activeDropTarget = null;
       return false;
     }
@@ -1023,6 +1069,16 @@ export class WidgetManager {
     const wy = this.lastDragPointer?.y ?? draggedLive.frame.root.y + draggedLive.entry.height / 2;
 
     const consumed = targetLive.ctrl.dropTarget.onDrop(draggedId, wx, wy);
+    log.debug(
+      "widget-manager.drop",
+      "[DROP-DBG] tryDropOnTarget: onDrop",
+      "draggedType:",
+      draggedLive.entry.type,
+      "targetType:",
+      targetLive.entry.type,
+      "consumed:",
+      consumed
+    );
 
     // if the primary drop was consumed and there are other selected widgets
     // in the batch drag, drop those too (multi-drop into bin)

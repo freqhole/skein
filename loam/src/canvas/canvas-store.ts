@@ -50,6 +50,31 @@ export class CanvasStore {
     return this._localNodeId;
   }
 
+  /** registered by `WidgetManager` at construction time — lets a widget
+   *  whose own drag gesture doesn't go through `WidgetManager`'s normal
+   *  widget-frame-drag tracking (e.g. `bin-drag.ts`'s drag-a-card-out
+   *  gesture, where the dragged item is still just bin-list data, not a
+   *  live top-level widget frame, at the moment of release) still check
+   *  "is the drop point over some OTHER live widget's own drop target"
+   *  before falling back to its own default behavior (e.g. un-nesting as
+   *  a standalone widget). `null` outside a real canvas (headless/test
+   *  contexts never call `setDropTargetResolver`). */
+  private _dropTargetResolver: ((draggedId: string, worldX: number, worldY: number) => boolean) | null = null;
+
+  setDropTargetResolver(fn: (draggedId: string, worldX: number, worldY: number) => boolean): void {
+    this._dropTargetResolver = fn;
+  }
+
+  /** true if some live widget's own drop target claimed and consumed the
+   *  drop at `(worldX, worldY)` (world/stage coordinates, matching
+   *  `widget-frame.ts`'s own `onDragPointerMove` convention) — false if
+   *  nothing claimed it (including when no resolver is registered at all,
+   *  e.g. a headless/test context), so callers can safely fall back to
+   *  their own default drop behavior either way. */
+  tryDropOnWidgetAt(draggedId: string, worldX: number, worldY: number): boolean {
+    return this._dropTargetResolver?.(draggedId, worldX, worldY) ?? false;
+  }
+
   private constructor(repo: Repo, handle: DocHandle<CanvasDocument>) {
     this.repo = repo;
     this.handle = handle;

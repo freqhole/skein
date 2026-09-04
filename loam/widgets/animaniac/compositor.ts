@@ -41,6 +41,18 @@ export interface CompositorOptions {
   getTracks: () => Track[];
   getClips: () => Clip[];
   getPeers?: () => PeersMap | undefined;
+  /** when true, a video-segment clip's pool entry still exists (and is
+   *  still positioned/scaled/rotated every tick, and its own `<video>`
+   *  element still gets created/seeked/played by this module — see
+   *  `makeVideoEntry()`/`applyVideoTime()`) but never gets an actual pixi
+   *  `Sprite`/`VideoSource` attached — `dom-video-overlay.ts` renders the
+   *  clip's real pixels instead, as a plain HTML `<video>` element
+   *  positioned via `getVideoScreenRect()`/`getVideoElement()` below,
+   *  sidestepping a still-open upstream pixi.js video-texture bug
+   *  (https://github.com/pixijs/pixijs/issues/11001) entirely. a live
+   *  getter (not a one-time option) so the feature flag can be flipped at
+   *  runtime without remounting the widget. */
+  domVideoMode?: () => boolean;
 }
 
 export interface CompositorHandle {
@@ -66,6 +78,21 @@ export interface CompositorHandle {
    *  (nothing to edit — e.g. it isn't active at the current time). */
   beginLiveEdit(clipId: string): Container | null;
   endLiveEdit(clipId: string): void;
+  /** the underlying `<video>` element `makeVideoEntry()` already created/
+   *  manages for this clip (seeking/play-pause/mute all still handled
+   *  here regardless of `domVideoMode`) — used by `dom-video-overlay.ts`
+   *  to actually mount it into the DOM. null if the clip isn't currently
+   *  pooled, isn't a video-segment, or its element hasn't loaded yet. */
+  getVideoElement(clipId: string): HTMLVideoElement | null;
+  /** a video-segment clip's current on-screen rect, derived from the
+   *  EXACT same pixi transform `update()` itself applies to the (in
+   *  `domVideoMode`, invisible-placeholder) pool entry node — including a
+   *  live drag-transform in progress via `beginLiveEdit()`. in pixi GLOBAL
+   *  stage coordinates (NOT page/CSS pixels — the caller adds its own
+   *  canvas element's `getBoundingClientRect()` offset, mirroring
+   *  `dom-overlay.ts`'s own convention). null if the clip isn't currently
+   *  pooled, or its natural size isn't known yet. */
+  getVideoScreenRect(clipId: string): { centerX: number; centerY: number; width: number; height: number; rotationDeg: number; opacity: number } | null;
   destroy(): void;
 }
 
@@ -110,7 +137,7 @@ interface MouthPoolEntry {
 }
 
 export function createCompositor(options: CompositorOptions): CompositorHandle {
-  const { container, getPreviewSize, getTracks, getClips, getPeers } = options;
+  const { container, getPreviewSize, getTracks, getClips, getPeers, domVideoMode } = options;
 
   const pool = new Map<string, PoolEntry>();
   // clip ids currently under exclusive live-drag control by
@@ -311,6 +338,15 @@ export function createCompositor(options: CompositorOptions): CompositorHandle {
       // texture already has valid data + dimensions.
       const attachSprite = () => {
         if (node.destroyed || entry.node.children.length > 0) return;
+        // `dom-video-overlay.ts` renders this clip's actual pixels as a
+        // plain HTML `<video>` element instead (see `domVideoMode`'s own
+        // doc comment) — the pool entry above still exists (and still
+        // gets positioned/scaled/rotated every tick, and this element
+        // still gets seeked/played) purely so hit-testing/selection/the
+        // transform editor keep working identically; it just never
+        // becomes visible pixi content, sidestepping the WebGL bug below
+        // entirely.
+        if (domVideoMode?.()) return;
         // "WebGL: INVALID_VALUE: Offset overflows texture dimensions" is a
         // confirmed, still-open upstream pixi.js bug for video textures
         // (https://github.com/pixijs/pixijs/issues/11001) — pixi's own
@@ -522,6 +558,26 @@ export function createCompositor(options: CompositorOptions): CompositorHandle {
     },
     endLiveEdit(clipId: string) {
       liveEditIds.delete(clipId);
+    },
+    getVideoElement(clipId: string) {
+      return pool.get(clipId)?.video ?? null;
+    },
+    getVideoScreenRect(clipId: string) {
+      const entry = pool.get(clipId);
+      if (!entry || !entry.naturalSize) return null;
+      const halfW = entry.naturalSize.width / 2;
+      const halfH = entry.naturalSize.height / 2;
+      const center = entry.node.toGlobal({ x: 0, y: 0 });
+      const right = entry.node.toGlobal({ x: halfW, y: 0 });
+      const bottom = entry.node.toGlobal({ x: 0, y: halfH });
+      return {
+        centerX: center.x,
+        centerY: center.y,
+        width: 2 * Math.hypot(right.x - center.x, right.y - center.y),
+        height: 2 * Math.hypot(bottom.x - center.x, bottom.y - center.y),
+        rotationDeg: (entry.node.rotation * 180) / Math.PI,
+        opacity: entry.node.alpha,
+      };
     },
     destroy() {
       for (const entry of pool.values()) entry.destroy();

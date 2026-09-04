@@ -19,6 +19,7 @@
  */
 
 import { z } from "zod";
+import { strokeSchema } from "../doodle";
 
 // ---------------------------------------------------------------------------
 // keyframe / transform
@@ -92,6 +93,38 @@ export const doodleFrameClipSchema = clipBaseSchema.extend({
    *  (or the hub, after it finishes snatching) discover who else to ask
    *  for this blob without a live ephemeral ping. */
   snatchedBy: z.array(z.string()).default([]),
+  /** the FULL doodle source state (strokes + drawing settings) captured
+   *  alongside `imageUrl` above, purely so a later drag-out-to-canvas
+   *  restore (`clip-restore.ts`) can rebuild an actual re-editable doodle
+   *  widget instead of a flat image — never read by `compositor.ts` (it
+   *  still just renders `imageUrl` as a static sprite, matching every
+   *  other visual clip kind's own "self-contained snapshot" rendering).
+   *  optional/absent for a clip captured before this field existed, or
+   *  one whose source doodle was empty at capture time — restores as a
+   *  plain `image` widget then (see `clip-restore.ts`'s own fallback). */
+  sourceDoodle: z
+    .object({
+      strokes: z.array(strokeSchema).default([]),
+      bgColor: z.number().default(-1),
+      penColor: z.number().default(0xd946ef),
+      penWidth: z.number().default(3),
+      pressureScale: z.number().default(0),
+      brushShape: z.string().default("circle"),
+      angleScale: z.number().default(0),
+      chiselAngle: z.number().default(-45),
+      penOpacity: z.number().default(100),
+      borderColor: z.number().default(0xa855f7),
+      borderWidth: z.number().default(1),
+      /** the source doodle widget's own on-canvas size at capture time —
+       *  stroke points are in that widget's own local coordinates, so a
+       *  restore recreates it at this same size rather than the doodle
+       *  widget factory's generic default (which would shift/crop/scale
+       *  the strokes if it differed). falls back to that same generic
+       *  default (640x340) for a clip captured before this existed. */
+      width: z.number().default(640),
+      height: z.number().default(340),
+    })
+    .optional(),
 });
 export type DoodleFrameClip = z.infer<typeof doodleFrameClipSchema>;
 

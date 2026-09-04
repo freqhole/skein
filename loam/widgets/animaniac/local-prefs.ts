@@ -73,3 +73,26 @@ export function saveAutoSnatchEnabled(widgetId: string): void {
     // not fatal — just means this peer re-asks (auto-retries anyway) next session
   }
 }
+
+// -- DOM video overlay feature flag — global (not per-widget), since it's
+// an internal/dev-facing switch rather than a real user preference. when
+// on (the default), video-segment clips render as real HTML `<video>`
+// elements positioned over the preview area (see `dom-video-overlay.ts`)
+// instead of pixi's own `VideoSource`/`Texture.from(video)` GPU path,
+// which hits a still-open upstream pixi.js bug ("WebGL: INVALID_VALUE:
+// Offset overflows texture dimensions") and generally poor decode quality
+// on some platforms. flip to "0" (e.g. via devtools:
+// `localStorage.setItem("skein.animaniac.domVideoOverlay", "0")`) to fall
+// back to the old in-canvas pixi rendering without a rebuild — kept
+// around deliberately so that work can be picked back up later rather
+// than ripped out. ---------------------------------------------------------
+
+const DOM_VIDEO_OVERLAY_KEY = "skein.animaniac.domVideoOverlay";
+
+export function isDomVideoOverlayEnabled(): boolean {
+  try {
+    return localStorage.getItem(DOM_VIDEO_OVERLAY_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
