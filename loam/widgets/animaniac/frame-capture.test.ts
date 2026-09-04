@@ -61,7 +61,7 @@ describe("resolveCapturedClip", () => {
       id: "fixed-id",
       trackId: "v1",
       start: 2,
-      keyframes: [{ t: 0, x: 0, y: 0, scale: 1, rotation: 0, opacity: 1, easing: "linear" }],
+      keyframes: [{ t: 0, x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1, easing: "linear" }],
       imageUrl: "blob:abc123",
       durationSec: 1,
     });
@@ -157,7 +157,7 @@ describe("resolveCapturedClip", () => {
       videoBlake3: "vh1",
       sourceInSec: 0,
       sourceOutSec: 30,
-      muted: true,
+      muted: false,
     });
   });
 
@@ -182,7 +182,7 @@ describe("resolveCapturedClip", () => {
       0,
       newId
     );
-    expect(videoClip).toMatchObject({ kind: "video-segment", videoBlobId: "f2", sourceOutSec: 20, muted: true });
+    expect(videoClip).toMatchObject({ kind: "video-segment", videoBlobId: "f2", sourceOutSec: 20, muted: false });
   });
 
   it("file: returns null when duration hasn't been probed yet (0, or a pre-probe legacy widget)", async () => {

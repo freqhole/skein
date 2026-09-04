@@ -35,7 +35,8 @@ export const keyframeSchema = z.object({
   t: z.number().default(0),
   x: z.number().default(0),
   y: z.number().default(0),
-  scale: z.number().default(1),
+  scaleX: z.number().default(1),
+  scaleY: z.number().default(1),
   rotation: z.number().default(0),
   opacity: z.number().default(1),
   easing: easingSchema.default("linear"),
@@ -70,7 +71,7 @@ const clipBaseSchema = z.object({
   trackId: z.string(),
   /** placement on animaniac's own timeline, seconds. */
   start: z.number().default(0),
-  keyframes: z.array(keyframeSchema).default([{ t: 0, x: 0, y: 0, scale: 1, rotation: 0, opacity: 1, easing: "linear" }]),
+  keyframes: z.array(keyframeSchema).default([{ t: 0, x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1, easing: "linear" }]),
 });
 
 /** a captured doodle-widget snapshot (see `frame-capture.ts`) — an
@@ -170,10 +171,12 @@ export const videoSegmentClipSchema = clipBaseSchema.extend({
   videoMime: z.string().default(""),
   sourceInSec: z.number().default(0),
   sourceOutSec: z.number(),
-  /** whether the video's own embedded audio plays — default true (muted)
-   *  since audio is more often supplied by a separate voice/tts/audio-
-   *  segment clip; explicit opt-in avoids doubled/undesired source audio. */
-  muted: z.boolean().default(true),
+  /** whether the video's own embedded audio plays — default false (audio
+   *  audible) so a dropped-in video's soundtrack is present by default,
+   *  shown as a "shadow" segment on the first audio track (see
+   *  `tracks/shadow-clips.ts`); deleting that segment sets this to
+   *  `true` instead of removing the clip. */
+  muted: z.boolean().default(false),
 });
 export type VideoSegmentClip = z.infer<typeof videoSegmentClipSchema>;
 

@@ -8,7 +8,7 @@
  */
 
 import { Graphics, Text } from "pixi.js";
-import { createTrackItemInteraction, type TrackItemInteractionHandle } from "../../../src/widgets/timeline/track-item-interaction";
+import { createTrackItemInteraction, type Span, type TrackItemInteractionHandle } from "../../../src/widgets/timeline/track-item-interaction";
 import { drawTrackItemBody } from "../../../src/widgets/timeline/track-item-render";
 import type { TrackCameraView, TrackRowContainers } from "../../../src/widgets/timeline/timeline-types";
 import { clipTrackAdapter } from "../clip-track-adapter";
@@ -37,6 +37,19 @@ export interface AudioTrackOptions {
    *  every other track's clips untouched) — caller writes it to the doc. */
   onClipsChange: (next: Clip[]) => void;
   onSelectionChange?: (clip: Clip | null) => void;
+  /** lets a move drag reassign this clip to a DIFFERENT track (this row
+   *  doesn't know other rows exist) — return `true` if handled, matching
+   *  `track-item-interaction.ts`'s own `onMoveOutOfRow` contract. */
+  onMoveOutOfRow?: (clip: Clip, span: Span, globalY: number) => boolean;
+  /** live ghost-preview hook, fired continuously during a move drag — see
+   *  `track-item-interaction.ts`'s own `onDraggingMove` contract. */
+  onDraggingMove?: (clip: Clip, span: Span | null, globalY: number) => void;
+  /** whether this clip's own backing media blob isn't local yet — drawn
+   *  as a dashed border instead of solid (see snatch-controller.ts). */
+  isClipRemote?: (clip: Clip) => boolean;
+  /** 0..1 live download progress for a remote clip — fills the dashed
+   *  border's faint background up to full opacity as it downloads. */
+  getClipProgress?: (clip: Clip) => number;
 }
 
 export type AudioTrackHandle = Pick<TrackItemInteractionHandle<Clip>, "refresh" | "getSelected" | "deleteSelected" | "clearSelection" | "selectId" | "destroy">;
@@ -56,7 +69,7 @@ function mergeTrackClips(all: Clip[], trackId: string, next: Clip[]): Clip[] {
 }
 
 export function createAudioTrack(options: AudioTrackOptions): AudioTrackHandle {
-  const { trackId, row, camera, getDuration, isSnapEnabled, getSnapTimes, getClips, onClipsChange, onSelectionChange } = options;
+  const { trackId, row, camera, getDuration, isSnapEnabled, getSnapTimes, getClips, onClipsChange, onSelectionChange, onMoveOutOfRow, onDraggingMove, isClipRemote, getClipProgress } = options;
 
   // one small label Text per pooled item Graphics — `drawItem()` is called
   // fresh on every redraw with no persistent per-item state of its own, so
@@ -75,10 +88,28 @@ export function createAudioTrack(options: AudioTrackOptions): AudioTrackHandle {
     getSnapTimes,
     allowCreateByDrag: false,
     clampEndToDuration: false,
+    // items on a single strip must not overlap each other — overlap is
+    // still allowed ACROSS separate tracks (add another track for that);
+    // see docs/animaniac-media-segments-plan.md's decision D update.
+    preventOverlap: true,
+    onMoveOutOfRow,
+    onDraggingMove,
     onChange: (nextForTrack) => onClipsChange(mergeTrackClips(getClips(), trackId, nextForTrack)),
     onSelectionChange,
     drawItem(g: Graphics, item: Clip, state) {
-      drawTrackItemBody(g, state.left, state.right, AUDIO_TRACK_ROW_HEIGHT, AUDIO_CLIP_COLORS, state.hovered, state.hoveredRegion, state.selected);
+      drawTrackItemBody(
+        g,
+        state.left,
+        state.right,
+        AUDIO_TRACK_ROW_HEIGHT,
+        AUDIO_CLIP_COLORS,
+        state.hovered,
+        state.hoveredRegion,
+        state.selected,
+        undefined,
+        isClipRemote?.(item),
+        getClipProgress?.(item)
+      );
       // a waveform-style thumbnail (mirroring stfu's audio-clips-track.ts)
       // is a follow-up, not needed for the audio-mixtape MVP itself — a
       // plain text label is enough to tell clips apart for now.

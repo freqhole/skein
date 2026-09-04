@@ -150,7 +150,15 @@ export function createTimelineCamera(options: TimelineCameraOptions): TimelineCa
       setZoom(zoomIndex - 1);
     },
     zoomFit() {
-      setZoom(0);
+      // "fit" means "the multiplier that shows exactly the full duration"
+      // (1x), NOT necessarily the first entry in `zoomLevels` — a caller
+      // may prepend sub-1 multipliers (e.g. animaniac's own zoom-out-past-
+      // fit levels, for extra empty timeline space to shuffle clips
+      // around in) without breaking this button's meaning. falls back to
+      // index 0 if `zoomLevels` has no exact 1 entry (shouldn't happen in
+      // practice — every caller's own array includes it).
+      const fitIndex = zoomLevels.indexOf(1);
+      setZoom(fitIndex >= 0 ? fitIndex : 0);
     },
     panBy(deltaTime: number) {
       viewStartTime = clampViewStart(viewStartTime + deltaTime);

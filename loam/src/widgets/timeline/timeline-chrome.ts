@@ -15,13 +15,13 @@ export const TOOLBAR_HEIGHT = 24;
 export const TOOLBAR_GROUP_GAP = 24;
 export const TOOLBAR_TRAILING_SLOT_WIDTH = 24;
 
-type ButtonContainer = Container & { buttonWidth: number; redraw?: () => void };
+type ButtonContainer = Container & { buttonWidth: number; redraw?: () => void; setLabel?: (label: string) => void };
 
 export function makeTextButton(label: string, onClick: () => void): ButtonContainer {
   const c = new Container() as ButtonContainer;
   const bg = new Graphics();
   const text = new Text({ text: label, style: { fontFamily: FONT_FAMILY, fontSize: 11, fill: 0xe2e2e2 }, resolution: TEXT_RESOLUTION });
-  const w = Math.max(22, text.width + 12);
+  let w = Math.max(22, text.width + 12);
   const h = TOOLBAR_HEIGHT;
   const draw = (color: number) => {
     bg.clear();
@@ -41,6 +41,13 @@ export function makeTextButton(label: string, onClick: () => void): ButtonContai
     onClick();
   });
   c.buttonWidth = w;
+  c.setLabel = (nextLabel: string) => {
+    text.text = nextLabel;
+    w = Math.max(22, text.width + 12);
+    text.x = w / 2;
+    c.buttonWidth = w;
+    draw(0x2a2a3e);
+  };
   return c;
 }
 
@@ -128,6 +135,12 @@ export interface TimelineToolbarHandle {
   /** fixed anchor at the row's right edge, `TOOLBAR_TRAILING_SLOT_WIDTH`
    *  px wide — external controls add their own child here. */
   trailingSlot: Container;
+  /** the autoscroll button's own current left edge (x) — external trailing
+   *  controls (e.g. animaniac's own +audio/+video buttons) should anchor
+   *  themselves to the left of THIS, not `trailingSlot.x` directly, or
+   *  they land on top of the autoscroll button (which already occupies
+   *  the space immediately left of `trailingSlot`). */
+  getTrailingGroupLeftX(): number;
   setZoomLevelLabel(text: string): void;
   refreshUndoRedo(): void;
   layout(contentWidth: number): void;
@@ -191,6 +204,9 @@ export function createTimelineToolbar(options: TimelineToolbarOptions): Timeline
       layoutButtons();
     },
     trailingSlot,
+    getTrailingGroupLeftX() {
+      return autoscrollBtn.x;
+    },
     setZoomLevelLabel(text: string) {
       zoomLevelText.text = text;
     },

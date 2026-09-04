@@ -25,8 +25,15 @@
  */
 
 import { renderDoodleSnapshot, type DoodleStroke } from "../doodle";
-import { saveImageDataUrlAsBlobRef } from "../../src/file-utils/image-prop-blob";
-import type { Clip } from "./types";
+import { saveImageDataUrlAsBlobRef, resolveImagePropUrl } from "../../src/file-utils/image-prop-blob";
+import { getMediaPlaybackUrl } from "../../src/media";
+import type { Clip, Keyframe } from "./types";
+
+/** doodle captures render much bigger than the doodle widget's own
+ *  128px bin-card thumbnail default, since animaniac's preview (and its
+ *  resize-handle scaling) can stretch a doodle-frame clip well past its
+ *  source widget's on-canvas size. */
+const DOODLE_CAPTURE_SIZE = 512;
 
 /** widget types this module knows how to turn into a clip — anything else
  *  is silently not droppable (matches `audio-clip-drag.ts`'s own
@@ -56,7 +63,62 @@ function enumVal<T extends string>(v: unknown, allowed: readonly T[], fallback: 
   return typeof v === "string" && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
 }
 
-const baseKeyframes = [{ t: 0, x: 0, y: 0, scale: 1, rotation: 0, opacity: 1, easing: "linear" as const }];
+const baseKeyframes = [{ t: 0, x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1, easing: "linear" as const }];
+
+/** a freshly-captured clip's initial keyframe list, scaled (uniformly, so
+ *  aspect ratio is preserved) to fit within the composition preview's own
+ *  width/height — "contain" semantics, never upscaling a naturally-
+ *  smaller source. `naturalSize`/`previewSize` missing or invalid (e.g. a
+ *  probe below failed) falls back to the old always-1 behavior. */
+function containKeyframes(
+  naturalSize: { width: number; height: number } | null,
+  previewSize: { width: number; height: number } | undefined
+): Keyframe[] {
+  const scale =
+    naturalSize && previewSize && naturalSize.width > 0 && naturalSize.height > 0
+      ? Math.min(1, previewSize.width / naturalSize.width, previewSize.height / naturalSize.height)
+      : 1;
+  return [{ t: 0, x: 0, y: 0, scaleX: scale, scaleY: scale, rotation: 0, opacity: 1, easing: "linear" }];
+}
+
+/** decodes an already-stored image ref (a `blob:<id>` ref or external url,
+ *  same shape `imageClipSchema`/`doodleFrameClipSchema` store) just far
+ *  enough to read its natural pixel dimensions — used once at capture time
+ *  to compute `containKeyframes()`'s initial scale. best-effort: returns
+ *  null on any failure (blob not local yet, decode error, etc.) rather
+ *  than blocking the capture. */
+async function probeImageNaturalSize(imageUrl: string): Promise<{ width: number; height: number } | null> {
+  try {
+    const resolvedUrl = await resolveImagePropUrl(imageUrl);
+    if (!resolvedUrl) return null;
+    const blob = await fetch(resolvedUrl).then((r) => r.blob());
+    const bitmap = await createImageBitmap(blob);
+    const size = { width: bitmap.width, height: bitmap.height };
+    bitmap.close();
+    return size;
+  } catch {
+    return null;
+  }
+}
+
+/** same idea as `probeImageNaturalSize()` but for a video-segment's own
+ *  blob — loads just enough of a detached `<video>` element to read its
+ *  `videoWidth`/`videoHeight` from `loadedmetadata`, then lets it go. */
+async function probeVideoNaturalSize(blobId: string, mime: string, blake3: string): Promise<{ width: number; height: number } | null> {
+  try {
+    const url = await getMediaPlaybackUrl(blobId, { category: "video", mime: mime || undefined, blake3: blake3 || undefined });
+    if (!url) return null;
+    return await new Promise((resolve) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.addEventListener("loadedmetadata", () => resolve({ width: video.videoWidth, height: video.videoHeight }), { once: true });
+      video.addEventListener("error", () => resolve(null), { once: true });
+      video.src = url;
+    });
+  } catch {
+    return null;
+  }
+}
 
 /**
  * given a source widget's own `type` + schema-parsed doc state, decide
@@ -74,14 +136,19 @@ export async function resolveCapturedClip(
   sourceState: Record<string, unknown>,
   trackId: string,
   start: number,
-  newId: () => string = () => crypto.randomUUID()
+  newId: () => string = () => crypto.randomUUID(),
+  previewSize?: { width: number; height: number }
 ): Promise<Clip | null> {
   switch (sourceType) {
     case "doodle": {
       const strokes = Array.isArray(sourceState.strokes) ? (sourceState.strokes as DoodleStroke[]) : [];
       if (strokes.length === 0) return null;
       const bgColor = num(sourceState.bgColor, -1);
-      const dataUrl = await renderDoodleSnapshot(strokes, bgColor);
+      // renderDoodleSnapshot()'s own default (128px, for a small bin-card
+      // thumbnail) looks blurry once stretched up in animaniac's preview
+      // (especially with the resize handles' own scaleX/scaleY) — capture
+      // at a much larger fixed size here instead.
+      const dataUrl = await renderDoodleSnapshot(strokes, bgColor, DOODLE_CAPTURE_SIZE);
       if (!dataUrl) return null;
       const imageUrl = await saveImageDataUrlAsBlobRef(dataUrl);
       return {
@@ -89,7 +156,7 @@ export async function resolveCapturedClip(
         id: newId(),
         trackId,
         start,
-        keyframes: baseKeyframes,
+        keyframes: containKeyframes({ width: DOODLE_CAPTURE_SIZE, height: DOODLE_CAPTURE_SIZE }, previewSize),
         imageUrl,
         durationSec: 1,
       };
@@ -103,7 +170,7 @@ export async function resolveCapturedClip(
         id: newId(),
         trackId,
         start,
-        keyframes: baseKeyframes,
+        keyframes: containKeyframes(await probeImageNaturalSize(url), previewSize),
         imageUrl: url,
         durationSec: 1,
       };
@@ -220,13 +287,13 @@ export async function resolveCapturedClip(
           id: newId(),
           trackId,
           start,
-          keyframes: baseKeyframes,
+          keyframes: containKeyframes(await probeVideoNaturalSize(blobId, str(sourceState.mime), str(sourceState.blake3)), previewSize),
           videoBlobId: blobId,
           videoBlake3: str(sourceState.blake3),
           videoMime: str(sourceState.mime),
           sourceInSec: 0,
           sourceOutSec: duration,
-          muted: true,
+          muted: false,
         };
       }
       return null;
@@ -244,13 +311,13 @@ export async function resolveCapturedClip(
         id: newId(),
         trackId,
         start,
-        keyframes: baseKeyframes,
+        keyframes: containKeyframes(await probeVideoNaturalSize(videoBlobId, str(sourceState.videoMime), str(sourceState.videoBlake3)), previewSize),
         videoBlobId,
         videoBlake3: str(sourceState.videoBlake3),
         videoMime: str(sourceState.videoMime),
         sourceInSec: 0,
         sourceOutSec: videoDurationSec,
-        muted: true,
+        muted: false,
       };
     }
 

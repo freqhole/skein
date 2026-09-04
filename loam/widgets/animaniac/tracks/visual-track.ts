@@ -6,7 +6,7 @@
  */
 
 import { Graphics, Text } from "pixi.js";
-import { createTrackItemInteraction, type TrackItemInteractionHandle } from "../../../src/widgets/timeline/track-item-interaction";
+import { createTrackItemInteraction, type Span, type TrackItemInteractionHandle } from "../../../src/widgets/timeline/track-item-interaction";
 import { drawTrackItemBody } from "../../../src/widgets/timeline/track-item-render";
 import type { TrackCameraView, TrackRowContainers } from "../../../src/widgets/timeline/timeline-types";
 import { clipTrackAdapter } from "../clip-track-adapter";
@@ -41,6 +41,19 @@ export interface VisualTrackOptions {
   getClips: () => Clip[];
   onClipsChange: (next: Clip[]) => void;
   onSelectionChange?: (clip: Clip | null) => void;
+  /** lets a move drag reassign this clip to a DIFFERENT track (this row
+   *  doesn't know other rows exist) — return `true` if handled, matching
+   *  `track-item-interaction.ts`'s own `onMoveOutOfRow` contract. */
+  onMoveOutOfRow?: (clip: Clip, span: Span, globalY: number) => boolean;
+  /** live ghost-preview hook, fired continuously during a move drag — see
+   *  `track-item-interaction.ts`'s own `onDraggingMove` contract. */
+  onDraggingMove?: (clip: Clip, span: Span | null, globalY: number) => void;
+  /** whether this clip's own backing media blob isn't local yet — drawn
+   *  as a dashed border instead of solid (see snatch-controller.ts). */
+  isClipRemote?: (clip: Clip) => boolean;
+  /** 0..1 live download progress for a remote clip — fills the dashed
+   *  border's faint background up to full opacity as it downloads. */
+  getClipProgress?: (clip: Clip) => number;
 }
 
 export type VisualTrackHandle = Pick<TrackItemInteractionHandle<Clip>, "refresh" | "getSelected" | "deleteSelected" | "clearSelection" | "selectId" | "destroy">;
@@ -57,7 +70,7 @@ function mergeTrackClips(all: Clip[], trackId: string, next: Clip[]): Clip[] {
 }
 
 export function createVisualTrack(options: VisualTrackOptions): VisualTrackHandle {
-  const { trackId, row, camera, getDuration, isSnapEnabled, getSnapTimes, getClips, onClipsChange, onSelectionChange } = options;
+  const { trackId, row, camera, getDuration, isSnapEnabled, getSnapTimes, getClips, onClipsChange, onSelectionChange, onMoveOutOfRow, onDraggingMove, isClipRemote, getClipProgress } = options;
 
   const labels = new WeakMap<Graphics, Text>();
 
@@ -71,10 +84,28 @@ export function createVisualTrack(options: VisualTrackOptions): VisualTrackHandl
     getSnapTimes,
     allowCreateByDrag: false,
     clampEndToDuration: false,
+    // items on a single strip must not overlap each other — overlap is
+    // still allowed ACROSS separate tracks (add another track for that);
+    // see docs/animaniac-media-segments-plan.md's decision D update.
+    preventOverlap: true,
+    onMoveOutOfRow,
+    onDraggingMove,
     onChange: (nextForTrack) => onClipsChange(mergeTrackClips(getClips(), trackId, nextForTrack)),
     onSelectionChange,
     drawItem(g: Graphics, item: Clip, state) {
-      drawTrackItemBody(g, state.left, state.right, VISUAL_TRACK_ROW_HEIGHT, VISUAL_CLIP_COLORS, state.hovered, state.hoveredRegion, state.selected);
+      drawTrackItemBody(
+        g,
+        state.left,
+        state.right,
+        VISUAL_TRACK_ROW_HEIGHT,
+        VISUAL_CLIP_COLORS,
+        state.hovered,
+        state.hoveredRegion,
+        state.selected,
+        undefined,
+        isClipRemote?.(item),
+        getClipProgress?.(item)
+      );
       // real thumbnails (a rendered doodle/image/video frame preview) are a
       // follow-up — a plain kind/text label is enough to distinguish clips
       // for the phase-1 static-cel-playback goal.

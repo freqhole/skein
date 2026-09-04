@@ -354,8 +354,17 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
             newSprite = new Sprite(texture);
           }
         } else {
-          // remote URL — fetch, then either build a GifSource (gif) or load
-          // via Assets (everything else)
+          // remote URL — fetch, then either build a GifSource (gif) or
+          // decode via createImageBitmap (everything else). NOTE: this
+          // used to call `Assets.load<Texture>(blobUrl)` on a freshly
+          // created object URL — pixi's own `loadTextures.js` parser
+          // `test()` only matches a `data:` URL or a recognized file
+          // extension, never a bare `blob:<uuid>`, so it silently picked
+          // the wrong parser and resolved to a texture with no usable
+          // `.source` (no thrown error — a blank/invisible sprite, or a
+          // logged "don't know how to parse it" warning). decode directly
+          // from the already-fetched `blob` instead, bypassing pixi's
+          // resolver entirely — no object URL needed at all for this path.
           const response = await fetch(resolvedUrl, { signal: abort.signal });
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
@@ -368,10 +377,14 @@ export const imageWidget: WidgetFactory<typeof imageSchema> = {
             newSprite = new GifSprite({ source: newGifSource, autoPlay: false });
             assetKey = resolvedUrl;
           } else {
-            const blobUrl = URL.createObjectURL(blob);
-            texture = await Assets.load<Texture>(blobUrl);
+            texture = Texture.from(await createImageBitmap(blob));
+            if (!texture.source?.style) throw new Error("decoded texture has no usable GPU source");
             newSprite = new Sprite(texture);
-            assetKey = blobUrl;
+            // no Assets registration and no object URL was created for
+            // this path — nothing for destroySprite()'s cleanup to unload/
+            // revoke (its `assetKey.startsWith("blob:")` check is `false`
+            // for an empty string, so it correctly skips).
+            assetKey = "";
           }
         }
 

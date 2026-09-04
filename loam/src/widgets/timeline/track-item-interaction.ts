@@ -40,7 +40,7 @@ const DEFAULT_MIN_DURATION_SEC = 0.05;
 const DEFAULT_DRAG_THRESHOLD_PX = 3;
 const DEFAULT_MARGIN_Y = 3;
 
-interface Span {
+export interface Span {
   start: number;
   end: number;
 }
@@ -55,6 +55,10 @@ interface DragState<T> {
   startSpan: Span;
   pending: Span;
   moved: boolean;
+  /** last seen `e.global.y` during the drag — used by `onMoveOutOfRow` at
+   *  release time to let the caller check whether the pointer ended up
+   *  over a different track's row (cross-track move). */
+  lastGlobalY: number;
 }
 
 export interface TrackItemInteractionOptions<T> {
@@ -85,6 +89,34 @@ export interface TrackItemInteractionOptions<T> {
    *  where dragging a clip past the current end should be allowed to grow
    *  the timeline, not get clamped to it). */
   clampEndToDuration?: boolean;
+  /** when true, a move/resize drag can't push an item into an overlap
+   *  with another item already on this same track — the drag is clamped
+   *  to whatever gap the item originally occupied (its neighbors' own
+   *  edges), rather than allowed to slide over/through them. off by
+   *  default (matches every existing consumer's prior behavior, where
+   *  overlap was always allowed). doesn't affect items that already
+   *  overlap from before this was enabled or from an external drop —
+   *  only constrains NEW interactive edits. */
+  preventOverlap?: boolean;
+  /** called once, at the end of a completed "move" drag, with the item's
+   *  own resolved [start,end] and the pointer's final global Y — lets the
+   *  caller move an item to a DIFFERENT track (this engine only ever
+   *  operates on one track's own items, it has no idea other rows exist).
+   *  return `true` if the caller claimed/handled the move itself (e.g. it
+   *  reassigned the item to another track's own clips array) — this
+   *  engine then skips its own normal same-track commit entirely (the
+   *  item no longer belongs in `getItems()`'s array). return `false`/
+   *  `undefined` for a normal same-track move. */
+  onMoveOutOfRow?: (item: T, span: Span, globalY: number) => boolean;
+  /** called continuously (on every pointer-move) during an in-progress
+   *  "move" drag, with the item's own live (unsnapped-to-a-track) [start,
+   *  end] and the pointer's current global Y — lets the caller draw/
+   *  update a live ghost-segment preview in whichever row the pointer is
+   *  currently over, mirroring `drop-controller.ts`'s drag-IN placeholder
+   *  but for an item already on one of this widget's own tracks. called
+   *  with `null` once the drag ends (committed or not) so the caller can
+   *  hide its ghost — always paired, never left dangling. */
+  onDraggingMove?: (item: T, span: Span | null, globalY: number) => void;
   /** builds a brand-new item from a create-drag's clamped [start,end] —
    *  required when `allowCreateByDrag` is true (also used to render the
    *  live create-preview, so the preview looks exactly like the real
@@ -135,6 +167,9 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
     marginY = DEFAULT_MARGIN_Y,
     allowCreateByDrag = false,
     clampEndToDuration = true,
+    preventOverlap = false,
+    onMoveOutOfRow,
+    onDraggingMove,
     createItem,
     onChange,
     onSelectionChange,
@@ -189,6 +224,30 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
     });
     (getSnapTimes?.() ?? []).forEach(consider);
     return best;
+  }
+
+  /** nearest OTHER item's `end` that is <= `beforeTime` (0 if none) — the
+   *  left wall a `preventOverlap` drag can't cross. */
+  function overlapLeftBound(excludeId: string | null, beforeTime: number): number {
+    let bound = 0;
+    getItems().forEach((item, i) => {
+      if (idOf(item, i) === excludeId) return;
+      const end = adapter.getSpan(item).end;
+      if (end <= beforeTime && end > bound) bound = end;
+    });
+    return bound;
+  }
+
+  /** nearest OTHER item's `start` that is >= `afterTime` (+Infinity if
+   *  none) — the right wall a `preventOverlap` drag can't cross. */
+  function overlapRightBound(excludeId: string | null, afterTime: number): number {
+    let bound = Infinity;
+    getItems().forEach((item, i) => {
+      if (idOf(item, i) === excludeId) return;
+      const start = adapter.getSpan(item).start;
+      if (start >= afterTime && start < bound) bound = start;
+    });
+    return bound;
   }
 
   function clampSpan(span: Span): Span {
@@ -288,6 +347,7 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
         startSpan: span,
         pending: span,
         moved: false,
+        lastGlobalY: e.global.y,
       };
       return;
     }
@@ -302,11 +362,13 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
       startSpan: { start: t, end: t },
       pending: { start: t, end: t },
       moved: false,
+      lastGlobalY: e.global.y,
     };
   }
 
   function onGlobalPointerMove(e: FederatedPointerEvent): void {
     if (!drag) return;
+    drag.lastGlobalY = e.global.y;
     const deltaPx = e.global.x - drag.startClientX;
     if (!drag.moved && Math.abs(deltaPx) <= dragThresholdPx) return;
     drag.moved = true;
@@ -340,10 +402,25 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
         if (snappedEnd !== movedEnd) start = snappedEnd - dur;
       }
       drag.pending = { start, end: start + dur };
+      // NOTE: no preventOverlap clamp here (unlike resize below) — a move
+      // is allowed to slide freely past a neighbor while dragging (so the
+      // user can actually REORDER two items, not just get stuck against
+      // whichever neighbor it started next to); the final resting spot is
+      // resolved into a real non-overlapping gap at commit time in
+      // `onGlobalPointerUp()`, anchored to wherever it was actually
+      // dropped rather than where the drag began.
     } else if (drag.mode === "resize-left") {
       drag.pending = { start: snapTime(drag.startSpan.start + deltaSec, drag.id), end: drag.startSpan.end };
+      if (preventOverlap) {
+        const leftBound = overlapLeftBound(drag.id, drag.startSpan.start);
+        drag.pending = { start: Math.max(leftBound, drag.pending.start), end: drag.pending.end };
+      }
     } else {
       drag.pending = { start: drag.startSpan.start, end: snapTime(drag.startSpan.end + deltaSec, drag.id) };
+      if (preventOverlap) {
+        const rightBound = overlapRightBound(drag.id, drag.startSpan.end);
+        drag.pending = { start: drag.pending.start, end: Math.min(rightBound, drag.pending.end) };
+      }
     }
 
     const g = drag.id ? rows.get(drag.id) : undefined;
@@ -353,12 +430,17 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
       const region = drag.mode === "resize-left" || drag.mode === "resize-right" ? drag.mode : null;
       drawItem(g, adapter.withSpan(drag.item, clamped), { left, right, hovered: true, hoveredRegion: region, selected: true });
     }
+
+    if (drag.mode === "move" && drag.item) {
+      onDraggingMove?.(drag.item, drag.pending, drag.lastGlobalY);
+    }
   }
 
   function onGlobalPointerUp(): void {
     if (!drag) return;
     const finished = drag;
     drag = null;
+    if (finished.mode === "move" && finished.item) onDraggingMove?.(finished.item, null, finished.lastGlobalY);
 
     if (!finished.moved) {
       refresh();
@@ -385,7 +467,28 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
       refresh();
       return;
     }
-    items[idx] = adapter.withSpan(items[idx], clampSpan(finished.pending));
+    let resolvedPending = finished.pending;
+    if (finished.mode === "move" && preventOverlap) {
+      // resolve into whichever gap the item actually landed in (anchored to
+      // the DROP position, not drag-start) — this is what lets a move drag
+      // actually reorder past a neighbor instead of being walled in at its
+      // original position.
+      const dur = resolvedPending.end - resolvedPending.start;
+      const leftBound = overlapLeftBound(finished.id, resolvedPending.start);
+      const rightBound = overlapRightBound(finished.id, resolvedPending.end);
+      const clampedStart = Math.max(leftBound, Math.min(rightBound - dur, resolvedPending.start));
+      resolvedPending = { start: clampedStart, end: clampedStart + dur };
+    }
+    if (finished.mode === "move" && onMoveOutOfRow?.(items[idx], clampSpan(resolvedPending), finished.lastGlobalY)) {
+      // caller moved this item to a different track's own clips array —
+      // this row's own commit must NOT also write it back (it no longer
+      // belongs in `getItems()`'s array at all); just clear selection/
+      // redraw whatever's left.
+      setSelectedId(null);
+      refresh();
+      return;
+    }
+    items[idx] = adapter.withSpan(items[idx], clampSpan(resolvedPending));
     commit(items);
   }
 

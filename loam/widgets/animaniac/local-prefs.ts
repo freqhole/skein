@@ -47,3 +47,29 @@ export function saveLocalAnimaniacPrefs(widgetId: string, prefs: LocalAnimaniacP
     // private browsing / storage disabled / quota exceeded — not fatal, prefs just don't persist
   }
 }
+
+// -- "snatch" auto-sync opt-in — separate key from the JSON blob above so
+// it can be set/read independently of the rest of prefs (mirrors
+// stfu/local-prefs.ts's own identical mechanism: once a peer has done one
+// successful manual/automatic snatch for this widget, every later blob it
+// needs is fetched silently from then on, no repeat manual action). ------
+
+function autoSnatchEnabledKey(widgetId: string): string {
+  return `skein.animaniac.${widgetId}.autoSnatchEnabled`;
+}
+
+export function loadAutoSnatchEnabled(widgetId: string): boolean {
+  try {
+    return localStorage.getItem(autoSnatchEnabledKey(widgetId)) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function saveAutoSnatchEnabled(widgetId: string): void {
+  try {
+    localStorage.setItem(autoSnatchEnabledKey(widgetId), "1");
+  } catch {
+    // not fatal — just means this peer re-asks (auto-retries anyway) next session
+  }
+}

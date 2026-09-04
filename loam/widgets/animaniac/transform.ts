@@ -14,12 +14,13 @@ import type { EasingId, Keyframe } from "./types";
 export interface Transform {
   x: number;
   y: number;
-  scale: number;
+  scaleX: number;
+  scaleY: number;
   rotation: number;
   opacity: number;
 }
 
-export const IDENTITY_TRANSFORM: Transform = { x: 0, y: 0, scale: 1, rotation: 0, opacity: 1 };
+export const IDENTITY_TRANSFORM: Transform = { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1 };
 
 /** standard easing curves — `easing` on keyframe A (the segment's start)
  *  governs the whole A->B interpolation, matching the common animation-
@@ -50,7 +51,7 @@ function lerpAngle(a: number, b: number, p: number): number {
 }
 
 function toTransform(kf: Keyframe): Transform {
-  return { x: kf.x, y: kf.y, scale: kf.scale, rotation: kf.rotation, opacity: kf.opacity };
+  return { x: kf.x, y: kf.y, scaleX: kf.scaleX, scaleY: kf.scaleY, rotation: kf.rotation, opacity: kf.opacity };
 }
 
 /** resolves a clip's transform at `t` seconds after the clip's own start
@@ -82,7 +83,8 @@ export function resolveTransformAt(keyframes: readonly Keyframe[], t: number): T
   return {
     x: lerp(a.x, b.x, p),
     y: lerp(a.y, b.y, p),
-    scale: lerp(a.scale, b.scale, p),
+    scaleX: lerp(a.scaleX, b.scaleX, p),
+    scaleY: lerp(a.scaleY, b.scaleY, p),
     rotation: lerpAngle(a.rotation, b.rotation, p),
     opacity: lerp(a.opacity, b.opacity, p),
   };

@@ -20,6 +20,13 @@ export interface PlaybackClockOptions {
    *  `currentTime` on every regular tick glitches audibly, especially on
    *  tauri's wkwebview). */
   onTick: (t: number, seeked: boolean) => void;
+  /** fires whenever `isPlaying()` actually changes — both for an explicit
+   *  `play()`/`pause()`/`togglePlay()` call AND for the clock stopping
+   *  itself at the end of the timeline (see `tick()`'s own end-of-duration
+   *  branch) — `onTick` alone doesn't cover that last case, so a play/pause
+   *  button driven only by the click handler's own optimistic toggle goes
+   *  stale once playback runs off the end on its own. */
+  onPlayingChange?: (playing: boolean) => void;
   /** injectable for testing — defaults to the real `requestAnimationFrame`. */
   raf?: (cb: (now: number) => void) => number;
   cancelRaf?: (handle: number) => void;
@@ -46,7 +53,7 @@ const defaultCancelRaf = (handle: number): void => {
 const defaultNow = (): number => (typeof performance !== "undefined" ? performance.now() : Date.now());
 
 export function createPlaybackClock(options: PlaybackClockOptions): PlaybackClock {
-  const { getDurationSec, onTick, raf = defaultRaf, cancelRaf = defaultCancelRaf, now = defaultNow } = options;
+  const { getDurationSec, onTick, onPlayingChange, raf = defaultRaf, cancelRaf = defaultCancelRaf, now = defaultNow } = options;
 
   let playing = false;
   let currentTime = 0;
@@ -73,6 +80,7 @@ export function createPlaybackClock(options: PlaybackClockOptions): PlaybackCloc
       currentTime = duration;
       playing = false;
       onTick(currentTime, isResume);
+      onPlayingChange?.(false);
       return; // stop at the end rather than looping — matches every other
       // media-driven timeline in this codebase (no auto-loop behavior)
     }
@@ -87,6 +95,7 @@ export function createPlaybackClock(options: PlaybackClockOptions): PlaybackCloc
       playing = true;
       lastFrameAt = null;
       rafHandle = raf(tick);
+      onPlayingChange?.(true);
     },
     pause() {
       if (!playing) return;
@@ -94,6 +103,7 @@ export function createPlaybackClock(options: PlaybackClockOptions): PlaybackCloc
       if (rafHandle !== null) cancelRaf(rafHandle);
       rafHandle = null;
       onTick(currentTime, false);
+      onPlayingChange?.(false);
     },
     togglePlay() {
       if (playing) this.pause();

@@ -31,23 +31,34 @@ import type { DropTargetHandler } from "../../src/widgets/widget-types";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import type { TrackCameraView, TrackRowContainers } from "../../src/widgets/timeline/timeline-types";
 import { expectedTrackKindFor, isCapturableWidgetType, resolveCapturedClip } from "./frame-capture";
-import { computeTimelineDuration } from "./track-model";
+import { clipBlobInfo, makeAnimaniacNewBlobMessage } from "./snatch-controller";
+import { computeTimelineDuration, clipDurationSec, clipEnd, clipsForTrack } from "./track-model";
 import { AUDIO_CLIP_KINDS, VISUAL_CLIP_KINDS, type AnimaniacState, type Clip, type Track } from "./types";
 
 export interface AnimaniacDropControllerOptions {
   store: CanvasStore | null;
   repo: Repo | null;
   registry: WidgetRegistry | null;
+  /** this animaniac widget's own id — tags the ephemeral "new blob" ping
+   *  broadcast after a capture so every peer's own animaniac instance can
+   *  tell whether the ping is about ITS doc (several animaniac widgets can
+   *  be on the same canvas at once). */
+  widgetId: string;
   /** animaniac's own root container — the drop zone + hover-border host. */
   container: Container;
   findWorldContainer: () => Container;
   getSize: () => { width: number; height: number };
+  /** the composition/preview area's own size (narrower than `getSize()`'s
+   *  whole-widget size, which also includes the toolbar/timeline rows) —
+   *  a freshly-captured clip's initial scale is contain-fit to this so it
+   *  doesn't render far larger than the composition it's dropped into. */
+  getPreviewSize: () => { width: number; height: number };
   getTracks: () => Track[];
   getClips: () => Clip[];
   /** the track's own row containers, once mounted — null if that track's
    *  row isn't currently laid out (e.g. hidden). */
-  getTrackRow: (trackId: string) => TrackRowContainers | null;
-  camera: Pick<TrackCameraView, "screenXToTime">;
+  getTrackRow: (trackId: string) => (TrackRowContainers & { height: number }) | null;
+  camera: Pick<TrackCameraView, "screenXToTime" | "timeToScreenX">;
   changeDoc: (fn: (d: AnimaniacState) => void) => void;
   /** called after a clip is actually added — refresh the relevant track +
    *  push an undo-history entry. */
@@ -65,7 +76,7 @@ function clipKindMatchesTrack(kind: string, trackKind: Track["kind"]): boolean {
 }
 
 export function createAnimaniacDropController(options: AnimaniacDropControllerOptions): AnimaniacDropControllerHandle {
-  const { store, repo, registry, container, findWorldContainer, getSize, getTracks, getClips, getTrackRow, camera, changeDoc, onClipAdded } =
+  const { store, repo, registry, widgetId, container, findWorldContainer, getSize, getPreviewSize, getTracks, getClips, getTrackRow, camera, changeDoc, onClipAdded } =
     options;
 
   const hoverBorder = new Graphics();
@@ -81,6 +92,64 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
       .clear()
       .rect(1, 1, Math.max(0, width - 2), Math.max(0, height - 2))
       .stroke({ width: 3, color: 0xd946ef });
+  }
+
+  // live placeholder segment shown WHILE hovering (before the drop is
+  // actually committed) — reveals which track + timeline position the
+  // widget would land at, reusing the same target-resolution logic
+  // `onDrop()` itself uses (so the preview never lies about where the
+  // real drop will go). one shared Graphics, reparented to whichever
+  // row is the current best-guess target (only one row can be targeted
+  // at a time).
+  const placeholderGhost = new Graphics();
+  placeholderGhost.eventMode = "none";
+  placeholderGhost.visible = false;
+
+  function hidePlaceholder(): void {
+    placeholderGhost.visible = false;
+    placeholderGhost.parent?.removeChild(placeholderGhost);
+  }
+
+  function showPlaceholder(worldX: number, worldY: number, draggedWidgetId: string): void {
+    if (!store || !isInsideWidget(worldX, worldY)) {
+      hidePlaceholder();
+      return;
+    }
+    const entry = store.getWidget(draggedWidgetId);
+    if (!entry || !isCapturableWidgetType(entry.type)) {
+      hidePlaceholder();
+      return;
+    }
+    const sourceState = readDroppedState(entry.type, entry.docId);
+    if (!sourceState) {
+      hidePlaceholder();
+      return;
+    }
+    const expectedKind = expectedTrackKindFor(entry.type, sourceState);
+    if (!expectedKind) {
+      hidePlaceholder();
+      return;
+    }
+    const target = resolveDropTarget(worldX, worldY, expectedKind);
+    const row = target ? getTrackRow(target.trackId) : null;
+    if (!target || !row) {
+      hidePlaceholder();
+      return;
+    }
+    // rough duration estimate for the placeholder's own width — mirrors
+    // `resolveCapturedClip()`'s own defaults without doing the real
+    // (possibly async, e.g. a doodle snapshot) capture itself.
+    const rawDuration = sourceState.duration ?? sourceState.videoDurationSec;
+    const duration = typeof rawDuration === "number" && rawDuration > 0 ? rawDuration : 1;
+    const x1 = camera.timeToScreenX(target.start);
+    const x2 = camera.timeToScreenX(target.start + duration);
+    row.contentLayer.addChild(placeholderGhost);
+    placeholderGhost.visible = true;
+    placeholderGhost
+      .clear()
+      .roundRect(Math.min(x1, x2), 2, Math.max(2, Math.abs(x2 - x1)), Math.max(0, row.height - 4), 3)
+      .fill({ color: 0xd946ef, alpha: 0.25 })
+      .stroke({ width: 1.5, color: 0xd946ef });
   }
 
   /** converts a world-space point into animaniac's own root container's
@@ -150,16 +219,19 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
           return isInsideWidget(worldX, worldY);
         },
 
-        onHover(): void {
+        onHover(worldX: number, worldY: number, draggedWidgetId: string): void {
           setHovering(true);
+          showPlaceholder(worldX, worldY, draggedWidgetId);
         },
 
         onLeave(): void {
           setHovering(false);
+          hidePlaceholder();
         },
 
         onDrop(draggedWidgetId: string, worldX: number, worldY: number): boolean {
           setHovering(false);
+          hidePlaceholder();
           const entry = store.getWidget(draggedWidgetId);
           if (!entry || !isCapturableWidgetType(entry.type)) {
             log.debug("animaniac.drop", "onDrop: dragged widget not capturable", { entryType: entry?.type });
@@ -183,7 +255,7 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
           const { trackId, start } = target;
           log.debug("animaniac.drop", "onDrop: hit", { entryType: entry.type, trackId, start });
 
-          void resolveCapturedClip(entry.type, sourceState, trackId, start).then((clip) => {
+          void resolveCapturedClip(entry.type, sourceState, trackId, start, undefined, getPreviewSize()).then((clip) => {
             if (!clip) {
               log.debug("animaniac.drop", "onDrop: resolveCapturedClip returned null (nothing capturable yet)", { entryType: entry.type });
               return;
@@ -192,12 +264,32 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
               log.debug("animaniac.drop", "onDrop: clip kind doesn't match track kind, rejected", { clipKind: clip.kind, expectedKind });
               return;
             }
+            // items on a single track must not overlap each other (see
+            // track-item-interaction.ts's own preventOverlap option, used
+            // by tracks/audio-track.ts + tracks/visual-track.ts for
+            // interactive drags) — a drop lands wherever the pointer was
+            // released with no collision check of its own, so re-place it
+            // at the end of THIS track's own clips if it would overlap one
+            // already there.
+            const existingOnTrack = clipsForTrack(getClips(), trackId);
+            const newEnd = clip.start + clipDurationSec(clip);
+            const overlaps = existingOnTrack.some((other) => clip.start < clipEnd(other) && newEnd > other.start);
+            if (overlaps) {
+              const trackEnd = existingOnTrack.reduce((max, other) => Math.max(max, clipEnd(other)), 0);
+              clip.start = trackEnd;
+            }
             changeDoc((d) => {
               d.clips.push(clip);
             });
             onClipAdded();
             store.removeWidget(draggedWidgetId);
             log.debug("animaniac.drop", "onDrop: captured", { clipKind: clip.kind, trackId });
+            // notify every OTHER peer currently on this canvas right away
+            // (ephemeral, not a doc change — see snatch-controller.ts's own
+            // doc comment) so their own snatch-all cue lights up without
+            // waiting on a full clip-list rescan.
+            const blob = clipBlobInfo(clip);
+            if (blob) store.broadcastEphemeral(new TextEncoder().encode(JSON.stringify(makeAnimaniacNewBlobMessage(widgetId, blob))));
           });
 
           return true;
@@ -209,6 +301,7 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
     dropTarget,
     destroy() {
       hoverBorder.destroy();
+      placeholderGhost.destroy();
     },
   };
 }

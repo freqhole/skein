@@ -85,9 +85,11 @@ describe("createPlaybackClock", () => {
 
   it("stops (does not loop) once it reaches the duration", () => {
     const sched = makeFakeScheduler();
+    const playingChanges: boolean[] = [];
     const clock = createPlaybackClock({
       getDurationSec: () => 1,
       onTick: () => {},
+      onPlayingChange: (p) => playingChanges.push(p),
       raf: sched.raf,
       cancelRaf: sched.cancelRaf,
       now: sched.now,
@@ -98,6 +100,29 @@ describe("createPlaybackClock", () => {
     expect(clock.getCurrentTime()).toBe(1);
     expect(clock.isPlaying()).toBe(false);
     expect(sched.hasPending()).toBe(false);
+    // onPlayingChange must fire (true) on play() and (false) once the
+    // clock auto-stops itself at the end — not just on an explicit
+    // pause()/togglePlay() call, so a UI button relying only on the click
+    // handler's own optimistic toggle doesn't go stale.
+    expect(playingChanges).toEqual([true, false]);
+  });
+
+  it("onPlayingChange fires on explicit play()/pause() too", () => {
+    const sched = makeFakeScheduler();
+    const playingChanges: boolean[] = [];
+    const clock = createPlaybackClock({
+      getDurationSec: () => 10,
+      onTick: () => {},
+      onPlayingChange: (p) => playingChanges.push(p),
+      raf: sched.raf,
+      cancelRaf: sched.cancelRaf,
+      now: sched.now,
+    });
+    clock.play();
+    clock.play(); // already playing — no duplicate notification
+    clock.pause();
+    clock.pause(); // already paused — no duplicate notification
+    expect(playingChanges).toEqual([true, false]);
   });
 
   it("togglePlay() flips between play and pause", () => {

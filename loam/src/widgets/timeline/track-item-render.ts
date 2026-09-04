@@ -80,10 +80,50 @@ export function drawDeleteGlyph(g: Graphics, right: number, marginY: number): vo
     .stroke({ width: 1.3, color: 0xe08080 });
 }
 
+/** draws a dashed rounded-rect border — straight edges are dashed, corner
+ *  arcs stay solid (small enough that dashing them looks noisy). used for
+ *  a track item whose backing media blob isn't local yet (see
+ *  `drawTrackItemBody()`'s own `remote` option) — mirrors narthex/canvas-
+ *  card.ts's own dashed-border helper, kept separate since track items
+ *  draw into a per-item pooled Graphics rather than one shared card. */
+function drawDashedRoundRect(g: Graphics, x: number, y: number, w: number, h: number, r: number, color: number, lineWidth: number): void {
+  const dashLen = 5;
+  const gapLen = 3;
+  const dashLine = (x1: number, y1: number, x2: number, y2: number) => {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len === 0) return;
+    const nx = dx / len;
+    const ny = dy / len;
+    let pos = 0;
+    while (pos < len) {
+      const end = Math.min(pos + dashLen, len);
+      g.moveTo(x1 + nx * pos, y1 + ny * pos);
+      g.lineTo(x1 + nx * end, y1 + ny * end);
+      pos = end + gapLen;
+    }
+  };
+  dashLine(x + r, y, x + w - r, y); // top
+  dashLine(x + w, y + r, x + w, y + h - r); // right
+  dashLine(x + w - r, y + h, x + r, y + h); // bottom
+  dashLine(x, y + h - r, x, y + r); // left
+  g.moveTo(x + w - r, y).arc(x + w - r, y + r, r, -Math.PI / 2, 0);
+  g.moveTo(x + w, y + h - r).arc(x + w - r, y + h - r, r, 0, Math.PI / 2);
+  g.moveTo(x + r, y + h).arc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
+  g.moveTo(x, y + r).arc(x + r, y + r, r, Math.PI, Math.PI * 1.5);
+  g.stroke({ color, width: lineWidth });
+}
+
 /** draws one item's body (rounded rect + stroke), the hovered resize edge
  *  highlight, a selection outline, and (while hovered) the delete glyph —
  *  the exact visual language `cut-segments-track.ts` established. caller
- *  supplies colors + row height; everything else is shared. */
+ *  supplies colors + row height; everything else is shared. `remote`
+ *  draws the border dashed instead of solid — the "backing media blob
+ *  isn't local yet" cue (see snatch-controller.ts's own locality tracking).
+ *  `progress` (0..1, only meaningful while `remote`) fills the background
+ *  from a faint tint up to full opacity left-to-right as the blob
+ *  downloads. */
 export function drawTrackItemBody(
   g: Graphics,
   left: number,
@@ -93,14 +133,29 @@ export function drawTrackItemBody(
   hovered: boolean,
   hoveredRegion: TrackHitRegion | null,
   selected: boolean,
-  marginY = DEFAULT_MARGIN_Y
+  marginY = DEFAULT_MARGIN_Y,
+  remote = false,
+  progress = 0
 ): void {
   g.clear();
   const width = Math.max(1, right - left);
   const top = marginY;
   const height = rowHeight - marginY * 2;
-  g.roundRect(left, top, width, height, 3).fill({ color: hovered ? colors.fillHover : colors.fill });
-  g.roundRect(left, top, width, height, 3).stroke({ color: colors.stroke, width: 1 });
+  const baseFill = hovered ? colors.fillHover : colors.fill;
+  if (remote) {
+    g.roundRect(left, top, width, height, 3).fill({ color: baseFill, alpha: 0.18 });
+    const filledWidth = Math.max(0, Math.min(width, width * progress));
+    if (filledWidth > 0) {
+      g.roundRect(left, top, filledWidth, height, 3).fill({ color: baseFill });
+    }
+  } else {
+    g.roundRect(left, top, width, height, 3).fill({ color: baseFill });
+  }
+  if (remote) {
+    drawDashedRoundRect(g, left, top, width, height, 3, colors.stroke, 1);
+  } else {
+    g.roundRect(left, top, width, height, 3).stroke({ color: colors.stroke, width: 1 });
+  }
   if (hovered && hoveredRegion === "resize-left") {
     g.rect(left, top, 3, height).fill({ color: 0xffffff });
   } else if (hovered && hoveredRegion === "resize-right") {

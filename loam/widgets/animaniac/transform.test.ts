@@ -3,7 +3,7 @@ import { IDENTITY_TRANSFORM, resolveTransformAt } from "./transform";
 import type { Keyframe } from "./types";
 
 function kf(overrides: Partial<Keyframe>): Keyframe {
-  return { t: 0, x: 0, y: 0, scale: 1, rotation: 0, opacity: 1, easing: "linear", ...overrides };
+  return { t: 0, x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1, easing: "linear", ...overrides };
 }
 
 describe("resolveTransformAt", () => {
@@ -12,9 +12,9 @@ describe("resolveTransformAt", () => {
   });
 
   it("returns the single keyframe's values regardless of t (phase-1 static clip)", () => {
-    const k = kf({ t: 3, x: 10, y: 20, scale: 2, rotation: 1, opacity: 0.5 });
-    expect(resolveTransformAt([k], 0)).toEqual({ x: 10, y: 20, scale: 2, rotation: 1, opacity: 0.5 });
-    expect(resolveTransformAt([k], 999)).toEqual({ x: 10, y: 20, scale: 2, rotation: 1, opacity: 0.5 });
+    const k = kf({ t: 3, x: 10, y: 20, scaleX: 2, scaleY: 2, rotation: 1, opacity: 0.5 });
+    expect(resolveTransformAt([k], 0)).toEqual({ x: 10, y: 20, scaleX: 2, scaleY: 2, rotation: 1, opacity: 0.5 });
+    expect(resolveTransformAt([k], 999)).toEqual({ x: 10, y: 20, scaleX: 2, scaleY: 2, rotation: 1, opacity: 0.5 });
   });
 
   it("clamps to the first/last keyframe before/after the covered range", () => {
@@ -25,12 +25,13 @@ describe("resolveTransformAt", () => {
   });
 
   it("linearly interpolates x/y/scale/opacity at the midpoint", () => {
-    const a = kf({ t: 0, x: 0, y: 0, scale: 1, opacity: 0, easing: "linear" });
-    const b = kf({ t: 10, x: 100, y: 50, scale: 3, opacity: 1 });
+    const a = kf({ t: 0, x: 0, y: 0, scaleX: 1, scaleY: 1, opacity: 0, easing: "linear" });
+    const b = kf({ t: 10, x: 100, y: 50, scaleX: 3, scaleY: 3, opacity: 1 });
     const mid = resolveTransformAt([a, b], 5);
     expect(mid.x).toBe(50);
     expect(mid.y).toBe(25);
-    expect(mid.scale).toBe(2);
+    expect(mid.scaleX).toBe(2);
+    expect(mid.scaleY).toBe(2);
     expect(mid.opacity).toBe(0.5);
   });
 
