@@ -16,6 +16,8 @@ import type { CanvasStore } from "../canvas/canvas-store";
 import { fileSchema } from "../../widgets/file";
 import { classifyDomain } from "../storage/blob-store";
 import { getThumbnailDataUrl } from "./thumbnail-utils";
+import { probeMediaDuration } from "./media-duration";
+import { getMediaPlaybackUrl } from "../media/media-urls";
 import { addBlobCanvasRef } from "./blob-canvas-refs";
 import { getLocalNodeId } from "./file-shared";
 
@@ -61,6 +63,24 @@ export async function createFileWidgetFromBlob(
     log.debug(TAG, `thumbnail fetch failed for ${blobId.slice(0, 12)}... (non-fatal):`, err);
   }
 
+  // probe duration upfront (mirrors file.ts's own post-upload
+  // probeAndWriteDuration()) so an audio/video widget created this way is
+  // immediately capturable as an animaniac segment (frame-capture.ts
+  // requires `duration > 0`) instead of needing to wait for file.ts's own
+  // mount-time probe to catch up first — matters when the caller (e.g.
+  // filez-widget.ts's drag-out-to-canvas) may try dropping the brand-new
+  // widget straight onto another widget's drop target right after this
+  // resolves.
+  let duration = 0;
+  if (domain === "audio" || domain === "video") {
+    try {
+      const url = await getMediaPlaybackUrl(blobId, { category: domain, mime: mime || undefined, blake3: blake3 || undefined });
+      if (url) duration = await probeMediaDuration(url, domain);
+    } catch (err) {
+      log.debug(TAG, `duration probe failed for ${blobId.slice(0, 12)}... (non-fatal):`, err);
+    }
+  }
+
   const widgetDoc = fileSchema.parse({
     blobId,
     domain,
@@ -69,6 +89,7 @@ export async function createFileWidgetFromBlob(
     size,
     blake3: blake3 ?? "",
     thumbnailDataUrl,
+    duration,
     snatchedBy: localNodeId ? [localNodeId] : [],
   });
 

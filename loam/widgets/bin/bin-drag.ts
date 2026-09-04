@@ -249,8 +249,15 @@ export function createBinDragHandler(ctx: BinDragContext): CardInteractionCallba
           const handled = ctx.onInternalMove?.(dragCandidate.widgetId, worldPos.x, worldPos.y);
 
           if (!handled) {
-            // drop was outside the bin — un-nest and move to world
-            ctx.store.unparentAndMove(dragCandidate.widgetId, worldPos.x, worldPos.y);
+            // drop was outside the bin — try another live widget's own drop
+            // target first (e.g. dragging an audio/voice-recording card
+            // straight out of a bin onto animaniac's timeline), falling
+            // back to un-nesting as a standalone frame only if nothing
+            // claimed it. either way the item leaves the bin's own list.
+            const droppedOnWidget = ctx.store.tryDropOnWidgetAt(dragCandidate.widgetId, worldPos.x, worldPos.y);
+            if (!droppedOnWidget) {
+              ctx.store.unparentAndMove(dragCandidate.widgetId, worldPos.x, worldPos.y);
+            }
             ctx.onDragOut(dragCandidate.widgetId);
           }
         }

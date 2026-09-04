@@ -179,6 +179,7 @@ export class WidgetManager {
     this.keyboard = keyboard;
     this.canvasElement = canvasElement;
     this.stageBg = stageBg;
+    store.setDropTargetResolver((draggedId, worldX, worldY) => this.tryDropWidgetAt(draggedId, worldX, worldY));
   }
 
   /** register a hook that fires before a widget is permanently removed.
@@ -963,6 +964,34 @@ export class WidgetManager {
 
     this.batchDrag = null;
     this.updateStageBounds();
+  }
+
+  /**
+   * single-shot "is the drop point over some live widget's own drop
+   * target" check, usable OUTSIDE the normal widget-frame-drag tracking
+   * this class does for its own `checkDropTargetHover()`/
+   * `tryDropOnTarget()` above (which both require the dragged widget to
+   * already be a tracked, live top-level frame in `liveWidgets` — not
+   * true for e.g. a bin's own drag-out-of-bin gesture, where the item is
+   * still just bin-list data at the moment of release). registered onto
+   * `CanvasStore` at construction time (see `setDropTargetResolver()`) so
+   * a caller with only a `CanvasStore` reference (no direct access to
+   * this manager) can still reach it — see `bin-drag.ts`'s own use.
+   * returns true if some live widget's drop target claimed AND consumed
+   * the drop; false otherwise (including "nothing hit-tested"), so the
+   * caller can safely fall back to its own default drop behavior.
+   */
+  tryDropWidgetAt(draggedId: string, worldX: number, worldY: number): boolean {
+    for (const [targetId, live] of this.liveWidgets) {
+      if (targetId === draggedId) continue;
+      if (!live.ctrl.dropTarget) continue;
+      if (!live.ctrl.dropTarget.hitTest(worldX, worldY)) continue;
+      const consumed = live.ctrl.dropTarget.onDrop(draggedId, worldX, worldY);
+      log.debug("widget-manager.drop", "[DROP-DBG] tryDropWidgetAt (single-shot):", "draggedId:", draggedId, "targetType:", live.entry.type, "consumed:", consumed);
+      live.ctrl.dropTarget.onLeave();
+      if (consumed) return true;
+    }
+    return false;
   }
 
   /**
