@@ -29,6 +29,8 @@ export class InputRouter {
   private onDeleteWidget: ((id: string) => void) | null = null;
   private bringForwardHandler: ((id: string) => void) | null = null;
   private sendBackwardHandler: ((id: string) => void) | null = null;
+  private onCopyWidgets: ((ids: ReadonlySet<string>) => void) | null = null;
+  private onPasteWidgets: (() => void) | null = null;
   private keydownHandler: ((e: KeyboardEvent) => void) | null = null;
 
   constructor() {
@@ -65,6 +67,16 @@ export class InputRouter {
   /** set the callback for sending a widget backward in z-order */
   setSendBackwardHandler(handler: (id: string) => void): void {
     this.sendBackwardHandler = handler;
+  }
+
+  /** set the callback for Cmd/Ctrl+C — receives the current multi-selection. */
+  setCopyHandler(handler: (ids: ReadonlySet<string>) => void): void {
+    this.onCopyWidgets = handler;
+  }
+
+  /** set the callback for Cmd/Ctrl+V — paste has no selection dependency. */
+  setPasteHandler(handler: () => void): void {
+    this.onPasteWidgets = handler;
   }
 
   /**
@@ -166,6 +178,22 @@ export class InputRouter {
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
 
+    const modKey = e.metaKey || e.ctrlKey;
+
+    // Cmd/Ctrl+C copies the current selection
+    if (modKey && e.key.toLowerCase() === "c" && this._selectedWidgetIds.size > 0 && this.onCopyWidgets) {
+      this.onCopyWidgets(this._selectedWidgetIds);
+      e.preventDefault();
+      return;
+    }
+
+    // Cmd/Ctrl+V pastes the clipboard onto whichever canvas is open
+    if (modKey && e.key.toLowerCase() === "v" && this.onPasteWidgets) {
+      this.onPasteWidgets();
+      e.preventDefault();
+      return;
+    }
+
     // delete/backspace removes selected widget(s)
     if ((e.key === "Delete" || e.key === "Backspace") && this._selectedWidgetIds.size > 0) {
       // snapshot ids before clearing selection
@@ -226,5 +254,7 @@ export class InputRouter {
     this.onDeleteWidget = null;
     this.bringForwardHandler = null;
     this.sendBackwardHandler = null;
+    this.onCopyWidgets = null;
+    this.onPasteWidgets = null;
   }
 }

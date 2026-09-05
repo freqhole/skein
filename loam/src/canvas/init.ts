@@ -18,6 +18,7 @@ import type { BreadcrumbItem } from "./toolbar";
 import { Toolbar } from "./toolbar";
 import { Viewport } from "./viewport";
 import { WidgetManager } from "./widget-manager";
+import { attachClipboardCursor } from "./clipboard-cursor";
 
 export interface InitCanvasOptions {
   /** DOM element to mount the PixiJS canvas into */
@@ -503,18 +504,17 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
   const canvasEl = app.canvas as HTMLCanvasElement;
   let onPointerMove: ((e: PointerEvent) => void) | null = null;
 
+  // the clipboard-follower badge is independent of presence/narthex — it
+  // should show anywhere there's copied skein widget content, including
+  // the narthex itself, and survives navigating between canvases since
+  // this whole function re-runs (and re-attaches) on every canvas open.
+  const clipboardCursorCleanup = attachClipboardCursor(app, canvasEl, theme);
+
   if (!options.isNarthex) {
     // we listen on the canvas element for pointermove and convert screen
     // coordinates to world coordinates so remote peers see the correct position.
     onPointerMove = (e: PointerEvent) => {
-      const rect = canvasEl.getBoundingClientRect();
-      const screenX = e.clientX - rect.left;
-      const screenY = e.clientY - rect.top;
-
-      // convert screen coordinates to world coordinates (accounting for pan/zoom)
-      const worldX = (screenX - world.x) / (world.scale.x || 1);
-      const worldY = (screenY - world.y) / (world.scale.y || 1);
-
+      const { x: worldX, y: worldY } = viewport.screenToWorld(e.clientX, e.clientY);
       presenceManager.broadcastCursor(worldX, worldY);
     };
     canvasEl.addEventListener("pointermove", onPointerMove);
@@ -569,6 +569,7 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
       if (onPointerMove) {
         canvasEl.removeEventListener("pointermove", onPointerMove);
       }
+      clipboardCursorCleanup();
       if (syncOverlay) {
         syncOverlay.destroy({ children: true });
         syncOverlay = null;

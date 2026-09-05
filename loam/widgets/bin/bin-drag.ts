@@ -3,6 +3,7 @@ import { Container, Graphics, Text, type FederatedPointerEvent } from "pixi.js";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import type { CardInteractionCallbacks } from "./bin-types";
+import { deepUnwrapAmStrings } from "../../src/canvas/automerge-values";
 
 const FONT_FAMILY = "'Atkinson Hyperlegible Next', sans-serif";
 const TEXT_RESOLUTION = typeof window !== "undefined" ? Math.max(window.devicePixelRatio, 2) : 2;
@@ -115,7 +116,11 @@ export function createBinDragHandler(ctx: BinDragContext): CardInteractionCallba
       const rawDoc = handle.doc();
       if (!rawDoc) return factory.metadata.name;
 
-      const state = factory.schema ? factory.schema.parse(rawDoc) : rawDoc;
+      // a widget doc the tumulus hub has ever written into directly (e.g.
+      // stamping `snatchedBy` after a p2p snatch) round-trips string
+      // fields as `ImmutableString` instances, which zod's `z.string()`
+      // rejects outright — see `automerge-values.ts`'s own doc comment.
+      const state = factory.schema ? factory.schema.parse(deepUnwrapAmStrings(rawDoc)) : rawDoc;
       return factory.getCompactInfo(state).label;
     } catch {
       return factory?.metadata.name ?? entry.type;

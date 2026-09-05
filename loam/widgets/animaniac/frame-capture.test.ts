@@ -140,8 +140,13 @@ describe("resolveCapturedClip", () => {
     });
   });
 
-  it("audio-recording: returns null with zero duration (nothing recorded)", async () => {
-    expect(await resolveCapturedClip("audio-recording", { blobId: "b3", duration: 0 }, "a1", 0, newId)).toBeNull();
+  it("audio-recording: returns null with no blobId (nothing recorded)", async () => {
+    expect(await resolveCapturedClip("audio-recording", { blobId: "", duration: 0 }, "a1", 0, newId)).toBeNull();
+  });
+
+  it("audio-recording: falls back to a default duration when it's 0 and can't be probed (no blob store in this test env)", async () => {
+    const clip = await resolveCapturedClip("audio-recording", { blobId: "b3", duration: 0 }, "a1", 0, newId);
+    expect(clip).toMatchObject({ kind: "audio-segment", audioBlobId: "b3", sourceInSec: 0, sourceOutSec: 5 });
   });
 
   it("stfu: maps to a video-segment spanning the full source duration, ignoring any cut list", async () => {
@@ -186,8 +191,9 @@ describe("resolveCapturedClip", () => {
     expect(videoClip).toMatchObject({ kind: "video-segment", videoBlobId: "f2", sourceOutSec: 20, muted: false });
   });
 
-  it("file: returns null when duration hasn't been probed yet (0, or a pre-probe legacy widget)", async () => {
-    expect(await resolveCapturedClip("file", { blobId: "f1", domain: "audio", duration: 0 }, "a1", 0, newId)).toBeNull();
+  it("file: falls back to a default duration when it's 0 and can't be re-probed (0, or a pre-probe legacy widget)", async () => {
+    const clip = await resolveCapturedClip("file", { blobId: "f1", domain: "audio", duration: 0 }, "a1", 0, newId);
+    expect(clip).toMatchObject({ kind: "audio-segment", audioBlobId: "f1", sourceInSec: 0, sourceOutSec: 5 });
   });
 
   it("file: returns null for an unresolved domain", async () => {

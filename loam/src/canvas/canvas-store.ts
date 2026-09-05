@@ -652,7 +652,15 @@ export class CanvasStore {
   addWidget(entry: WidgetEntry): string {
     const createdBy = entry.createdBy || this._localNodeId || undefined;
     this.handle.change((doc) => {
-      doc.widgets[entry.id] = { ...entry };
+      // automerge rejects an explicit `undefined` value being assigned to a
+      // property (unlike a plain JS object) — strip any undefined-valued
+      // keys (e.g. an omitted `title`) before spreading rather than
+      // letting them through as explicit `undefined`.
+      const clean: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(entry)) {
+        if (value !== undefined) clean[key] = value;
+      }
+      doc.widgets[entry.id] = clean as unknown as WidgetEntry;
       // only set the key when there's a real value — automerge drafts
       // don't need (and shouldn't get) an explicit `undefined` property.
       if (createdBy) {

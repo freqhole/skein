@@ -25,7 +25,14 @@
 import { renderDoodleSnapshot, type DoodleStroke } from "../doodle";
 import { saveImageDataUrlAsBlobRef, resolveImagePropUrl } from "../../src/file-utils/image-prop-blob";
 import { getMediaPlaybackUrl } from "../../src/media";
+import { probeMediaDuration } from "../../src/file-utils/media-duration";
 import type { Clip, Keyframe } from "./types";
+
+/** clip length (seconds) used when a source's duration is unknown AND an
+ *  on-drop probe (see `resolveClipDuration()`) also fails — the clip still
+ *  lands on the track instead of the drop being silently refused, and the
+ *  user can drag its resize handle to the real length by hand afterward. */
+const FALLBACK_CLIP_DURATION_SEC = 5;
 
 /** doodle captures render much bigger than the doodle widget's own
  *  128px bin-card thumbnail default, since animaniac's preview (and its
@@ -116,6 +123,26 @@ async function probeVideoNaturalSize(blobId: string, mime: string, blake3: strin
   } catch {
     return null;
   }
+}
+
+/** `sourceState.duration` if already known and positive; otherwise probes
+ *  the blob directly (same technique `file-utils/backfill-file-durations.ts`
+ *  uses) so a drop never has to wait for that separate one-shot tool to run
+ *  first. falls back to `FALLBACK_CLIP_DURATION_SEC` if the probe also
+ *  fails (blob not local yet, decode error) — never writes back to the
+ *  source widget's own doc, this only affects the freshly captured clip's
+ *  own length. */
+async function resolveClipDuration(sourceState: Record<string, unknown>, domain: "audio" | "video", blobId: string): Promise<number> {
+  const known = num(sourceState.duration);
+  if (known > 0) return known;
+  try {
+    const url = await getMediaPlaybackUrl(blobId, { category: domain, mime: str(sourceState.mime) || undefined, blake3: str(sourceState.blake3) || undefined });
+    const probed = url ? await probeMediaDuration(url, domain) : 0;
+    if (probed > 0) return probed;
+  } catch {
+    // fall through to the default below
+  }
+  return FALLBACK_CLIP_DURATION_SEC;
 }
 
 /**
@@ -264,8 +291,8 @@ export async function resolveCapturedClip(
       // matching every other frame type's "capture now, refine later"
       // flow), not a voice-recording clip.
       const blobId = str(sourceState.blobId);
-      const duration = num(sourceState.duration);
-      if (!blobId || duration <= 0) return null;
+      if (!blobId) return null;
+      const duration = await resolveClipDuration(sourceState, "audio", blobId);
       return {
         kind: "audio-segment",
         id: newId(),
@@ -283,15 +310,16 @@ export async function resolveCapturedClip(
     }
 
     case "file": {
-      // file.ts now probes+stores `duration` for audio/video domains right
-      // after upload (see src/file-utils/media-duration.ts) — a widget
-      // uploaded before that existed just has duration 0 and isn't
-      // capturable yet (matches every other "nothing to capture" case
-      // here, not a special gap anymore).
+      // file.ts probes+stores `duration` for audio/video domains right
+      // after upload (see src/file-utils/media-duration.ts) — an older
+      // widget uploaded before that existed (or one whose probe failed,
+      // e.g. the blob wasn't local yet) can still be stuck at duration 0,
+      // so `resolveClipDuration()` re-probes on drop and falls back to a
+      // default length rather than refusing the capture outright.
       const domain = str(sourceState.domain);
       const blobId = str(sourceState.blobId);
-      const duration = num(sourceState.duration);
-      if (!blobId || duration <= 0) return null;
+      if (!blobId || (domain !== "audio" && domain !== "video")) return null;
+      const duration = await resolveClipDuration(sourceState, domain, blobId);
       if (domain === "audio") {
         return {
           kind: "audio-segment",

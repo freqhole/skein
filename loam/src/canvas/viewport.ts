@@ -75,6 +75,21 @@ export class Viewport {
     return this.panning;
   }
 
+  /** convert a native MouseEvent's `clientX`/`clientY` (screen pixels) into
+   *  world coordinates (the same space `WidgetEntry.x`/`y` use), accounting
+   *  for the canvas element's own on-page offset and the current pan/zoom —
+   *  mirrors the calc `init.ts`'s cursor-broadcast handler already does
+   *  inline for pointermove. */
+  screenToWorld(clientX: number, clientY: number): { x: number; y: number } {
+    const rect = this.canvasEl.getBoundingClientRect();
+    const screenX = clientX - rect.left;
+    const screenY = clientY - rect.top;
+    return {
+      x: (screenX - this.world.x) / (this.world.scale.x || 1),
+      y: (screenY - this.world.y) / (this.world.scale.y || 1),
+    };
+  }
+
   /** lock/unlock user-driven pan+zoom gestures (see `locked` for details) */
   setLocked(locked: boolean): void {
     this.locked = locked;

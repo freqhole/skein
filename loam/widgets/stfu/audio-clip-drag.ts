@@ -19,6 +19,7 @@ import type { DropTargetHandler } from "../../src/widgets/widget-types";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
 import { AUDIO_CLIP_TRACK_HEIGHT, type VideoTimelineHandle } from "./video-timeline";
 import type { AudioClip, StfuState } from "./types";
+import { deepUnwrapAmStrings } from "../../src/canvas/automerge-values";
 
 const DROPPABLE_TYPES = new Set(["audio-recording", "tts", "voice-recording"]);
 
@@ -102,7 +103,11 @@ export function createAudioClipDragController(options: AudioClipDragOptions): Au
       const handle = repo.handles[docId as DocumentId];
       const rawDoc = handle?.doc();
       if (!rawDoc) return null;
-      const state = factory.schema.parse(rawDoc) as Record<string, unknown>;
+      // a widget doc the tumulus hub has ever written into directly (e.g.
+      // stamping `snatchedBy` after a p2p snatch) round-trips string
+      // fields as `ImmutableString` instances, which zod's `z.string()`
+      // rejects outright — see `automerge-values.ts`'s own doc comment.
+      const state = factory.schema.parse(deepUnwrapAmStrings(rawDoc)) as Record<string, unknown>;
       if (!state.blobId) return null; // nothing generated/recorded yet — no audio to place
       return {
         blobId: String(state.blobId),

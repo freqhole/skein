@@ -77,6 +77,7 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
     hidden: true,
     singleton: true,
     closable: true, // shows a header "x" button for quick dismissal
+    copyable: false, // a duplicate would just show this same canvas's own metadata again
     defaultWidth: 280,
     defaultHeight: 340,
   },

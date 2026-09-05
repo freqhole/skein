@@ -17,7 +17,7 @@
  *
  * intentionally not wired into any UI button — meant to be run once, ad
  * hoc, from the browser devtools console against the currently open
- * canvas, bundled into `window.__skeinBackfillFileDurations()` (see
+ * canvas, bundled into `window.__skeinDiagnose()` (see
  * `standalone/boot.ts`) alongside the duration backfill.
  */
 

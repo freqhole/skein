@@ -461,6 +461,12 @@ export interface WidgetMetadata {
    *  small utility panels the user expects to be able to quickly dismiss
    *  (e.g. the trash can). defaults to false when omitted. */
   closable?: boolean;
+  /** whether this widget type can be copied/pasted (Cmd/Ctrl+C/V, the
+   *  right-click menu). defaults to true when omitted. set to false for
+   *  widgets that only make sense as a single, canvas-specific instance
+   *  (e.g. canvas-info — a duplicate would just show the same canvas's
+   *  own metadata twice). */
+  copyable?: boolean;
 }
 
 /**
