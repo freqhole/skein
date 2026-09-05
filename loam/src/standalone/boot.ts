@@ -1309,11 +1309,18 @@ class SkeinRouter {
         const immutableStrings = await fixImmutableStringFields(canvas.store);
         const dropDiagnosis = await diagnoseAnimaniacDrops(canvas.store, canvas.registry);
         /* eslint-disable no-console -- intentional devtools diagnostic dump */
+        console.log("[skein] connection summary:", this.irohAdapter.getConnectionSummary());
         console.log("[skein] backfill durations:", durations);
         if (durations.details.length) console.table(durations.details);
         console.log("[skein] fix immutable strings:", immutableStrings);
         console.log("[skein] animaniac drop diagnosis: peerCount =", dropDiagnosis.peerCount);
-        console.table(dropDiagnosis.animaniacWidgets);
+        console.table(dropDiagnosis.animaniacWidgets.map(({ clips: _clips, ...w }) => w));
+        for (const w of dropDiagnosis.animaniacWidgets) {
+          if (w.clips.length) {
+            console.log(`[skein] animaniac ${w.widgetId} clips:`);
+            console.table(w.clips);
+          }
+        }
         console.table(dropDiagnosis.widgets);
         /* eslint-enable no-console */
         return { durations, immutableStrings, dropDiagnosis };
@@ -2664,11 +2671,18 @@ class SkeinRouter {
         const immutableStrings = await fixImmutableStringFields(canvas.store);
         const dropDiagnosis = await diagnoseAnimaniacDrops(canvas.store, canvas.registry);
         /* eslint-disable no-console -- intentional devtools diagnostic dump */
+        console.log("[skein] connection summary:", this.irohAdapter.getConnectionSummary());
         console.log("[skein] backfill durations:", durations);
         if (durations.details.length) console.table(durations.details);
         console.log("[skein] fix immutable strings:", immutableStrings);
         console.log("[skein] animaniac drop diagnosis: peerCount =", dropDiagnosis.peerCount);
-        console.table(dropDiagnosis.animaniacWidgets);
+        console.table(dropDiagnosis.animaniacWidgets.map(({ clips: _clips, ...w }) => w));
+        for (const w of dropDiagnosis.animaniacWidgets) {
+          if (w.clips.length) {
+            console.log(`[skein] animaniac ${w.widgetId} clips:`);
+            console.table(w.clips);
+          }
+        }
         console.table(dropDiagnosis.widgets);
         /* eslint-enable no-console */
         return { durations, immutableStrings, dropDiagnosis };

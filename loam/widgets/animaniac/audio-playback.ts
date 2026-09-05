@@ -13,10 +13,15 @@
  * a clip first becomes active, tear down once it stops being active).
  */
 
+import { log } from "@freqhole/reliquary/utils";
 import type { PeersMap } from "../../src/file-utils/file-shared";
 import { getMediaPlaybackUrl } from "../../src/media";
+import { checkBlobLocality } from "../../src/file-utils/blob-locality";
+import { isTauriMode } from "../../src/p2p/tauri-transport";
 import { activeClipsAt } from "./track-model";
 import type { AudioSegmentClip, Clip } from "./types";
+
+const TAG = "animaniac.audio-playback";
 
 const AUDIO_KINDS = new Set(["voice-recording", "tts", "audio-segment"]);
 
@@ -71,11 +76,44 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
       entry.resolving = true;
       const mime = clip.kind === "voice-recording" || clip.kind === "tts" || clip.kind === "audio-segment" ? clip.audioMime : "";
       const blake3 = clip.kind === "voice-recording" || clip.kind === "tts" || clip.kind === "audio-segment" ? clip.audioBlake3 : "";
+      // in tauri mode, blob_get_path()/blob lookups prefer blake3 over
+      // blobId when both are present (see media-urls.ts's own "lookupId =
+      // blake3 || blobId" comment: "on skein-tauri, blob ids ARE blake3
+      // hashes") — a clip whose `audioBlake3` was captured stale/empty (or
+      // simply wrong, e.g. left over from before a snatch re-keyed the
+      // blob locally) resolves under a DIFFERENT key than the live file
+      // widget's own doc uses, even though the underlying content is the
+      // same. logging both the value actually used as the lookup key AND
+      // a live locality check makes a stale reference obvious at a glance.
+      const tauriLookupId = blake3 || blobId;
+      log.debug(TAG, "resolving playback url", {
+        clipId: clip.id,
+        kind: clip.kind,
+        blobId,
+        blake3,
+        mime,
+        isTauriMode: isTauriMode(),
+        tauriLookupId,
+      });
+      checkBlobLocality(blobId, blake3 || undefined)
+        .then((info) => log.debug(TAG, "blob locality (blobId+blake3 as stored on the clip)", { clipId: clip.id, ...info }))
+        .catch((err) => log.debug(TAG, "checkBlobLocality threw (non-fatal)", { clipId: clip.id, err }));
       void getMediaPlaybackUrl(blobId, { category: "audio", mime: mime || undefined, blake3: blake3 || undefined, peers: getPeers?.() }).then(
         (url) => {
-          if (!url) return;
+          if (!url) {
+            log.warn(TAG, "getMediaPlaybackUrl returned null — nothing to play", { clipId: clip.id, kind: clip.kind, blobId: blobId.slice(0, 12) });
+            return;
+          }
+          log.debug(TAG, "playback url resolved", { clipId: clip.id, kind: clip.kind, url: url.slice(0, 60) });
           const el = document.createElement("audio");
           el.src = url;
+          el.addEventListener("error", () => {
+            log.warn(TAG, "<audio> element error event", {
+              clipId: clip.id,
+              kind: clip.kind,
+              mediaError: el.error ? { code: el.error.code, message: el.error.message } : null,
+            });
+          });
           entry!.el = el;
         }
       );
@@ -111,8 +149,13 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
       if (!entry.synced || seeked) {
         entry.el.currentTime = target;
         entry.synced = true;
+        log.debug(TAG, "seeked", { clipId: clip.id, kind: clip.kind, target, sourceOffsetSec: sourceOffsetSec(clip), localElapsed, audioDuration: entry.el.duration });
       }
-      if (playing && entry.el.paused) void entry.el.play().catch(() => {});
+      if (playing && entry.el.paused) {
+        void entry.el.play().catch((err) => {
+          log.warn(TAG, "play() rejected", { clipId: clip.id, kind: clip.kind, error: err instanceof Error ? err.message : String(err) });
+        });
+      }
       if (!playing && !entry.el.paused) entry.el.pause();
     }
   }

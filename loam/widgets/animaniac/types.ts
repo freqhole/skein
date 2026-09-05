@@ -193,6 +193,10 @@ export const audioSegmentClipSchema = clipBaseSchema.extend({
   audioBlobId: z.string(),
   audioBlake3: z.string().default(""),
   audioMime: z.string().default(""),
+  /** byte size of the source blob — carried over purely so a drag-out
+   *  restore (clip-restore.ts) can show the right file size again; never
+   *  read by the compositor/playback itself. */
+  audioSize: z.number().default(0),
   sourceInSec: z.number().default(0),
   sourceOutSec: z.number(),
   label: z.string().default(""),
@@ -210,6 +214,8 @@ export const videoSegmentClipSchema = clipBaseSchema.extend({
   videoBlobId: z.string(),
   videoBlake3: z.string().default(""),
   videoMime: z.string().default(""),
+  /** byte size of the source blob — same purpose as `audioSegmentClipSchema.audioSize`. */
+  videoSize: z.number().default(0),
   sourceInSec: z.number().default(0),
   sourceOutSec: z.number(),
   /** whether the video's own embedded audio plays — default false (audio
