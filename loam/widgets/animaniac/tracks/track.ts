@@ -79,9 +79,33 @@ export interface TrackOptions {
    *  the same faint/dashed treatment as a not-yet-local remote clip (a
    *  different reason, same "this isn't fully present" visual language). */
   isClipMuted?: (clip: Clip) => boolean;
+  /** true if `clipId` is part of the caller's own cross-track multi-
+   *  selection — see `track-item-interaction.ts`'s own `isSelected` doc
+   *  comment for the exact click/drag semantics this enables. */
+  isSelected?: (clipId: string) => boolean;
+  /** Cmd/Ctrl+click toggle-select — see `track-item-interaction.ts`'s own
+   *  `onToggleSelect`. */
+  onToggleSelect?: (clipId: string) => void;
+  /** group-move delta ticks — see `track-item-interaction.ts`'s own
+   *  `onBatchDragDelta`. */
+  onBatchDragDelta?: (draggedClipId: string, deltaSec: number) => void;
+  /** group-move end — see `track-item-interaction.ts`'s own `onBatchDragEnd`. */
+  onBatchDragEnd?: (draggedClipId: string, committed: boolean) => void;
 }
 
-export type TrackHandle = Pick<TrackItemInteractionHandle<Clip>, "refresh" | "getSelected" | "deleteSelected" | "clearSelection" | "selectId" | "destroy">;
+export type TrackHandle = Pick<
+  TrackItemInteractionHandle<Clip>,
+  | "refresh"
+  | "getSelected"
+  | "deleteSelected"
+  | "clearSelection"
+  | "selectId"
+  | "destroy"
+  | "beginExternalMove"
+  | "previewExternalMove"
+  | "commitExternalMove"
+  | "cancelExternalMove"
+>;
 
 /** clips belonging to this track only — any kind, no restriction. */
 function clipsForThisTrack(all: Clip[], trackId: string): Clip[] {
@@ -96,8 +120,26 @@ function mergeTrackClips(all: Clip[], trackId: string, next: Clip[]): Clip[] {
 }
 
 export function createTrack(options: TrackOptions): TrackHandle {
-  const { trackId, row, camera, getDuration, isSnapEnabled, getSnapTimes, getClips, onClipsChange, onSelectionChange, onMoveOutOfRow, onDraggingMove, isClipRemote, getClipProgress, isClipMuted } =
-    options;
+  const {
+    trackId,
+    row,
+    camera,
+    getDuration,
+    isSnapEnabled,
+    getSnapTimes,
+    getClips,
+    onClipsChange,
+    onSelectionChange,
+    onMoveOutOfRow,
+    onDraggingMove,
+    isClipRemote,
+    getClipProgress,
+    isClipMuted,
+    isSelected,
+    onToggleSelect,
+    onBatchDragDelta,
+    onBatchDragEnd,
+  } = options;
 
   const labels = new WeakMap<Graphics, Text>();
 
@@ -119,6 +161,10 @@ export function createTrack(options: TrackOptions): TrackHandle {
     onDraggingMove,
     onChange: (nextForTrack) => onClipsChange(mergeTrackClips(getClips(), trackId, nextForTrack)),
     onSelectionChange,
+    isSelected,
+    onToggleSelect,
+    onBatchDragDelta,
+    onBatchDragEnd,
     drawItem(g: Graphics, item: Clip, state) {
       const remote = isClipRemote?.(item) ?? false;
       drawTrackItemBody(

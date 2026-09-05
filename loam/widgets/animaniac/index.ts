@@ -208,6 +208,12 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     // track row's own selection, and with the preview transform editor's
     // own click-to-select — see `setSelectedClipId()`) ----------------------
     let selectedClipId: string | null = null;
+    // Cmd/Ctrl+click builds up a cross-track multi-selection for batch
+    // moving (see `toggleClipMultiSelect()`/`onBatchDragDelta()`) — always
+    // a subset containing `selectedClipId` when its size is exactly 1;
+    // `selectedClipId` is null whenever this has 0 or 2+ members (mirrors
+    // the main canvas's own InputRouter "primary" convention).
+    let multiSelectedClipIds: Set<string> = new Set();
     // guards against the reentrant `onSelectionChange(null)` call
     // `clearSelection()` fires below (see `setSelectedClipId()`'s own
     // comment) — without it, that reentrant call clobbers `selectedClipId`
@@ -221,6 +227,10 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       isUpdatingSelection = true;
       try {
         selectedClipId = id;
+        // a plain (non-modifier) select always collapses any cross-track
+        // multi-selection down to just this one clip (or none) — mirrors
+        // the main canvas's own InputRouter.selectWidget() convention.
+        multiSelectedClipIds = new Set(id ? [id] : []);
         const clip = id ? ctx.doc.current.clips.find((c) => c.id === id) : null;
         // only one clip may ever be selected across the WHOLE widget at a
         // time — each track's own interaction engine previously kept its
@@ -237,8 +247,80 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         if (clip) trackInstances.get(clip.trackId)?.selectId(id!);
         previewTransformEditor.refresh();
         updateTimelineActionBar();
+        refreshAllTracks();
       } finally {
         isUpdatingSelection = false;
+      }
+    }
+
+    /** Cmd/Ctrl+click on a clip — toggles it into/out of the cross-track
+     *  multi-selection (does NOT start a drag on this click; see
+     *  track-item-interaction.ts's own `onToggleSelect` doc comment). the
+     *  usual single-clip UI (preview transform editor, mute button,
+     *  delete-key) only ever applies to an unambiguous ONE selected clip,
+     *  matching InputRouter's own "primary is null unless exactly one is
+     *  selected" convention — it simply won't show/act while 0 or 2+ clips
+     *  are multi-selected, no separate multi-clip UI needed for that. */
+    function toggleClipMultiSelect(id: string): void {
+      const next = new Set(multiSelectedClipIds);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      multiSelectedClipIds = next;
+      const primary = next.size === 1 ? [...next][0] : null;
+      selectedClipId = primary;
+      const clip = primary ? ctx.doc.current.clips.find((c) => c.id === primary) : null;
+      for (const [trackId, inst] of trackInstances) {
+        if (clip && trackId === clip.trackId) continue;
+        inst.clearSelection();
+      }
+      if (clip) trackInstances.get(clip.trackId)?.selectId(primary!);
+      previewTransformEditor.refresh();
+      updateTimelineActionBar();
+      refreshAllTracks();
+    }
+
+    /** in-progress cross-track group move — see `onBatchDragDelta()`/
+     *  `onBatchDragEnd()`, wired into every track's own `onBatchDragDelta`/
+     *  `onBatchDragEnd` options below. */
+    let batchDrag: { draggedId: string; companionIds: string[]; lastDeltaSec: number } | null = null;
+
+    /** applies the SAME raw (unsnapped) delta every OTHER multi-selected
+     *  clip's own track already got from the actively-dragged clip's move
+     *  — each companion clip is previewed via its OWN track's
+     *  `previewExternalMove()`, so it's still subject to that track's own
+     *  `preventOverlap`/duration clamping, just like the primary clip is. */
+    function onBatchDragDelta(draggedId: string, deltaSec: number): void {
+      if (!batchDrag || batchDrag.draggedId !== draggedId) {
+        const companionIds = [...multiSelectedClipIds].filter((id) => id !== draggedId);
+        if (companionIds.length === 0) return;
+        for (const id of companionIds) {
+          const clip = ctx.doc.current.clips.find((c) => c.id === id);
+          if (clip) trackInstances.get(clip.trackId)?.beginExternalMove(id);
+        }
+        batchDrag = { draggedId, companionIds, lastDeltaSec: deltaSec };
+      }
+      batchDrag.lastDeltaSec = deltaSec;
+      for (const id of batchDrag.companionIds) {
+        const clip = ctx.doc.current.clips.find((c) => c.id === id);
+        if (clip) trackInstances.get(clip.trackId)?.previewExternalMove(id, deltaSec);
+      }
+    }
+
+    function onBatchDragEnd(draggedId: string, committed: boolean): void {
+      if (!batchDrag || batchDrag.draggedId !== draggedId) return;
+      const { companionIds, lastDeltaSec } = batchDrag;
+      batchDrag = null;
+      for (const id of companionIds) {
+        const clip = ctx.doc.current.clips.find((c) => c.id === id);
+        const inst = clip ? trackInstances.get(clip.trackId) : undefined;
+        if (!inst) continue;
+        if (committed) inst.commitExternalMove(id, lastDeltaSec);
+        else inst.cancelExternalMove(id);
+      }
+      if (committed && companionIds.length > 0) {
+        history.push();
+        camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
+        renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       }
     }
 
@@ -849,6 +931,10 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         isClipRemote: (clip: Clip) => isClipRemote(clip),
         getClipProgress: (clip: Clip) => clipProgress(clip),
         isClipMuted: (clip: Clip) => isClipMuted(clip),
+        isSelected: (clipId: string) => multiSelectedClipIds.size > 1 && multiSelectedClipIds.has(clipId),
+        onToggleSelect: (clipId: string) => toggleClipMultiSelect(clipId),
+        onBatchDragDelta,
+        onBatchDragEnd,
       };
       return createTrack(common);
     }
