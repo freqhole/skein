@@ -28,6 +28,7 @@ import type { DocumentId } from "@automerge/automerge-repo";
 import type { CanvasStore } from "../canvas/canvas-store";
 import type { WidgetRegistry } from "../widgets/widget-registry";
 import { resolveDocReadyCached } from "../p2p/doc-ready";
+import { deepUnwrapAmStrings } from "../canvas/automerge-values";
 import { isCapturableWidgetType } from "../../widgets/animaniac/frame-capture";
 import { animaniacSchema } from "../../widgets/animaniac/types";
 
@@ -117,7 +118,7 @@ export async function diagnoseAnimaniacDrops(store: CanvasStore, registry: Widge
       continue;
     }
     const handle = await resolveDocReadyCached(store.repo, entry.docId as DocumentId, { context: "diagnose-animaniac-drops" });
-    const parsed = handle ? animaniacSchema.safeParse(handle.doc()) : null;
+    const parsed = handle ? animaniacSchema.safeParse(deepUnwrapAmStrings(handle.doc())) : null;
     const tracks = parsed?.success ? parsed.data.tracks : [];
     animaniacWidgets.push({
       widgetId: entry.id,
@@ -151,7 +152,12 @@ export async function diagnoseAnimaniacDrops(store: CanvasStore, registry: Widge
         }
         let parsed: Record<string, unknown>;
         try {
-          parsed = factory.schema.parse(rawDoc) as Record<string, unknown>;
+          // see drop-controller.ts's own `readDroppedState()` doc comment:
+          // a widget doc the tumulus hub has ever written into directly
+          // (e.g. stamping `snatchedBy` after a p2p snatch) round-trips
+          // string fields as `ImmutableString` instances, which zod's
+          // `z.string()` rejects outright unless normalized first.
+          parsed = factory.schema.parse(deepUnwrapAmStrings(rawDoc)) as Record<string, unknown>;
         } catch (err) {
           return { widgetId: entry.id, type: entry.type, docId: entry.docId, capturable, docReachable: true, wouldCaptureAs: null, reason: `schema.parse threw: ${err instanceof Error ? err.message : String(err)}` };
         }

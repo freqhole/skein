@@ -59,6 +59,7 @@ import { setPandocFormatsAvailable } from "../file-utils/upload";
 import { checkSayAvailable } from "../../widgets/tts/voices";
 import { freeUpLocalBlobCopy, checkBlobLocality } from "../file-utils/blob-locality";
 import { backfillMissingFileDurations } from "../file-utils/backfill-file-durations";
+import { fixImmutableStringFields } from "../file-utils/fix-immutable-strings";
 import { diagnoseAnimaniacDrops } from "../file-utils/diagnose-animaniac-drops";
 import { pauseSnatchDownload } from "../file-utils/snatch";
 import {
@@ -1297,9 +1298,14 @@ class SkeinRouter {
       (window as any).__skein = canvas;
       // one-shot console helper: re-probes `duration` for any `file` widget
       // (audio/video domain) on this canvas still stuck at 0 from before
-      // create-file-widget.ts started probing it upfront — see that
-      // module's own doc comment. run via `window.__skeinBackfillFileDurations()`.
-      (window as any).__skeinBackfillFileDurations = () => backfillMissingFileDurations(canvas.store);
+      // create-file-widget.ts started probing it upfront, AND permanently
+      // fixes any widget doc a rust writer left with `ImmutableString`
+      // fields (see backfill-file-durations.ts's/fix-immutable-strings.ts's
+      // own doc comments). run via `window.__skeinBackfillFileDurations()`.
+      (window as any).__skeinBackfillFileDurations = async () => ({
+        durations: await backfillMissingFileDurations(canvas.store),
+        immutableStrings: await fixImmutableStringFields(canvas.store),
+      });
       // one-shot console helper: reports, per widget on this canvas, whether
       // animaniac would capture it as a clip right now (and why not, if
       // not) plus every animaniac widget's own track count — see the
@@ -2640,9 +2646,14 @@ class SkeinRouter {
       (window as any).__skein = canvas;
       // one-shot console helper: re-probes `duration` for any `file` widget
       // (audio/video domain) on this canvas still stuck at 0 from before
-      // create-file-widget.ts started probing it upfront — see that
-      // module's own doc comment. run via `window.__skeinBackfillFileDurations()`.
-      (window as any).__skeinBackfillFileDurations = () => backfillMissingFileDurations(canvas.store);
+      // create-file-widget.ts started probing it upfront, AND permanently
+      // fixes any widget doc a rust writer left with `ImmutableString`
+      // fields (see backfill-file-durations.ts's/fix-immutable-strings.ts's
+      // own doc comments). run via `window.__skeinBackfillFileDurations()`.
+      (window as any).__skeinBackfillFileDurations = async () => ({
+        durations: await backfillMissingFileDurations(canvas.store),
+        immutableStrings: await fixImmutableStringFields(canvas.store),
+      });
       // one-shot console helper: reports, per widget on this canvas, whether
       // animaniac would capture it as a clip right now (and why not, if
       // not) plus every animaniac widget's own track count — see the

@@ -33,6 +33,7 @@ import type {
   TrackRowContainers,
 } from "../../src/widgets/timeline/timeline-types";
 import { resolveDocReadyCached } from "../../src/p2p/doc-ready";
+import { deepUnwrapAmStrings } from "../../src/canvas/automerge-values";
 import { expectedTrackKindFor, isCapturableWidgetType, resolveCapturedClip } from "./frame-capture";
 import { clipBlobInfo, makeAnimaniacNewBlobMessage } from "./snatch-controller";
 import { computeTimelineDuration, clipDurationSec, clipEnd, clipsForTrack } from "./track-model";
@@ -262,7 +263,14 @@ export function createAnimaniacDropController(
         );
         return null;
       }
-      const parsed = factory.schema.parse(rawDoc) as Record<string, unknown>;
+      // a widget doc the tumulus hub has ever written into directly (e.g.
+      // stamping `snatchedBy` after a p2p snatch) round-trips string
+      // fields as `ImmutableString` instances, which zod's `z.string()`
+      // rejects outright — see `automerge-values.ts`'s own doc comment
+      // (the same normalization `widget-doc.ts` already applies for every
+      // OTHER doc read; this module reads a DIFFERENT widget's raw doc
+      // directly, bypassing that facade, so it needs its own call here).
+      const parsed = factory.schema.parse(deepUnwrapAmStrings(rawDoc)) as Record<string, unknown>;
       log.debug(
         "animaniac.drop",
         "[ANIMANIAC-DBG] readDroppedState: parsed ok",
@@ -307,7 +315,7 @@ export function createAnimaniacDropController(
     const rawDoc = handle.doc();
     if (!rawDoc) return null;
     try {
-      return factory.schema.parse(rawDoc) as Record<string, unknown>;
+      return factory.schema.parse(deepUnwrapAmStrings(rawDoc)) as Record<string, unknown>;
     } catch (err) {
       log.debug(
         "animaniac.drop",
