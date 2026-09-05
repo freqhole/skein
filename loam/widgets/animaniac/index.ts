@@ -63,6 +63,7 @@ import { getMediaPlaybackUrl } from "../../src/media";
 import { isTauriMode, dispatch } from "../../src/p2p/tauri-transport";
 import { storeBlobFromFile } from "../../src/storage/blob-store";
 import { freeUpLocalBlobCopy } from "../../src/file-utils/blob-locality";
+import { addBlobCanvasRef } from "../../src/file-utils/blob-canvas-refs";
 import { base64Encode } from "@freqhole/reliquary/worker";
 import { animaniacSchema, type AnimaniacState, type Clip, type Track } from "./types";
 import type { AudioSegmentClip, TtsClip, VoiceRecordingClip } from "./types";
@@ -1454,17 +1455,127 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     });
 
     // -- export: audio mixdown -----------------------------------------------
+    // memory-intensive (decodes every unique source in full, then renders
+    // the whole mix into one buffer — see audio-mixdown.ts's own doc
+    // comment); guarded against overlapping clicks below.
+    let mixdownInFlight = false;
+    let mixdownHeartbeat: ReturnType<typeof setInterval> | null = null;
+
     async function handleExportAudioMixdown(): Promise<void> {
-      const { tracks, clips } = ctx.doc.current;
-      const result = await renderAudioMixdown({ tracks, clips, getPeers });
-      if (destroyed) return;
-      const blob = new Blob([result.bytes.buffer as ArrayBuffer], { type: "audio/wav" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "animaniac-mixdown.wav";
-      a.click();
-      URL.revokeObjectURL(url);
+      if (mixdownInFlight || !store) return;
+      mixdownInFlight = true;
+
+      // drop a placeholder audio file widget right away — same
+      // uploadingBy/uploadingProgress lock+progress fields file.ts's own
+      // upload flow uses, so it renders the exact same "preparing..."
+      // progress view (see file.ts's own doc comment on those fields)
+      // instead of downloading a file the user has to go find afterward.
+      const selfEntry = store.getWidget(ctx.widgetId);
+      const width = 320;
+      const height = 160;
+      const x = selfEntry ? selfEntry.x + selfEntry.width + 20 : 0;
+      const y = selfEntry ? selfEntry.y : 0;
+      const zIndex = 1 + Math.max(0, ...store.allWidgets().map((w) => w.zIndex || 0));
+      const localNodeId = store.localNodeId ?? "";
+      const placeholderId = crypto.randomUUID();
+      store.addWidget({
+        id: placeholderId,
+        type: "file",
+        x,
+        y,
+        width,
+        height,
+        zIndex,
+        title: "animaniac mixdown",
+        props: {
+          domain: "audio",
+          uploadingBy: localNodeId,
+          uploadingProgress: 0,
+          uploadingAt: Date.now(),
+        },
+        collapsed: false,
+        docId: null,
+        parentId: null,
+      });
+
+      // keep the lock fresh for the WHOLE render, not just whenever
+      // renderAudioMixdown's own decode-phase progress happens to tick —
+      // the actual OfflineAudioContext render step has no progress signal
+      // of its own (see audio-mixdown.ts) and can run long on a big
+      // project, well past the lock's own staleness window otherwise.
+      const heartbeat = setInterval(() => {
+        if (destroyed) return;
+        void store.updateWidgetProps(placeholderId, { uploadingAt: Date.now() });
+      }, 5000);
+      mixdownHeartbeat = heartbeat;
+
+      try {
+        const { tracks, clips } = ctx.doc.current;
+        const result = await renderAudioMixdown({
+          tracks,
+          clips,
+          getPeers,
+          onProgress: (fraction) => {
+            if (destroyed) return;
+            // reserve the last 10% for the upload step below.
+            void store.updateWidgetProps(placeholderId, { uploadingProgress: fraction * 0.9, uploadingAt: Date.now() });
+          },
+        });
+        if (destroyed) return;
+
+        const filename = "animaniac-mixdown.wav";
+        let record: { blob_id: string; blake3: string; size: number; mime: string };
+        if (isTauriMode()) {
+          const base64Data = await base64Encode(result.bytes.buffer as ArrayBuffer);
+          const response = (await dispatch("blob_insert", {
+            filename,
+            mime: "audio/wav",
+            data: base64Data,
+          })) as { blake3: string; mime: string | null; size: number };
+          record = {
+            blob_id: response.blake3,
+            blake3: response.blake3,
+            size: response.size,
+            mime: response.mime || "audio/wav",
+          };
+        } else {
+          const file = new File([result.bytes.buffer as ArrayBuffer], filename, { type: "audio/wav" });
+          const fileRecord = await storeBlobFromFile(file, { metadata: { domain: "audio" } });
+          record = {
+            blob_id: fileRecord.blob_id,
+            blake3: fileRecord.blake3 || fileRecord.blob_id,
+            size: fileRecord.size,
+            mime: fileRecord.mime,
+          };
+        }
+
+        await store.updateWidgetProps(placeholderId, {
+          blobId: record.blob_id,
+          blake3: record.blake3,
+          mime: record.mime,
+          size: record.size,
+          domain: "audio",
+          filename,
+          title: filename,
+          uploadingBy: "",
+          uploadingProgress: 0,
+          uploadingAt: 0,
+          snatchedBy: localNodeId ? [localNodeId] : [],
+        });
+        const refCanvasDocId = store.handle.documentId;
+        if (refCanvasDocId) {
+          addBlobCanvasRef(record.blob_id, record.blake3, refCanvasDocId).catch((err) => {
+            console.warn("[animaniac] addBlobCanvasRef failed for mixdown (non-fatal):", err);
+          });
+        }
+      } catch (err) {
+        console.warn("[animaniac] audio mixdown failed:", err);
+        if (!destroyed) await store.updateWidgetProps(placeholderId, { uploadingBy: "", uploadingProgress: 0, uploadingAt: 0 });
+      } finally {
+        clearInterval(heartbeat);
+        mixdownHeartbeat = null;
+        mixdownInFlight = false;
+      }
     }
 
     // -- doc-change subscription (remote peer edits) -------------------------
@@ -1554,6 +1665,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         gainSlider.destroy();
         for (const timer of gainRenderTimers.values()) clearTimeout(timer);
         gainRenderTimers.clear();
+        if (mixdownHeartbeat) clearInterval(mixdownHeartbeat);
         container.destroy({ children: true });
       },
     };

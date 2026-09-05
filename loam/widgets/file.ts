@@ -2863,13 +2863,26 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       localNodeIdCached = id ?? "";
     });
 
-    /** true when ANOTHER peer holds a fresh upload lock on this widget */
-    function remoteUploadLockActive(state: FileState): boolean {
-      return (
-        !!state.uploadingBy &&
-        state.uploadingBy !== localNodeIdCached &&
-        Date.now() - (state.uploadingAt || 0) < UPLOAD_LOCK_STALE_MS
-      );
+    /** true while a fresh upload lock is held, by ANY peer — including
+     *  this one, e.g. a mixdown/derived-file flow (see animaniac's own
+     *  export/audio-mixdown.ts caller) that populates this widget from
+     *  the OUTSIDE, before its own uploadFile() ever runs, so `!uploadAbort`
+     *  alone wouldn't otherwise catch it. */
+    function uploadLockActive(state: FileState): boolean {
+      return !!state.uploadingBy && Date.now() - (state.uploadingAt || 0) < UPLOAD_LOCK_STALE_MS;
+    }
+
+    /** true when the ACTIVE lock (see `uploadLockActive`) belongs to
+     *  another peer — drives the "peer uploading..." vs "preparing..."
+     *  label wording only, not whether the locked progress view shows at
+     *  all. */
+    function isRemoteUploadLock(state: FileState): boolean {
+      return !!state.uploadingBy && state.uploadingBy !== localNodeIdCached;
+    }
+
+    function uploadLockLabel(state: FileState): string {
+      const pct = Math.round((state.uploadingProgress || 0) * 100);
+      return isRemoteUploadLock(state) ? `peer uploading... ${pct}%` : `preparing... ${pct}%`;
     }
 
     let prevBlobId = ctx.doc.current.blobId;
@@ -2922,15 +2935,17 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
 
       drawBg(currentWidth, currentHeight);
 
-      // cross-peer upload lock: while another peer uploads into this widget,
-      // render a locked progress view (and handleUpload refuses to start).
-      // only relevant before a blob lands — once blobId is set the normal
+      // upload lock: while a fresh claim is held (by another peer, or by
+      // this same peer via an externally-driven flow, e.g. animaniac's
+      // mixdown — see uploadLockActive()'s own doc comment), render a
+      // locked progress view (and handleUpload refuses to start). only
+      // relevant before a blob lands — once blobId is set the normal
       // loaded path below takes over.
       if (!state.blobId && !uploadAbort) {
-        if (remoteUploadLockActive(state)) {
+        if (uploadLockActive(state)) {
           loadState = "loading";
           syncVisibility();
-          loadingText.text = `peer uploading... ${Math.round((state.uploadingProgress || 0) * 100)}%`;
+          loadingText.text = uploadLockLabel(state);
           return;
         }
         if (loadState === "loading") {
@@ -3040,12 +3055,12 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       }
 
       checkLocality(ctx.doc.current.blobId);
-    } else if (remoteUploadLockActive(ctx.doc.current)) {
-      // mounted mid-upload (another peer holds a fresh lock) — show the
-      // locked progress view instead of the upload placeholder
+    } else if (uploadLockActive(ctx.doc.current)) {
+      // mounted mid-upload (a fresh lock is held, ours or another peer's)
+      // — show the locked progress view instead of the upload placeholder
       loadState = "loading";
       syncVisibility();
-      loadingText.text = `peer uploading... ${Math.round((ctx.doc.current.uploadingProgress || 0) * 100)}%`;
+      loadingText.text = uploadLockLabel(ctx.doc.current);
     }
 
     // -- return controller ----------------------------------------------------
