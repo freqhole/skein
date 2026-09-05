@@ -85,6 +85,20 @@ export function deepUnwrapAmStrings<T>(value: T): T {
   return value;
 }
 
+/** true if `value` (typically a whole automerge doc) contains an
+ *  `ImmutableString` instance anywhere, at any depth — lets a caller skip
+ *  writing back an unaffected doc entirely (e.g. `fix-immutable-strings.ts`'s
+ *  one-shot migration, which should be a no-op for a doc no rust writer has
+ *  ever touched). short-circuits on the first hit. */
+export function containsImmutableString(value: unknown): boolean {
+  if (isImmutableString(value)) return true;
+  if (Array.isArray(value)) return value.some(containsImmutableString);
+  if (value && typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).some(containsImmutableString);
+  }
+  return false;
+}
+
 /**
  * normalize the subtrees of a `CanvasDocument` that tumulus's rust code is
  * known to write into directly: `peers`, `acl[x].role`, and `pendingKnocks`

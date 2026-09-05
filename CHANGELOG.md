@@ -1,5 +1,11 @@
 # skein
 
+## 0.1.14
+
+### Patch Changes
+
+- 34ed925: bump up animaniac widget drop loggin' to catch any issuez
+
 ## 0.1.13
 
 ### Patch Changes

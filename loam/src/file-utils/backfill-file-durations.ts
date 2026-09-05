@@ -26,6 +26,7 @@ import type { CanvasStore } from "../canvas/canvas-store";
 import { fileSchema } from "../../widgets/file";
 import { getMediaPlaybackUrl } from "../media/media-urls";
 import { probeMediaDuration } from "./media-duration";
+import { resolveDocReadyCached } from "../p2p/doc-ready";
 
 const TAG = "file-utils.backfill-file-durations";
 
@@ -38,6 +39,13 @@ export interface BackfillFileDurationsResult {
    *  failed/returned 0 (e.g. the blob isn't locally available to probe) —
    *  left untouched, safe to re-run later once the blob is snatched. */
   failed: number;
+  /** how many `file` widgets' own per-widget doc never became reachable at
+   *  all (see `resolveDocReadyCached()`'s bounded ~15s wait) — these were
+   *  never even checked for a stale duration, so a `checked: 0` result
+   *  with `unreachable > 0` means "couldn't tell", NOT "nothing needed
+   *  fixing". safe to re-run later once connectivity/peer availability
+   *  improves. */
+  unreachable: number;
 }
 
 /** re-probes and backfills `duration` for every `file` widget on `store`'s
@@ -45,16 +53,21 @@ export interface BackfillFileDurationsResult {
  *  read-only for every other widget (skips non-file types, non-audio/video
  *  domains, and anything that already has a real duration). */
 export async function backfillMissingFileDurations(store: CanvasStore): Promise<BackfillFileDurationsResult> {
-  const result: BackfillFileDurationsResult = { checked: 0, fixed: 0, failed: 0 };
+  const result: BackfillFileDurationsResult = { checked: 0, fixed: 0, failed: 0, unreachable: 0 };
 
   for (const entry of store.allWidgets()) {
     if (entry.type !== "file" || !entry.docId) continue;
 
-    const handle = await store.repo.find<{ duration: number }>(entry.docId as DocumentId).catch(() => null);
-    if (!handle) continue;
-    await handle.whenReady().catch(() => {});
+    const handle = await resolveDocReadyCached<{ duration: number }>(store.repo, entry.docId as DocumentId, { context: "backfill-file-durations" });
+    if (!handle) {
+      result.unreachable++;
+      continue;
+    }
     const rawDoc = handle.doc();
-    if (!rawDoc) continue;
+    if (!rawDoc) {
+      result.unreachable++;
+      continue;
+    }
 
     const parsed = fileSchema.safeParse(rawDoc);
     if (!parsed.success) continue;

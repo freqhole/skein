@@ -28,7 +28,12 @@ import { log } from "@freqhole/reliquary/utils";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import type { DropTargetHandler } from "../../src/widgets/widget-types";
 import type { WidgetRegistry } from "../../src/widgets/widget-registry";
-import type { TrackCameraView, TrackRowContainers } from "../../src/widgets/timeline/timeline-types";
+import type {
+  TrackCameraView,
+  TrackRowContainers,
+} from "../../src/widgets/timeline/timeline-types";
+import { resolveDocReadyCached } from "../../src/p2p/doc-ready";
+import { deepUnwrapAmStrings } from "../../src/canvas/automerge-values";
 import { expectedTrackKindFor, isCapturableWidgetType, resolveCapturedClip } from "./frame-capture";
 import { clipBlobInfo, makeAnimaniacNewBlobMessage } from "./snatch-controller";
 import { computeTimelineDuration, clipDurationSec, clipEnd, clipsForTrack } from "./track-model";
@@ -69,9 +74,25 @@ export interface AnimaniacDropControllerHandle {
   destroy(): void;
 }
 
-export function createAnimaniacDropController(options: AnimaniacDropControllerOptions): AnimaniacDropControllerHandle {
-  const { store, repo, registry, widgetId, container, findWorldContainer, getSize, getPreviewSize, getTracks, getClips, getTrackRow, camera, changeDoc, onClipAdded } =
-    options;
+export function createAnimaniacDropController(
+  options: AnimaniacDropControllerOptions
+): AnimaniacDropControllerHandle {
+  const {
+    store,
+    repo,
+    registry,
+    widgetId,
+    container,
+    findWorldContainer,
+    getSize,
+    getPreviewSize,
+    getTracks,
+    getClips,
+    getTrackRow,
+    camera,
+    changeDoc,
+    onClipAdded,
+  } = options;
 
   const hoverBorder = new Graphics();
   hoverBorder.eventMode = "none";
@@ -117,20 +138,37 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
     }
     const sourceState = readDroppedState(entry.type, entry.docId);
     if (!sourceState) {
-      log.debug("animaniac.drop", "[ANIMANIAC-DBG] showPlaceholder: no sourceState", entry.type, entry.docId);
+      log.debug(
+        "animaniac.drop",
+        "[ANIMANIAC-DBG] showPlaceholder: no sourceState",
+        entry.type,
+        entry.docId
+      );
       hidePlaceholder();
       return;
     }
     const expectedKind = expectedTrackKindFor(entry.type, sourceState);
     if (!expectedKind) {
-      log.debug("animaniac.drop", "[ANIMANIAC-DBG] showPlaceholder: expectedTrackKindFor returned null", entry.type, sourceState);
+      log.debug(
+        "animaniac.drop",
+        "[ANIMANIAC-DBG] showPlaceholder: expectedTrackKindFor returned null",
+        entry.type,
+        sourceState
+      );
       hidePlaceholder();
       return;
     }
     const target = resolveDropTarget(worldX, worldY);
     const row = target ? getTrackRow(target.trackId) : null;
     if (!target || !row) {
-      log.debug("animaniac.drop", "[ANIMANIAC-DBG] showPlaceholder: no target/row", "target:", target, "hasRow:", !!row);
+      log.debug(
+        "animaniac.drop",
+        "[ANIMANIAC-DBG] showPlaceholder: no target/row",
+        "target:",
+        target,
+        "hasRow:",
+        !!row
+      );
       hidePlaceholder();
       return;
     }
@@ -145,7 +183,13 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
     placeholderGhost.visible = true;
     placeholderGhost
       .clear()
-      .roundRect(Math.min(x1, x2), 2, Math.max(2, Math.abs(x2 - x1)), Math.max(0, row.height - 4), 3)
+      .roundRect(
+        Math.min(x1, x2),
+        2,
+        Math.max(2, Math.abs(x2 - x1)),
+        Math.max(0, row.height - 4),
+        3
+      )
       .fill({ color: 0xd946ef, alpha: 0.25 })
       .stroke({ width: 1.5, color: 0xd946ef });
   }
@@ -165,20 +209,28 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
 
   /** finds which track row (if any) contains this world-space point, along
    *  with the point converted into that row's own local frame. */
-  function hitTestTrack(worldX: number, worldY: number): { track: Track; localX: number; localY: number } | null {
+  function hitTestTrack(
+    worldX: number,
+    worldY: number
+  ): { track: Track; localX: number; localY: number } | null {
     const world = findWorldContainer();
     for (const track of getTracks()) {
       if (track.hidden) continue;
       const row = getTrackRow(track.id);
       if (!row) continue;
       const local = row.hitArea.toLocal({ x: worldX, y: worldY }, world);
-      const hitRect = row.hitArea.hitArea as { contains?: (x: number, y: number) => boolean } | null;
+      const hitRect = row.hitArea.hitArea as {
+        contains?: (x: number, y: number) => boolean;
+      } | null;
       if (hitRect?.contains?.(local.x, local.y)) return { track, localX: local.x, localY: local.y };
     }
     return null;
   }
 
-  function readDroppedState(entryType: string, docId: string | null): Record<string, unknown> | null {
+  function readDroppedState(
+    entryType: string,
+    docId: string | null
+  ): Record<string, unknown> | null {
     if (!repo || !registry || !docId || !isCapturableWidgetType(entryType)) {
       log.debug("animaniac.drop", "[ANIMANIAC-DBG] readDroppedState: bailing", {
         entryType,
@@ -191,21 +243,86 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
     }
     const factory = registry.get(entryType);
     if (!factory?.schema) {
-      log.debug("animaniac.drop", "[ANIMANIAC-DBG] readDroppedState: no registered factory/schema for type", entryType);
+      log.debug(
+        "animaniac.drop",
+        "[ANIMANIAC-DBG] readDroppedState: no registered factory/schema for type",
+        entryType
+      );
       return null;
     }
     try {
       const handle = repo.handles[docId as DocumentId];
       const rawDoc = handle?.doc();
       if (!rawDoc) {
-        log.debug("animaniac.drop", "[ANIMANIAC-DBG] readDroppedState: no handle/doc yet for docId", docId, "hasHandle:", !!handle);
+        log.debug(
+          "animaniac.drop",
+          "[ANIMANIAC-DBG] readDroppedState: no handle/doc yet for docId",
+          docId,
+          "hasHandle:",
+          !!handle
+        );
         return null;
       }
-      const parsed = factory.schema.parse(rawDoc) as Record<string, unknown>;
-      log.debug("animaniac.drop", "[ANIMANIAC-DBG] readDroppedState: parsed ok", entryType, Object.keys(parsed));
+      // a widget doc the tumulus hub has ever written into directly (e.g.
+      // stamping `snatchedBy` after a p2p snatch) round-trips string
+      // fields as `ImmutableString` instances, which zod's `z.string()`
+      // rejects outright — see `automerge-values.ts`'s own doc comment
+      // (the same normalization `widget-doc.ts` already applies for every
+      // OTHER doc read; this module reads a DIFFERENT widget's raw doc
+      // directly, bypassing that facade, so it needs its own call here).
+      const parsed = factory.schema.parse(deepUnwrapAmStrings(rawDoc)) as Record<string, unknown>;
+      log.debug(
+        "animaniac.drop",
+        "[ANIMANIAC-DBG] readDroppedState: parsed ok",
+        entryType,
+        Object.keys(parsed)
+      );
       return parsed;
     } catch (err) {
-      log.debug("animaniac.drop", "[ANIMANIAC-DBG] readDroppedState: schema.parse threw", entryType, err);
+      log.debug(
+        "animaniac.drop",
+        "[ANIMANIAC-DBG] readDroppedState: schema.parse threw",
+        entryType,
+        err
+      );
+      return null;
+    }
+  }
+
+  /** same as `readDroppedState()`, but for `onDrop()`'s own real capture
+   *  step (unlike `showPlaceholder()`'s hover-preview call, this one is
+   *  worth waiting on) — tries the synchronous cache first (instant for a
+   *  widget already mounted/opened this session, the overwhelmingly common
+   *  case), then falls back to `resolveDocReadyCached()`'s bounded wait for
+   *  a widget whose own per-widget doc handle was never opened locally
+   *  yet (e.g. sitting untouched inside a bin since before this browser
+   *  tab loaded) — without this fallback, a dropped widget whose doc
+   *  simply hadn't synced/opened yet was silently treated as "not
+   *  capturable" instead of "not ready yet". */
+  async function readDroppedStateAsync(
+    entryType: string,
+    docId: string | null
+  ): Promise<Record<string, unknown> | null> {
+    const synced = readDroppedState(entryType, docId);
+    if (synced) return synced;
+    if (!repo || !registry || !docId || !isCapturableWidgetType(entryType)) return null;
+    const factory = registry.get(entryType);
+    if (!factory?.schema) return null;
+    const handle = await resolveDocReadyCached(repo, docId as DocumentId, {
+      context: "animaniac.drop",
+    });
+    if (!handle) return null;
+    const rawDoc = handle.doc();
+    if (!rawDoc) return null;
+    try {
+      return factory.schema.parse(deepUnwrapAmStrings(rawDoc)) as Record<string, unknown>;
+    } catch (err) {
+      log.debug(
+        "animaniac.drop",
+        "[ANIMANIAC-DBG] readDroppedStateAsync: schema.parse threw",
+        entryType,
+        err
+      );
       return null;
     }
   }
@@ -215,7 +332,10 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
    *  placed at the current end of the timeline (per the user's "if it's
    *  not dropped in a specific place, just place it at the end" request).
    *  any track accepts any clip kind (tracks are unified). */
-  function resolveDropTarget(worldX: number, worldY: number): { trackId: string; start: number } | null {
+  function resolveDropTarget(
+    worldX: number,
+    worldY: number
+  ): { trackId: string; start: number } | null {
     const hit = hitTestTrack(worldX, worldY);
     if (hit) {
       return { trackId: hit.track.id, start: Math.max(0, camera.screenXToTime(hit.localX)) };
@@ -242,7 +362,13 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
         onHover(worldX: number, worldY: number, draggedWidgetId: string): void {
           setHovering(true);
           const entry = store.getWidget(draggedWidgetId);
-          log.debug("animaniac.drop", "[ANIMANIAC-DBG] onHover:", draggedWidgetId, "entryType:", entry?.type);
+          log.debug(
+            "animaniac.drop",
+            "[ANIMANIAC-DBG] onHover:",
+            draggedWidgetId,
+            "entryType:",
+            entry?.type
+          );
           showPlaceholder(worldX, worldY, draggedWidgetId);
         },
 
@@ -256,71 +382,109 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
           hidePlaceholder();
           const entry = store.getWidget(draggedWidgetId);
           if (!entry || !isCapturableWidgetType(entry.type)) {
-            log.debug("animaniac.drop", "onDrop: dragged widget not capturable", { entryType: entry?.type });
-            return false;
-          }
-          const sourceState = readDroppedState(entry.type, entry.docId);
-          if (!sourceState) {
-            log.debug("animaniac.drop", "onDrop: could not read dropped widget's doc state", { entryType: entry.type, docId: entry.docId });
-            return false;
-          }
-          const expectedKind = expectedTrackKindFor(entry.type, sourceState);
-          if (!expectedKind) {
-            log.debug("animaniac.drop", "onDrop: could not determine target track kind", { entryType: entry.type });
+            log.debug("animaniac.drop", "onDrop: dragged widget not capturable", {
+              entryType: entry?.type,
+            });
             return false;
           }
           const target = resolveDropTarget(worldX, worldY);
           if (!target) {
-            log.debug("animaniac.drop", "onDrop: no track exists", { expectedKind });
+            log.debug("animaniac.drop", "onDrop: no track exists", { entryType: entry.type });
             return false;
           }
           const { trackId, start } = target;
           log.debug("animaniac.drop", "onDrop: hit", { entryType: entry.type, trackId, start });
 
-          void resolveCapturedClip(entry.type, sourceState, trackId, start, undefined, getPreviewSize(), { width: entry.width, height: entry.height }).then((clip) => {
-            if (!clip) {
-              // resolveCapturedClip() is deliberately pure/unlogged (see its
-              // own doc comment) — log the relevant sourceState fields HERE
-              // instead so a "why did this return null" question is
-              // answerable from this one log line without touching that
-              // module (e.g. a not-yet-generated tts clip has no
-              // audioBlobId yet; a fresh audio-recording may have duration
-              // 0 until its own probe finishes).
-              log.debug("animaniac.drop", "[ANIMANIAC-DBG] onDrop: resolveCapturedClip returned null (nothing capturable yet)", {
+          // claim the drop synchronously (per this module's own doc
+          // comment) — everything from here on is async, INCLUDING
+          // reading the dropped widget's own doc state itself now (see
+          // `readDroppedStateAsync()`'s own doc comment: a widget whose
+          // per-widget doc handle was never opened locally yet — e.g.
+          // sitting untouched inside a bin since before this browser tab
+          // loaded — used to fail this synchronously and reject the whole
+          // drop instead of just waiting for it).
+          void readDroppedStateAsync(entry.type, entry.docId).then((sourceState) => {
+            if (!sourceState) {
+              log.debug("animaniac.drop", "onDrop: could not read dropped widget's doc state", {
                 entryType: entry.type,
-                blobId: sourceState.blobId,
-                domain: sourceState.domain,
-                duration: sourceState.duration,
-                videoBlobId: sourceState.videoBlobId,
-                videoDurationSec: sourceState.videoDurationSec,
+                docId: entry.docId,
               });
               return;
             }
-            // items on a single track must not overlap each other (see
-            // track-item-interaction.ts's own preventOverlap option, used
-            // by tracks/track.ts for interactive drags) — a drop lands
-            // wherever the pointer was released with no collision check of
-            // its own, so re-place it at the end of THIS track's own clips
-            // if it would overlap one already there.
-            const existingOnTrack = clipsForTrack(getClips(), trackId);
-            const newEnd = clip.start + clipDurationSec(clip);
-            const overlaps = existingOnTrack.some((other) => clip.start < clipEnd(other) && newEnd > other.start);
-            if (overlaps) {
-              const trackEnd = existingOnTrack.reduce((max, other) => Math.max(max, clipEnd(other)), 0);
-              clip.start = trackEnd;
+            const expectedKind = expectedTrackKindFor(entry.type, sourceState);
+            if (!expectedKind) {
+              log.debug("animaniac.drop", "onDrop: could not determine target track kind", {
+                entryType: entry.type,
+              });
+              return;
             }
-            changeDoc((d) => {
-              d.clips.push(clip);
+            void resolveCapturedClip(
+              entry.type,
+              sourceState,
+              trackId,
+              start,
+              undefined,
+              getPreviewSize(),
+              { width: entry.width, height: entry.height }
+            ).then((clip) => {
+              if (!clip) {
+                // resolveCapturedClip() is deliberately pure/unlogged (see its
+                // own doc comment) — log the relevant sourceState fields HERE
+                // instead so a "why did this return null" question is
+                // answerable from this one log line without touching that
+                // module (e.g. a not-yet-generated tts clip has no
+                // audioBlobId yet; a fresh audio-recording may have duration
+                // 0 until its own probe finishes).
+                log.debug(
+                  "animaniac.drop",
+                  "[ANIMANIAC-DBG] onDrop: resolveCapturedClip returned null (nothing capturable yet)",
+                  {
+                    entryType: entry.type,
+                    blobId: sourceState.blobId,
+                    domain: sourceState.domain,
+                    duration: sourceState.duration,
+                    videoBlobId: sourceState.videoBlobId,
+                    videoDurationSec: sourceState.videoDurationSec,
+                  }
+                );
+                return;
+              }
+              // items on a single track must not overlap each other (see
+              // track-item-interaction.ts's own preventOverlap option, used
+              // by tracks/track.ts for interactive drags) — a drop lands
+              // wherever the pointer was released with no collision check of
+              // its own, so re-place it at the end of THIS track's own clips
+              // if it would overlap one already there.
+              const existingOnTrack = clipsForTrack(getClips(), trackId);
+              const newEnd = clip.start + clipDurationSec(clip);
+              const overlaps = existingOnTrack.some(
+                (other) => clip.start < clipEnd(other) && newEnd > other.start
+              );
+              if (overlaps) {
+                const trackEnd = existingOnTrack.reduce(
+                  (max, other) => Math.max(max, clipEnd(other)),
+                  0
+                );
+                clip.start = trackEnd;
+              }
+              changeDoc((d) => {
+                d.clips.push(clip);
+              });
+              onClipAdded();
+              store.removeWidget(draggedWidgetId);
+              log.debug("animaniac.drop", "onDrop: captured", { clipKind: clip.kind, trackId });
+              // notify every OTHER peer currently on this canvas right away
+              // (ephemeral, not a doc change — see snatch-controller.ts's own
+              // doc comment) so their own snatch-all cue lights up without
+              // waiting on a full clip-list rescan.
+              const blob = clipBlobInfo(clip);
+              if (blob)
+                store.broadcastEphemeral(
+                  new TextEncoder().encode(
+                    JSON.stringify(makeAnimaniacNewBlobMessage(widgetId, blob))
+                  )
+                );
             });
-            onClipAdded();
-            store.removeWidget(draggedWidgetId);
-            log.debug("animaniac.drop", "onDrop: captured", { clipKind: clip.kind, trackId });
-            // notify every OTHER peer currently on this canvas right away
-            // (ephemeral, not a doc change — see snatch-controller.ts's own
-            // doc comment) so their own snatch-all cue lights up without
-            // waiting on a full clip-list rescan.
-            const blob = clipBlobInfo(clip);
-            if (blob) store.broadcastEphemeral(new TextEncoder().encode(JSON.stringify(makeAnimaniacNewBlobMessage(widgetId, blob))));
           });
 
           return true;
@@ -336,4 +500,3 @@ export function createAnimaniacDropController(options: AnimaniacDropControllerOp
     },
   };
 }
-
