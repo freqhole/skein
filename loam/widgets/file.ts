@@ -1,8 +1,11 @@
 import { Assets, Container, Graphics, Rectangle, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
 import { log, pickImageAsDataUrl } from "@freqhole/reliquary/utils";
+import { base64Encode } from "@freqhole/reliquary/worker";
 import { getMediaPlaybackUrl } from "../src/media";
-import { isTauriMode } from "../src/p2p/tauri-transport";
+import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
+import { storeBlobFromFile } from "../src/storage/blob-store";
+import { interleaveChannels, encodeWav } from "./animaniac/export/wav-encode";
 import { getLocalNodeId, type PeersMap, type PickedFile, type ThumbnailOptions } from "../src/file-utils/file-shared";
 import { probeMediaDuration } from "../src/file-utils/media-duration";
 import { formatFileSize } from "../src/widgets/format";
@@ -89,6 +92,23 @@ export const fileSchema = z.object({
    *  same pattern as peedeeeff's processingClaimedBy/processingClaimedAt. */
   domainIngestClaimedBy: z.string().default(""),
   domainIngestClaimedAt: z.number().default(0),
+  /** gain multiplier applied to an audio-domain file (1 = original,
+   *  unamplified) — see fileEditableProps()/the gain widgetActions below.
+   *  purely a UI/preview value; playback amplification only takes effect
+   *  once `gainRenditionBlobId` is set via "apply volume". */
+  gainValue: z.number().default(1),
+  /** a re-rendered copy of the original file with `gainValue` baked into
+   *  the samples — empty when no gain has been applied, in which case
+   *  playback uses `blobId` directly. */
+  gainRenditionBlobId: z.string().default(""),
+  gainRenditionBlake3: z.string().default(""),
+  gainRenditionMime: z.string().default(""),
+  gainRenditionSize: z.number().default(0),
+  /** node IDs that have snatched (or rendered) the gain rendition blob —
+   *  kept separate from `snatchedBy` since it's a DIFFERENT blob; peers
+   *  who only ever fetched the original would otherwise be wrongly
+   *  reported as having the rendition too. */
+  gainRenditionSnatchedBy: z.array(z.string()).default([]),
 });
 
 export type FileState = z.infer<typeof fileSchema>;
@@ -153,6 +173,19 @@ function fileEditableProps(domain: string): WidgetPropDef[] {
       // showing through the whole processing run, and after a failure
       // reverts `domain` back to "" - though it re-appearing then is correct).
       visibleWhen: { key: "domain", value: ["", "file"] },
+    });
+  }
+  if (domain === "audio") {
+    // last editableProp so it renders immediately above the
+    // preview/stop/apply/reset buttons in widgetActions below.
+    props.push({
+      key: "gainValue",
+      label: "volume",
+      type: "number",
+      default: 1,
+      min: 0,
+      max: 11,
+      step: 0.1,
     });
   }
   return props;
@@ -1161,6 +1194,69 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       positionInfoBar(currentWidth, currentHeight);
     };
 
+    /** best-effort background snatch for an applied gain rendition — no
+     *  dedicated progress UI (unlike the original's own `handleSnatch()`
+     *  above/below), just a quiet catch-up fetch. called both when the
+     *  ORIGINAL blob is confirmed local (a peer who already has the
+     *  original very plausibly wants any rendition too, without a second
+     *  manual click) and after a manual "snatch" of the original succeeds
+     *  (the explicit fallback for whenever the auto-catch-up path above
+     *  doesn't fire, e.g. this device wasn't online yet when the
+     *  rendition first landed). no-ops if there's no rendition, it's
+     *  already local, or no peers are reachable. */
+    async function snatchGainRenditionIfNeeded(): Promise<void> {
+      const state = ctx.doc.current;
+      const blobId = state.gainRenditionBlobId;
+      if (!blobId) return;
+      const info = await checkBlobLocality(blobId, state.gainRenditionBlake3 || undefined).catch(
+        () => ({ locality: "unknown" as const, metadata: null })
+      );
+      if (info.locality === "local") return;
+      const allPeers = ctx.canvasStore?.peers();
+      if (!allPeers || Object.keys(allPeers).length === 0) return;
+
+      const renditionSnatchedBy = (state.gainRenditionSnatchedBy ?? []).map(String);
+      let peers = allPeers;
+      if (renditionSnatchedBy.length > 0) {
+        const filtered: typeof allPeers = {};
+        for (const [key, value] of Object.entries(allPeers)) {
+          if (renditionSnatchedBy.includes(String(value.nodeId))) filtered[key] = value;
+        }
+        if (Object.keys(filtered).length > 0) peers = filtered;
+      }
+
+      try {
+        const result = await snatchBlob(
+          {
+            blobId,
+            filename: `${state.filename || "audio"}-gain.wav`,
+            mime: state.gainRenditionMime || "audio/wav",
+            size: state.gainRenditionSize,
+            blake3: state.gainRenditionBlake3 || "",
+            domain: "audio",
+          },
+          peers as PeersMap
+        );
+        if (destroyed || !result || ctx.doc.current.gainRenditionBlobId !== blobId) return;
+        const localNodeId = await getLocalNodeId();
+        if (localNodeId) {
+          ctx.doc.change((d) => {
+            if (d.gainRenditionBlobId === blobId && !d.gainRenditionSnatchedBy.includes(localNodeId)) {
+              d.gainRenditionSnatchedBy.push(localNodeId);
+            }
+          });
+        }
+        const refCanvasDocId = ctx.canvasStore?.handle.documentId;
+        if (refCanvasDocId) {
+          addBlobCanvasRef(blobId, state.gainRenditionBlake3, refCanvasDocId).catch((err) => {
+            log.warn("file-widget", "addBlobCanvasRef failed for gain rendition (non-fatal):", err);
+          });
+        }
+      } catch (err) {
+        log.debug("file-widget", "background gain rendition snatch failed (non-fatal):", err);
+      }
+    }
+
     const checkLocality = async (blobId: string) => {
       if (!blobId) {
         actionState = "checking";
@@ -1206,6 +1302,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         if (!isDomainEditable(domainNow) && !ctx.doc.current.thumbnailDataUrl) {
           kickOffDomainIngest(domainNow);
         }
+        void snatchGainRenditionIfNeeded();
       } else {
         localByteSize = null;
         actionState = "remote";
@@ -2293,6 +2390,11 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
             }
           });
         }
+        // manual fallback for whenever the auto-catch-up in checkLocality's
+        // own "local" branch doesn't fire (e.g. this device only just
+        // learned about the rendition) — see snatchGainRenditionIfNeeded's
+        // own doc comment.
+        void snatchGainRenditionIfNeeded();
 
         syncActionButtons();
 
@@ -2529,12 +2631,18 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
         "mime:",
         state.mime
       );
-      const src = await getMediaPlaybackUrl(state.blobId, {
-        category: overlayType as "video" | "audio",
-        mime: state.mime,
-        blake3: state.blake3,
-        // no peers — preview only uses local sources
-      });
+      // an applied gain rendition (see "apply volume" below) always wins
+      // over the original file — the whole point of committing one.
+      const usingGainRendition = overlayType === "audio" && !!state.gainRenditionBlobId;
+      const src = await getMediaPlaybackUrl(
+        usingGainRendition ? state.gainRenditionBlobId : state.blobId,
+        {
+          category: overlayType as "video" | "audio",
+          mime: usingGainRendition ? state.gainRenditionMime : state.mime,
+          blake3: usingGainRendition ? state.gainRenditionBlake3 : state.blake3,
+          // no peers — preview only uses local sources
+        }
+      );
       log.debug(
         "file-widget",
         "audio/video: getMediaPlaybackUrl returned",
@@ -2573,6 +2681,164 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           }
         },
       });
+    }
+
+    // -- gain adjustment: preview/apply/reset (audio domain only) -----------
+    // see voice-recording.ts's mirror of this same block for the full
+    // rationale (offline OfflineAudioContext render, never a live WebAudio
+    // tap on a playing <audio> element).
+    let decodedOriginalBuffer: AudioBuffer | null = null;
+    let lastRenderedGain: number | null = null;
+    let lastRenderedWavBytes: Uint8Array | null = null;
+    let previewEl: HTMLAudioElement | null = null;
+    let previewObjectUrl: string | null = null;
+
+    async function ensureDecodedOriginal(): Promise<AudioBuffer | null> {
+      if (decodedOriginalBuffer) return decodedOriginalBuffer;
+      const { blobId, mime, blake3 } = ctx.doc.current;
+      if (!blobId) return null;
+      const url = await getMediaPlaybackUrl(blobId, {
+        category: "audio",
+        mime: mime || undefined,
+        blake3: blake3 || undefined,
+      });
+      if (!url) return null;
+      const bytes = await fetch(url).then((r) => r.arrayBuffer());
+      const decodeCtx = new OfflineAudioContext(2, 1, 44100);
+      decodedOriginalBuffer = await decodeCtx.decodeAudioData(bytes);
+      return decodedOriginalBuffer;
+    }
+
+    async function renderGainedWav(gain: number): Promise<Uint8Array | null> {
+      if (lastRenderedGain === gain && lastRenderedWavBytes) return lastRenderedWavBytes;
+      const original = await ensureDecodedOriginal();
+      if (!original) return null;
+      const renderCtx = new OfflineAudioContext(
+        original.numberOfChannels,
+        original.length,
+        original.sampleRate
+      );
+      const source = renderCtx.createBufferSource();
+      source.buffer = original;
+      const gainNode = renderCtx.createGain();
+      gainNode.gain.value = gain;
+      source.connect(gainNode).connect(renderCtx.destination);
+      source.start();
+      const rendered = await renderCtx.startRendering();
+      const channels: Float32Array[] = [];
+      for (let i = 0; i < rendered.numberOfChannels; i++) channels.push(rendered.getChannelData(i));
+      const bytes = encodeWav(interleaveChannels(channels), rendered.numberOfChannels, rendered.sampleRate);
+      lastRenderedGain = gain;
+      lastRenderedWavBytes = bytes;
+      return bytes;
+    }
+
+    function stopPreviewGain(): void {
+      if (previewEl) {
+        previewEl.pause();
+        previewEl.src = "";
+        previewEl = null;
+      }
+      if (previewObjectUrl) {
+        URL.revokeObjectURL(previewObjectUrl);
+        previewObjectUrl = null;
+      }
+    }
+
+    async function previewGain(): Promise<void> {
+      stopPreviewGain();
+      const bytes = await renderGainedWav(ctx.doc.current.gainValue);
+      if (!bytes || destroyed) return;
+      previewObjectUrl = URL.createObjectURL(new Blob([bytes.buffer as ArrayBuffer], { type: "audio/wav" }));
+      previewEl = new Audio(previewObjectUrl);
+      previewEl.addEventListener("ended", stopPreviewGain, { once: true });
+      await previewEl.play().catch((err) => log.warn("file-widget", "gain preview play() rejected:", err));
+    }
+
+    function forgetRenditionBlob(blobId: string, blake3: string): void {
+      if (!blobId) return;
+      freeUpLocalBlobCopy(blobId, blake3 || undefined).catch((err) => {
+        log.warn("file-widget", "failed to free old gain rendition blob (non-fatal):", err);
+      });
+    }
+
+    async function commitGainRendition(): Promise<void> {
+      const gain = ctx.doc.current.gainValue;
+      const bytes = await renderGainedWav(gain);
+      if (!bytes || destroyed) return;
+
+      const filename = `${ctx.doc.current.filename || "audio"}-gain.wav`;
+      let record: { blob_id: string; blake3: string; size: number; mime: string };
+      if (isTauriMode()) {
+        const base64Data = await base64Encode(bytes.buffer as ArrayBuffer);
+        const response = (await dispatch("blob_insert", {
+          filename,
+          mime: "audio/wav",
+          data: base64Data,
+        })) as { blake3: string; mime: string | null; size: number };
+        record = {
+          blob_id: response.blake3,
+          blake3: response.blake3,
+          size: response.size,
+          mime: response.mime || "audio/wav",
+        };
+      } else {
+        const file = new File([bytes.buffer as ArrayBuffer], filename, { type: "audio/wav" });
+        const fileRecord = await storeBlobFromFile(file, { metadata: { domain: "audio" } });
+        record = {
+          blob_id: fileRecord.blob_id,
+          blake3: fileRecord.blake3 || fileRecord.blob_id,
+          size: fileRecord.size,
+          mime: fileRecord.mime,
+        };
+      }
+
+      const previousRenditionBlobId = ctx.doc.current.gainRenditionBlobId;
+      const previousRenditionBlake3 = ctx.doc.current.gainRenditionBlake3;
+      // this device has the rendition locally the moment it renders it —
+      // record that immediately, same as any other freshly-stored blob.
+      const localNodeId = await getLocalNodeId();
+      ctx.doc.change((d) => {
+        d.gainRenditionBlobId = record.blob_id;
+        d.gainRenditionBlake3 = record.blake3;
+        d.gainRenditionMime = record.mime;
+        d.gainRenditionSize = record.size;
+        d.gainRenditionSnatchedBy = localNodeId ? [localNodeId] : [];
+      });
+      const refCanvasDocId = ctx.canvasStore?.handle.documentId;
+      if (refCanvasDocId) {
+        addBlobCanvasRef(record.blob_id, record.blake3, refCanvasDocId).catch((err) => {
+          log.warn("file-widget", "addBlobCanvasRef failed for gain rendition (non-fatal):", err);
+        });
+      }
+      if (activePlayer && !activePlayer.closed) {
+        activePlayer.close();
+        activePlayer = null;
+        void handlePreview();
+      }
+      if (previousRenditionBlobId && previousRenditionBlobId !== record.blob_id) {
+        forgetRenditionBlob(previousRenditionBlobId, previousRenditionBlake3);
+      }
+    }
+
+    function resetGain(): void {
+      stopPreviewGain();
+      const previousRenditionBlobId = ctx.doc.current.gainRenditionBlobId;
+      const previousRenditionBlake3 = ctx.doc.current.gainRenditionBlake3;
+      ctx.doc.change((d) => {
+        d.gainValue = 1;
+        d.gainRenditionBlobId = "";
+        d.gainRenditionBlake3 = "";
+        d.gainRenditionMime = "";
+        d.gainRenditionSize = 0;
+        d.gainRenditionSnatchedBy = [];
+      });
+      if (activePlayer && !activePlayer.closed) {
+        activePlayer.close();
+        activePlayer = null;
+        void handlePreview();
+      }
+      if (previousRenditionBlobId) forgetRenditionBlob(previousRenditionBlobId, previousRenditionBlake3);
     }
 
     // -- overlay repositioning ------------------------------------------------
@@ -2896,26 +3162,37 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
       // audio/video/pdf/whatever), "purge local copy" (frees the local
       // OPFS/blobz copy — e.g. to retry a snatch that left a corrupt/0-byte
       // file — without disturbing the widget doc), and who-has-this-file info rows
-      widgetActions: [
-        { id: "choose-thumbnail", label: "choose thumbnail", onClick: () => void handleChooseThumbnail() },
-        { id: "remove-thumbnail", label: "remove thumbnail", onClick: handleRemoveThumbnail },
-        ...(ctx.doc.current.blobId && isDocumentFilename(ctx.doc.current.filename)
-          ? [
-              {
-                id: "convert-to-peedeeeff",
-                label: "convert to peedeeeff",
-                onClick: handleConvertToPeedeeeff,
-              },
-            ]
-          : []),
-        {
-          id: "purge-local-copy",
-          label: "purge local copy",
-          onClick: () => {
-            void handleFreeUpSpace();
+      get widgetActions() {
+        const state = ctx.doc.current;
+        return [
+          { id: "choose-thumbnail", label: "choose thumbnail", onClick: () => void handleChooseThumbnail() },
+          { id: "remove-thumbnail", label: "remove thumbnail", onClick: handleRemoveThumbnail },
+          ...(state.blobId && isDocumentFilename(state.filename)
+            ? [
+                {
+                  id: "convert-to-peedeeeff",
+                  label: "convert to peedeeeff",
+                  onClick: handleConvertToPeedeeeff,
+                },
+              ]
+            : []),
+          ...(state.domain === "audio" && state.blobId
+            ? [
+                { id: "preview-gain", label: "preview volume", onClick: () => void previewGain() },
+                { id: "stop-gain-preview", label: "stop preview", onClick: stopPreviewGain },
+                { id: "apply-gain", label: "apply volume", onClick: () => void commitGainRendition() },
+                { id: "reset-gain", label: "reset volume", onClick: resetGain },
+              ]
+            : []),
+          {
+            id: "purge-local-copy",
+            label: "purge local copy",
+            onClick: () => {
+              void handleFreeUpSpace();
+            },
           },
-        },
-      ],
+        ];
+      },
       widgetInfoRows: () => {
         const state = ctx.doc.current;
         if (!state.blobId) return [];
@@ -2976,6 +3253,7 @@ export const fileWidget: WidgetFactory<typeof fileSchema> = {
           activePlayer.close();
           activePlayer = null;
         }
+        stopPreviewGain();
         unsub();
         unsubTransferProgress?.();
         unsubTransferProgress = null;

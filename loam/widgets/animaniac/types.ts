@@ -154,6 +154,26 @@ export type LabelClip = z.infer<typeof labelClipSchema>;
  *  mirror `voice-recording.ts`'s own schema fields exactly — copied at
  *  capture time (see `frame-capture.ts`) since the source widget itself
  *  may be edited/removed later, but the clip should keep looking the same. */
+/** gain fields shared by every audio-bearing clip kind (voice-recording/
+ *  tts/audio-segment) — see voice-recording.ts's mirror of this same
+ *  concept for the full rationale. always rendered from the WHOLE
+ *  original source (never just a trimmed range), so a clip stays correct
+ *  across later re-trims. `gainValue` 1 (default) means "play
+ *  `audioBlobId` unmodified"; a non-empty `gainRenditionBlobId` always
+ *  takes precedence over it once set. */
+const gainFields = {
+  gainValue: z.number().default(1),
+  gainRenditionBlobId: z.string().default(""),
+  gainRenditionBlake3: z.string().default(""),
+  gainRenditionMime: z.string().default(""),
+  gainRenditionSize: z.number().default(0),
+  /** node IDs that have snatched (or rendered) the gain rendition blob —
+   *  kept separate from `snatchedBy` since it's a DIFFERENT blob; peers
+   *  who only ever fetched the original would otherwise be wrongly
+   *  reported as having the rendition too. */
+  gainRenditionSnatchedBy: z.array(z.string()).default([]),
+};
+
 export const voiceRecordingClipSchema = clipBaseSchema.extend({
   kind: z.literal("voice-recording"),
   audioBlobId: z.string(),
@@ -167,6 +187,7 @@ export const voiceRecordingClipSchema = clipBaseSchema.extend({
   cupidBowAmount: z.number().default(4),
   /** see `doodleFrameClipSchema.snatchedBy`'s own doc comment. */
   snatchedBy: z.array(z.string()).default([]),
+  ...gainFields,
 });
 export type VoiceRecordingClip = z.infer<typeof voiceRecordingClipSchema>;
 
@@ -182,6 +203,7 @@ export const ttsClipSchema = clipBaseSchema.extend({
   ttsVoiceLang: z.string().default(""),
   ttsRate: z.number().default(1),
   snatchedBy: z.array(z.string()).default([]),
+  ...gainFields,
 });
 export type TtsClip = z.infer<typeof ttsClipSchema>;
 
@@ -201,6 +223,7 @@ export const audioSegmentClipSchema = clipBaseSchema.extend({
   sourceOutSec: z.number(),
   label: z.string().default(""),
   snatchedBy: z.array(z.string()).default([]),
+  ...gainFields,
 });
 export type AudioSegmentClip = z.infer<typeof audioSegmentClipSchema>;
 

@@ -36,8 +36,24 @@ function sourceOffsetSec(clip: Clip): number {
   return clip.kind === "audio-segment" ? (clip as AudioSegmentClip).sourceInSec : 0;
 }
 
-function audioBlobIdOf(clip: Clip): string {
-  return clip.kind === "voice-recording" || clip.kind === "tts" || clip.kind === "audio-segment" ? clip.audioBlobId : "";
+export interface AudioRef {
+  blobId: string;
+  mime: string;
+  blake3: string;
+}
+
+/** an applied gain rendition (see voice-recording.ts's mirror of this same
+ *  concept) always wins over the clip's original audio — the whole point
+ *  of committing one. gain is always rendered from the WHOLE original
+ *  source (never just the trimmed range), so this is safe to prefer
+ *  regardless of `sourceInSec`/`sourceOutSec`. */
+export function effectiveAudioRef(clip: Clip): AudioRef | null {
+  if (clip.kind !== "voice-recording" && clip.kind !== "tts" && clip.kind !== "audio-segment") return null;
+  if (clip.gainRenditionBlobId) {
+    return { blobId: clip.gainRenditionBlobId, mime: clip.gainRenditionMime, blake3: clip.gainRenditionBlake3 };
+  }
+  if (!clip.audioBlobId) return null;
+  return { blobId: clip.audioBlobId, mime: clip.audioMime, blake3: clip.audioBlake3 };
 }
 
 export interface AudioPlaybackOptions {
@@ -60,22 +76,31 @@ interface PoolEntry {
   resolving: boolean;
   /** true once `el.currentTime` has been set at least once — see `update()`. */
   synced: boolean;
+  /** the `AudioRef` this entry's `el` was resolved from — a live doc write
+   *  changing which ref a clip effectively points to (e.g. a fresh gain
+   *  rendition landing) is detected by comparing against this each tick,
+   *  see `update()`'s own re-resolve check. `null` while still resolving. */
+  resolvedKey: string | null;
 }
 
 export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybackHandle {
   const { getClips, getPeers } = options;
   const pool = new Map<string, PoolEntry>();
 
+  function refKey(ref: AudioRef): string {
+    return `${ref.blobId}|${ref.blake3}`;
+  }
+
   function ensureEntry(clip: Clip): PoolEntry {
     let entry = pool.get(clip.id);
     if (entry) return entry;
-    entry = { el: null, resolving: false, synced: false };
+    entry = { el: null, resolving: false, synced: false, resolvedKey: null };
     pool.set(clip.id, entry);
-    const blobId = audioBlobIdOf(clip);
-    if (blobId && !entry.resolving) {
+    const ref = effectiveAudioRef(clip);
+    if (ref && !entry.resolving) {
       entry.resolving = true;
-      const mime = clip.kind === "voice-recording" || clip.kind === "tts" || clip.kind === "audio-segment" ? clip.audioMime : "";
-      const blake3 = clip.kind === "voice-recording" || clip.kind === "tts" || clip.kind === "audio-segment" ? clip.audioBlake3 : "";
+      const { blobId, mime, blake3 } = ref;
+      entry.resolvedKey = refKey(ref);
       // in tauri mode, blob_get_path()/blob lookups prefer blake3 over
       // blobId when both are present (see media-urls.ts's own "lookupId =
       // blake3 || blobId" comment: "on skein-tauri, blob ids ARE blake3
@@ -131,6 +156,23 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
         pool.delete(id);
       }
     }
+
+    // a still-active clip whose effective ref changed (a gain rendition
+    // just landed, from this peer or a remote one) needs a fresh element —
+    // deleting the stale entry here lets `ensureEntry()` below recreate it
+    // and re-seek/resume at the correct position via its own `!synced`
+    // path, same as a brand-new clip becoming active.
+    for (const clip of active) {
+      const entry = pool.get(clip.id);
+      if (!entry || entry.resolvedKey === null) continue; // not created yet, or still resolving for the first time
+      const ref = effectiveAudioRef(clip);
+      const currentKey = ref ? refKey(ref) : null;
+      if (currentKey !== entry.resolvedKey) {
+        entry.el?.pause();
+        pool.delete(clip.id);
+      }
+    }
+
 
     for (const clip of active) {
       const entry = ensureEntry(clip);

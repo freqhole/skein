@@ -89,6 +89,12 @@ export function restoreWidgetFromClip(clip: Clip): RestoredWidget {
           teethStyle: clip.teethStyle,
           cupidBowAmount: clip.cupidBowAmount,
           snatchedBy: clip.snatchedBy,
+          gainValue: clip.gainValue,
+          gainRenditionBlobId: clip.gainRenditionBlobId,
+          gainRenditionBlake3: clip.gainRenditionBlake3,
+          gainRenditionMime: clip.gainRenditionMime,
+          gainRenditionSize: clip.gainRenditionSize,
+          gainRenditionSnatchedBy: clip.gainRenditionSnatchedBy,
         },
       };
 
@@ -120,6 +126,12 @@ export function restoreWidgetFromClip(clip: Clip): RestoredWidget {
           filename: clip.label,
           duration: Math.max(0, clip.sourceOutSec - clip.sourceInSec),
           snatchedBy: clip.snatchedBy,
+          gainValue: clip.gainValue,
+          gainRenditionBlobId: clip.gainRenditionBlobId,
+          gainRenditionBlake3: clip.gainRenditionBlake3,
+          gainRenditionMime: clip.gainRenditionMime,
+          gainRenditionSize: clip.gainRenditionSize,
+          gainRenditionSnatchedBy: clip.gainRenditionSnatchedBy,
         },
       };
 

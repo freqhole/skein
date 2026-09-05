@@ -55,12 +55,16 @@ export function isAnimaniacNewBlobMessage(msg: unknown): msg is AnimaniacNewBlob
 }
 
 /** every blob reference this widget's own doc currently carries — one
- *  pass over `clips[]`, covering every clip kind with a blob field. */
+ *  pass over `clips[]`, covering every clip kind with a blob field, plus
+ *  any applied gain rendition (see `clipGainRenditionBlobInfo()`) each
+ *  audio-bearing clip may separately carry. */
 export function buildSnatchAllBlobs(state: AnimaniacState): SnatchBlobInfo[] {
   const blobs: SnatchBlobInfo[] = [];
   for (const clip of state.clips) {
     const blob = clipBlobInfo(clip);
     if (blob) blobs.push(blob);
+    const rendition = clipGainRenditionBlobInfo(clip);
+    if (rendition) blobs.push(rendition);
   }
   return blobs;
 }
@@ -106,6 +110,22 @@ export function clipBlobInfo(clip: Clip): SnatchBlobInfo | null {
     default:
       return null;
   }
+}
+
+/** an applied gain rendition (see index.ts's `commitGainRender()`) is a
+ *  SEPARATE blob from the clip's own `clipBlobInfo()` reference — null for
+ *  every clip kind without one, or one that hasn't had gain applied. */
+export function clipGainRenditionBlobInfo(clip: Clip): SnatchBlobInfo | null {
+  if (clip.kind !== "voice-recording" && clip.kind !== "tts" && clip.kind !== "audio-segment") return null;
+  if (!clip.gainRenditionBlobId) return null;
+  return {
+    blobId: clip.gainRenditionBlobId,
+    filename: `${clip.id}-gain`,
+    mime: clip.gainRenditionMime || "",
+    size: clip.gainRenditionSize,
+    blake3: clip.gainRenditionBlake3 || "",
+    domain: "audio",
+  };
 }
 
 export interface SnatchControllerOptions {
@@ -209,14 +229,24 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
    *  peer (or the hub, via tumulus/src/snatch.rs's own per-clip mirror of
    *  this) discover this peer as a source without a live ephemeral ping.
    *  a no-op if no identity exists yet, or no clip currently carries this
-   *  blobId (e.g. it was deleted mid-download). */
+   *  blobId (e.g. it was deleted mid-download). checks the OWNING clip's
+   *  primary blob field first, then its gain rendition field — `blobId`
+   *  unambiguously identifies which one, since they're always different
+   *  blobs (see `clipGainRenditionBlobInfo()`). */
   function markClipSnatched(blobId: string): void {
     const localNodeId = getLocalNodeId();
     if (!localNodeId) return;
     changeDoc((d) => {
       const clip = d.clips.find((c) => clipBlobInfo(c)?.blobId === blobId);
-      if (!clip || !("snatchedBy" in clip)) return;
-      if (!clip.snatchedBy.includes(localNodeId)) clip.snatchedBy.push(localNodeId);
+      if (clip && "snatchedBy" in clip) {
+        if (!clip.snatchedBy.includes(localNodeId)) clip.snatchedBy.push(localNodeId);
+        return;
+      }
+      const renditionClip = d.clips.find((c) => clipGainRenditionBlobInfo(c)?.blobId === blobId);
+      if (!renditionClip || !("gainRenditionSnatchedBy" in renditionClip)) return;
+      if (!renditionClip.gainRenditionSnatchedBy.includes(localNodeId)) {
+        renditionClip.gainRenditionSnatchedBy.push(localNodeId);
+      }
     });
   }
 
