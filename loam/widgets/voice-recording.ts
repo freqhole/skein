@@ -25,6 +25,7 @@
 
 import { Container, Graphics, Rectangle, Text } from "pixi.js";
 import { z } from "zod";
+import type { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
 import { storeBlobFromFile } from "../src/storage/blob-store";
 import { base64Encode } from "@freqhole/reliquary/worker";
@@ -33,9 +34,13 @@ import { checkBlobLocality } from "../src/file-utils/blob-locality";
 import { getLocalNodeId, type PeersMap } from "../src/file-utils/file-shared";
 import { getLocalAccentColor, sendFriendRequest } from "../src/p2p/friendz-bridge";
 import { registerPendingBlobRetry } from "../src/p2p/pending-blob-access";
+import { resolveDocReadyCached } from "../src/p2p/doc-ready";
+import { deepUnwrapAmStrings } from "../src/canvas/automerge-values";
+import type { WidgetRegistry } from "../src/widgets/widget-registry";
 import {
   isTransparent,
   type CompactInfo,
+  type DropTargetHandler,
   type HeaderAction,
   type WidgetAction,
   type WidgetController,
@@ -242,6 +247,14 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     // before this field existed) are unrestricted.
     const iAmCreator = !ctx.canvasStore || ctx.canvasStore.isLocalWidgetCreator(ctx.widgetId);
 
+    // -- cross-widget drop: drag an existing file(audio)/audio-recording
+    // widget onto this one, before it has its own recording, to use that
+    // audio for the mouth animation instead of recording fresh — see
+    // `dropTarget` below, mirrors animaniac/drop-controller.ts's mechanics.
+    const store = ctx.canvasStore ?? null;
+    const repo: Repo | null = store?.repo ?? null;
+    const registry: WidgetRegistry | null = _voiceRecordingWidgetRegistry;
+
     // -- transient playback state --
     let audioEl: HTMLAudioElement | null = null;
     // separate AudioContext for playback so the mic context can be closed after recording
@@ -405,6 +418,66 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     statusText.eventMode = "none";
     statusText.anchor.set(0.5, 0.5);
     container.addChild(statusText);
+
+    // hover highlight while a droppable audio source is dragged over this
+    // widget (see `dropTarget` below) — drawn last so it sits on top.
+    const dropHighlightGfx = new Graphics();
+    dropHighlightGfx.eventMode = "none";
+    dropHighlightGfx.visible = false;
+    container.addChild(dropHighlightGfx);
+    const setDropHighlight = (active: boolean): void => {
+      dropHighlightGfx.visible = active;
+      if (!active) return;
+      dropHighlightGfx.clear().rect(1, 1, Math.max(0, cw - 2), Math.max(0, ch - 2)).stroke({ width: 3, color: 0xd946ef });
+    };
+
+    /** a "file" widget (audio domain) or "audio-recording" widget — the
+     *  only two source types this widget accepts an existing blob from. */
+    const isDroppableSourceType = (entryType: string, sourceState: Record<string, unknown>): boolean =>
+      entryType === "audio-recording" || (entryType === "file" && sourceState.domain === "audio");
+
+    interface DroppedAudioSource {
+      blobId: string;
+      filename: string;
+      mime: string;
+      size: number;
+      blake3: string;
+      duration: number;
+      snatchedBy: string[];
+    }
+
+    /** reads a dropped widget's doc via the shared registry/repo (same
+     *  normalize-then-parse path animaniac's drop-controller.ts uses),
+     *  falling back to `resolveDocReadyCached()`'s bounded wait for a
+     *  widget whose doc handle was never opened locally yet this session
+     *  (e.g. sitting untouched inside a bin) — returns null for anything
+     *  not a droppable type, or with nothing recorded/uploaded yet. */
+    async function readDroppedAudioSource(entryType: string, docId: string | null): Promise<DroppedAudioSource | null> {
+      if (!repo || !registry || !docId) return null;
+      const factory = registry.get(entryType);
+      if (!factory?.schema) return null;
+      let handle: DocHandle<any> | undefined = repo.handles[docId as DocumentId];
+      if (!handle?.doc()) {
+        handle = (await resolveDocReadyCached(repo, docId as DocumentId, { context: "voice-recording.drop" })) ?? undefined;
+      }
+      const rawDoc = handle?.doc();
+      if (!rawDoc) return null;
+      try {
+        const state = factory.schema.parse(deepUnwrapAmStrings(rawDoc)) as Record<string, unknown>;
+        if (!isDroppableSourceType(entryType, state) || !state.blobId) return null;
+        return {
+          blobId: String(state.blobId),
+          filename: typeof state.filename === "string" ? state.filename : "",
+          mime: typeof state.mime === "string" ? state.mime : "",
+          size: typeof state.size === "number" ? state.size : 0,
+          blake3: typeof state.blake3 === "string" ? state.blake3 : "",
+          duration: typeof state.duration === "number" ? state.duration : 0,
+          snatchedBy: Array.isArray(state.snatchedBy) ? state.snatchedBy.map(String) : [],
+        };
+      } catch {
+        return null;
+      }
+    }
 
     // -- pill button constants --
     const PILL_W = 90;
@@ -1112,6 +1185,57 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
           default: DEVICE_DEFAULT,
         },
       ],
+      dropTarget: (store
+        ? {
+            hitTest(worldX: number, worldY: number): boolean {
+              // only while there's nothing recorded yet — a drop is a
+              // one-time "seed this widget's audio" action, not a swap.
+              if (ctx.doc.current.blobId || !iAmCreator) return false;
+              const entry = store.getWidget(ctx.widgetId);
+              if (!entry) return false;
+              return (
+                worldX >= entry.x &&
+                worldX <= entry.x + entry.width &&
+                worldY >= entry.y &&
+                worldY <= entry.y + entry.height
+              );
+            },
+
+            onHover(_worldX: number, _worldY: number, draggedWidgetId: string): void {
+              const entry = store.getWidget(draggedWidgetId);
+              setDropHighlight(!!entry && (entry.type === "audio-recording" || entry.type === "file"));
+            },
+
+            onLeave(): void {
+              setDropHighlight(false);
+            },
+
+            onDrop(draggedWidgetId: string, _worldX: number, _worldY: number): boolean {
+              setDropHighlight(false);
+              const entry = store.getWidget(draggedWidgetId);
+              if (!entry || (entry.type !== "audio-recording" && entry.type !== "file")) return false;
+
+              void readDroppedAudioSource(entry.type, entry.docId).then((source) => {
+                if (!source) return;
+                // the existing doc-change subscription above already flips
+                // recState "idle"/"error" -> "ready" the moment blobId goes
+                // truthy, so this write is all that's needed here.
+                ctx.doc.change((d) => {
+                  d.blobId = source.blobId;
+                  d.filename = source.filename;
+                  d.mime = source.mime;
+                  d.size = source.size;
+                  d.blake3 = source.blake3;
+                  d.duration = source.duration;
+                  d.snatchedBy = source.snatchedBy;
+                });
+                store.removeWidget(draggedWidgetId);
+              });
+
+              return true;
+            },
+          }
+        : undefined) as DropTargetHandler | undefined,
       destroy() {
         destroyed = true;
         stopRecordingAnim();
@@ -1144,3 +1268,15 @@ export const voiceRecordingWidget: WidgetFactory<typeof voiceRecordingSchema> = 
     };
   },
 };
+
+// module-level reference set by registerVoiceRecordingWidget() so the
+// widget's own create() can read another dropped widget's doc via the
+// full registry — same pattern animaniac/index.ts and stfu/index.ts use
+// for their own cross-widget drop targets (WidgetMountContext doesn't
+// carry the registry itself).
+let _voiceRecordingWidgetRegistry: WidgetRegistry | null = null;
+
+export function registerVoiceRecordingWidget(registry: WidgetRegistry): void {
+  registry.register(voiceRecordingWidget);
+  _voiceRecordingWidgetRegistry = registry;
+}

@@ -2,7 +2,7 @@ import { WidgetRegistry } from "../src/widgets/widget-registry";
 import { registerAnimaniacWidget } from "./animaniac/index";
 import { registerBinWidget } from "./bin/index";
 import { audioRecordingWidget } from "./audio-recording";
-import { voiceRecordingWidget } from "./voice-recording";
+import { registerVoiceRecordingWidget } from "./voice-recording";
 import { canvasInfoWidget } from "./canvas-info";
 import { canvasLinkPickerWidget } from "./canvas-link-picker";
 import { doodleWidget } from "./doodle";
@@ -35,7 +35,7 @@ import { canvasWizardWidget } from "./narthex/canvas-wizard";
 export function createTestRegistry(): WidgetRegistry {
   const registry = new WidgetRegistry();
   registry.register(audioRecordingWidget);
-  registry.register(voiceRecordingWidget);
+  registerVoiceRecordingWidget(registry);
   registry.register(canvasInfoWidget);
   registry.register(doodleWidget);
   registry.register(fileWidget);
