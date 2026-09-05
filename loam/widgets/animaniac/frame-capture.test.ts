@@ -100,7 +100,9 @@ describe("resolveCapturedClip", () => {
       audioBlobId: "b1",
       audioBlake3: "hash1",
       audioMime: "audio/webm",
-      durationSec: 4.2,
+      sourceInSec: 0,
+      sourceOutSec: 4.2,
+      sourceDurationSec: 4.2,
     });
   });
 

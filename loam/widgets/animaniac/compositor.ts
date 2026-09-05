@@ -539,7 +539,7 @@ export function createCompositor(options: CompositorOptions): CompositorHandle {
         entry.node.rotation = transform.rotation;
         entry.node.alpha = transform.opacity;
       }
-      entry.mouth.setOpenness(entry.envelope ? opennessAtElapsed(entry.envelope, localElapsed) : 0);
+      entry.mouth.setOpenness(entry.envelope ? opennessAtElapsed(entry.envelope, clip.sourceInSec + localElapsed) : 0);
     }
 
     // keep mouths above every doodle/image/label/video sprite regardless

@@ -18,6 +18,12 @@ import type { TrackDragMode, TrackHitRegion } from "./timeline-types";
 
 export const DEFAULT_HANDLE_PX = 8;
 export const DEFAULT_MARGIN_Y = 3;
+// below this on-screen width, resize handles disable entirely (always
+// "move") — a narrow-at-this-zoom item is more useful to grab/reposition
+// than to fuss with trimming; this is purely about ZOOM/on-screen pixels,
+// never the item's own semantic duration, so zooming in always brings
+// trim handles back even for an inherently very short item.
+export const MIN_RESIZE_WIDTH_PX = 24;
 const DELETE_GLYPH_RADIUS = 7;
 const DELETE_GLYPH_HIT_RADIUS = 8;
 
@@ -36,11 +42,15 @@ export function hitDeleteGlyph(right: number, marginY: number, localX: number, l
 }
 
 /** resolves which drag mode a pointer-down at `localX` (within
- *  `[left, right]`) should start — caps the resize-handle zone to a third
- *  of the item's own width so a narrow item (common at typical zoom
- *  levels) still keeps a reachable "move" region in the middle, rather
- *  than both edges' zones overlapping and swallowing the whole item. */
+ *  `[left, right]`) should start — below `MIN_RESIZE_WIDTH_PX`, always
+ *  "move" (no room for a usable trim zone at all, and moving/selecting
+ *  matters more than trimming at that zoom); otherwise caps the resize-
+ *  handle zone to a third of the item's own width so a narrow-but-above-
+ *  threshold item still keeps a reachable "move" region in the middle,
+ *  rather than both edges' zones overlapping and swallowing the whole
+ *  item. */
 export function modeForLocalX(left: number, right: number, localX: number, handlePx = DEFAULT_HANDLE_PX): TrackDragMode {
+  if (right - left < MIN_RESIZE_WIDTH_PX) return "move";
   const cappedHandlePx = Math.max(2, Math.min(handlePx, (right - left) / 3));
   const distLeft = Math.abs(localX - left);
   const distRight = Math.abs(localX - right);

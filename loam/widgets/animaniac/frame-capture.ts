@@ -272,6 +272,7 @@ export async function resolveCapturedClip(
     case "voice-recording": {
       const blobId = str(sourceState.blobId);
       if (!blobId) return null;
+      const duration = await resolveClipDuration(sourceState, "audio", blobId);
       return {
         kind: "voice-recording",
         id: newId(),
@@ -281,7 +282,9 @@ export async function resolveCapturedClip(
         audioBlobId: blobId,
         audioBlake3: str(sourceState.blake3),
         audioMime: str(sourceState.mime),
-        durationSec: num(sourceState.duration),
+        sourceInSec: 0,
+        sourceOutSec: duration,
+        sourceDurationSec: duration,
         lipsColor: num(sourceState.lipsColor, 0xc2455a),
         lipThickness: num(sourceState.lipThickness, 5),
         mouthMood: enumVal(sourceState.mouthMood, ["frown", "neutral", "smile"] as const, "neutral"),
@@ -295,6 +298,7 @@ export async function resolveCapturedClip(
     case "tts": {
       const blobId = str(sourceState.blobId);
       if (!blobId) return null; // not generated yet — nothing to capture
+      const duration = await resolveClipDuration(sourceState, "audio", blobId);
       return {
         kind: "tts",
         id: newId(),
@@ -304,7 +308,9 @@ export async function resolveCapturedClip(
         audioBlobId: blobId,
         audioBlake3: str(sourceState.blake3),
         audioMime: str(sourceState.mime),
-        durationSec: num(sourceState.duration),
+        sourceInSec: 0,
+        sourceOutSec: duration,
+        sourceDurationSec: duration,
         ttsText: str(sourceState.ttsText),
         ttsVoiceName: str(sourceState.ttsVoiceName),
         ttsVoiceLang: str(sourceState.ttsVoiceLang),
@@ -334,6 +340,7 @@ export async function resolveCapturedClip(
         audioSize: num(sourceState.size),
         sourceInSec: 0,
         sourceOutSec: duration,
+        sourceDurationSec: duration,
         label: str(sourceState.filename),
         snatchedBy: [],
         ...gainFieldsFrom(sourceState),
@@ -364,6 +371,7 @@ export async function resolveCapturedClip(
           audioSize: num(sourceState.size),
           sourceInSec: 0,
           sourceOutSec: duration,
+          sourceDurationSec: duration,
           label: str(sourceState.filename),
           snatchedBy: [],
           ...gainFieldsFrom(sourceState),
@@ -382,6 +390,7 @@ export async function resolveCapturedClip(
           videoSize: num(sourceState.size),
           sourceInSec: 0,
           sourceOutSec: duration,
+          sourceDurationSec: duration,
           muted: false,
           snatchedBy: [],
         };
@@ -408,6 +417,7 @@ export async function resolveCapturedClip(
         videoSize: num(sourceState.videoSize),
         sourceInSec: 0,
         sourceOutSec: videoDurationSec,
+        sourceDurationSec: videoDurationSec,
         muted: false,
         snatchedBy: [],
       };

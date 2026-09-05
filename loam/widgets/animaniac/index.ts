@@ -55,7 +55,7 @@ import { loadLocalAnimaniacPrefs, saveLocalAnimaniacPrefs, isDomVideoOverlayEnab
 import { createAnimaniacDropController } from "./drop-controller";
 import { restoreWidgetFromClip } from "./clip-restore";
 import { createSnatchController, isAnimaniacNewBlobMessage, clipBlobInfo, clipGainRenditionBlobInfo, makeAnimaniacNewBlobMessage } from "./snatch-controller";
-import { computeDisplayDurationSec, nextTrackOrder, removeTrack as removeTrackFromArrays, sortedTracks } from "./track-model";
+import { clipDurationSec, computeDisplayDurationSec, nextTrackOrder, removeTrack as removeTrackFromArrays, sortedTracks } from "./track-model";
 import { createTrack, TRACK_ROW_HEIGHT, type TrackHandle } from "./tracks/track";
 import { renderAudioMixdown } from "./export/audio-mixdown";
 import { encodeAudioBufferToWav } from "./export/wav-encode";
@@ -90,6 +90,31 @@ const TIMELINE_MIN_HEIGHT = 140;
 // for shuffling long clips around), not part of stfu's own default set.
 const ZOOM_LEVELS = [0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256];
 
+/** one-time repair pass for animaniac docs written before voice-recording/
+ *  tts clips gained real `sourceInSec`/`sourceOutSec` trim support (they
+ *  previously had a plain, non-trimmable `durationSec` instead — see
+ *  types.ts's own schema doc comment). making `sourceOutSec` required (no
+ *  default) is what makes a legacy clip actually FAIL to parse and land
+ *  here, rather than silently defaulting to a nonsensical near-zero
+ *  duration on every read (see widget-doc.ts's `createWidgetDoc`). writes
+ *  directly into the raw automerge doc so the fix is permanent and syncs
+ *  to every peer. */
+function migrateAnimaniac(raw: any): void {
+  if (!Array.isArray(raw.clips)) return;
+  for (const clip of raw.clips) {
+    if (!clip || (clip.kind !== "voice-recording" && clip.kind !== "tts")) continue;
+    if (typeof clip.sourceOutSec === "number") continue; // already migrated
+    // 5s: same fallback frame-capture.ts's own resolveClipDuration() uses
+    // when a real probe isn't available.
+    const legacyDuration = typeof clip.durationSec === "number" && clip.durationSec > 0 ? clip.durationSec : 5;
+    clip.sourceInSec = 0;
+    clip.sourceOutSec = legacyDuration;
+    if (typeof clip.sourceDurationSec !== "number" || clip.sourceDurationSec <= 0) {
+      clip.sourceDurationSec = legacyDuration;
+    }
+  }
+}
+
 export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
   type: "animaniac",
   metadata: {
@@ -101,6 +126,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     defaultHeight: 480,
   },
   schema: animaniacSchema,
+  migrate: migrateAnimaniac,
 
   getCompactInfo(state: AnimaniacState): CompactInfo {
     return {
@@ -639,10 +665,18 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
 
     const toolbarContainer = new Container();
     timelineContainer.addChild(toolbarContainer);
+    // zoom re-centers on this when there IS a selection, instead of always
+    // the playhead (camera.zoomIn()/zoomOut()'s own default) — otherwise
+    // zooming in on a clip selected somewhere away from the playhead can
+    // push it right out of view.
+    const focusTimeForZoom = (): number | undefined => {
+      const clip = selectedClipId ? ctx.doc.current.clips.find((c) => c.id === selectedClipId) : undefined;
+      return clip ? clip.start + clipDurationSec(clip) / 2 : undefined;
+    };
     const toolbar: TimelineToolbarHandle = createTimelineToolbar({
       container: toolbarContainer,
-      zoomIn: () => camera.zoomIn(),
-      zoomOut: () => camera.zoomOut(),
+      zoomIn: () => camera.setZoom(camera.getView().zoomIndex + 1, focusTimeForZoom()),
+      zoomOut: () => camera.setZoom(camera.getView().zoomIndex - 1, focusTimeForZoom()),
       zoomFit: () => camera.zoomFit(),
       onUndo: () => history.undo(),
       onRedo: () => history.redo(),
@@ -1109,10 +1143,21 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         camera,
         getDuration: () => camera.getView().duration,
         isSnapEnabled: () => prefs.snapEnabled,
-        // clips always snap to the very start of the timeline (besides
-        // other clips' own edges, already handled by the interaction
-        // engine) — makes it easy to drag a clip flush against t=0.
-        getSnapTimes: () => [0],
+        // 0 (very start of the timeline) plus every OTHER track's own clip
+        // edges — track-item-interaction.ts's own snapTime() already
+        // covers snapping to clips on THIS SAME track (via its own
+        // getItems()), but has no visibility into any other row, so
+        // cross-track snapping (unified tracks means clips routinely need
+        // to align with a clip on a totally different track now) has to
+        // be supplied explicitly here.
+        getSnapTimes: () => {
+          const edges = [0];
+          for (const clip of ctx.doc.current.clips) {
+            if (clip.trackId === track.id) continue;
+            edges.push(clip.start, clip.start + clipDurationSec(clip));
+          }
+          return edges;
+        },
         getClips: () => ctx.doc.current.clips,
         onClipsChange,
         // selecting a clip on the timeline also shows its handles in the
@@ -1130,6 +1175,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         isClipRemote: (clip: Clip) => isClipRemote(clip),
         getClipProgress: (clip: Clip) => clipProgress(clip),
         isClipMuted: (clip: Clip) => isClipMuted(clip),
+        getPeers,
         isSelected: (clipId: string) => multiSelectedClipIds.size > 1 && multiSelectedClipIds.has(clipId),
         onToggleSelect: (clipId: string) => toggleClipMultiSelect(clipId),
         onBatchDragDelta,
@@ -1447,6 +1493,10 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         if (!selectedClipId) return;
         e.preventDefault();
         deleteSelectedClip();
+      } else if (e.key === "Escape") {
+        if (!selectedClipId && multiSelectedClipIds.size === 0) return;
+        e.preventDefault();
+        setSelectedClipId(null);
       }
     }
     document.addEventListener("keydown", handleKeyDown);

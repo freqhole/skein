@@ -19,7 +19,7 @@ import { getMediaPlaybackUrl } from "../../src/media";
 import { checkBlobLocality } from "../../src/file-utils/blob-locality";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import { activeClipsAt } from "./track-model";
-import type { AudioSegmentClip, Clip } from "./types";
+import type { Clip } from "./types";
 
 const TAG = "animaniac.audio-playback";
 
@@ -30,10 +30,9 @@ function isAudioBearingClip(clip: Clip): boolean {
 }
 
 /** where in the SOURCE audio this clip's playback should start from —
- *  trimmed segments start at their own `sourceInSec`, whole-clip kinds
- *  (voice-recording/tts) always start at 0. */
+ *  every audio-bearing kind now carries its own `sourceInSec` trim. */
 function sourceOffsetSec(clip: Clip): number {
-  return clip.kind === "audio-segment" ? (clip as AudioSegmentClip).sourceInSec : 0;
+  return clip.kind === "audio-segment" || clip.kind === "voice-recording" || clip.kind === "tts" ? clip.sourceInSec : 0;
 }
 
 export interface AudioRef {

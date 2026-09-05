@@ -30,10 +30,9 @@ function isAudioBearing(clip: Clip): clip is AudioBearingClip {
 }
 
 /** where in the SOURCE audio this clip's playback should start from —
- *  trimmed segments start at their own `sourceInSec`, whole-clip kinds
- *  (voice-recording/tts) always start at 0. */
+ *  every audio-bearing kind now carries its own `sourceInSec` trim. */
 function sourceOffsetSec(clip: AudioBearingClip): number {
-  return clip.kind === "audio-segment" ? clip.sourceInSec : 0;
+  return clip.sourceInSec;
 }
 
 export interface AudioMixdownOptions {

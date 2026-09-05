@@ -9,11 +9,15 @@
  * - every clip stores its own transform as a **keyframe list** (even a
  *   single-keyframe/static clip) from day one, so motion tweening (later)
  *   is additive rather than a schema migration — see `transform.ts`.
- * - a clip's `durationSec` is either stored directly (voice-recording/tts,
- *   where the source audio's own length is authoritative once known) or
- *   *derived* from `sourceInSec`/`sourceOutSec` (audio-segment/
- *   video-segment) — never both, to avoid the two ever disagreeing after
- *   a trim edit. see `clipDurationSec()` in `track-model.ts`.
+ * - a clip's `durationSec` is *derived* from `sourceInSec`/`sourceOutSec`
+ *   for every audio/video-bearing kind (voice-recording/tts/audio-segment/
+ *   video-segment) — never stored directly, so it can't disagree with the
+ *   trim window after an edit. see `clipDurationSec()` in `track-model.ts`.
+ *   `sourceDurationSec` (also on those same kinds) is a SEPARATE, never-
+ *   mutated-after-capture ceiling — the real known length of the full
+ *   source — so a resize can be clamped to it and never trim "past the
+ *   end of the actual audio" (which otherwise re-triggers `.play()` on an
+ *   already-`ended` element, audibly restarting/"repeating" it).
  * - every field is default-backed (matches every other widget's own
  *   "schema stability discipline" convention in this codebase).
  */
@@ -174,12 +178,27 @@ const gainFields = {
   gainRenditionSnatchedBy: z.array(z.string()).default([]),
 };
 
+/** the real, known length of a clip's full (untrimmed) source — set ONCE
+ *  at capture time (or on first successful probe for a legacy clip
+ *  predating this field) and never mutated by a later resize/trim. `0`
+ *  means "not yet known" (a resize is left unclamped in that case, same
+ *  best-effort spirit as every other not-yet-probed value in this app).
+ *  this is what lets a trim resize be clamped so it can never extend past
+ *  actual audio/video content — see `withClipSpan()`'s own doc comment
+ *  for why that matters (an unclamped over-trim silently "repeats" the
+ *  clip's audio once playback runs past the real content and re-triggers
+ *  `.play()` on an already-`ended` element). */
+const sourceDurationField = {
+  sourceDurationSec: z.number().default(0),
+};
+
 export const voiceRecordingClipSchema = clipBaseSchema.extend({
   kind: z.literal("voice-recording"),
   audioBlobId: z.string(),
   audioBlake3: z.string().default(""),
   audioMime: z.string().default(""),
-  durationSec: z.number().default(0),
+  sourceInSec: z.number().default(0),
+  sourceOutSec: z.number(),
   lipsColor: z.number().default(0xc2455a),
   lipThickness: z.number().default(5),
   mouthMood: z.enum(["frown", "neutral", "smile"]).default("neutral"),
@@ -188,6 +207,7 @@ export const voiceRecordingClipSchema = clipBaseSchema.extend({
   /** see `doodleFrameClipSchema.snatchedBy`'s own doc comment. */
   snatchedBy: z.array(z.string()).default([]),
   ...gainFields,
+  ...sourceDurationField,
 });
 export type VoiceRecordingClip = z.infer<typeof voiceRecordingClipSchema>;
 
@@ -197,13 +217,15 @@ export const ttsClipSchema = clipBaseSchema.extend({
   audioBlobId: z.string().default(""),
   audioBlake3: z.string().default(""),
   audioMime: z.string().default(""),
-  durationSec: z.number().default(0),
+  sourceInSec: z.number().default(0),
+  sourceOutSec: z.number(),
   ttsText: z.string().default(""),
   ttsVoiceName: z.string().default(""),
   ttsVoiceLang: z.string().default(""),
   ttsRate: z.number().default(1),
   snatchedBy: z.array(z.string()).default([]),
   ...gainFields,
+  ...sourceDurationField,
 });
 export type TtsClip = z.infer<typeof ttsClipSchema>;
 
@@ -224,6 +246,7 @@ export const audioSegmentClipSchema = clipBaseSchema.extend({
   label: z.string().default(""),
   snatchedBy: z.array(z.string()).default([]),
   ...gainFields,
+  ...sourceDurationField,
 });
 export type AudioSegmentClip = z.infer<typeof audioSegmentClipSchema>;
 
@@ -250,6 +273,7 @@ export const videoSegmentClipSchema = clipBaseSchema.extend({
   muted: z.boolean().default(false),
   /** see `doodleFrameClipSchema.snatchedBy`'s own doc comment. */
   snatchedBy: z.array(z.string()).default([]),
+  ...sourceDurationField,
 });
 export type VideoSegmentClip = z.infer<typeof videoSegmentClipSchema>;
 

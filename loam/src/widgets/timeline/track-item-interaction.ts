@@ -371,12 +371,19 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
     if (!found || !g) return;
     const span = clampSpan(adapter.getSpan(found.item));
     const { left, right } = spanToScreen(span);
+    const hovered = id === hoveredId;
+    const selected = id === selectedId || (isSelected?.(id) ?? false);
+    // an unclipped hovered/selected label (see the caller's own `drawItem`)
+    // can overflow past this item's own bounds — bring it fully to the
+    // front so that overflow isn't hidden under a neighboring item, above
+    // even `refresh()`'s own later-start-on-top stacking order.
+    if (hovered || selected) row.contentLayer.addChild(g);
     drawItem(g, found.item, {
       left,
       right,
-      hovered: id === hoveredId,
-      hoveredRegion: id === hoveredId ? hoveredRegion : null,
-      selected: id === selectedId || (isSelected?.(id) ?? false),
+      hovered,
+      hoveredRegion: hovered ? hoveredRegion : null,
+      selected,
     });
   }
 
@@ -522,9 +529,16 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
     const g = drag.id ? rows.get(drag.id) : undefined;
     if (g && drag.item) {
       const clamped = clampSpan(drag.mode === "move" ? resolveMoveSpan(drag.pending, drag.id) : drag.pending);
-      const { left, right } = spanToScreen(clamped);
+      const resizedItem = adapter.withSpan(drag.item, clamped);
+      // re-derive the drawn box from the ADAPTER's own resulting span, not
+      // straight from `clamped` — an adapter can clamp further on its own
+      // terms (e.g. a trim resize capped against the source's real known
+      // duration, see clip-track-adapter.ts's `sourceDurationSec` ceiling)
+      // and the live preview must reflect THAT, or the box looks like it
+      // never clamped at all until commit silently snaps it back.
+      const { left, right } = spanToScreen(adapter.getSpan(resizedItem));
       const region = drag.mode === "resize-left" || drag.mode === "resize-right" ? drag.mode : null;
-      drawItem(g, adapter.withSpan(drag.item, clamped), { left, right, hovered: true, hoveredRegion: region, selected: true });
+      drawItem(g, resizedItem, { left, right, hovered: true, hoveredRegion: region, selected: true });
     }
 
     if (drag.mode === "move" && drag.item) {
@@ -617,7 +631,7 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
   row.hitArea.on("pointerout", onTrackPointerOut);
 
   function refresh(): void {
-    createPreviewRow?.destroy();
+    createPreviewRow?.destroy({ children: true });
     createPreviewRow = null;
 
     const items = getItems();
@@ -630,7 +644,7 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
 
     for (const [id, g] of rows) {
       if (!liveIds.has(id)) {
-        g.destroy();
+        g.destroy({ children: true });
         rows.delete(id);
       }
     }
@@ -649,6 +663,22 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
         rows.set(id, g);
       }
     });
+
+    // stacking order: later-starting items render on top of earlier ones
+    // (matters when an unclipped hovered/selected label — see
+    // `redrawItem()`'s own bring-to-front — overflows into a neighboring
+    // item's screen space). `addChild()` on an already-parented child just
+    // moves it to the end of the display list, no duplicate/re-parent.
+    // ids are computed against each item's OWN original index in `items`
+    // (never a post-sort position) — some adapters fall back to the index
+    // for an item with no stable id of its own.
+    items
+      .map((item, i) => ({ id: idOf(item, i), start: adapter.getSpan(item).start }))
+      .sort((a, b) => a.start - b.start)
+      .forEach(({ id }) => {
+        const g = rows.get(id);
+        if (g) row.contentLayer.addChild(g);
+      });
 
     items.forEach((item, i) => {
       const id = idOf(item, i);
@@ -738,7 +768,7 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
     showPreview(item: T | null) {
       previewItem = item;
       if (!item) {
-        previewRow?.destroy();
+        previewRow?.destroy({ children: true });
         previewRow = null;
         return;
       }
@@ -758,11 +788,11 @@ export function createTrackItemInteraction<T>(options: TrackItemInteractionOptio
       row.hitArea.off("pointerupoutside", onGlobalPointerUp);
       row.hitArea.off("pointermove", onTrackPointerMove);
       row.hitArea.off("pointerout", onTrackPointerOut);
-      createPreviewRow?.destroy();
+      createPreviewRow?.destroy({ children: true });
       createPreviewRow = null;
-      previewRow?.destroy();
+      previewRow?.destroy({ children: true });
       previewRow = null;
-      for (const g of rows.values()) g.destroy();
+      for (const g of rows.values()) g.destroy({ children: true });
       rows.clear();
     },
   };
