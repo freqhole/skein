@@ -7,6 +7,7 @@
 import type { DocumentId, Repo } from "@automerge/automerge-repo";
 import { log } from "@freqhole/reliquary/utils";
 import { resolveDocReady } from "../../src/p2p/doc-ready";
+import { deepUnwrapAmStrings } from "../../src/canvas/automerge-values";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import { getThumbnailDataUrl } from "../../src/file-utils/thumbnail-utils";
 import {
@@ -98,7 +99,7 @@ async function collectFileChildren(
   // parse through bin schema to get the items array
   let items: Array<{ widgetId: string }>;
   try {
-    const parsed = binSchema.parse(doc);
+    const parsed = binSchema.parse(deepUnwrapAmStrings(doc));
     items = parsed.items;
   } catch {
     log.warn(TAG, "failed to parse bin doc for", binWidgetId);
@@ -131,7 +132,11 @@ async function collectFileChildren(
     if (!childDoc) continue;
 
     try {
-      const state = fileSchema.parse(childDoc);
+      // a widget doc the tumulus hub has ever written into directly (e.g.
+      // stamping `snatchedBy` after a p2p snatch) round-trips string
+      // fields as `ImmutableString` instances, which zod's `z.string()`
+      // rejects outright — see `automerge-values.ts`'s own doc comment.
+      const state = fileSchema.parse(deepUnwrapAmStrings(childDoc));
       if (!state.blobId) continue;
       result.push({
         widgetId: item.widgetId,

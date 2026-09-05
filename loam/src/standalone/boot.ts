@@ -1297,20 +1297,27 @@ class SkeinRouter {
       canvas.toolbar.refreshRoleGating();
       (window as any).__skein = canvas;
       // one-shot console helper: re-probes `duration` for any `file` widget
-      // (audio/video domain) on this canvas still stuck at 0 from before
-      // create-file-widget.ts started probing it upfront, AND permanently
-      // fixes any widget doc a rust writer left with `ImmutableString`
-      // fields (see backfill-file-durations.ts's/fix-immutable-strings.ts's
-      // own doc comments). run via `window.__skeinBackfillFileDurations()`.
-      (window as any).__skeinBackfillFileDurations = async () => ({
-        durations: await backfillMissingFileDurations(canvas.store),
-        immutableStrings: await fixImmutableStringFields(canvas.store),
-      });
-      // one-shot console helper: reports, per widget on this canvas, whether
-      // animaniac would capture it as a clip right now (and why not, if
-      // not) plus every animaniac widget's own track count — see the
-      // module's own doc comment. run via `window.__skeinDiagnoseAnimaniacDrops()`.
-      (window as any).__skeinDiagnoseAnimaniacDrops = () => diagnoseAnimaniacDrops(canvas.store, canvas.registry);
+      // stuck at 0, permanently fixes any widget doc a rust writer left
+      // with `ImmutableString` fields, and reports whether animaniac would
+      // capture each widget as a clip right now (and why not, if not) — see
+      // backfill-file-durations.ts's/fix-immutable-strings.ts's/diagnose-
+      // animaniac-drops.ts's own doc comments. console.tables everything
+      // unconditionally (not gated behind `localStorage.logLevel`) so one
+      // call gives the full picture. run via `window.__skeinDiagnose()`.
+      (window as any).__skeinDiagnose = async () => {
+        const durations = await backfillMissingFileDurations(canvas.store);
+        const immutableStrings = await fixImmutableStringFields(canvas.store);
+        const dropDiagnosis = await diagnoseAnimaniacDrops(canvas.store, canvas.registry);
+        /* eslint-disable no-console -- intentional devtools diagnostic dump */
+        console.log("[skein] backfill durations:", durations);
+        if (durations.details.length) console.table(durations.details);
+        console.log("[skein] fix immutable strings:", immutableStrings);
+        console.log("[skein] animaniac drop diagnosis: peerCount =", dropDiagnosis.peerCount);
+        console.table(dropDiagnosis.animaniacWidgets);
+        console.table(dropDiagnosis.widgets);
+        /* eslint-enable no-console */
+        return { durations, immutableStrings, dropDiagnosis };
+      };
 
       // when a canvas-card is deleted from the narthex, clean up the linked
       // canvas document and all its per-widget docs from IndexedDB.
@@ -2645,20 +2652,27 @@ class SkeinRouter {
       }
       (window as any).__skein = canvas;
       // one-shot console helper: re-probes `duration` for any `file` widget
-      // (audio/video domain) on this canvas still stuck at 0 from before
-      // create-file-widget.ts started probing it upfront, AND permanently
-      // fixes any widget doc a rust writer left with `ImmutableString`
-      // fields (see backfill-file-durations.ts's/fix-immutable-strings.ts's
-      // own doc comments). run via `window.__skeinBackfillFileDurations()`.
-      (window as any).__skeinBackfillFileDurations = async () => ({
-        durations: await backfillMissingFileDurations(canvas.store),
-        immutableStrings: await fixImmutableStringFields(canvas.store),
-      });
-      // one-shot console helper: reports, per widget on this canvas, whether
-      // animaniac would capture it as a clip right now (and why not, if
-      // not) plus every animaniac widget's own track count — see the
-      // module's own doc comment. run via `window.__skeinDiagnoseAnimaniacDrops()`.
-      (window as any).__skeinDiagnoseAnimaniacDrops = () => diagnoseAnimaniacDrops(canvas.store, canvas.registry);
+      // stuck at 0, permanently fixes any widget doc a rust writer left
+      // with `ImmutableString` fields, and reports whether animaniac would
+      // capture each widget as a clip right now (and why not, if not) — see
+      // backfill-file-durations.ts's/fix-immutable-strings.ts's/diagnose-
+      // animaniac-drops.ts's own doc comments. console.tables everything
+      // unconditionally (not gated behind `localStorage.logLevel`) so one
+      // call gives the full picture. run via `window.__skeinDiagnose()`.
+      (window as any).__skeinDiagnose = async () => {
+        const durations = await backfillMissingFileDurations(canvas.store);
+        const immutableStrings = await fixImmutableStringFields(canvas.store);
+        const dropDiagnosis = await diagnoseAnimaniacDrops(canvas.store, canvas.registry);
+        /* eslint-disable no-console -- intentional devtools diagnostic dump */
+        console.log("[skein] backfill durations:", durations);
+        if (durations.details.length) console.table(durations.details);
+        console.log("[skein] fix immutable strings:", immutableStrings);
+        console.log("[skein] animaniac drop diagnosis: peerCount =", dropDiagnosis.peerCount);
+        console.table(dropDiagnosis.animaniacWidgets);
+        console.table(dropDiagnosis.widgets);
+        /* eslint-enable no-console */
+        return { durations, immutableStrings, dropDiagnosis };
+      };
 
       // expose a share helper for quick testing via browser console
       (window as any).__skein.share = async () => {

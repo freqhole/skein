@@ -16,7 +16,7 @@
  *
  * intentionally not wired into any UI button — this is meant to be run
  * once, ad hoc, from the browser devtools console against the currently
- * open canvas: `window.__skeinBackfillFileDurations()` (wired in
+ * open canvas, bundled into `window.__skeinDiagnose()` (wired in
  * `standalone/boot.ts` right next to `window.__skein`).
  */
 
@@ -27,6 +27,7 @@ import { fileSchema } from "../../widgets/file";
 import { getMediaPlaybackUrl } from "../media/media-urls";
 import { probeMediaDuration } from "./media-duration";
 import { resolveDocReadyCached } from "../p2p/doc-ready";
+import { deepUnwrapAmStrings } from "../canvas/automerge-values";
 
 const TAG = "file-utils.backfill-file-durations";
 
@@ -46,6 +47,12 @@ export interface BackfillFileDurationsResult {
    *  fixing". safe to re-run later once connectivity/peer availability
    *  improves. */
   unreachable: number;
+  /** one entry per `file` widget this run actually looked at (i.e. every
+   *  `unreachable`/`failed`/`fixed` case above) — always populated
+   *  regardless of `localStorage.logLevel`, so a caller can see exactly
+   *  which widgets are still stuck and why without needing debug logging
+   *  turned on first. */
+  details: Array<{ widgetId: string; filename: string; outcome: "fixed" | "failed" | "unreachable"; duration?: number; reason?: string }>;
 }
 
 /** re-probes and backfills `duration` for every `file` widget on `store`'s
@@ -53,7 +60,7 @@ export interface BackfillFileDurationsResult {
  *  read-only for every other widget (skips non-file types, non-audio/video
  *  domains, and anything that already has a real duration). */
 export async function backfillMissingFileDurations(store: CanvasStore): Promise<BackfillFileDurationsResult> {
-  const result: BackfillFileDurationsResult = { checked: 0, fixed: 0, failed: 0, unreachable: 0 };
+  const result: BackfillFileDurationsResult = { checked: 0, fixed: 0, failed: 0, unreachable: 0, details: [] };
 
   for (const entry of store.allWidgets()) {
     if (entry.type !== "file" || !entry.docId) continue;
@@ -61,16 +68,28 @@ export async function backfillMissingFileDurations(store: CanvasStore): Promise<
     const handle = await resolveDocReadyCached<{ duration: number }>(store.repo, entry.docId as DocumentId, { context: "backfill-file-durations" });
     if (!handle) {
       result.unreachable++;
+      result.details.push({ widgetId: entry.id, filename: "(doc unreachable)", outcome: "unreachable", reason: "doc did not become ready (no local copy, no reachable peer)" });
       continue;
     }
     const rawDoc = handle.doc();
     if (!rawDoc) {
       result.unreachable++;
+      result.details.push({ widgetId: entry.id, filename: "(doc unreachable)", outcome: "unreachable", reason: "doc handle resolved but has no content" });
       continue;
     }
 
-    const parsed = fileSchema.safeParse(rawDoc);
-    if (!parsed.success) continue;
+    // a widget doc the tumulus hub has ever written into directly (e.g.
+    // stamping `snatchedBy`) round-trips string fields as `ImmutableString`
+    // instances, which zod's `z.string()` rejects unless normalized first
+    // — without this, such a widget silently falls through every counter
+    // below (not `unreachable`, not `failed`), making a real gap invisible.
+    const parsed = fileSchema.safeParse(deepUnwrapAmStrings(rawDoc));
+    if (!parsed.success) {
+      result.failed++;
+      result.details.push({ widgetId: entry.id, filename: "(parse failed)", outcome: "failed", reason: `schema.parse failed (likely still ImmutableString-tainted): ${parsed.error.message}` });
+      log.debug(TAG, `schema.parse failed for ${entry.docId.slice(0, 12)}... (likely still ImmutableString-tainted):`, parsed.error.message);
+      continue;
+    }
     const state = parsed.data;
     if (state.domain !== "audio" && state.domain !== "video") continue;
     if (state.duration > 0) continue;
@@ -88,12 +107,15 @@ export async function backfillMissingFileDurations(store: CanvasStore): Promise<
           d.duration = duration;
         });
         result.fixed++;
+        result.details.push({ widgetId: entry.id, filename: state.filename, outcome: "fixed", duration });
         log.debug(TAG, `backfilled duration for ${entry.docId.slice(0, 12)}... (${state.filename}): ${duration}s`);
       } else {
         result.failed++;
+        result.details.push({ widgetId: entry.id, filename: state.filename, outcome: "failed", reason: url ? "probe returned 0 (metadata load failed)" : "blob isn't locally available (no playback url)" });
       }
     } catch (err) {
       result.failed++;
+      result.details.push({ widgetId: entry.id, filename: state.filename, outcome: "failed", reason: err instanceof Error ? err.message : String(err) });
       log.debug(TAG, `probe failed for ${entry.docId.slice(0, 12)}... (non-fatal):`, err);
     }
   }

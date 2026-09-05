@@ -1,8 +1,9 @@
 /**
  * one-shot console diagnostic for "why can't I drop this widget onto
  * animaniac" — meant to be run ad hoc from browser devtools against the
- * currently open canvas: `window.__skeinDiagnoseAnimaniacDrops()` (wired
- * in `standalone/boot.ts` right next to `window.__skeinBackfillFileDurations`).
+ * currently open canvas, bundled into `window.__skeinDiagnose()` (wired
+ * in `standalone/boot.ts` right next to `window.__skein`; kept as a
+ * single dev hook deliberately, see boot.ts's own comment there).
  *
  * for every widget on the canvas that animaniac's drop-controller would
  * even consider (`isCapturableWidgetType()`), reports:
@@ -89,13 +90,17 @@ function wouldCaptureAsClip(sourceType: string, s: Record<string, unknown>): { k
       return str(s.blobId) ? { kind: "tts", reason: "has generated audio" } : { kind: null, reason: "not generated yet" };
     case "audio-recording":
       if (!str(s.blobId)) return { kind: null, reason: "nothing recorded yet" };
-      if (num(s.duration) <= 0) return { kind: null, reason: "duration is 0 (probe never completed)" };
+      if (num(s.duration) <= 0) {
+        return { kind: "audio-segment", reason: "duration is 0 — frame-capture.ts will re-probe on drop, falling back to a default (resizable) length if that also fails" };
+      }
       return { kind: "audio-segment", reason: "has a recorded blob with a known duration" };
     case "file": {
       const domain = str(s.domain);
       if (domain !== "audio" && domain !== "video") return { kind: null, reason: `domain "${domain || "(none)"}" is not audio/video` };
       if (!str(s.blobId)) return { kind: null, reason: "no blobId set" };
-      if (num(s.duration) <= 0) return { kind: null, reason: "duration is 0 — try window.__skeinBackfillFileDurations() for this canvas" };
+      if (num(s.duration) <= 0) {
+        return { kind: domain === "audio" ? "audio-segment" : "video-segment", reason: "duration is 0 — frame-capture.ts will re-probe on drop, falling back to a default (resizable) length if that also fails" };
+      }
       return { kind: domain === "audio" ? "audio-segment" : "video-segment", reason: "has a blob with a known duration" };
     }
     case "stfu":
