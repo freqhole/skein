@@ -25,6 +25,9 @@ pub enum ThumbnailError {
 
     #[error("image decode/encode: {0}")]
     Image(String),
+
+    #[error("source file no longer exists at {0} — it was likely moved, renamed, or deleted since being added (local uploads are referenced in place, not copied — see register_external_path)")]
+    SourceMissing(String),
 }
 
 /// generate a thumbnail for a blob on disk.
@@ -43,6 +46,17 @@ pub async fn generate_thumbnail(
     size: u32,
     fit: bool,
 ) -> Result<Value, ThumbnailError> {
+    // local uploads are registered in place (`register_external_path`), not
+    // copied into managed storage — if the user has since moved/renamed/
+    // deleted the original file, every source-type branch below would
+    // otherwise fail with an opaque ffmpeg/image-crate stderr dump ("No such
+    // file or directory") that gives no hint this is an absent-source issue
+    // rather than a real decode/corruption bug.
+    if !tokio::fs::try_exists(blob_path).await.unwrap_or(false) {
+        return Err(ThumbnailError::SourceMissing(
+            blob_path.to_string_lossy().to_string(),
+        ));
+    }
     if mime.starts_with("image/") {
         thumbnail_image(blob_path, size, fit).await
     } else if mime == "application/pdf" {
@@ -420,5 +434,17 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
 
         assert!(result["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn missing_source_file_returns_clear_error() {
+        let dir = std::env::temp_dir().join(format!("skein_thumb_test_{}", uuid_like()));
+        let path = dir.join("gone.mp3"); // never created — simulates a moved/deleted external upload
+
+        let err = generate_thumbnail(&path, "audio/mpeg", 200, false)
+            .await
+            .expect_err("missing source file should error, not silently succeed");
+        assert!(matches!(err, ThumbnailError::SourceMissing(_)));
+        assert!(err.to_string().contains("no longer exists"));
     }
 }

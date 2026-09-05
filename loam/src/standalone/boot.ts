@@ -59,6 +59,7 @@ import { setPandocFormatsAvailable } from "../file-utils/upload";
 import { checkSayAvailable } from "../../widgets/tts/voices";
 import { freeUpLocalBlobCopy, checkBlobLocality } from "../file-utils/blob-locality";
 import { backfillMissingFileDurations } from "../file-utils/backfill-file-durations";
+import { diagnoseAnimaniacDrops } from "../file-utils/diagnose-animaniac-drops";
 import { pauseSnatchDownload } from "../file-utils/snatch";
 import {
   getBlobCanvasRefs,
@@ -1299,6 +1300,11 @@ class SkeinRouter {
       // create-file-widget.ts started probing it upfront — see that
       // module's own doc comment. run via `window.__skeinBackfillFileDurations()`.
       (window as any).__skeinBackfillFileDurations = () => backfillMissingFileDurations(canvas.store);
+      // one-shot console helper: reports, per widget on this canvas, whether
+      // animaniac would capture it as a clip right now (and why not, if
+      // not) plus every animaniac widget's own track count — see the
+      // module's own doc comment. run via `window.__skeinDiagnoseAnimaniacDrops()`.
+      (window as any).__skeinDiagnoseAnimaniacDrops = () => diagnoseAnimaniacDrops(canvas.store, canvas.registry);
 
       // when a canvas-card is deleted from the narthex, clean up the linked
       // canvas document and all its per-widget docs from IndexedDB.
@@ -2637,6 +2643,11 @@ class SkeinRouter {
       // create-file-widget.ts started probing it upfront — see that
       // module's own doc comment. run via `window.__skeinBackfillFileDurations()`.
       (window as any).__skeinBackfillFileDurations = () => backfillMissingFileDurations(canvas.store);
+      // one-shot console helper: reports, per widget on this canvas, whether
+      // animaniac would capture it as a clip right now (and why not, if
+      // not) plus every animaniac widget's own track count — see the
+      // module's own doc comment. run via `window.__skeinDiagnoseAnimaniacDrops()`.
+      (window as any).__skeinDiagnoseAnimaniacDrops = () => diagnoseAnimaniacDrops(canvas.store, canvas.registry);
 
       // expose a share helper for quick testing via browser console
       (window as any).__skein.share = async () => {
