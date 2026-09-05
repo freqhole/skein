@@ -15,6 +15,7 @@ import type { WidgetRegistry } from "../widgets/widget-registry";
 import type { CanvasStore } from "./canvas-store";
 import type { InputRouter } from "./input-router";
 import { isTauriMode } from "../p2p/tauri-transport";
+import { createScrollableContent, type ScrollableContent } from "../widgets/scrollable-content";
 
 export interface ToolbarOptions {
   /** if true, this toolbar is in the narthex (home screen) */
@@ -92,6 +93,9 @@ export class Toolbar {
   private flyoutOpen = false;
   private stageDismissHandler: ((e: any) => void) | null = null;
   private flyoutBackdrop: Graphics | null = null;
+  /** set only while the flyout's item list is taller than fits the
+   *  viewport — see `buildFlyoutItems()`. */
+  private scrollableFlyoutContent: ScrollableContent | null = null;
 
   private unsubs: (() => void)[] = [];
   private widgetCounter = 0;
@@ -663,16 +667,40 @@ export class Toolbar {
       });
 
       items.push(item);
-      this.flyout.addChild(item);
     }
 
-    // now draw all hover backgrounds at the correct max width and draw the flyout bg
+    // now draw all hover backgrounds at the correct max width
     const flyoutWidth = maxItemWidth + flyoutPad * 2;
-    const flyoutHeight = y - itemGap + itemPadV + flyoutPad;
+    const contentHeight = y - itemGap + itemPadV;
+    const naturalFlyoutHeight = contentHeight + flyoutPad;
 
-    // offset items horizontally for flyout padding
+    // cap flyout height to the viewport (same margin the width cap above
+    // uses) and scroll the item list instead of letting it run off-screen.
+    const viewportH = vv ? vv.height : window.innerHeight;
+    const maxFlyoutHeight = Math.max(80, viewportH - flyoutMargin * 2);
+    const needsScroll = naturalFlyoutHeight > maxFlyoutHeight;
+    const flyoutHeight = needsScroll ? maxFlyoutHeight : naturalFlyoutHeight;
+
+    let itemParent: Container = this.flyout;
+    if (needsScroll) {
+      const scrollable = createScrollableContent(
+        this.flyout,
+        this.app.canvas as HTMLCanvasElement,
+        flyoutPad,
+        flyoutPad,
+        maxItemWidth,
+        flyoutHeight - flyoutPad * 2
+      );
+      scrollable.reflow(maxItemWidth, contentHeight);
+      this.scrollableFlyoutContent = scrollable;
+      itemParent = scrollable.content;
+    }
+
     for (const item of items) {
-      item.x = flyoutPad;
+      // items inside the scrollable content are already offset by its own
+      // (flyoutPad, flyoutPad) position, so they sit at x=0 locally —
+      // only the non-scrolling path needs the padding applied per item.
+      item.x = needsScroll ? 0 : flyoutPad;
       const hoverBg = (item as any)._hoverBg as Graphics;
       const h = (item as any)._itemHeight as number;
       // pre-draw transparent so the hit area is correct
@@ -681,6 +709,7 @@ export class Toolbar {
       // explicit hitArea so PixiJS hit-testing doesn't depend on the
       // alpha-0 fill (which some versions skip during picking)
       item.hitArea = new Rectangle(0, 0, maxItemWidth, h);
+      itemParent.addChild(item);
     }
 
     this.flyoutBg.clear();
@@ -691,6 +720,8 @@ export class Toolbar {
 
   /** clear and rebuild flyout items so singleton filtering is up to date. */
   private rebuildFlyout(): void {
+    this.scrollableFlyoutContent?.destroy();
+    this.scrollableFlyoutContent = null;
     // remove all children except the background
     while (this.flyout.children.length > 1) {
       this.flyout.removeChildAt(1).destroy({ children: true });
@@ -1233,6 +1264,8 @@ export class Toolbar {
   destroy(): void {
     this.closeFlyout();
     this.removeFlyoutBackdrop();
+    this.scrollableFlyoutContent?.destroy();
+    this.scrollableFlyoutContent = null;
     for (const unsub of this.unsubs) {
       unsub();
     }
