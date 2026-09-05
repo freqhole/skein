@@ -15,7 +15,8 @@ import type { InputRouter } from "./input-router";
 import type { BreadcrumbItem, Toolbar } from "./toolbar";
 import type { Viewport } from "./viewport";
 import { WidgetFrame } from "./widget-frame";
-import { copySelectionToClipboard, pasteClipboardIntoStore } from "./widget-clipboard";
+import { copySelectionToClipboard, pasteClipboardIntoStore, hasClipboardContent, clearClipboard, isCopyable } from "./widget-clipboard";
+import { showContextMenu, dismissContextMenu, type ContextMenuItem } from "./context-menu";
 
 /**
  * stamp `ownerCanvasId` onto a widget doc that predates this stamping
@@ -300,6 +301,10 @@ export class WidgetManager {
           log.debug("widget-manager.clipboard", "paste failed (non-fatal):", err);
         });
     });
+
+    // right-click: "Copy" (selection) / "Paste here" (clipboard, at the
+    // clicked world position) — see context-menu.ts/clipboard-cursor.ts.
+    this.canvasElement.addEventListener("contextmenu", this.handleContextMenu);
 
     this.updateBreadcrumbs();
   }
@@ -1300,6 +1305,54 @@ export class WidgetManager {
     }
   }
 
+  /** right-click handler: offers "Copy" when something is selected, and
+   *  "Paste" (at the clicked world position, then clears the clipboard —
+   *  a one-shot placement, unlike the repeatable Cmd/Ctrl+V) when the
+   *  clipboard has content. shows nothing (but still suppresses the
+   *  native browser menu) if neither applies. */
+  private handleContextMenu = (e: MouseEvent): void => {
+    e.preventDefault();
+
+    const items: ContextMenuItem[] = [];
+    const selected = this.inputRouter.selectedWidgetIds;
+    const anyCopyable = [...selected].some((id) => {
+      const entry = this.store.getWidget(id);
+      return entry && isCopyable(this.registry, entry.type);
+    });
+    if (anyCopyable) {
+      items.push({
+        label: "copy",
+        onSelect: () => {
+          copySelectionToClipboard(this.store, this.registry, selected).catch((err) => {
+            log.debug("widget-manager.clipboard", "copy failed (non-fatal):", err);
+          });
+        },
+      });
+    }
+    if (hasClipboardContent()) {
+      items.push({
+        label: "paste",
+        onSelect: () => {
+          if (this.store.isLocalViewer() || !this.viewport) return;
+          const at = this.viewport.screenToWorld(e.clientX, e.clientY);
+          pasteClipboardIntoStore(this.store, { at, clearAfter: true })
+            .then((result) => {
+              if (result.pasted.length > 0) this.inputRouter.selectWidgets(result.pasted);
+            })
+            .catch((err) => {
+              log.debug("widget-manager.clipboard", "paste failed (non-fatal):", err);
+            });
+        },
+      });
+      items.push({
+        label: "clear",
+        onSelect: () => clearClipboard(),
+      });
+    }
+    if (items.length === 0) return;
+    showContextMenu(e.clientX, e.clientY, items, this.theme);
+  };
+
   /** set lasso-active state on all live widget frames.
    *  when active, all widget content becomes inert with a dark overlay
    *  so the lasso pointer events aren't captured by widget content. */
@@ -1370,6 +1423,9 @@ export class WidgetManager {
     // clean up focus stack
     this.focusStack.clear();
     this.maximizedEscapees.clear();
+
+    this.canvasElement.removeEventListener("contextmenu", this.handleContextMenu);
+    dismissContextMenu();
 
     for (const unsub of this.unsubs) {
       unsub();

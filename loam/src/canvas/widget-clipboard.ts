@@ -61,10 +61,49 @@ interface ClipboardWidget {
 }
 
 let clipboard: ClipboardWidget[] | null = null;
+let changeListeners: Array<(count: number) => void> = [];
 
 /** true if a previous copy left something to paste. */
 export function hasClipboardContent(): boolean {
   return !!clipboard && clipboard.length > 0;
+}
+
+/** number of TOP-LEVEL widgets currently on the clipboard (nested bin
+ *  children don't count separately) — used by clipboard-cursor.ts to pick
+ *  how many "cards" to draw. */
+export function clipboardCount(): number {
+  return clipboard?.length ?? 0;
+}
+
+/** subscribe to clipboard content changes (copy, clear, or a paste that
+ *  clears afterward). called immediately with the current count, then
+ *  again on every change. returns an unsubscribe function. */
+export function onClipboardChange(listener: (count: number) => void): () => void {
+  changeListeners.push(listener);
+  listener(clipboardCount());
+  return () => {
+    changeListeners = changeListeners.filter((l) => l !== listener);
+  };
+}
+
+function notifyClipboardChange(): void {
+  const count = clipboardCount();
+  for (const listener of changeListeners) listener(count);
+}
+
+/** explicitly empty the clipboard (e.g. after a context-menu "paste here",
+ *  which is meant to be a one-shot precise placement rather than the
+ *  repeatable Cmd+V). */
+export function clearClipboard(): void {
+  if (!clipboard) return;
+  clipboard = null;
+  notifyClipboardChange();
+}
+
+/** true unless the widget type's factory metadata explicitly opts out
+ *  (see `WidgetMetadata.copyable`'s own doc comment — e.g. canvas-info). */
+export function isCopyable(registry: WidgetRegistry, type: string): boolean {
+  return registry.get(type)?.metadata.copyable !== false;
 }
 
 /** read one widget's current state through its registry schema — the same
@@ -100,8 +139,7 @@ async function buildClipboardWidget(
   store: CanvasStore,
   registry: WidgetRegistry,
   entry: WidgetEntry
-): Promise<ClipboardWidget> {
-  const state = await readWidgetState(store, registry, entry);
+): Promise<ClipboardWidget> {  const state = await readWidgetState(store, registry, entry);
   const bundle: ClipboardWidget = {
     type: entry.type,
     x: entry.x,
@@ -121,7 +159,7 @@ async function buildClipboardWidget(
       : [];
     for (const item of items) {
       const childEntry = store.getWidget(item.widgetId);
-      if (!childEntry) continue;
+      if (!childEntry || !isCopyable(registry, childEntry.type)) continue;
       bundle.children.push({ slot: item.slot, widget: await buildClipboardWidget(store, registry, childEntry) });
     }
   }
@@ -144,12 +182,13 @@ export async function copySelectionToClipboard(
   const bundles: ClipboardWidget[] = [];
   for (const id of ids) {
     const entry = store.getWidget(id);
-    if (!entry) continue;
+    if (!entry || !isCopyable(registry, entry.type)) continue;
     if (entry.parentId && ids.includes(entry.parentId)) continue;
     bundles.push(await buildClipboardWidget(store, registry, entry));
   }
   clipboard = bundles.length > 0 ? bundles : null;
   log.debug(TAG, `copied ${bundles.length} widget(s) to clipboard`);
+  notifyClipboardChange();
 }
 
 /** best-effort blob-canvas-ref registration for a pasted widget's state —
@@ -182,6 +221,8 @@ async function pasteOne(
   bundle: ClipboardWidget,
   parentId: string | null,
   canvasDocId: string,
+  dx: number,
+  dy: number,
   onSkip: () => void
 ): Promise<string | null> {
   if (bundle.hadDocId && bundle.state === null) {
@@ -201,8 +242,8 @@ async function pasteOne(
   store.addWidget({
     id: widgetId,
     type: bundle.type,
-    x: bundle.x + PASTE_OFFSET,
-    y: bundle.y + PASTE_OFFSET,
+    x: bundle.x + dx,
+    y: bundle.y + dy,
     width: bundle.width,
     height: bundle.height,
     zIndex,
@@ -216,7 +257,7 @@ async function pasteOne(
   if (bundle.children.length > 0 && docId) {
     const items: Array<{ widgetId: string; slot: { col: number; row: number } }> = [];
     for (const child of bundle.children) {
-      const childId = await pasteOne(store, child.widget, widgetId, canvasDocId, onSkip);
+      const childId = await pasteOne(store, child.widget, widgetId, canvasDocId, dx, dy, onSkip);
       if (childId) items.push({ widgetId: childId, slot: child.slot });
     }
     const binHandle = await resolveDocReadyCached<{ items: unknown }>(store.repo, docId as DocumentId, {
@@ -230,21 +271,42 @@ async function pasteOne(
   return widgetId;
 }
 
+export interface PasteOptions {
+  /** paste anchored so the copied selection's top-left bounding-box corner
+   *  lands exactly at this world position (context-menu "paste here") —
+   *  when omitted, uses the fixed `PASTE_OFFSET` from the original
+   *  coordinates instead (Cmd/Ctrl+V's repeatable-paste behavior). */
+  at?: { x: number; y: number };
+  /** empty the clipboard (and its cursor) once paste completes — a
+   *  one-shot placement rather than a repeatable paste. */
+  clearAfter?: boolean;
+}
+
 /** paste the current clipboard content onto `store`. a no-op (empty
  *  result) if the clipboard is empty or the local peer is a viewer. */
-export async function pasteClipboardIntoStore(store: CanvasStore): Promise<PasteResult> {
+export async function pasteClipboardIntoStore(store: CanvasStore, options?: PasteOptions): Promise<PasteResult> {
   if (!clipboard || clipboard.length === 0 || store.isLocalViewer()) {
     return { pasted: [], skipped: 0 };
+  }
+
+  let dx = PASTE_OFFSET;
+  let dy = PASTE_OFFSET;
+  if (options?.at) {
+    const minX = Math.min(...clipboard.map((b) => b.x));
+    const minY = Math.min(...clipboard.map((b) => b.y));
+    dx = options.at.x - minX;
+    dy = options.at.y - minY;
   }
 
   const canvasDocId = store.handle.documentId;
   let skipped = 0;
   const pastedIds: string[] = [];
   for (const bundle of clipboard) {
-    const id = await pasteOne(store, bundle, null, canvasDocId, () => skipped++);
+    const id = await pasteOne(store, bundle, null, canvasDocId, dx, dy, () => skipped++);
     if (id) pastedIds.push(id);
   }
 
   log.debug(TAG, `pasted ${pastedIds.length} widget(s), skipped ${skipped}`);
+  if (options?.clearAfter) clearClipboard();
   return { pasted: pastedIds, skipped };
 }
