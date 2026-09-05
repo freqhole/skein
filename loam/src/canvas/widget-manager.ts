@@ -15,6 +15,7 @@ import type { InputRouter } from "./input-router";
 import type { BreadcrumbItem, Toolbar } from "./toolbar";
 import type { Viewport } from "./viewport";
 import { WidgetFrame } from "./widget-frame";
+import { copySelectionToClipboard, pasteClipboardIntoStore } from "./widget-clipboard";
 
 /**
  * stamp `ownerCanvasId` onto a widget doc that predates this stamping
@@ -279,6 +280,25 @@ export class WidgetManager {
     this.inputRouter.setSendBackwardHandler((id) => {
       this.store.sendToBack(id);
       this.updateLayerInfo();
+    });
+
+    // wire up Cmd/Ctrl+C / Cmd/Ctrl+V — see widget-clipboard.ts's own doc
+    // comment for why the clipboard itself lives outside this class (it
+    // must survive navigating to a different canvas, this class doesn't).
+    this.inputRouter.setCopyHandler((ids) => {
+      copySelectionToClipboard(this.store, this.registry, ids).catch((err) => {
+        log.debug("widget-manager.clipboard", "copy failed (non-fatal):", err);
+      });
+    });
+    this.inputRouter.setPasteHandler(() => {
+      if (this.store.isLocalViewer()) return;
+      pasteClipboardIntoStore(this.store)
+        .then((result) => {
+          if (result.pasted.length > 0) this.inputRouter.selectWidgets(result.pasted);
+        })
+        .catch((err) => {
+          log.debug("widget-manager.clipboard", "paste failed (non-fatal):", err);
+        });
     });
 
     this.updateBreadcrumbs();
@@ -684,7 +704,7 @@ export class WidgetManager {
     if (ctrl.headerActions) {
       frame.setCustomActions(ctrl.headerActions);
     }
-    if (ctrl.titleProgress != null) {
+    if (ctrl.titleProgress !== null && ctrl.titleProgress !== undefined) {
       frame.setTitleProgress(ctrl.titleProgress);
     }
 
