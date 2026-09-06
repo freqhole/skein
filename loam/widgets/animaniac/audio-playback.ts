@@ -75,6 +75,15 @@ interface PoolEntry {
   resolving: boolean;
   /** true once `el.currentTime` has been set at least once — see `update()`. */
   synced: boolean;
+  /** true once `el` has fired `loadedmetadata` (or already had metadata the
+   *  moment it was checked) — `update()` withholds the first seek/`.play()`
+   *  until this is true, since seeking a codec whose demuxer is slower to
+   *  initialize (flac, on WKWebView/AVFoundation, confirmed empirically —
+   *  other formats tolerate an immediate pre-ready seek fine) before it's
+   *  ready has been observed to permanently wedge the element into
+   *  rejecting every subsequent `.play()` with `NotSupportedError`, rather
+   *  than just queuing the seek per spec. */
+  ready: boolean;
   /** the `AudioRef` this entry's `el` was resolved from — a live doc write
    *  changing which ref a clip effectively points to (e.g. a fresh gain
    *  rendition landing) is detected by comparing against this each tick,
@@ -93,7 +102,7 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
   function ensureEntry(clip: Clip): PoolEntry {
     let entry = pool.get(clip.id);
     if (entry) return entry;
-    entry = { el: null, resolving: false, synced: false, resolvedKey: null };
+    entry = { el: null, resolving: false, synced: false, ready: false, resolvedKey: null };
     pool.set(clip.id, entry);
     const ref = effectiveAudioRef(clip);
     if (ref && !entry.resolving) {
@@ -130,12 +139,17 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
           }
           log.debug(TAG, "playback url resolved", { clipId: clip.id, kind: clip.kind, url: url.slice(0, 60) });
           const el = document.createElement("audio");
+          el.addEventListener("loadedmetadata", () => {
+            entry!.ready = true;
+          });
           el.src = url;
+          if (el.readyState >= HTMLMediaElement.HAVE_METADATA) entry!.ready = true;
           el.addEventListener("error", () => {
             log.warn(TAG, "<audio> element error event", {
               clipId: clip.id,
               kind: clip.kind,
               mediaError: el.error ? { code: el.error.code, message: el.error.message } : null,
+              srcPrefix: el.src.slice(0, 32),
             });
           });
           entry!.el = el;
@@ -176,6 +190,7 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
     for (const clip of active) {
       const entry = ensureEntry(clip);
       if (!entry.el) continue; // still resolving the blob URL, or nothing to play yet (e.g. ungenerated tts)
+      if (!entry.ready) continue; // element created but not yet past HAVE_METADATA — wait rather than race a seek
       const localElapsed = t - clip.start;
       const target = sourceOffsetSec(clip) + localElapsed;
       // only force a currentTime write on a discrete jump (`seeked`, or the
@@ -194,7 +209,7 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
       }
       if (playing && entry.el.paused) {
         void entry.el.play().catch((err) => {
-          log.warn(TAG, "play() rejected", { clipId: clip.id, kind: clip.kind, error: err instanceof Error ? err.message : String(err) });
+          log.warn(TAG, "play() rejected", { clipId: clip.id, kind: clip.kind, error: err instanceof Error ? err.message : String(err), srcPrefix: entry.el?.src.slice(0, 32) });
         });
       }
       if (!playing && !entry.el.paused) entry.el.pause();
