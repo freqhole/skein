@@ -1,5 +1,11 @@
 # skein
 
+## 0.1.16
+
+### Patch Changes
+
+- 9be0e31: try to fix flac playback in animaniac widget; scroll share modal; fix narthex localStorage bug
+
 ## 0.1.15
 
 ### Patch Changes

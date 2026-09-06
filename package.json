@@ -1,6 +1,6 @@
 {
     "name": "skein",
-    "version": "0.1.15",
+    "version": "0.1.16",
     "private": true,
     "description": "release coordination (changesets + version sync) for skein. not published.",
     "type": "module",
