@@ -1509,8 +1509,16 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
     hubFriendSectionHeight +
     pendingSectionHeight +
     declinedSectionHeight;
-  const DIALOG_HEIGHT =
+  const naturalDialogHeight =
     DIALOG_PADDING * 2 + titleText.height + contentNeeded + closeBtnHeight + DIALOG_PADDING;
+  // clamp to the viewport so a canvas with many peers/friends/invites
+  // doesn't grow the dialog itself taller than the window (with no way to
+  // reach whatever fell outside it) — the Dialog's own internal scrollBox
+  // (sized as `dialogHeight - padding - title - buttons`, per the comment
+  // above) then ends up shorter than `contentNeeded`, which is exactly what
+  // makes @pixi/ui's ScrollBox actually scroll instead of just growing to
+  // fit everything unscrolled.
+  const DIALOG_HEIGHT = Math.min(naturalDialogHeight, Math.max(200, app.screen.height - 80));
 
   // -------------------------------------------------------------------------
   // background panel
@@ -1562,6 +1570,16 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
   const shareUrlInput = createReadOnlyInput(shareUrlRow.placeholder, canvasEl, shareUrl, theme);
   domInputs.push(shareUrlInput);
 
+  // the dialog's backdrop covers the whole screen while open, so ANY wheel
+  // event during that time should stay within the dialog (scrolling its own
+  // content) rather than also panning/zooming the canvas underneath —
+  // viewport.ts's own wheel handler already bails out when it sees this
+  // flag (same `_skeinWidgetScroll` convention scrollable-content.ts uses).
+  const onNativeWheel = (e: WheelEvent): void => {
+    (e as { _skeinWidgetScroll?: boolean } & WheelEvent)._skeinWidgetScroll = true;
+  };
+  document.addEventListener("wheel", onNativeWheel, { capture: true, passive: true });
+
   // -------------------------------------------------------------------------
   // close / teardown wiring
   // -------------------------------------------------------------------------
@@ -1571,6 +1589,7 @@ export function showShareDialog(options: ShareDialogOptions): ShareDialogHandle 
     removed = true;
 
     window.removeEventListener("keydown", handleKeyDown, true);
+    document.removeEventListener("wheel", onNativeWheel, { capture: true });
 
     for (const input of domInputs) {
       input.remove();

@@ -352,13 +352,30 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
       const saved = localStorage.getItem(viewportStorageKey);
       if (saved) {
         const parsed = JSON.parse(saved) as { x: number; y: number; zoom: number };
+        // `stageBg` (the double-click-to-add-widget hit target, also the
+        // only thing making the canvas look non-blank) is a fixed 4000x4000
+        // rect in WORLD coordinates, itself a child of `world` — so a
+        // corrupted/out-of-range x or y here doesn't just look wrong, it
+        // pans that rect (and every widget) entirely out of view AND out of
+        // the double-click hit area, with no error thrown anywhere (the
+        // canvas just renders blank and clicks hit nothing). guard against
+        // ever restoring a value that broken, and drop the bad entry so it
+        // can't wedge this canvas again on the next visit.
+        const MAX_NARTHEX_CAMERA_COORD = 20000;
         if (
           typeof parsed.x === "number" &&
           typeof parsed.y === "number" &&
-          typeof parsed.zoom === "number"
+          typeof parsed.zoom === "number" &&
+          Number.isFinite(parsed.x) &&
+          Number.isFinite(parsed.y) &&
+          Number.isFinite(parsed.zoom) &&
+          Math.abs(parsed.x) < MAX_NARTHEX_CAMERA_COORD &&
+          Math.abs(parsed.y) < MAX_NARTHEX_CAMERA_COORD
         ) {
           viewport.zoomTo(parsed.zoom);
           viewport.panTo(parsed.x, parsed.y);
+        } else {
+          localStorage.removeItem(viewportStorageKey);
         }
       }
     } catch {

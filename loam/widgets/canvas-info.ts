@@ -421,7 +421,21 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
           setImageText.y = 0;
           return;
         }
-        const texture = await Assets.load<Texture>(resolvedUrl);
+        // pixi's Assets loader picks a parser by testing for a `data:` URL
+        // or a recognized file extension — a bare `blob:<uuid>` (the OPFS/
+        // browser-mode resolution of a `blob:<id>` ref) matches neither, so
+        // `Assets.load()` silently warns "don't know how to parse it" and
+        // never actually loads it (see image.ts's own loadImage() for the
+        // same bug, already fixed there the same way this fixes it here).
+        let texture: Texture;
+        if (resolvedUrl.startsWith("data:")) {
+          texture = await Assets.load<Texture>(resolvedUrl);
+        } else {
+          const response = await fetch(resolvedUrl);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const blob = await response.blob();
+          texture = Texture.from(await createImageBitmap(blob));
+        }
         if (destroyed) return;
         previewTexture = texture;
         loadedAssetKey = resolvedUrl;
