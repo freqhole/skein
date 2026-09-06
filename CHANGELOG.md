@@ -1,5 +1,16 @@
 # skein
 
+## 0.1.15
+
+### Patch Changes
+
+- d6d2564: more animaniac and snatching bug fixes; add more diagnostic stuff; copy/paste widgetz between canvasz;
+- 9ede661: audio clip volume adjustmentz
+- 0d62cc6: improve animaniac clip segment labelz + add audio waveformz
+- fb10a46: tidy export audio mixdown to handle one request at a time, and then also just drop audio file into a new canvas widget rather than download
+- f982db0: multi-select animaniac segment clipz to move 'em
+- ad2ace8: drop audio files on empty voice recordingz to use as mouth animation audio
+
 ## 0.1.14
 
 ### Patch Changes
