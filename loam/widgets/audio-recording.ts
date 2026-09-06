@@ -58,8 +58,10 @@ import { z } from "zod";
 import { isTauriMode, dispatch } from "../src/p2p/tauri-transport";
 import { getBlobData as getBrowserBlobData, storeBlobFromFile } from "../src/storage/blob-store";
 import { base64Encode, base64Decode } from "@freqhole/reliquary/worker";
-import { checkBlobLocality } from "../src/file-utils/blob-locality";
+import { checkBlobLocality, freeUpLocalBlobCopy } from "../src/file-utils/blob-locality";
 import { snatchBlob, BlobAccessDeniedError } from "../src/file-utils/snatch";
+import { getMediaPlaybackUrl } from "../src/media";
+import { interleaveChannels, encodeWav } from "./animaniac/export/wav-encode";
 import {
   getLocalNodeId,
   type BlobLocalityInfo,
@@ -116,6 +118,22 @@ export const audioRecordingSchema = z.object({
    * if the label isn\'t found on this machine, recording falls back to default.
    */
   deviceLabel: z.string().default(""),
+  /** gain multiplier applied to the recording (1 = original, unamplified) —
+   *  purely a UI/preview value; playback amplification only takes effect
+   *  once `gainRenditionBlobId` is set via "apply volume". */
+  gainValue: z.number().default(1),
+  /** a re-rendered copy of the original recording with `gainValue` baked
+   *  into the samples — empty when no gain has been applied, in which
+   *  case playback uses `blobId` directly. */
+  gainRenditionBlobId: z.string().default(""),
+  gainRenditionBlake3: z.string().default(""),
+  gainRenditionMime: z.string().default(""),
+  gainRenditionSize: z.number().default(0),
+  /** node IDs that have snatched (or rendered) the gain rendition blob —
+   *  kept separate from `snatchedBy` since it's a DIFFERENT blob; peers
+   *  who only ever fetched the original would otherwise be wrongly
+   *  reported as having the rendition too. */
+  gainRenditionSnatchedBy: z.array(z.string()).default([]),
 });
 
 export type AudioRecordingState = z.infer<typeof audioRecordingSchema>;
@@ -1060,10 +1078,29 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
     // resolves an object URL for the recorded audio, fetching the bytes from
     // a canvas peer when they aren't local yet (see resolveAudioBytes above
     // for the "check locality, then snatch" algorithm).
+
+    /** forces the next getPlaybackUrl() call to re-resolve — call whenever
+     *  which blob playback SHOULD use changes underneath it (a gain
+     *  rendition applied/cleared). */
+    function invalidatePlaybackCache(): void {
+      if (playbackUrl) {
+        URL.revokeObjectURL(playbackUrl);
+        playbackUrl = null;
+      }
+    }
+
     const getPlaybackUrl = async (): Promise<string | null> => {
       if (playbackUrl) return playbackUrl;
 
-      const { blobId, filename, mime, size, blake3 } = ctx.doc.current;
+      // an applied gain rendition (see "apply volume" below) always wins
+      // over the original recording — the whole point of committing one.
+      const state = ctx.doc.current;
+      const usingRendition = !!state.gainRenditionBlobId;
+      const blobId = usingRendition ? state.gainRenditionBlobId : state.blobId;
+      const mime = usingRendition ? state.gainRenditionMime : state.mime;
+      const blake3 = usingRendition ? state.gainRenditionBlake3 : state.blake3;
+      const size = usingRendition ? state.gainRenditionSize : state.size;
+      const { filename } = state;
       if (!blobId) return null;
 
       const peers = ctx.canvasStore?.peers() as PeersMap | undefined;
@@ -1101,12 +1138,21 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       if (resolved.snatchedByNodeId !== null) {
         if (resolved.blobId !== blobId || resolved.blake3 !== blake3) {
           ctx.doc.change((d) => {
-            d.blobId = resolved!.blobId;
-            d.blake3 = resolved!.blake3;
+            if (usingRendition) {
+              d.gainRenditionBlobId = resolved!.blobId;
+              d.gainRenditionBlake3 = resolved!.blake3;
+            } else {
+              d.blobId = resolved!.blobId;
+              d.blake3 = resolved!.blake3;
+            }
           });
         }
         ctx.doc.change((d) => {
-          d.snatchedBy = addSnatcher(d.snatchedBy, resolved!.snatchedByNodeId);
+          if (usingRendition) {
+            d.gainRenditionSnatchedBy = addSnatcher(d.gainRenditionSnatchedBy, resolved!.snatchedByNodeId);
+          } else {
+            d.snatchedBy = addSnatcher(d.snatchedBy, resolved!.snatchedByNodeId);
+          }
         });
       }
 
@@ -1114,6 +1160,155 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
       playbackUrl = URL.createObjectURL(blob);
       return playbackUrl;
     };
+
+    // -- gain adjustment: preview/apply/reset ---------------------------
+    // see voice-recording.ts's mirror of this same block for the full
+    // rationale (offline OfflineAudioContext render, never a live WebAudio
+    // tap on a playing <audio> element — see the tauri WebAudio caveat in
+    // voice-recording-mouth.ts's own audio code).
+    let decodedOriginalBuffer: AudioBuffer | null = null;
+    let lastRenderedGain: number | null = null;
+    let lastRenderedWavBytes: Uint8Array | null = null;
+    let previewEl: HTMLAudioElement | null = null;
+    let previewObjectUrl: string | null = null;
+
+    async function ensureDecodedOriginal(): Promise<AudioBuffer | null> {
+      if (decodedOriginalBuffer) return decodedOriginalBuffer;
+      const { blobId, mime, blake3 } = ctx.doc.current;
+      if (!blobId) return null;
+      const peers = ctx.canvasStore?.peers() as PeersMap | undefined;
+      const url = await getMediaPlaybackUrl(blobId, {
+        category: "audio",
+        mime: mime || undefined,
+        blake3: blake3 || undefined,
+        peers,
+      });
+      if (!url) return null;
+      const bytes = await fetch(url).then((r) => r.arrayBuffer());
+      const decodeCtx = new OfflineAudioContext(2, 1, 44100);
+      decodedOriginalBuffer = await decodeCtx.decodeAudioData(bytes);
+      return decodedOriginalBuffer;
+    }
+
+    async function renderGainedWav(gain: number): Promise<Uint8Array | null> {
+      if (lastRenderedGain === gain && lastRenderedWavBytes) return lastRenderedWavBytes;
+      const original = await ensureDecodedOriginal();
+      if (!original) return null;
+      const renderCtx = new OfflineAudioContext(
+        original.numberOfChannels,
+        original.length,
+        original.sampleRate
+      );
+      const source = renderCtx.createBufferSource();
+      source.buffer = original;
+      const gainNode = renderCtx.createGain();
+      gainNode.gain.value = gain;
+      source.connect(gainNode).connect(renderCtx.destination);
+      source.start();
+      const rendered = await renderCtx.startRendering();
+      const channels: Float32Array[] = [];
+      for (let i = 0; i < rendered.numberOfChannels; i++) channels.push(rendered.getChannelData(i));
+      const bytes = encodeWav(interleaveChannels(channels), rendered.numberOfChannels, rendered.sampleRate);
+      lastRenderedGain = gain;
+      lastRenderedWavBytes = bytes;
+      return bytes;
+    }
+
+    function stopPreviewGain(): void {
+      if (previewEl) {
+        previewEl.pause();
+        previewEl.src = "";
+        previewEl = null;
+      }
+      if (previewObjectUrl) {
+        URL.revokeObjectURL(previewObjectUrl);
+        previewObjectUrl = null;
+      }
+    }
+
+    async function previewGain(): Promise<void> {
+      stopPreviewGain();
+      const bytes = await renderGainedWav(ctx.doc.current.gainValue);
+      if (!bytes || destroyed) return;
+      previewObjectUrl = URL.createObjectURL(new Blob([bytes.buffer as ArrayBuffer], { type: "audio/wav" }));
+      previewEl = new Audio(previewObjectUrl);
+      previewEl.addEventListener("ended", stopPreviewGain, { once: true });
+      await previewEl
+        .play()
+        .catch((err) => console.warn("[audio-recording] gain preview play() rejected:", err));
+    }
+
+    function forgetRenditionBlob(blobId: string, blake3: string): void {
+      if (!blobId) return;
+      freeUpLocalBlobCopy(blobId, blake3 || undefined).catch((err) => {
+        console.warn("[audio-recording] failed to free old gain rendition blob (non-fatal):", err);
+      });
+    }
+
+    async function commitGainRendition(): Promise<void> {
+      const gain = ctx.doc.current.gainValue;
+      const bytes = await renderGainedWav(gain);
+      if (!bytes || destroyed) return;
+
+      const filename = `${ctx.doc.current.filename || "recording"}-gain.wav`;
+      let record: { blob_id: string; blake3: string; size: number; mime: string };
+      if (isTauriMode()) {
+        const base64Data = await base64Encode(bytes.buffer as ArrayBuffer);
+        const response = (await dispatch("blob_insert", {
+          filename,
+          mime: "audio/wav",
+          data: base64Data,
+        })) as { blake3: string; mime: string | null; size: number };
+        record = {
+          blob_id: response.blake3,
+          blake3: response.blake3,
+          size: response.size,
+          mime: response.mime || "audio/wav",
+        };
+      } else {
+        const file = new File([bytes.buffer as ArrayBuffer], filename, { type: "audio/wav" });
+        const fileRecord = await storeBlobFromFile(file, { metadata: { domain: "audio" } });
+        record = {
+          blob_id: fileRecord.blob_id,
+          blake3: fileRecord.blake3 || fileRecord.blob_id,
+          size: fileRecord.size,
+          mime: fileRecord.mime,
+        };
+      }
+
+      const previousRenditionBlobId = ctx.doc.current.gainRenditionBlobId;
+      const previousRenditionBlake3 = ctx.doc.current.gainRenditionBlake3;
+      // this device has the rendition locally the moment it renders it —
+      // record that immediately, same as a fresh recording's own upload.
+      const localNodeId = await getLocalNodeId();
+      ctx.doc.change((d) => {
+        d.gainRenditionBlobId = record.blob_id;
+        d.gainRenditionBlake3 = record.blake3;
+        d.gainRenditionMime = record.mime;
+        d.gainRenditionSize = record.size;
+        d.gainRenditionSnatchedBy = addSnatcher([], localNodeId);
+      });
+      invalidatePlaybackCache();
+      if (previousRenditionBlobId && previousRenditionBlobId !== record.blob_id) {
+        forgetRenditionBlob(previousRenditionBlobId, previousRenditionBlake3);
+      }
+    }
+
+    function resetGain(): void {
+      stopPreviewGain();
+      const previousRenditionBlobId = ctx.doc.current.gainRenditionBlobId;
+      const previousRenditionBlake3 = ctx.doc.current.gainRenditionBlake3;
+      ctx.doc.change((d) => {
+        d.gainValue = 1;
+        d.gainRenditionBlobId = "";
+        d.gainRenditionBlake3 = "";
+        d.gainRenditionMime = "";
+        d.gainRenditionSize = 0;
+        d.gainRenditionSnatchedBy = [];
+      });
+      invalidatePlaybackCache();
+      if (previousRenditionBlobId) forgetRenditionBlob(previousRenditionBlobId, previousRenditionBlake3);
+    }
 
     const startPlayback = async () => {
       fetchErrorMessage = "";
@@ -1349,6 +1544,10 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
 
     // ── widget actions (property tray) ───────────────────────────────────────
     const widgetActions: WidgetAction[] = [
+      { id: "preview-gain", label: "preview volume", onClick: () => void previewGain() },
+      { id: "stop-gain-preview", label: "stop preview", onClick: stopPreviewGain },
+      { id: "apply-gain", label: "apply volume", onClick: () => void commitGainRendition() },
+      { id: "reset-gain", label: "reset volume", onClick: resetGain },
       {
         id: "delete-recording",
         label: "delete recording",
@@ -1371,12 +1570,24 @@ export const audioRecordingWidget: WidgetFactory<typeof audioRecordingSchema> = 
           options: deviceOptions,
           default: DEVICE_DEFAULT,
         },
+        // last editableProp so it renders immediately above the
+        // preview/stop/apply/reset buttons in widgetActions below.
+        {
+          key: "gainValue",
+          label: "volume",
+          type: "number" as const,
+          default: 1,
+          min: 0,
+          max: 11,
+          step: 0.1,
+        },
       ],
       destroy() {
         destroyed = true;
         stopWaveAnim();
         stopPlayAnim();
         stopFetchAnim();
+        stopPreviewGain();
         unregisterPendingRetry?.();
         unregisterPendingRetry = null;
         mediaRecorder?.stop();

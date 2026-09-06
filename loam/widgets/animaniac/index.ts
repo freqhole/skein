@@ -48,16 +48,25 @@ import { createCompositor, type CompositorHandle } from "./compositor";
 import { createDomVideoOverlay, type DomVideoOverlayHandle } from "./dom-video-overlay";
 import { createPreviewTransformEditor, type PreviewTransformEditorHandle, type TransformPatch } from "./preview-transform-editor";
 import { createAudioPlayback, type AudioPlaybackHandle } from "./audio-playback";
+import { createGainSlider, type GainSliderHandle } from "./gain-slider";
 import { createPlaybackClock, type PlaybackClock } from "./playback-clock";
 import { createHistoryController, type HistoryControllerHandle } from "./history";
 import { loadLocalAnimaniacPrefs, saveLocalAnimaniacPrefs, isDomVideoOverlayEnabled } from "./local-prefs";
 import { createAnimaniacDropController } from "./drop-controller";
 import { restoreWidgetFromClip } from "./clip-restore";
-import { createSnatchController, isAnimaniacNewBlobMessage, clipBlobInfo } from "./snatch-controller";
-import { computeDisplayDurationSec, nextTrackOrder, removeTrack as removeTrackFromArrays, sortedTracks } from "./track-model";
+import { createSnatchController, isAnimaniacNewBlobMessage, clipBlobInfo, clipGainRenditionBlobInfo, makeAnimaniacNewBlobMessage } from "./snatch-controller";
+import { clipDurationSec, computeDisplayDurationSec, nextTrackOrder, removeTrack as removeTrackFromArrays, sortedTracks } from "./track-model";
 import { createTrack, TRACK_ROW_HEIGHT, type TrackHandle } from "./tracks/track";
 import { renderAudioMixdown } from "./export/audio-mixdown";
+import { encodeAudioBufferToWav } from "./export/wav-encode";
+import { getMediaPlaybackUrl } from "../../src/media";
+import { isTauriMode, dispatch } from "../../src/p2p/tauri-transport";
+import { storeBlobFromFile } from "../../src/storage/blob-store";
+import { freeUpLocalBlobCopy } from "../../src/file-utils/blob-locality";
+import { addBlobCanvasRef } from "../../src/file-utils/blob-canvas-refs";
+import { base64Encode } from "@freqhole/reliquary/worker";
 import { animaniacSchema, type AnimaniacState, type Clip, type Track } from "./types";
+import type { AudioSegmentClip, TtsClip, VoiceRecordingClip } from "./types";
 
 export { animaniacSchema };
 export type { AnimaniacState };
@@ -82,6 +91,31 @@ const TIMELINE_MIN_HEIGHT = 140;
 // for shuffling long clips around), not part of stfu's own default set.
 const ZOOM_LEVELS = [0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256];
 
+/** one-time repair pass for animaniac docs written before voice-recording/
+ *  tts clips gained real `sourceInSec`/`sourceOutSec` trim support (they
+ *  previously had a plain, non-trimmable `durationSec` instead — see
+ *  types.ts's own schema doc comment). making `sourceOutSec` required (no
+ *  default) is what makes a legacy clip actually FAIL to parse and land
+ *  here, rather than silently defaulting to a nonsensical near-zero
+ *  duration on every read (see widget-doc.ts's `createWidgetDoc`). writes
+ *  directly into the raw automerge doc so the fix is permanent and syncs
+ *  to every peer. */
+function migrateAnimaniac(raw: any): void {
+  if (!Array.isArray(raw.clips)) return;
+  for (const clip of raw.clips) {
+    if (!clip || (clip.kind !== "voice-recording" && clip.kind !== "tts")) continue;
+    if (typeof clip.sourceOutSec === "number") continue; // already migrated
+    // 5s: same fallback frame-capture.ts's own resolveClipDuration() uses
+    // when a real probe isn't available.
+    const legacyDuration = typeof clip.durationSec === "number" && clip.durationSec > 0 ? clip.durationSec : 5;
+    clip.sourceInSec = 0;
+    clip.sourceOutSec = legacyDuration;
+    if (typeof clip.sourceDurationSec !== "number" || clip.sourceDurationSec <= 0) {
+      clip.sourceDurationSec = legacyDuration;
+    }
+  }
+}
+
 export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
   type: "animaniac",
   metadata: {
@@ -93,6 +127,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     defaultHeight: 480,
   },
   schema: animaniacSchema,
+  migrate: migrateAnimaniac,
 
   getCompactInfo(state: AnimaniacState): CompactInfo {
     return {
@@ -208,6 +243,12 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     // track row's own selection, and with the preview transform editor's
     // own click-to-select — see `setSelectedClipId()`) ----------------------
     let selectedClipId: string | null = null;
+    // Cmd/Ctrl+click builds up a cross-track multi-selection for batch
+    // moving (see `toggleClipMultiSelect()`/`onBatchDragDelta()`) — always
+    // a subset containing `selectedClipId` when its size is exactly 1;
+    // `selectedClipId` is null whenever this has 0 or 2+ members (mirrors
+    // the main canvas's own InputRouter "primary" convention).
+    let multiSelectedClipIds: Set<string> = new Set();
     // guards against the reentrant `onSelectionChange(null)` call
     // `clearSelection()` fires below (see `setSelectedClipId()`'s own
     // comment) — without it, that reentrant call clobbers `selectedClipId`
@@ -221,6 +262,10 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       isUpdatingSelection = true;
       try {
         selectedClipId = id;
+        // a plain (non-modifier) select always collapses any cross-track
+        // multi-selection down to just this one clip (or none) — mirrors
+        // the main canvas's own InputRouter.selectWidget() convention.
+        multiSelectedClipIds = new Set(id ? [id] : []);
         const clip = id ? ctx.doc.current.clips.find((c) => c.id === id) : null;
         // only one clip may ever be selected across the WHOLE widget at a
         // time — each track's own interaction engine previously kept its
@@ -237,8 +282,80 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         if (clip) trackInstances.get(clip.trackId)?.selectId(id!);
         previewTransformEditor.refresh();
         updateTimelineActionBar();
+        refreshAllTracks();
       } finally {
         isUpdatingSelection = false;
+      }
+    }
+
+    /** Cmd/Ctrl+click on a clip — toggles it into/out of the cross-track
+     *  multi-selection (does NOT start a drag on this click; see
+     *  track-item-interaction.ts's own `onToggleSelect` doc comment). the
+     *  usual single-clip UI (preview transform editor, mute button,
+     *  delete-key) only ever applies to an unambiguous ONE selected clip,
+     *  matching InputRouter's own "primary is null unless exactly one is
+     *  selected" convention — it simply won't show/act while 0 or 2+ clips
+     *  are multi-selected, no separate multi-clip UI needed for that. */
+    function toggleClipMultiSelect(id: string): void {
+      const next = new Set(multiSelectedClipIds);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      multiSelectedClipIds = next;
+      const primary = next.size === 1 ? [...next][0] : null;
+      selectedClipId = primary;
+      const clip = primary ? ctx.doc.current.clips.find((c) => c.id === primary) : null;
+      for (const [trackId, inst] of trackInstances) {
+        if (clip && trackId === clip.trackId) continue;
+        inst.clearSelection();
+      }
+      if (clip) trackInstances.get(clip.trackId)?.selectId(primary!);
+      previewTransformEditor.refresh();
+      updateTimelineActionBar();
+      refreshAllTracks();
+    }
+
+    /** in-progress cross-track group move — see `onBatchDragDelta()`/
+     *  `onBatchDragEnd()`, wired into every track's own `onBatchDragDelta`/
+     *  `onBatchDragEnd` options below. */
+    let batchDrag: { draggedId: string; companionIds: string[]; lastDeltaSec: number } | null = null;
+
+    /** applies the SAME raw (unsnapped) delta every OTHER multi-selected
+     *  clip's own track already got from the actively-dragged clip's move
+     *  — each companion clip is previewed via its OWN track's
+     *  `previewExternalMove()`, so it's still subject to that track's own
+     *  `preventOverlap`/duration clamping, just like the primary clip is. */
+    function onBatchDragDelta(draggedId: string, deltaSec: number): void {
+      if (!batchDrag || batchDrag.draggedId !== draggedId) {
+        const companionIds = [...multiSelectedClipIds].filter((id) => id !== draggedId);
+        if (companionIds.length === 0) return;
+        for (const id of companionIds) {
+          const clip = ctx.doc.current.clips.find((c) => c.id === id);
+          if (clip) trackInstances.get(clip.trackId)?.beginExternalMove(id);
+        }
+        batchDrag = { draggedId, companionIds, lastDeltaSec: deltaSec };
+      }
+      batchDrag.lastDeltaSec = deltaSec;
+      for (const id of batchDrag.companionIds) {
+        const clip = ctx.doc.current.clips.find((c) => c.id === id);
+        if (clip) trackInstances.get(clip.trackId)?.previewExternalMove(id, deltaSec);
+      }
+    }
+
+    function onBatchDragEnd(draggedId: string, committed: boolean): void {
+      if (!batchDrag || batchDrag.draggedId !== draggedId) return;
+      const { companionIds, lastDeltaSec } = batchDrag;
+      batchDrag = null;
+      for (const id of companionIds) {
+        const clip = ctx.doc.current.clips.find((c) => c.id === id);
+        const inst = clip ? trackInstances.get(clip.trackId) : undefined;
+        if (!inst) continue;
+        if (committed) inst.commitExternalMove(id, lastDeltaSec);
+        else inst.cancelExternalMove(id);
+      }
+      if (committed && companionIds.length > 0) {
+        history.push();
+        camera.setDuration(computeDisplayDurationSec(ctx.doc.current.clips));
+        renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
       }
     }
 
@@ -297,6 +414,172 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       refreshAllTracks();
       updateTimelineActionBar();
       renderFrame(playbackClock.getCurrentTime(), playbackClock.isPlaying(), true);
+    }
+
+    // -- gain adjustment (audio-segment/voice-recording/tts clips only) --
+    // wired to the timeline action bar's volume slider, shown only while
+    // one of those three kinds is selected (see `updateTimelineActionBar()`).
+    // always rendered from the WHOLE original source (see gain-slider.ts's
+    // caller below + types.ts's own `gainFields` doc comment) via the same
+    // OfflineAudioContext technique voice-recording.ts/audio-recording.ts/
+    // file.ts already use — never a live WebAudio tap on a playing
+    // <audio> element (see those widgets for the tauri WebAudio caveat).
+    type GainAdjustableClip = VoiceRecordingClip | TtsClip | AudioSegmentClip;
+    const GAIN_DEBOUNCE_MS = 350;
+    const decodedOriginalCache = new Map<string, AudioBuffer>(); // keyed by audioBlobId
+    const gainRenderTimers = new Map<string, ReturnType<typeof setTimeout>>(); // keyed by clip id
+    const gainRenderGeneration = new Map<string, number>(); // keyed by clip id
+
+    function isGainAdjustableClip(clip: Clip | undefined | null): clip is GainAdjustableClip {
+      return !!clip && (clip.kind === "voice-recording" || clip.kind === "tts" || clip.kind === "audio-segment");
+    }
+
+    async function decodeOriginalAudio(clip: GainAdjustableClip): Promise<AudioBuffer | null> {
+      if (!clip.audioBlobId) return null;
+      const cached = decodedOriginalCache.get(clip.audioBlobId);
+      if (cached) return cached;
+      const url = await getMediaPlaybackUrl(clip.audioBlobId, {
+        category: "audio",
+        mime: clip.audioMime || undefined,
+        blake3: clip.audioBlake3 || undefined,
+        peers: getPeers(),
+      });
+      if (!url) return null;
+      const bytes = await fetch(url).then((r) => r.arrayBuffer());
+      const decodeCtx = new OfflineAudioContext(2, 1, 44100);
+      const decoded = await decodeCtx.decodeAudioData(bytes);
+      decodedOriginalCache.set(clip.audioBlobId, decoded);
+      return decoded;
+    }
+
+    async function renderClipGain(clip: GainAdjustableClip, gain: number): Promise<Uint8Array | null> {
+      const original = await decodeOriginalAudio(clip);
+      if (!original) return null;
+      const renderCtx = new OfflineAudioContext(original.numberOfChannels, original.length, original.sampleRate);
+      const source = renderCtx.createBufferSource();
+      source.buffer = original;
+      const gainNode = renderCtx.createGain();
+      gainNode.gain.value = gain;
+      source.connect(gainNode).connect(renderCtx.destination);
+      source.start();
+      const rendered = await renderCtx.startRendering();
+      const channels: Float32Array[] = [];
+      for (let i = 0; i < rendered.numberOfChannels; i++) channels.push(rendered.getChannelData(i));
+      return encodeAudioBufferToWav(channels, rendered.sampleRate);
+    }
+
+    interface GainRenditionRecord {
+      blob_id: string;
+      blake3: string;
+      size: number;
+      mime: string;
+    }
+
+    async function uploadGainRendition(bytes: Uint8Array, baseFilename: string): Promise<GainRenditionRecord> {
+      const filename = `${baseFilename || "audio"}-gain.wav`;
+      if (isTauriMode()) {
+        const base64Data = await base64Encode(bytes.buffer as ArrayBuffer);
+        const response = (await dispatch("blob_insert", {
+          filename,
+          mime: "audio/wav",
+          data: base64Data,
+        })) as { blake3: string; mime: string | null; size: number };
+        return { blob_id: response.blake3, blake3: response.blake3, size: response.size, mime: response.mime || "audio/wav" };
+      }
+      const file = new File([bytes.buffer as ArrayBuffer], filename, { type: "audio/wav" });
+      const fileRecord = await storeBlobFromFile(file, { metadata: { domain: "audio" } });
+      return {
+        blob_id: fileRecord.blob_id,
+        blake3: fileRecord.blake3 || fileRecord.blob_id,
+        size: fileRecord.size,
+        mime: fileRecord.mime,
+      };
+    }
+
+    function forgetGainRenditionBlob(blobId: string, blake3: string): void {
+      if (!blobId) return;
+      freeUpLocalBlobCopy(blobId, blake3 || undefined).catch((err) => {
+        console.warn(`[animaniac] failed to free old gain rendition blob ${blobId} (non-fatal):`, err);
+      });
+    }
+
+    /** debounced: (re)schedules a gain render+commit for `clipId` at
+     *  `gain`, cancelling any not-yet-fired render already pending for it
+     *  — a fast-dragging slider only ever renders its FINAL settled value.
+     *  the generation counter additionally guards the (rarer) case where a
+     *  render/upload already in flight is still running when a NEWER one
+     *  gets scheduled — see `commitGainRender()`'s own staleness checks. */
+    function scheduleGainRender(clipId: string, gain: number): void {
+      const existingTimer = gainRenderTimers.get(clipId);
+      if (existingTimer) clearTimeout(existingTimer);
+      const generation = (gainRenderGeneration.get(clipId) ?? 0) + 1;
+      gainRenderGeneration.set(clipId, generation);
+      const timer = setTimeout(() => {
+        gainRenderTimers.delete(clipId);
+        void commitGainRender(clipId, gain, generation);
+      }, GAIN_DEBOUNCE_MS);
+      gainRenderTimers.set(clipId, timer);
+    }
+
+    async function commitGainRender(clipId: string, gain: number, generation: number): Promise<void> {
+      const clip = ctx.doc.current.clips.find((c) => c.id === clipId);
+      if (!isGainAdjustableClip(clip)) return;
+      const isStale = () => destroyed || gainRenderGeneration.get(clipId) !== generation;
+      gainSlider.setBusy(true);
+      try {
+        // gain === 1 (back to original) never needs a rendition at all —
+        // clearing gainRendition* below falls back to the plain original.
+        let record: GainRenditionRecord | null = null;
+        if (gain !== 1) {
+          const bytes = await renderClipGain(clip, gain);
+          if (isStale()) return;
+          if (!bytes) return; // couldn't resolve/decode the original — leave the doc untouched
+          record = await uploadGainRendition(bytes, clip.kind === "audio-segment" ? clip.label : "recording");
+          if (isStale()) {
+            // a newer drag/render already superseded this one while the
+            // upload was in flight — don't clobber it, just clean up.
+            forgetGainRenditionBlob(record.blob_id, record.blake3);
+            return;
+          }
+        }
+        const freshClip = ctx.doc.current.clips.find((c) => c.id === clipId);
+        if (!isGainAdjustableClip(freshClip)) {
+          if (record) forgetGainRenditionBlob(record.blob_id, record.blake3);
+          return;
+        }
+        const previousRenditionBlobId = freshClip.gainRenditionBlobId;
+        const previousRenditionBlake3 = freshClip.gainRenditionBlake3;
+        const localNodeId = ctx.canvasStore?.localNodeId ?? "";
+        ctx.doc.change((d) => {
+          const target = d.clips.find((c) => c.id === clipId);
+          if (!isGainAdjustableClip(target)) return;
+          target.gainValue = gain;
+          target.gainRenditionBlobId = record ? record.blob_id : "";
+          target.gainRenditionBlake3 = record ? record.blake3 : "";
+          target.gainRenditionMime = record ? record.mime : "";
+          target.gainRenditionSize = record ? record.size : 0;
+          target.gainRenditionSnatchedBy = record && localNodeId ? [localNodeId] : [];
+        });
+        history.push();
+        if (record) {
+          // let every OTHER peer currently on this canvas react right away
+          // (ephemeral, not a doc change — see snatch-controller.ts's own
+          // doc comment) instead of waiting on a bounded catch-up rescan.
+          const info = clipGainRenditionBlobInfo(ctx.doc.current.clips.find((c) => c.id === clipId) ?? freshClip);
+          if (info) {
+            ctx.canvasStore?.broadcastEphemeral(
+              new TextEncoder().encode(JSON.stringify(makeAnimaniacNewBlobMessage(ctx.widgetId, info)))
+            );
+          }
+        }
+        if (previousRenditionBlobId && previousRenditionBlobId !== (record?.blob_id ?? "")) {
+          forgetGainRenditionBlob(previousRenditionBlobId, previousRenditionBlake3);
+        }
+      } catch (err) {
+        console.warn(`[animaniac] gain render/commit failed for clip ${clipId}:`, err);
+      } finally {
+        if (!destroyed) gainSlider.setBusy(false);
+      }
     }
 
     /** adds a new, empty track, appended after every existing track. */
@@ -383,10 +666,18 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
 
     const toolbarContainer = new Container();
     timelineContainer.addChild(toolbarContainer);
+    // zoom re-centers on this when there IS a selection, instead of always
+    // the playhead (camera.zoomIn()/zoomOut()'s own default) — otherwise
+    // zooming in on a clip selected somewhere away from the playhead can
+    // push it right out of view.
+    const focusTimeForZoom = (): number | undefined => {
+      const clip = selectedClipId ? ctx.doc.current.clips.find((c) => c.id === selectedClipId) : undefined;
+      return clip ? clip.start + clipDurationSec(clip) / 2 : undefined;
+    };
     const toolbar: TimelineToolbarHandle = createTimelineToolbar({
       container: toolbarContainer,
-      zoomIn: () => camera.zoomIn(),
-      zoomOut: () => camera.zoomOut(),
+      zoomIn: () => camera.setZoom(camera.getView().zoomIndex + 1, focusTimeForZoom()),
+      zoomOut: () => camera.setZoom(camera.getView().zoomIndex - 1, focusTimeForZoom()),
       zoomFit: () => camera.zoomFit(),
       onUndo: () => history.undo(),
       onRedo: () => history.redo(),
@@ -430,26 +721,47 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       if (selectedClipId) toggleMuteVideoClip(selectedClipId);
     });
     toolbarMuteBtn.visible = false;
-    toolbarContainer.addChild(toolbarPlayBtn, toolbarMuteBtn);
+    const gainSlider: GainSliderHandle = createGainSlider({
+      initialValue: 1,
+      onChange: (value) => {
+        if (selectedClipId) scheduleGainRender(selectedClipId, value);
+      },
+    });
+    gainSlider.container.visible = false;
+    toolbarContainer.addChild(toolbarPlayBtn, toolbarMuteBtn, gainSlider.container);
 
-    /** positions the toolbar's own play/mute buttons to the left of
-     *  autoscroll — recomputed whenever either button's own width changes
-     *  (a label change) or the widget resizes. */
+    /** positions the toolbar's own play/mute/gain-slider controls to the
+     *  left of autoscroll — recomputed whenever any of their own widths
+     *  change (a label change) or the widget resizes. mute and the gain
+     *  slider are mutually exclusive (video-segment vs. audio-bearing
+     *  clip kinds), but chaining off whichever is actually visible keeps
+     *  this correct regardless. */
     function layoutTrailingButtons(): void {
       const leftOfAutoscroll = toolbar.getTrailingGroupLeftX();
       toolbarPlayBtn.x = Math.max(0, leftOfAutoscroll - TOOLBAR_GROUP_GAP - toolbarPlayBtn.buttonWidth);
-      toolbarMuteBtn.x = toolbarMuteBtn.visible ? Math.max(0, toolbarPlayBtn.x - TOOLBAR_GROUP_GAP - toolbarMuteBtn.buttonWidth) : toolbarMuteBtn.x;
+      let cursorX = toolbarPlayBtn.x;
+      if (toolbarMuteBtn.visible) {
+        toolbarMuteBtn.x = Math.max(0, cursorX - TOOLBAR_GROUP_GAP - toolbarMuteBtn.buttonWidth);
+        cursorX = toolbarMuteBtn.x;
+      }
+      if (gainSlider.container.visible) {
+        gainSlider.container.x = Math.max(0, cursorX - TOOLBAR_GROUP_GAP - gainSlider.buttonWidth);
+      }
     }
 
     /** shows/hides + relabels the timeline's own selected-clip action bar
-     *  (currently just mute/unmute) — a video-segment clip has an
-     *  embedded-audio toggle; every other clip kind has nothing to show
-     *  here. called from `setSelectedClipId()` and after a mute toggle. */
+     *  (mute for a video-segment's embedded audio; a volume slider for
+     *  voice-recording/tts/audio-segment) — every other clip kind has
+     *  nothing to show here. called from `setSelectedClipId()` and after a
+     *  mute toggle/gain change. */
     function updateTimelineActionBar(): void {
       const clip = selectedClipId ? ctx.doc.current.clips.find((c) => c.id === selectedClipId) : undefined;
       const showMute = clip?.kind === "video-segment";
+      const showGain = isGainAdjustableClip(clip);
       toolbarMuteBtn.visible = showMute;
       if (showMute) toolbarMuteBtn.setLabel?.(clip!.muted ? "unmute" : "mute");
+      gainSlider.container.visible = showGain;
+      if (showGain) gainSlider.setValue(clip.gainValue);
       layoutTrailingButtons();
     }
 
@@ -545,10 +857,14 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
 
     /** whether `clip`'s own backing media blob isn't local yet — drives
      *  the dashed-border cue on track bars. false for a clip kind with no
-     *  blob field (label) at all. */
+     *  blob field (label) at all. also true for an applied gain rendition
+     *  that isn't local yet, since playback prefers it over the plain
+     *  original once one exists (see `effectiveAudioRef()`). */
     function isClipRemote(clip: Clip): boolean {
       const blob = clipBlobInfo(clip);
-      return !!blob && snatchController.isBlobRemote(blob.blobId);
+      if (blob && snatchController.isBlobRemote(blob.blobId)) return true;
+      const rendition = clipGainRenditionBlobInfo(clip);
+      return !!rendition && snatchController.isBlobRemote(rendition.blobId);
     }
 
     /** 0..1 live download progress for `clip`'s own blob, 0 if not
@@ -828,10 +1144,21 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         camera,
         getDuration: () => camera.getView().duration,
         isSnapEnabled: () => prefs.snapEnabled,
-        // clips always snap to the very start of the timeline (besides
-        // other clips' own edges, already handled by the interaction
-        // engine) — makes it easy to drag a clip flush against t=0.
-        getSnapTimes: () => [0],
+        // 0 (very start of the timeline) plus every OTHER track's own clip
+        // edges — track-item-interaction.ts's own snapTime() already
+        // covers snapping to clips on THIS SAME track (via its own
+        // getItems()), but has no visibility into any other row, so
+        // cross-track snapping (unified tracks means clips routinely need
+        // to align with a clip on a totally different track now) has to
+        // be supplied explicitly here.
+        getSnapTimes: () => {
+          const edges = [0];
+          for (const clip of ctx.doc.current.clips) {
+            if (clip.trackId === track.id) continue;
+            edges.push(clip.start, clip.start + clipDurationSec(clip));
+          }
+          return edges;
+        },
         getClips: () => ctx.doc.current.clips,
         onClipsChange,
         // selecting a clip on the timeline also shows its handles in the
@@ -849,6 +1176,11 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         isClipRemote: (clip: Clip) => isClipRemote(clip),
         getClipProgress: (clip: Clip) => clipProgress(clip),
         isClipMuted: (clip: Clip) => isClipMuted(clip),
+        getPeers,
+        isSelected: (clipId: string) => multiSelectedClipIds.size > 1 && multiSelectedClipIds.has(clipId),
+        onToggleSelect: (clipId: string) => toggleClipMultiSelect(clipId),
+        onBatchDragDelta,
+        onBatchDragEnd,
       };
       return createTrack(common);
     }
@@ -1123,17 +1455,127 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     });
 
     // -- export: audio mixdown -----------------------------------------------
+    // memory-intensive (decodes every unique source in full, then renders
+    // the whole mix into one buffer — see audio-mixdown.ts's own doc
+    // comment); guarded against overlapping clicks below.
+    let mixdownInFlight = false;
+    let mixdownHeartbeat: ReturnType<typeof setInterval> | null = null;
+
     async function handleExportAudioMixdown(): Promise<void> {
-      const { tracks, clips } = ctx.doc.current;
-      const result = await renderAudioMixdown({ tracks, clips, getPeers });
-      if (destroyed) return;
-      const blob = new Blob([result.bytes.buffer as ArrayBuffer], { type: "audio/wav" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "animaniac-mixdown.wav";
-      a.click();
-      URL.revokeObjectURL(url);
+      if (mixdownInFlight || !store) return;
+      mixdownInFlight = true;
+
+      // drop a placeholder audio file widget right away — same
+      // uploadingBy/uploadingProgress lock+progress fields file.ts's own
+      // upload flow uses, so it renders the exact same "preparing..."
+      // progress view (see file.ts's own doc comment on those fields)
+      // instead of downloading a file the user has to go find afterward.
+      const selfEntry = store.getWidget(ctx.widgetId);
+      const width = 320;
+      const height = 160;
+      const x = selfEntry ? selfEntry.x + selfEntry.width + 20 : 0;
+      const y = selfEntry ? selfEntry.y : 0;
+      const zIndex = 1 + Math.max(0, ...store.allWidgets().map((w) => w.zIndex || 0));
+      const localNodeId = store.localNodeId ?? "";
+      const placeholderId = crypto.randomUUID();
+      store.addWidget({
+        id: placeholderId,
+        type: "file",
+        x,
+        y,
+        width,
+        height,
+        zIndex,
+        title: "animaniac mixdown",
+        props: {
+          domain: "audio",
+          uploadingBy: localNodeId,
+          uploadingProgress: 0,
+          uploadingAt: Date.now(),
+        },
+        collapsed: false,
+        docId: null,
+        parentId: null,
+      });
+
+      // keep the lock fresh for the WHOLE render, not just whenever
+      // renderAudioMixdown's own decode-phase progress happens to tick —
+      // the actual OfflineAudioContext render step has no progress signal
+      // of its own (see audio-mixdown.ts) and can run long on a big
+      // project, well past the lock's own staleness window otherwise.
+      const heartbeat = setInterval(() => {
+        if (destroyed) return;
+        void store.updateWidgetProps(placeholderId, { uploadingAt: Date.now() });
+      }, 5000);
+      mixdownHeartbeat = heartbeat;
+
+      try {
+        const { tracks, clips } = ctx.doc.current;
+        const result = await renderAudioMixdown({
+          tracks,
+          clips,
+          getPeers,
+          onProgress: (fraction) => {
+            if (destroyed) return;
+            // reserve the last 10% for the upload step below.
+            void store.updateWidgetProps(placeholderId, { uploadingProgress: fraction * 0.9, uploadingAt: Date.now() });
+          },
+        });
+        if (destroyed) return;
+
+        const filename = "animaniac-mixdown.wav";
+        let record: { blob_id: string; blake3: string; size: number; mime: string };
+        if (isTauriMode()) {
+          const base64Data = await base64Encode(result.bytes.buffer as ArrayBuffer);
+          const response = (await dispatch("blob_insert", {
+            filename,
+            mime: "audio/wav",
+            data: base64Data,
+          })) as { blake3: string; mime: string | null; size: number };
+          record = {
+            blob_id: response.blake3,
+            blake3: response.blake3,
+            size: response.size,
+            mime: response.mime || "audio/wav",
+          };
+        } else {
+          const file = new File([result.bytes.buffer as ArrayBuffer], filename, { type: "audio/wav" });
+          const fileRecord = await storeBlobFromFile(file, { metadata: { domain: "audio" } });
+          record = {
+            blob_id: fileRecord.blob_id,
+            blake3: fileRecord.blake3 || fileRecord.blob_id,
+            size: fileRecord.size,
+            mime: fileRecord.mime,
+          };
+        }
+
+        await store.updateWidgetProps(placeholderId, {
+          blobId: record.blob_id,
+          blake3: record.blake3,
+          mime: record.mime,
+          size: record.size,
+          domain: "audio",
+          filename,
+          title: filename,
+          uploadingBy: "",
+          uploadingProgress: 0,
+          uploadingAt: 0,
+          snatchedBy: localNodeId ? [localNodeId] : [],
+        });
+        const refCanvasDocId = store.handle.documentId;
+        if (refCanvasDocId) {
+          addBlobCanvasRef(record.blob_id, record.blake3, refCanvasDocId).catch((err) => {
+            console.warn("[animaniac] addBlobCanvasRef failed for mixdown (non-fatal):", err);
+          });
+        }
+      } catch (err) {
+        console.warn("[animaniac] audio mixdown failed:", err);
+        if (!destroyed) await store.updateWidgetProps(placeholderId, { uploadingBy: "", uploadingProgress: 0, uploadingAt: 0 });
+      } finally {
+        clearInterval(heartbeat);
+        mixdownHeartbeat = null;
+        mixdownInFlight = false;
+      }
     }
 
     // -- doc-change subscription (remote peer edits) -------------------------
@@ -1162,6 +1604,10 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         if (!selectedClipId) return;
         e.preventDefault();
         deleteSelectedClip();
+      } else if (e.key === "Escape") {
+        if (!selectedClipId && multiSelectedClipIds.size === 0) return;
+        e.preventDefault();
+        setSelectedClipId(null);
       }
     }
     document.addEventListener("keydown", handleKeyDown);
@@ -1216,6 +1662,10 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         playhead.destroy();
         dropController.destroy();
         crossTrackGhost.destroy();
+        gainSlider.destroy();
+        for (const timer of gainRenderTimers.values()) clearTimeout(timer);
+        gainRenderTimers.clear();
+        if (mixdownHeartbeat) clearInterval(mixdownHeartbeat);
         container.destroy({ children: true });
       },
     };

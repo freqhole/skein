@@ -9,18 +9,19 @@
  * overlapping clips, within a track or across tracks.
  */
 
-import type { AudioSegmentClip, Clip, Track, VideoSegmentClip } from "./types";
+import type { AudioSegmentClip, Clip, Track, TtsClip, VideoSegmentClip, VoiceRecordingClip } from "./types";
 
 const MIN_CLIP_DURATION_SEC = 0.05;
 
-function isTrimmedSegment(clip: Clip): clip is AudioSegmentClip | VideoSegmentClip {
-  return clip.kind === "audio-segment" || clip.kind === "video-segment";
+function isTrimmedSegment(clip: Clip): clip is AudioSegmentClip | VideoSegmentClip | VoiceRecordingClip | TtsClip {
+  return clip.kind === "audio-segment" || clip.kind === "video-segment" || clip.kind === "voice-recording" || clip.kind === "tts";
 }
 
-/** a clip's on-timeline duration — stored directly for kinds where the
- *  source length is authoritative (voice-recording/tts), or *derived* from
- *  `sourceInSec`/`sourceOutSec` for trimmed segments so a trim edit can
- *  never leave the two disagreeing (see types.ts's schema doc comment). */
+/** a clip's on-timeline duration — stored directly for kinds with no real
+ *  source-trim concept (label/image/doodle-frame), or *derived* from
+ *  `sourceInSec`/`sourceOutSec` for every audio/video-bearing kind so a
+ *  trim edit can never leave the two disagreeing (see types.ts's schema
+ *  doc comment). */
 export function clipDurationSec(clip: Clip): number {
   if (isTrimmedSegment(clip)) {
     return Math.max(MIN_CLIP_DURATION_SEC, clip.sourceOutSec - clip.sourceInSec);

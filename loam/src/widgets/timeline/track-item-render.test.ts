@@ -23,16 +23,22 @@ describe("modeForLocalX", () => {
     expect(modeForLocalX(0, 100, 50)).toBe("move");
   });
 
-  it("caps the handle zone to a third of a narrow item's width so move stays reachable", () => {
-    // width 12 -> handlePx capped to 4 (12/3), not the default 8
-    expect(modeForLocalX(0, 12, 6)).toBe("move");
-    expect(modeForLocalX(0, 12, 1)).toBe("resize-left");
-    expect(modeForLocalX(0, 12, 11)).toBe("resize-right");
+  it("caps the handle zone to a third of a narrow (but above the resize-width floor) item's width so move stays reachable", () => {
+    // width 30 -> handlePx capped to 10 (30/3), not the default 8
+    expect(modeForLocalX(0, 30, 15)).toBe("move");
+    expect(modeForLocalX(0, 30, 1)).toBe("resize-left");
+    expect(modeForLocalX(0, 30, 29)).toBe("resize-right");
   });
 
   it("picks whichever edge is closer on ties/overlap", () => {
-    expect(modeForLocalX(0, 10, 3)).toBe("resize-left");
-    expect(modeForLocalX(0, 10, 7)).toBe("resize-right");
+    expect(modeForLocalX(0, 30, 5)).toBe("resize-left");
+    expect(modeForLocalX(0, 30, 25)).toBe("resize-right");
+  });
+
+  it("always resolves move below MIN_RESIZE_WIDTH_PX, even right at an edge — too narrow at this zoom for a usable trim zone", () => {
+    expect(modeForLocalX(0, 12, 1)).toBe("move");
+    expect(modeForLocalX(0, 12, 11)).toBe("move");
+    expect(modeForLocalX(0, 10, 0)).toBe("move");
   });
 });
 

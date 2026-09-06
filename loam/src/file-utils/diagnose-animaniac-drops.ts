@@ -30,8 +30,16 @@ import type { CanvasStore } from "../canvas/canvas-store";
 import type { WidgetRegistry } from "../widgets/widget-registry";
 import { resolveDocReadyCached } from "../p2p/doc-ready";
 import { deepUnwrapAmStrings } from "../canvas/automerge-values";
+import { checkBlobLocality } from "./blob-locality";
 import { isCapturableWidgetType } from "../../widgets/animaniac/frame-capture";
 import { animaniacSchema } from "../../widgets/animaniac/types";
+
+/** `resolveClipDuration()`'s own fallback value (frame-capture.ts) — a
+ *  clip's duration/size landing on exactly this number is a strong (not
+ *  certain) sign the real probe failed and it was defaulted rather than
+ *  measured, e.g. because the source blob wasn't locally available or
+ *  reachable from any peer at capture time. */
+const FALLBACK_CLIP_DURATION_SEC = 5;
 
 export interface AnimaniacDropDiagnosisEntry {
   widgetId: string;
@@ -51,6 +59,21 @@ export interface AnimaniacTrackSummary {
   widgetId: string;
   trackCount: number;
   nonHiddenTrackCount: number;
+  clips: AnimaniacClipDiagnosisEntry[];
+}
+
+/** per-clip sanity check — see `FALLBACK_CLIP_DURATION_SEC`'s own doc
+ *  comment for what "looksDefaulted" actually proves (a strong hint, not
+ *  certainty). `blobLocal` reflects the CURRENT state, not whatever it was
+ *  at capture time — a clip captured while offline can still show
+ *  `blobLocal: true` here if the blob has since synced. */
+export interface AnimaniacClipDiagnosisEntry {
+  clipId: string;
+  kind: string;
+  durationSec: number | null;
+  looksDefaulted: boolean;
+  blobId: string | null;
+  blobLocal: boolean | "unknown";
 }
 
 export interface AnimaniacDropDiagnosisReport {
@@ -119,16 +142,49 @@ export async function diagnoseAnimaniacDrops(store: CanvasStore, registry: Widge
   const animaniacWidgets: AnimaniacTrackSummary[] = [];
   for (const entry of allWidgets.filter((w) => w.type === "animaniac")) {
     if (!entry.docId) {
-      animaniacWidgets.push({ widgetId: entry.id, trackCount: 0, nonHiddenTrackCount: 0 });
+      animaniacWidgets.push({ widgetId: entry.id, trackCount: 0, nonHiddenTrackCount: 0, clips: [] });
       continue;
     }
     const handle = await resolveDocReadyCached(store.repo, entry.docId as DocumentId, { context: "diagnose-animaniac-drops" });
     const parsed = handle ? animaniacSchema.safeParse(deepUnwrapAmStrings(handle.doc())) : null;
     const tracks = parsed?.success ? parsed.data.tracks : [];
+    const clipsRaw = parsed?.success ? parsed.data.clips : [];
+    const clips: AnimaniacClipDiagnosisEntry[] = await Promise.all(
+      clipsRaw.map(async (clip): Promise<AnimaniacClipDiagnosisEntry> => {
+        const c = clip as unknown as Record<string, unknown>;
+        const durationSec =
+          typeof c.sourceOutSec === "number" && typeof c.sourceInSec === "number"
+            ? c.sourceOutSec - c.sourceInSec
+            : typeof c.durationSec === "number"
+              ? c.durationSec
+              : null;
+        const blobId =
+          typeof c.audioBlobId === "string" ? c.audioBlobId : typeof c.videoBlobId === "string" ? c.videoBlobId : null;
+        const blake3 =
+          typeof c.audioBlake3 === "string" ? c.audioBlake3 : typeof c.videoBlake3 === "string" ? c.videoBlake3 : undefined;
+        let blobLocal: boolean | "unknown" = "unknown";
+        if (blobId) {
+          try {
+            blobLocal = (await checkBlobLocality(blobId, blake3)).locality === "local";
+          } catch {
+            blobLocal = "unknown";
+          }
+        }
+        return {
+          clipId: String(c.id ?? ""),
+          kind: String(c.kind ?? ""),
+          durationSec,
+          looksDefaulted: durationSec === FALLBACK_CLIP_DURATION_SEC,
+          blobId,
+          blobLocal,
+        };
+      })
+    );
     animaniacWidgets.push({
       widgetId: entry.id,
       trackCount: tracks.length,
       nonHiddenTrackCount: tracks.filter((t) => !t.hidden).length,
+      clips,
     });
   }
 

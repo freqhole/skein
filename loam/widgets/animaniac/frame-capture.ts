@@ -68,6 +68,33 @@ function enumVal<T extends string>(v: unknown, allowed: readonly T[], fallback: 
   return typeof v === "string" && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
 }
 
+/** carries over an already-applied gain adjustment from the source widget
+ *  (voice-recording.ts/audio-recording.ts/file.ts all share this same
+ *  gainValue/gainRendition* shape) so dragging a widget the user already
+ *  turned up/down into animaniac doesn't silently reset it back to
+ *  original volume. defaults (1/empty) for any source predating this
+ *  field, or one with no rendition applied. `gainRenditionSnatchedBy`
+ *  deliberately always starts fresh (this device has the rendition
+ *  locally right now, by definition of being the one doing the capture),
+ *  same convention as every clip kind's own plain `snatchedBy: []`. */
+function gainFieldsFrom(sourceState: Record<string, unknown>): {
+  gainValue: number;
+  gainRenditionBlobId: string;
+  gainRenditionBlake3: string;
+  gainRenditionMime: string;
+  gainRenditionSize: number;
+  gainRenditionSnatchedBy: string[];
+} {
+  return {
+    gainValue: num(sourceState.gainValue, 1),
+    gainRenditionBlobId: str(sourceState.gainRenditionBlobId),
+    gainRenditionBlake3: str(sourceState.gainRenditionBlake3),
+    gainRenditionMime: str(sourceState.gainRenditionMime),
+    gainRenditionSize: num(sourceState.gainRenditionSize),
+    gainRenditionSnatchedBy: [],
+  };
+}
+
 const baseKeyframes = [{ t: 0, x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1, easing: "linear" as const }];
 
 /** a freshly-captured clip's initial keyframe list, scaled (uniformly, so
@@ -245,6 +272,7 @@ export async function resolveCapturedClip(
     case "voice-recording": {
       const blobId = str(sourceState.blobId);
       if (!blobId) return null;
+      const duration = await resolveClipDuration(sourceState, "audio", blobId);
       return {
         kind: "voice-recording",
         id: newId(),
@@ -254,19 +282,23 @@ export async function resolveCapturedClip(
         audioBlobId: blobId,
         audioBlake3: str(sourceState.blake3),
         audioMime: str(sourceState.mime),
-        durationSec: num(sourceState.duration),
+        sourceInSec: 0,
+        sourceOutSec: duration,
+        sourceDurationSec: duration,
         lipsColor: num(sourceState.lipsColor, 0xc2455a),
         lipThickness: num(sourceState.lipThickness, 5),
         mouthMood: enumVal(sourceState.mouthMood, ["frown", "neutral", "smile"] as const, "neutral"),
         teethStyle: enumVal(sourceState.teethStyle, ["straight", "curved"] as const, "straight"),
         cupidBowAmount: num(sourceState.cupidBowAmount, 4),
         snatchedBy: [],
+        ...gainFieldsFrom(sourceState),
       };
     }
 
     case "tts": {
       const blobId = str(sourceState.blobId);
       if (!blobId) return null; // not generated yet — nothing to capture
+      const duration = await resolveClipDuration(sourceState, "audio", blobId);
       return {
         kind: "tts",
         id: newId(),
@@ -276,12 +308,15 @@ export async function resolveCapturedClip(
         audioBlobId: blobId,
         audioBlake3: str(sourceState.blake3),
         audioMime: str(sourceState.mime),
-        durationSec: num(sourceState.duration),
+        sourceInSec: 0,
+        sourceOutSec: duration,
+        sourceDurationSec: duration,
         ttsText: str(sourceState.ttsText),
         ttsVoiceName: str(sourceState.ttsVoiceName),
         ttsVoiceLang: str(sourceState.ttsVoiceLang),
         ttsRate: num(sourceState.ttsRate, 1),
         snatchedBy: [],
+        ...gainFieldsFrom(sourceState),
       };
     }
 
@@ -302,10 +337,13 @@ export async function resolveCapturedClip(
         audioBlobId: blobId,
         audioBlake3: str(sourceState.blake3),
         audioMime: str(sourceState.mime),
+        audioSize: num(sourceState.size),
         sourceInSec: 0,
         sourceOutSec: duration,
+        sourceDurationSec: duration,
         label: str(sourceState.filename),
         snatchedBy: [],
+        ...gainFieldsFrom(sourceState),
       };
     }
 
@@ -330,10 +368,13 @@ export async function resolveCapturedClip(
           audioBlobId: blobId,
           audioBlake3: str(sourceState.blake3),
           audioMime: str(sourceState.mime),
+          audioSize: num(sourceState.size),
           sourceInSec: 0,
           sourceOutSec: duration,
+          sourceDurationSec: duration,
           label: str(sourceState.filename),
           snatchedBy: [],
+          ...gainFieldsFrom(sourceState),
         };
       }
       if (domain === "video") {
@@ -346,8 +387,10 @@ export async function resolveCapturedClip(
           videoBlobId: blobId,
           videoBlake3: str(sourceState.blake3),
           videoMime: str(sourceState.mime),
+          videoSize: num(sourceState.size),
           sourceInSec: 0,
           sourceOutSec: duration,
+          sourceDurationSec: duration,
           muted: false,
           snatchedBy: [],
         };
@@ -371,8 +414,10 @@ export async function resolveCapturedClip(
         videoBlobId,
         videoBlake3: str(sourceState.videoBlake3),
         videoMime: str(sourceState.videoMime),
+        videoSize: num(sourceState.videoSize),
         sourceInSec: 0,
         sourceOutSec: videoDurationSec,
+        sourceDurationSec: videoDurationSec,
         muted: false,
         snatchedBy: [],
       };

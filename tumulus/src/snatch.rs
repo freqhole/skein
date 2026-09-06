@@ -71,6 +71,16 @@ pub struct BlobRef {
     /// share the same widget doc. `None` for every other blob-bearing
     /// widget type, which carry exactly one blob at their doc's root.
     pub clip_id: Option<String>,
+    /// true for an applied gain-adjustment rendition (see loam's
+    /// `voice-recording.ts`/`audio-recording.ts`/`file.ts`/animaniac's own
+    /// `gainRenditionBlobId` field) — a SEPARATE blob from the widget/clip's
+    /// own primary one, tracked in its own `gainRenditionSnatchedBy` list
+    /// (never the primary blob's `snatchedBy`, since a peer who only ever
+    /// fetched the original shouldn't be reported as having the rendition
+    /// too). affects only which doc field(s) `read_widget_state()`/
+    /// `mark_snatched()` read from/write to — everything else about a
+    /// rendition `BlobRef` looks like any other.
+    pub is_gain_rendition: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -249,25 +259,39 @@ impl HubBlobRefSource {
 
     /// mark the local node as having snatched a blob, so future scans (by
     /// this node or any peer reading the same doc) see it in the relevant
-    /// `snatchedBy` list without re-probing. dispatches on `source_ref`'s
-    /// shape: a plain widget doc id (every widget type except animaniac)
-    /// writes to that doc's OWN root `snatchedBy` list; a composite
-    /// `"{widget_doc_id}#clip={clip_id}"` (see `to_descriptor()`'s own doc
-    /// comment) writes to that ONE clip's nested `snatchedBy` list instead,
-    /// leaving every other clip on the same animaniac doc untouched.
+    /// `snatchedBy`-shaped list without re-probing. `source_ref` is decoded
+    /// in two stages: an optional trailing `#gain` (see `to_descriptor()`'s
+    /// own doc comment) selects `gainRenditionSnatchedBy` over the default
+    /// `snatchedBy` field name, THEN the remainder is checked for the
+    /// animaniac composite `"{widget_doc_id}#clip={clip_id}"` shape (writes
+    /// to that one clip's own nested list) vs a plain widget doc id (every
+    /// other widget type — writes to the doc's own root list).
     async fn mark_snatched(&self, source_ref: &str, local_node_id: &str) {
-        match decode_clip_source_ref(source_ref) {
+        let (base_ref, field) = match source_ref.strip_suffix("#gain") {
+            Some(base) => (base, "gainRenditionSnatchedBy"),
+            None => (source_ref, "snatchedBy"),
+        };
+        match decode_clip_source_ref(base_ref) {
             Some((widget_doc_id, clip_id)) => {
-                self.mark_clip_snatched(widget_doc_id, clip_id, local_node_id)
+                self.mark_clip_snatched(widget_doc_id, clip_id, local_node_id, field)
                     .await
             }
-            None => self.mark_widget_snatched(source_ref, local_node_id).await,
+            None => {
+                self.mark_widget_snatched(base_ref, local_node_id, field)
+                    .await
+            }
         }
     }
 
     /// the pre-animaniac behavior: writes to `widget_doc_id`'s own doc-root
-    /// `snatchedBy` list.
-    async fn mark_widget_snatched(&self, widget_doc_id: &str, local_node_id: &str) {
+    /// `field` list (`snatchedBy`, or `gainRenditionSnatchedBy` for a gain
+    /// rendition — see `mark_snatched()`'s own doc comment).
+    async fn mark_widget_snatched(
+        &self,
+        widget_doc_id: &str,
+        local_node_id: &str,
+        field: &'static str,
+    ) {
         let Some(handle) = self.repo.find(widget_doc_id).await else {
             tracing::warn!(widget_doc_id, "cannot mark snatched: widget doc not found");
             return;
@@ -278,7 +302,7 @@ impl HubBlobRefSource {
 
         let wrote = tokio::task::spawn_blocking(move || {
             handle.with_document_mut(|doc| -> bool {
-                append_to_snatched_by(doc, &automerge::ROOT, &wdoc_id, &local_id)
+                append_to_snatched_by(doc, &automerge::ROOT, &wdoc_id, &local_id, field)
             })
         })
         .await
@@ -291,9 +315,16 @@ impl HubBlobRefSource {
 
     /// the animaniac case: finds the clip with a matching `id` inside
     /// `widget_doc_id`'s own `clips[]` list and writes to THAT clip's own
-    /// nested `snatchedBy` list, leaving the doc root (which has no blob
-    /// field of its own) and every other clip untouched.
-    async fn mark_clip_snatched(&self, widget_doc_id: &str, clip_id: &str, local_node_id: &str) {
+    /// nested `field` list (`snatchedBy`, or `gainRenditionSnatchedBy` for a
+    /// gain rendition), leaving the doc root (which has no blob field of
+    /// its own) and every other clip untouched.
+    async fn mark_clip_snatched(
+        &self,
+        widget_doc_id: &str,
+        clip_id: &str,
+        local_node_id: &str,
+        field: &'static str,
+    ) {
         let Some(handle) = self.repo.find(widget_doc_id).await else {
             tracing::warn!(
                 widget_doc_id,
@@ -329,7 +360,7 @@ impl HubBlobRefSource {
                     return false;
                 };
 
-                append_to_snatched_by(doc, &clip_obj_id, &wdoc_id, &local_id)
+                append_to_snatched_by(doc, &clip_obj_id, &wdoc_id, &local_id, field)
             })
         })
         .await
@@ -341,28 +372,31 @@ impl HubBlobRefSource {
     }
 }
 
-/// get-or-create `obj`'s own `snatchedBy` list and append `local_id` if
+/// get-or-create `obj`'s own `field`-named list and append `local_id` if
 /// it isn't already present. `obj` is either `automerge::ROOT` (every
 /// widget type except animaniac) or one specific clip's own object id
 /// (animaniac) — shared by `mark_widget_snatched()`/`mark_clip_snatched()`
-/// so the two only differ in WHICH object they point this at.
+/// so the two only differ in WHICH object they point this at. `field` is
+/// `"snatchedBy"` or `"gainRenditionSnatchedBy"` (see `mark_snatched()`'s
+/// own doc comment) — the two are always separate lists, never merged.
 fn append_to_snatched_by(
     doc: &mut automerge::Automerge,
     obj: &automerge::ObjId,
     log_widget_doc_id: &str,
     local_id: &str,
+    field: &str,
 ) -> bool {
     use automerge::ReadDoc;
 
-    let list_id = match doc.get(obj, "snatchedBy") {
+    let list_id = match doc.get(obj, field) {
         Ok(Some((automerge::Value::Object(automerge::ObjType::List), id))) => id,
         _ => match doc.transact::<_, _, automerge::AutomergeError>(|tx| {
             use automerge::transaction::Transactable;
-            tx.put_object(obj, "snatchedBy", automerge::ObjType::List)
+            tx.put_object(obj, field, automerge::ObjType::List)
         }) {
             Ok(result) => result.result,
             Err(e) => {
-                tracing::warn!(error = ?e, "failed to create snatchedBy list");
+                tracing::warn!(error = ?e, field, "failed to create snatched-by list");
                 return false;
             }
         },
@@ -372,7 +406,7 @@ fn append_to_snatched_by(
     for i in 0..len {
         if let Ok(Some((v, _))) = doc.get(&list_id, i) {
             if v.to_str() == Some(local_id) {
-                tracing::debug!(widget_doc_id = %log_widget_doc_id, "already in snatchedBy");
+                tracing::debug!(widget_doc_id = %log_widget_doc_id, field, "already in snatched-by list");
                 return false;
             }
         }
@@ -384,11 +418,11 @@ fn append_to_snatched_by(
         Ok(())
     }) {
         Ok(_) => {
-            tracing::info!(widget_doc_id = %log_widget_doc_id, node_id = trunc(local_id), "added self to snatchedBy");
+            tracing::info!(widget_doc_id = %log_widget_doc_id, node_id = trunc(local_id), field, "added self to snatched-by list");
             true
         }
         Err(e) => {
-            tracing::warn!(error = ?e, "failed to add node ID to snatchedBy");
+            tracing::warn!(error = ?e, field, "failed to add node ID to snatched-by list");
             false
         }
     }
@@ -396,7 +430,9 @@ fn append_to_snatched_by(
 
 /// decodes a `to_descriptor()`-produced `source_ref` back into
 /// `(widget_doc_id, clip_id)` if it's the animaniac-clip composite shape,
-/// or `None` for a plain widget doc id (every other widget type).
+/// or `None` for a plain widget doc id (every other widget type). callers
+/// strip any trailing `#gain` suffix first — see `mark_snatched()`'s own
+/// doc comment.
 fn decode_clip_source_ref(source_ref: &str) -> Option<(&str, &str)> {
     source_ref.split_once("#clip=")
 }
@@ -412,9 +448,12 @@ fn decode_clip_source_ref(source_ref: &str) -> Option<(&str, &str)> {
 /// `source_ref` is a fully opaque handle as far as [`SnatchEngine`] is
 /// concerned (it's only ever handed back verbatim to
 /// [`BlobRefSource::on_snatched`]) — for an animaniac clip (`blob_ref.
-/// clip_id.is_some()`) it's encoded as `"{widget_doc_id}#clip={clip_id}"`
-/// so `mark_snatched()` can find its way back to the right clip; every
-/// other widget type keeps the plain `widget_doc_id` it always used.
+/// clip_id.is_some()`) it's encoded as `"{widget_doc_id}#clip={clip_id}"`;
+/// every other widget type keeps the plain `widget_doc_id` it always used.
+/// either shape then gets a trailing `#gain` appended for a gain-rendition
+/// `BlobRef` (`blob_ref.is_gain_rendition`), so `mark_snatched()` can tell
+/// it apart from the SAME widget/clip's primary blob and write to the
+/// right (separate) snatched-by list.
 fn to_descriptor(
     blob_ref: BlobRef,
     canvas_peers: &[String],
@@ -426,9 +465,14 @@ fn to_descriptor(
         .filter(|node_id| canvas_peers.contains(node_id) && node_id.as_str() != local_node_id)
         .cloned()
         .collect();
-    let source_ref = match &blob_ref.clip_id {
+    let base_ref = match &blob_ref.clip_id {
         Some(clip_id) => format!("{}#clip={}", blob_ref.widget_doc_id, clip_id),
-        None => blob_ref.widget_doc_id,
+        None => blob_ref.widget_doc_id.clone(),
+    };
+    let source_ref = if blob_ref.is_gain_rendition {
+        format!("{}#gain", base_ref)
+    } else {
+        base_ref
     };
     BlobDescriptor {
         blake3: blob_ref.blake3,
@@ -787,6 +831,7 @@ pub(crate) fn read_canvas_for_file_widgets(
             size: 0,
             snatched_by: Vec::new(),
             clip_id: None,
+            is_gain_rendition: false,
         })
         .collect();
 
@@ -821,6 +866,39 @@ pub(crate) fn read_widget_state(
 ) -> Vec<BlobRef> {
     let mut results: Vec<BlobRef> = Vec::new();
 
+    /// pushes a gain-rendition `BlobRef` (see `BlobRef::is_gain_rendition`'s
+    /// own doc comment) if `obj` carries a non-empty `gainRenditionBlobId`
+    /// — shared by the root-level and per-clip cases below, a rendition is
+    /// a SEPARATE blob living alongside (never instead of) the primary one
+    /// on the SAME automerge object, so this is always an ADDITIONAL push,
+    /// never a replacement for the primary `BlobRef` already pushed.
+    fn push_gain_rendition(
+        doc: &automerge::Automerge,
+        obj: &automerge::ObjId,
+        results: &mut Vec<BlobRef>,
+        canvas_doc_id: &str,
+        widget_doc_id: &str,
+        clip_id: Option<String>,
+        filename: String,
+    ) {
+        let blob_id = read_str(doc, obj, "gainRenditionBlobId");
+        if blob_id.is_empty() {
+            return;
+        }
+        results.push(BlobRef {
+            canvas_doc_id: canvas_doc_id.to_string(),
+            widget_doc_id: widget_doc_id.to_string(),
+            blob_id,
+            blake3: read_str(doc, obj, "gainRenditionBlake3"),
+            filename,
+            mime: read_str(doc, obj, "gainRenditionMime"),
+            size: read_u64(doc, obj, "gainRenditionSize"),
+            snatched_by: read_string_list(doc, obj, "gainRenditionSnatchedBy"),
+            clip_id,
+            is_gain_rendition: true,
+        });
+    }
+
     handle.with_document(|doc| {
         use automerge::ReadDoc;
 
@@ -828,17 +906,32 @@ pub(crate) fn read_widget_state(
         let blake3 = read_str(doc, &automerge::ROOT, "blake3");
 
         if !blob_id.is_empty() || !blake3.is_empty() {
+            let filename = read_str(doc, &automerge::ROOT, "filename");
             results.push(BlobRef {
                 canvas_doc_id: canvas_doc_id.to_string(),
                 widget_doc_id: widget_doc_id.to_string(),
                 blob_id,
                 blake3,
-                filename: read_str(doc, &automerge::ROOT, "filename"),
+                filename: filename.clone(),
                 mime: read_str(doc, &automerge::ROOT, "mime"),
                 size: read_u64(doc, &automerge::ROOT, "size"),
                 snatched_by: read_string_list(doc, &automerge::ROOT, "snatchedBy"),
                 clip_id: None,
+                is_gain_rendition: false,
             });
+            // voice-recording.ts/audio-recording.ts/file.ts all carry an
+            // OPTIONAL gain-rendition blob at this SAME doc root (see
+            // types.ts's own gainFields) — check for it regardless of the
+            // primary blob above.
+            push_gain_rendition(
+                doc,
+                &automerge::ROOT,
+                &mut results,
+                canvas_doc_id,
+                widget_doc_id,
+                None,
+                filename,
+            );
             return;
         }
 
@@ -882,6 +975,18 @@ pub(crate) fn read_widget_state(
                     }
                     let blake3 = read_str(doc, &clip_id_obj, "audioBlake3");
                     let mime = read_str(doc, &clip_id_obj, "audioMime");
+                    // only these 3 clip kinds ever carry a gain rendition
+                    // (see types.ts's own gainFields) — video-segment/
+                    // image/doodle-frame/label never do.
+                    push_gain_rendition(
+                        doc,
+                        &clip_id_obj,
+                        &mut results,
+                        canvas_doc_id,
+                        widget_doc_id,
+                        Some(clip_id.clone()),
+                        clip_id.clone(),
+                    );
                     (blob_id, blake3, mime)
                 }
                 "video-segment" => {
@@ -907,6 +1012,7 @@ pub(crate) fn read_widget_state(
                 size: 0,
                 snatched_by: read_string_list(doc, &clip_id_obj, "snatchedBy"),
                 clip_id: Some(clip_id),
+                is_gain_rendition: false,
             });
         }
     });
@@ -997,6 +1103,7 @@ mod tests {
             size: 42,
             snatched_by: Vec::new(),
             clip_id: None,
+            is_gain_rendition: false,
         };
         assert_eq!(br.size, 42);
         assert!(br.blake3.is_empty());
@@ -1034,6 +1141,7 @@ mod tests {
             size: 0,
             snatched_by: Vec::new(),
             clip_id: None,
+            is_gain_rendition: false,
         };
         assert_eq!(trunc(&br.blake3), "");
         assert_eq!(trunc(&br.blob_id), "");

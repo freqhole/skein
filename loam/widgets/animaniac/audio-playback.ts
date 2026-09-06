@@ -13,10 +13,15 @@
  * a clip first becomes active, tear down once it stops being active).
  */
 
+import { log } from "@freqhole/reliquary/utils";
 import type { PeersMap } from "../../src/file-utils/file-shared";
 import { getMediaPlaybackUrl } from "../../src/media";
+import { checkBlobLocality } from "../../src/file-utils/blob-locality";
+import { isTauriMode } from "../../src/p2p/tauri-transport";
 import { activeClipsAt } from "./track-model";
-import type { AudioSegmentClip, Clip } from "./types";
+import type { Clip } from "./types";
+
+const TAG = "animaniac.audio-playback";
 
 const AUDIO_KINDS = new Set(["voice-recording", "tts", "audio-segment"]);
 
@@ -25,14 +30,29 @@ function isAudioBearingClip(clip: Clip): boolean {
 }
 
 /** where in the SOURCE audio this clip's playback should start from —
- *  trimmed segments start at their own `sourceInSec`, whole-clip kinds
- *  (voice-recording/tts) always start at 0. */
+ *  every audio-bearing kind now carries its own `sourceInSec` trim. */
 function sourceOffsetSec(clip: Clip): number {
-  return clip.kind === "audio-segment" ? (clip as AudioSegmentClip).sourceInSec : 0;
+  return clip.kind === "audio-segment" || clip.kind === "voice-recording" || clip.kind === "tts" ? clip.sourceInSec : 0;
 }
 
-function audioBlobIdOf(clip: Clip): string {
-  return clip.kind === "voice-recording" || clip.kind === "tts" || clip.kind === "audio-segment" ? clip.audioBlobId : "";
+export interface AudioRef {
+  blobId: string;
+  mime: string;
+  blake3: string;
+}
+
+/** an applied gain rendition (see voice-recording.ts's mirror of this same
+ *  concept) always wins over the clip's original audio — the whole point
+ *  of committing one. gain is always rendered from the WHOLE original
+ *  source (never just the trimmed range), so this is safe to prefer
+ *  regardless of `sourceInSec`/`sourceOutSec`. */
+export function effectiveAudioRef(clip: Clip): AudioRef | null {
+  if (clip.kind !== "voice-recording" && clip.kind !== "tts" && clip.kind !== "audio-segment") return null;
+  if (clip.gainRenditionBlobId) {
+    return { blobId: clip.gainRenditionBlobId, mime: clip.gainRenditionMime, blake3: clip.gainRenditionBlake3 };
+  }
+  if (!clip.audioBlobId) return null;
+  return { blobId: clip.audioBlobId, mime: clip.audioMime, blake3: clip.audioBlake3 };
 }
 
 export interface AudioPlaybackOptions {
@@ -55,27 +75,69 @@ interface PoolEntry {
   resolving: boolean;
   /** true once `el.currentTime` has been set at least once — see `update()`. */
   synced: boolean;
+  /** the `AudioRef` this entry's `el` was resolved from — a live doc write
+   *  changing which ref a clip effectively points to (e.g. a fresh gain
+   *  rendition landing) is detected by comparing against this each tick,
+   *  see `update()`'s own re-resolve check. `null` while still resolving. */
+  resolvedKey: string | null;
 }
 
 export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybackHandle {
   const { getClips, getPeers } = options;
   const pool = new Map<string, PoolEntry>();
 
+  function refKey(ref: AudioRef): string {
+    return `${ref.blobId}|${ref.blake3}`;
+  }
+
   function ensureEntry(clip: Clip): PoolEntry {
     let entry = pool.get(clip.id);
     if (entry) return entry;
-    entry = { el: null, resolving: false, synced: false };
+    entry = { el: null, resolving: false, synced: false, resolvedKey: null };
     pool.set(clip.id, entry);
-    const blobId = audioBlobIdOf(clip);
-    if (blobId && !entry.resolving) {
+    const ref = effectiveAudioRef(clip);
+    if (ref && !entry.resolving) {
       entry.resolving = true;
-      const mime = clip.kind === "voice-recording" || clip.kind === "tts" || clip.kind === "audio-segment" ? clip.audioMime : "";
-      const blake3 = clip.kind === "voice-recording" || clip.kind === "tts" || clip.kind === "audio-segment" ? clip.audioBlake3 : "";
+      const { blobId, mime, blake3 } = ref;
+      entry.resolvedKey = refKey(ref);
+      // in tauri mode, blob_get_path()/blob lookups prefer blake3 over
+      // blobId when both are present (see media-urls.ts's own "lookupId =
+      // blake3 || blobId" comment: "on skein-tauri, blob ids ARE blake3
+      // hashes") — a clip whose `audioBlake3` was captured stale/empty (or
+      // simply wrong, e.g. left over from before a snatch re-keyed the
+      // blob locally) resolves under a DIFFERENT key than the live file
+      // widget's own doc uses, even though the underlying content is the
+      // same. logging both the value actually used as the lookup key AND
+      // a live locality check makes a stale reference obvious at a glance.
+      const tauriLookupId = blake3 || blobId;
+      log.debug(TAG, "resolving playback url", {
+        clipId: clip.id,
+        kind: clip.kind,
+        blobId,
+        blake3,
+        mime,
+        isTauriMode: isTauriMode(),
+        tauriLookupId,
+      });
+      checkBlobLocality(blobId, blake3 || undefined)
+        .then((info) => log.debug(TAG, "blob locality (blobId+blake3 as stored on the clip)", { clipId: clip.id, ...info }))
+        .catch((err) => log.debug(TAG, "checkBlobLocality threw (non-fatal)", { clipId: clip.id, err }));
       void getMediaPlaybackUrl(blobId, { category: "audio", mime: mime || undefined, blake3: blake3 || undefined, peers: getPeers?.() }).then(
         (url) => {
-          if (!url) return;
+          if (!url) {
+            log.warn(TAG, "getMediaPlaybackUrl returned null — nothing to play", { clipId: clip.id, kind: clip.kind, blobId: blobId.slice(0, 12) });
+            return;
+          }
+          log.debug(TAG, "playback url resolved", { clipId: clip.id, kind: clip.kind, url: url.slice(0, 60) });
           const el = document.createElement("audio");
           el.src = url;
+          el.addEventListener("error", () => {
+            log.warn(TAG, "<audio> element error event", {
+              clipId: clip.id,
+              kind: clip.kind,
+              mediaError: el.error ? { code: el.error.code, message: el.error.message } : null,
+            });
+          });
           entry!.el = el;
         }
       );
@@ -94,6 +156,23 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
       }
     }
 
+    // a still-active clip whose effective ref changed (a gain rendition
+    // just landed, from this peer or a remote one) needs a fresh element —
+    // deleting the stale entry here lets `ensureEntry()` below recreate it
+    // and re-seek/resume at the correct position via its own `!synced`
+    // path, same as a brand-new clip becoming active.
+    for (const clip of active) {
+      const entry = pool.get(clip.id);
+      if (!entry || entry.resolvedKey === null) continue; // not created yet, or still resolving for the first time
+      const ref = effectiveAudioRef(clip);
+      const currentKey = ref ? refKey(ref) : null;
+      if (currentKey !== entry.resolvedKey) {
+        entry.el?.pause();
+        pool.delete(clip.id);
+      }
+    }
+
+
     for (const clip of active) {
       const entry = ensureEntry(clip);
       if (!entry.el) continue; // still resolving the blob URL, or nothing to play yet (e.g. ungenerated tts)
@@ -111,8 +190,13 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
       if (!entry.synced || seeked) {
         entry.el.currentTime = target;
         entry.synced = true;
+        log.debug(TAG, "seeked", { clipId: clip.id, kind: clip.kind, target, sourceOffsetSec: sourceOffsetSec(clip), localElapsed, audioDuration: entry.el.duration });
       }
-      if (playing && entry.el.paused) void entry.el.play().catch(() => {});
+      if (playing && entry.el.paused) {
+        void entry.el.play().catch((err) => {
+          log.warn(TAG, "play() rejected", { clipId: clip.id, kind: clip.kind, error: err instanceof Error ? err.message : String(err) });
+        });
+      }
       if (!playing && !entry.el.paused) entry.el.pause();
     }
   }

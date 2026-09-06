@@ -28,7 +28,8 @@ function voiceClip(overrides: Partial<VoiceRecordingClip> = {}): VoiceRecordingC
     audioBlobId: "b1",
     audioBlake3: "",
     audioMime: "",
-    durationSec: 5,
+    sourceInSec: 0,
+    sourceOutSec: 5,
     ...overrides,
   };
 }
@@ -68,8 +69,8 @@ function videoSegmentClip(overrides: Partial<VideoSegmentClip> = {}): VideoSegme
 }
 
 describe("clipDurationSec / clipEnd", () => {
-  it("uses the stored durationSec for a voice-recording clip", () => {
-    const c = voiceClip({ durationSec: 5 });
+  it("derives duration from sourceIn/sourceOut for a voice-recording clip too (also a trimmed segment now)", () => {
+    const c = voiceClip({ sourceInSec: 0, sourceOutSec: 5 });
     expect(clipDurationSec(c)).toBe(5);
     expect(clipEnd({ ...c, start: 10 })).toBe(15);
   });
@@ -87,8 +88,8 @@ describe("clipDurationSec / clipEnd", () => {
 
 describe("activeClipsAt", () => {
   it("returns every clip whose window contains t, including overlaps", () => {
-    const a = voiceClip({ id: "a", start: 0, durationSec: 5 });
-    const b = voiceClip({ id: "b", start: 2, durationSec: 5 }); // overlaps a
+    const a = voiceClip({ id: "a", start: 0, sourceInSec: 0, sourceOutSec: 5 });
+    const b = voiceClip({ id: "b", start: 2, sourceInSec: 0, sourceOutSec: 5 }); // overlaps a
     const clips: Clip[] = [a, b];
     expect(activeClipsAt(clips, 3).map((c) => c.id)).toEqual(["a", "b"]);
     expect(activeClipsAt(clips, 6).map((c) => c.id)).toEqual(["b"]);
@@ -96,7 +97,7 @@ describe("activeClipsAt", () => {
   });
 
   it("end time is exclusive (clip is not active exactly at its own end)", () => {
-    const a = voiceClip({ id: "a", start: 0, durationSec: 5 });
+    const a = voiceClip({ id: "a", start: 0, sourceInSec: 0, sourceOutSec: 5 });
     expect(activeClipsAt([a], 5)).toEqual([]);
     expect(activeClipsAt([a], 4.999)).toHaveLength(1);
   });
@@ -110,7 +111,7 @@ describe("clipsForTrack / computeTimelineDuration", () => {
   });
 
   it("computes duration as the furthest clip end across every track", () => {
-    const a = voiceClip({ id: "a", start: 0, durationSec: 5 });
+    const a = voiceClip({ id: "a", start: 0, sourceInSec: 0, sourceOutSec: 5 });
     const b = videoSegmentClip({ id: "b", start: 10, sourceInSec: 0, sourceOutSec: 3 });
     expect(computeTimelineDuration([a, b])).toBe(13);
     expect(computeTimelineDuration([])).toBe(0);
@@ -119,13 +120,13 @@ describe("clipsForTrack / computeTimelineDuration", () => {
 
 describe("computeDisplayDurationSec", () => {
   it("pads the true content duration with a trailing buffer", () => {
-    const a = voiceClip({ id: "a", start: 0, durationSec: 5 });
+    const a = voiceClip({ id: "a", start: 0, sourceInSec: 0, sourceOutSec: 5 });
     expect(computeDisplayDurationSec([a], 3, 0)).toBe(8);
   });
 
   it("floors at the minimum duration for a short/empty timeline", () => {
     expect(computeDisplayDurationSec([], 5, 20)).toBe(20);
-    const a = voiceClip({ id: "a", start: 0, durationSec: 1 });
+    const a = voiceClip({ id: "a", start: 0, sourceInSec: 0, sourceOutSec: 1 });
     expect(computeDisplayDurationSec([a], 1, 20)).toBe(20);
   });
 
