@@ -1512,11 +1512,80 @@ async fn blob_get_path(args: BlobGetArgs, state: &AppState) -> Result<Value, Dis
         .await
         .map(|m| m.len())
         .unwrap_or(meta.size);
+    // tauri's asset:// protocol (backing <audio>/<video> playback) goes
+    // through WKWebView/AVFoundation on macOS, which for some formats
+    // (confirmed: flac) needs a recognizable file EXTENSION to pick a
+    // demuxer — our own stored `mime` metadata isn't consulted at that
+    // layer at all. a content-addressed managed blob's canonical path has
+    // no extension (see blobz.rs's `insert()`/`register_ingested()` —
+    // always `<2charPrefix>/<restOfHash>`), so a perfectly valid flac blob
+    // (confirmed via a completely separate Web Audio decode succeeding,
+    // e.g. animaniac's waveform rendering) silently fails to play via
+    // <audio> for exactly this reason. `external` blobs
+    // (`register_external_path`) already reference the user's own file,
+    // which already has a real extension, so this only needs to run for
+    // managed/ingested blobs.
+    let playback_path = if !meta.external {
+        ensure_extension_hint(&path, meta.mime.as_deref())
+            .await
+            .unwrap_or_else(|| path.clone())
+    } else {
+        path.clone()
+    };
     Ok(json!({
-        "path": path.to_string_lossy(),
+        "path": playback_path.to_string_lossy(),
         "mime": meta.mime,
         "size": actual_size,
     }))
+}
+
+/// maps a mime type to the file extension AVFoundation/WKWebView needs to
+/// see in an asset:// path to correctly demux it — only the formats this
+/// app actually serves that are known to need the hint (or plausibly could)
+/// are listed; anything else returns `None` and plays via its existing
+/// extensionless path unchanged (mp3, for instance, has never shown this
+/// problem).
+fn extension_hint_for_mime(mime: &str) -> Option<&'static str> {
+    match mime {
+        "audio/flac" | "audio/x-flac" => Some("flac"),
+        "audio/wav" | "audio/x-wav" | "audio/wave" => Some("wav"),
+        "audio/ogg" => Some("ogg"),
+        "audio/mp4" | "audio/x-m4a" => Some("m4a"),
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        "video/quicktime" => Some("mov"),
+        _ => None,
+    }
+}
+
+/// hard-links `path` (a content-addressed, extensionless managed blob file)
+/// to a sibling path with a recognizable extension appended (via
+/// `extension_hint_for_mime`), reusing it if already created by an earlier
+/// call. returns `None` — caller falls back to the original extensionless
+/// path — if there's no extension mapping for this mime, or if the
+/// hard-link can't be created for any reason (e.g. a read-only filesystem);
+/// this is a best-effort playback-compatibility aid, never a hard
+/// requirement. a hard link (not a symlink) is used deliberately: it needs
+/// no special OS permissions on any of macOS/Linux/Windows (unlike a
+/// symlink on Windows without developer mode/admin), costs no extra disk
+/// space (same inode), and both paths keep working even if one is deleted.
+async fn ensure_extension_hint(path: &Path, mime: Option<&str>) -> Option<PathBuf> {
+    let ext = extension_hint_for_mime(mime?)?;
+    let aliased = path.with_extension(ext);
+    if tokio::fs::try_exists(&aliased).await.unwrap_or(false) {
+        return Some(aliased);
+    }
+    match tokio::fs::hard_link(path, &aliased).await {
+        Ok(()) => Some(aliased),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                path = %path.display(),
+                "ensure_extension_hint: hard_link failed, falling back to extensionless path"
+            );
+            None
+        }
+    }
 }
 
 /// delete the LOCAL copy of a blob (managed file + row) to reclaim disk

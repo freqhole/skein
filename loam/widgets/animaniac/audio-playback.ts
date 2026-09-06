@@ -16,7 +16,7 @@
 import { log } from "@freqhole/reliquary/utils";
 import type { PeersMap } from "../../src/file-utils/file-shared";
 import { getMediaPlaybackUrl } from "../../src/media";
-import { checkBlobLocality } from "../../src/file-utils/blob-locality";
+import { checkBlobLocality, getLocalBlobByteSize } from "../../src/file-utils/blob-locality";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import { activeClipsAt } from "./track-model";
 import type { Clip } from "./types";
@@ -129,8 +129,15 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
         tauriLookupId,
       });
       checkBlobLocality(blobId, blake3 || undefined)
-        .then((info) => log.debug(TAG, "blob locality (blobId+blake3 as stored on the clip)", { clipId: clip.id, ...info }))
+        .then((info) => log.debug(TAG, "blob locality (blobId+blake3 as stored on the clip)", { clipId: clip.id, locality: info.locality, ...info.metadata }))
         .catch((err) => log.debug(TAG, "checkBlobLocality threw (non-fatal)", { clipId: clip.id, err }));
+      // checkBlobLocality's own `metadata.size` can be a stale DB value
+      // (see getLocalBlobByteSize's own doc comment) — this stats the
+      // actual file on disk, the one thing that would confirm/rule out a
+      // truncated/incomplete snatch as the cause of a decode failure.
+      void getLocalBlobByteSize(blobId, blake3 || undefined)
+        .then((realByteSize) => log.debug(TAG, "real on-disk byte size", { clipId: clip.id, realByteSize }))
+        .catch((err) => log.debug(TAG, "getLocalBlobByteSize threw (non-fatal)", { clipId: clip.id, err }));
       void getMediaPlaybackUrl(blobId, { category: "audio", mime: mime || undefined, blake3: blake3 || undefined, peers: getPeers?.() }).then(
         (url) => {
           if (!url) {
@@ -139,6 +146,14 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
           }
           log.debug(TAG, "playback url resolved", { clipId: clip.id, kind: clip.kind, url: url.slice(0, 60) });
           const el = document.createElement("audio");
+          // a detached (never-appended-to-the-document) media element has
+          // been observed to fail decoding a less-common codec (flac) with
+          // `NotSupportedError` on WKWebView/AVFoundation even though the
+          // identical blob plays fine through file.ts's DOM-attached
+          // element — hidden but attached, matching every other working
+          // playback element in this codebase.
+          el.style.display = "none";
+          document.body.appendChild(el);
           el.addEventListener("loadedmetadata", () => {
             entry!.ready = true;
           });
@@ -148,6 +163,21 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
             log.warn(TAG, "<audio> element error event", {
               clipId: clip.id,
               kind: clip.kind,
+              blobId,
+              blake3,
+              mime,
+              // readyState/networkState/canPlayType are the browser's own
+              // diagnosis of WHY it rejected this src, without needing a
+              // separate debug-log-level capture; concurrentAudioElements
+              // (count of other pool entries with a live <audio> right now)
+              // tests whether this only fails when several clips' elements
+              // are alive at once (a possible AVFoundation concurrent-
+              // decoder-instance limit for a less common codec like flac).
+              readyState: el.readyState,
+              networkState: el.networkState,
+              canPlayFlac: el.canPlayType("audio/flac"),
+              isConnected: el.isConnected,
+              concurrentAudioElements: [...pool.values()].filter((e) => e.el).length,
               mediaError: el.error ? { code: el.error.code, message: el.error.message } : null,
               srcPrefix: el.src.slice(0, 32),
             });
@@ -166,6 +196,7 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
     for (const [id, entry] of pool) {
       if (!activeIds.has(id)) {
         entry.el?.pause();
+        entry.el?.remove();
         pool.delete(id);
       }
     }
@@ -182,6 +213,7 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
       const currentKey = ref ? refKey(ref) : null;
       if (currentKey !== entry.resolvedKey) {
         entry.el?.pause();
+        entry.el?.remove();
         pool.delete(clip.id);
       }
     }
@@ -219,7 +251,10 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
   return {
     update,
     destroy() {
-      for (const entry of pool.values()) entry.el?.pause();
+      for (const entry of pool.values()) {
+        entry.el?.pause();
+        entry.el?.remove();
+      }
       pool.clear();
     },
   };
