@@ -16,7 +16,7 @@
 import { log } from "@freqhole/reliquary/utils";
 import type { PeersMap } from "../../src/file-utils/file-shared";
 import { getMediaPlaybackUrl } from "../../src/media";
-import { checkBlobLocality } from "../../src/file-utils/blob-locality";
+import { checkBlobLocality, getLocalBlobByteSize } from "../../src/file-utils/blob-locality";
 import { isTauriMode } from "../../src/p2p/tauri-transport";
 import { activeClipsAt } from "./track-model";
 import type { Clip } from "./types";
@@ -129,8 +129,15 @@ export function createAudioPlayback(options: AudioPlaybackOptions): AudioPlaybac
         tauriLookupId,
       });
       checkBlobLocality(blobId, blake3 || undefined)
-        .then((info) => log.debug(TAG, "blob locality (blobId+blake3 as stored on the clip)", { clipId: clip.id, ...info }))
+        .then((info) => log.debug(TAG, "blob locality (blobId+blake3 as stored on the clip)", { clipId: clip.id, locality: info.locality, ...info.metadata }))
         .catch((err) => log.debug(TAG, "checkBlobLocality threw (non-fatal)", { clipId: clip.id, err }));
+      // checkBlobLocality's own `metadata.size` can be a stale DB value
+      // (see getLocalBlobByteSize's own doc comment) — this stats the
+      // actual file on disk, the one thing that would confirm/rule out a
+      // truncated/incomplete snatch as the cause of a decode failure.
+      void getLocalBlobByteSize(blobId, blake3 || undefined)
+        .then((realByteSize) => log.debug(TAG, "real on-disk byte size", { clipId: clip.id, realByteSize }))
+        .catch((err) => log.debug(TAG, "getLocalBlobByteSize threw (non-fatal)", { clipId: clip.id, err }));
       void getMediaPlaybackUrl(blobId, { category: "audio", mime: mime || undefined, blake3: blake3 || undefined, peers: getPeers?.() }).then(
         (url) => {
           if (!url) {
