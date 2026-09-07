@@ -24,6 +24,7 @@ function makeRegistry(): WidgetRegistry {
   const registry = new WidgetRegistry();
   registry.register(stubFactory("note", noteSchema));
   registry.register(stubFactory("canvas-card", canvasCardSchema));
+  registry.register(stubFactory("canvas-info", z.object({})));
   return registry;
 }
 
@@ -50,7 +51,7 @@ describe("widget-clipboard copy/paste", () => {
     });
 
     await copySelectionToClipboard(store, registry, new Set(["note-1"]));
-    const result = await pasteClipboardIntoStore(store);
+    const result = await pasteClipboardIntoStore(store, registry);
     expect(result.pasted).toHaveLength(1);
 
     const pastedEntry = store.getWidget(result.pasted[0])!;
@@ -87,7 +88,7 @@ describe("widget-clipboard copy/paste", () => {
     await copySelectionToClipboard(narthex, registry, new Set(["card-1"]));
     narthex.setLocalNodeId("me");
     narthex.stampAdmin("me");
-    const result = await pasteClipboardIntoStore(narthex);
+    const result = await pasteClipboardIntoStore(narthex, registry);
     expect(result.pasted).toHaveLength(1);
 
     const pastedCardEntry = narthex.getWidget(result.pasted[0])!;
@@ -162,7 +163,7 @@ describe("widget-clipboard copy/paste", () => {
     });
 
     await copySelectionToClipboard(narthex, registry, new Set(["card-1"]));
-    const result = await pasteClipboardIntoStore(narthex);
+    const result = await pasteClipboardIntoStore(narthex, registry);
     const pastedCardEntry = narthex.getWidget(result.pasted[0])!;
     const pastedCardState = (await repo.find(pastedCardEntry.docId as any)).doc() as { canvasDocId: string };
 

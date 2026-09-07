@@ -80,6 +80,18 @@ export interface LiveWidget {
 export class WidgetManager {
   private readonly store: CanvasStore;
   private readonly registry: WidgetRegistry;
+  /** the FULL, regular-canvas widget registry — always this, regardless of
+   *  which (possibly narrower, e.g. narthex's) registry `this.registry`
+   *  itself is. needed for any cross-canvas operation that must resolve
+   *  an ARBITRARY widget type on some OTHER canvas (e.g. duplicating a
+   *  canvas-card's linked canvas, see canvas-duplicate.ts) — importing
+   *  `createTestRegistry` directly from `widgets/index.ts` at the call
+   *  site (canvas-card.ts, widget-clipboard.ts) instead of threading it
+   *  down from here created real circular imports back into that same
+   *  barrel file (`npm run lint:circular` caught this in CI), since it's
+   *  the file that registers canvas-card.ts/widget-clipboard.ts's own
+   *  consumers in the first place. */
+  private readonly crossCanvasRegistry: WidgetRegistry;
   private readonly repo: Repo;
   private readonly stage: Container;
   private readonly theme: SkeinTheme;
@@ -176,6 +188,7 @@ export class WidgetManager {
   constructor(
     store: CanvasStore,
     registry: WidgetRegistry,
+    crossCanvasRegistry: WidgetRegistry,
     repo: Repo,
     stage: Container,
     theme: SkeinTheme,
@@ -186,6 +199,7 @@ export class WidgetManager {
   ) {
     this.store = store;
     this.registry = registry;
+    this.crossCanvasRegistry = crossCanvasRegistry;
     this.repo = repo;
     this.stage = stage;
     this.theme = theme;
@@ -305,7 +319,7 @@ export class WidgetManager {
     });
     this.inputRouter.setPasteHandler(() => {
       if (this.store.isLocalViewer()) return;
-      pasteClipboardIntoStore(this.store)
+      pasteClipboardIntoStore(this.store, this.crossCanvasRegistry)
         .then((result) => {
           if (result.pasted.length > 0) this.inputRouter.selectWidgets(result.pasted);
         })
@@ -718,6 +732,7 @@ export class WidgetManager {
       keyboard: this.keyboard,
       canvasElement: this.canvasElement,
       canvasStore: this.store,
+      crossCanvasRegistry: this.crossCanvasRegistry,
       widgetId: entry.id,
       setHeaderActions: (actions) => {
         frame.setCustomActions(actions);
@@ -1443,7 +1458,7 @@ export class WidgetManager {
         onSelect: () => {
           if (this.store.isLocalViewer() || !this.viewport) return;
           const at = this.viewport.screenToWorld(e.clientX, e.clientY);
-          pasteClipboardIntoStore(this.store, { at, clearAfter: true })
+          pasteClipboardIntoStore(this.store, this.crossCanvasRegistry, { at, clearAfter: true })
             .then((result) => {
               if (result.pasted.length > 0) this.inputRouter.selectWidgets(result.pasted);
             })

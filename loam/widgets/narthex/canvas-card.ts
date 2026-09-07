@@ -5,7 +5,6 @@ import { log } from "@freqhole/reliquary/utils";
 import { canvasRoleSchema } from "../../src/canvas/canvas-doc";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
 import { duplicateCanvasDeep } from "../../src/canvas/canvas-duplicate";
-import { createTestRegistry } from "../index";
 import {
   getFriendInfo,
   hasKnockAckForCanvas,
@@ -1306,8 +1305,9 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
      *  a real canvas without any risk to the original). */
     async function duplicateThisCanvas(): Promise<void> {
       const store = ctx.canvasStore;
+      const crossCanvasRegistry = ctx.crossCanvasRegistry;
       const state = ctx.doc.current;
-      if (!store || !state.canvasDocId || store.isLocalViewer() || duplicating) return;
+      if (!store || !crossCanvasRegistry || !state.canvasDocId || store.isLocalViewer() || duplicating) return;
       duplicating = true;
       try {
         // the FULL, regular-canvas widget registry — NOT whatever registry
@@ -1319,7 +1319,7 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
         // canvas that can contain any of those. confirmed live: using the
         // wrong (narrow) registry here silently skipped every non-narthex
         // widget as "couldn't read its doc", producing a blank duplicate.
-        const result = await duplicateCanvasDeep(store.repo, createTestRegistry(), state.canvasDocId, store.localNodeId);
+        const result = await duplicateCanvasDeep(store.repo, crossCanvasRegistry, state.canvasDocId, store.localNodeId);
         if (result.skipped > 0) {
           log.debug(
             "canvas-card",

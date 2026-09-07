@@ -1284,6 +1284,7 @@ class SkeinRouter {
         mountElement: this.mountElement,
         canvasDocId: this.narthexDocId,
         registry: createNarthexRegistry(),
+        crossCanvasRegistry: createTestRegistry(),
         repo: this.repo,
         isNarthex: true,
         hasIdentity: !!this.localNodeId,

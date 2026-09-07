@@ -33,7 +33,6 @@ import { resolveDocReadyCached } from "../p2p/doc-ready";
 import { deepUnwrapAmStrings } from "./automerge-values";
 import { registerBlobRefs } from "./blob-ref-registration";
 import { duplicateCanvasDeep } from "./canvas-duplicate";
-import { createTestRegistry } from "../../widgets/index";
 
 const TAG = "canvas.widget-clipboard";
 
@@ -205,9 +204,13 @@ export interface PasteResult {
 }
 
 /** recreate one clipboard bundle (and, for a bin, its children) on `store`,
- *  returning the new widget's id, or null if it had to be skipped. */
+ *  returning the new widget's id, or null if it had to be skipped.
+ *  `crossCanvasRegistry` must be the FULL, regular-canvas widget registry
+ *  (see the caller's own doc comment on why — `store`'s own registry may
+ *  be a narrower one, e.g. narthex's). */
 async function pasteOne(
   store: CanvasStore,
+  crossCanvasRegistry: WidgetRegistry,
   bundle: ClipboardWidget,
   parentId: string | null,
   canvasDocId: string,
@@ -229,10 +232,10 @@ async function pasteOne(
     // the copy" would silently edit the original's real widgets. give the
     // pasted card its own, fully independent target canvas instead (see
     // `canvas-duplicate.ts`'s own doc comment for why a shallow field copy
-    // isn't good enough here). uses the full, regular-canvas widget
-    // registry (`createTestRegistry()`), NOT whatever registry `store`'s
-    // own canvas happens to use — a canvas-card is routinely pasted while
-    // ON narthex (whose own registry is deliberately a narrow subset, see
+    // isn't good enough here). uses `crossCanvasRegistry` (the full,
+    // regular-canvas widget registry), NOT whatever registry `store`'s own
+    // canvas happens to use — a canvas-card is routinely pasted while ON
+    // narthex (whose own registry is deliberately a narrow subset, see
     // `createNarthexRegistry()`), but the canvas it POINTS TO is a regular
     // canvas that can contain ANY widget type, so narthex's own registry
     // would silently fail to recognize most of them (confirmed live: this
@@ -245,7 +248,7 @@ async function pasteOne(
     // best-effort resolve in this app.
     if (bundle.type === "canvas-card" && state && typeof state.canvasDocId === "string" && state.canvasDocId) {
       try {
-        const dup = await duplicateCanvasDeep(store.repo, createTestRegistry(), state.canvasDocId, store.localNodeId);
+        const dup = await duplicateCanvasDeep(store.repo, crossCanvasRegistry, state.canvasDocId, store.localNodeId);
         // `dup.title` is already suffixed with " (copy)" (see
         // `canvas-duplicate.ts`) — use it as-is, don't append again here.
         state = { ...state, canvasDocId: dup.newCanvasDocId, title: dup.title };
@@ -278,7 +281,7 @@ async function pasteOne(
   if (bundle.children.length > 0 && docId) {
     const items: Array<{ widgetId: string; slot: { col: number; row: number } }> = [];
     for (const child of bundle.children) {
-      const childId = await pasteOne(store, child.widget, widgetId, canvasDocId, dx, dy, onSkip);
+      const childId = await pasteOne(store, crossCanvasRegistry, child.widget, widgetId, canvasDocId, dx, dy, onSkip);
       if (childId) items.push({ widgetId: childId, slot: child.slot });
     }
     const binHandle = await resolveDocReadyCached<{ items: unknown }>(store.repo, docId as DocumentId, {
@@ -304,8 +307,16 @@ export interface PasteOptions {
 }
 
 /** paste the current clipboard content onto `store`. a no-op (empty
- *  result) if the clipboard is empty or the local peer is a viewer. */
-export async function pasteClipboardIntoStore(store: CanvasStore, options?: PasteOptions): Promise<PasteResult> {
+ *  result) if the clipboard is empty or the local peer is a viewer.
+ *  `crossCanvasRegistry` must be the FULL, regular-canvas widget registry
+ *  (see `pasteOne()`'s own doc comment) — needed for a pasted canvas-card
+ *  to correctly deep-clone its linked canvas regardless of which (possibly
+ *  narrower) registry `store`'s own canvas uses. */
+export async function pasteClipboardIntoStore(
+  store: CanvasStore,
+  crossCanvasRegistry: WidgetRegistry,
+  options?: PasteOptions
+): Promise<PasteResult> {
   if (!clipboard || clipboard.length === 0 || store.isLocalViewer()) {
     return { pasted: [], skipped: 0 };
   }
@@ -323,7 +334,7 @@ export async function pasteClipboardIntoStore(store: CanvasStore, options?: Past
   let skipped = 0;
   const pastedIds: string[] = [];
   for (const bundle of clipboard) {
-    const id = await pasteOne(store, bundle, null, canvasDocId, dx, dy, () => skipped++);
+    const id = await pasteOne(store, crossCanvasRegistry, bundle, null, canvasDocId, dx, dy, () => skipped++);
     if (id) pastedIds.push(id);
   }
 
