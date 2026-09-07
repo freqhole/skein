@@ -8,6 +8,7 @@
  */
 
 import { createUndoHistory, type UndoHistory } from "../../src/widgets/undo-history";
+import { patchOrReplaceArray } from "../../src/canvas/array-patch";
 import type { EditableSegment } from "./cut-segments-track";
 import type { AudioClip, StfuState } from "./types";
 
@@ -71,15 +72,19 @@ export function createHistoryController(options: HistoryControllerOptions): Hist
   }
 
   /** applies a history snapshot back to the doc — used by both `undo()` and
-   *  `redo()`. mutates the existing doc arrays in place (splice) rather
-   *  than reassigning them outright: reassigning a doc array to a new array
-   *  built from that array's own (proxied) elements throws in automerge,
-   *  but splicing in plain-value copies from a snapshot is safe (see
-   *  automerge-gotchas memory notes). */
+   *  `redo()`. mutates the existing doc arrays in place rather than
+   *  reassigning them outright: reassigning a doc array to a new array
+   *  built from that array's own (proxied) elements throws in automerge
+   *  (see automerge-gotchas memory notes). `editableSegments` is always a
+   *  full splice-replace (tuples of 2 numbers — a full-doc bloat concern in
+   *  practice, no per-item identity to key a patch off of anyway);
+   *  `audioClips` uses the same same-shape-fast-path/full-replace-fallback
+   *  as animaniac's clips, since most undo/redo entries revert a plain
+   *  field edit rather than an add/remove. */
   function applyHistorySnapshot(snap: HistorySnapshot): void {
     changeDoc((d) => {
       d.editableSegments.splice(0, d.editableSegments.length, ...snap.editableSegments.map((s) => [...s] as EditableSegment));
-      d.audioClips.splice(0, d.audioClips.length, ...snap.audioClips.map((c) => ({ ...c })));
+      patchOrReplaceArray(d.audioClips, snap.audioClips, (current, next) => Object.assign(current, next));
     });
     onApplied();
   }

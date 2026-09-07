@@ -9,6 +9,7 @@ import {
   type FederatedPointerEvent,
 } from "pixi.js";
 import { log } from "@freqhole/reliquary/utils";
+import type { DocHandle } from "@automerge/automerge-repo";
 import { resolveImagePropUrl, saveImageDataUrlAsBlobRef } from "../file-utils/image-prop-blob";
 import type { SkeinTheme } from "../theme/skein-theme";
 import { pickImageOrGifAsDataUrl } from "../widgets/gif-utils";
@@ -24,6 +25,8 @@ import type {
 import { TRANSPARENT_COLOR } from "../widgets/widget-types";
 import type { WidgetEntry } from "./canvas-doc";
 import type { CanvasStore } from "./canvas-store";
+import { compactDoc, waitForQuietPeriod } from "./compact-doc";
+import { computeDocHistoryStats, shouldOfferCompaction } from "../p2p/doc-history-stats";
 import type { InputRouter } from "./input-router";
 import type { WidgetManager } from "./widget-manager";
 
@@ -107,9 +110,14 @@ export class PropertyTray {
 
   private trayWidth = DEFAULT_TRAY_WIDTH;
   private currentWidgetId: string | null = null;
+  /** the `docId` the tray was last built against for `currentWidgetId` --
+   *  used by `checkForDocRotation()` to notice when another peer (or this
+   *  one) compacts the doc for the widget currently shown in the tray. */
+  private currentWidgetDocId: string | null = null;
   private controls: PropControl[] = [];
   private titleControl: PropControl | null = null;
   private deleteContainer: Container | null = null;
+  private compactContainer: Container | null = null;
   /** visibility conditions for controls with visibleWhen */
   private controlVisibility = new Map<number, { key: string; value: unknown }>();
   private actionContainers: Container[] = [];
@@ -206,8 +214,15 @@ export class PropertyTray {
     // subscribe to selection and mode changes
     this.unsubs.push(inputRouter.onSelectionChange(() => this.refresh()));
 
-    // reposition tray when the store changes (widget moved/resized)
-    this.unsubs.push(store.onChange(() => this.repositionIfNeeded()));
+    // reposition tray when the store changes (widget moved/resized), and
+    // check whether the selected widget's own doc got rotated (e.g. another
+    // peer compacted it) — see checkForDocRotation()'s own doc comment.
+    this.unsubs.push(
+      store.onChange(() => {
+        this.repositionIfNeeded();
+        this.checkForDocRotation();
+      })
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -334,6 +349,33 @@ export class PropertyTray {
   }
 
   /**
+   * detects when the currently-shown widget's own doc has been rotated
+   * (e.g. this peer or another peer compacted it via the "compact this
+   * doc" button) and rebuilds the tray against the fresh doc facade once
+   * the remount actually completes. without this, the tray would keep
+   * operating on a stale, orphaned DocHandle indefinitely -- its prop
+   * controls' doc subscription (`docUnsub`, set up in `show()`) is bound
+   * to the OLD facade captured at that time, and would simply go quiet
+   * once nobody writes to the abandoned doc anymore, silently discarding
+   * any further edits made through it.
+   */
+  private checkForDocRotation(): void {
+    if (!this.currentWidgetId) return;
+    const widgetId = this.currentWidgetId;
+    const currentDocId = this.store.doc().widgets[widgetId]?.docId ?? null;
+    if (currentDocId === this.currentWidgetDocId) return;
+
+    this.widgetManager.onNextMount(widgetId, () => {
+      // only rebuild if this widget is still the one selected by the time
+      // the remount finishes -- if the user selected something else in
+      // the meantime, refresh() already handled that separately.
+      if (this.currentWidgetId !== widgetId) return;
+      this.currentWidgetId = null; // defeat refresh()'s same-widget fast path
+      this.refresh();
+    });
+  }
+
+  /**
    * build and display the tray for a specific widget.
    */
   private show(
@@ -349,6 +391,7 @@ export class PropertyTray {
     this.clearControls();
 
     this.currentWidgetId = widgetId;
+    this.currentWidgetDocId = entry.docId ?? null;
     this.header.text = factory.metadata.name;
 
     // position the content below the header
@@ -455,6 +498,19 @@ export class PropertyTray {
       }
     }
 
+    // "compact this doc" — only for stateful widgets with a real automerge
+    // DocHandle (not stateless widgets or a non-automerge doc override like
+    // SqliteSocialDoc); shows an empty container (no button) otherwise, same
+    // pattern as createDeleteButton's isSingleton early-return.
+    const compact = this.createCompactButton(widgetId, this.widgetManager.getWidgetDocHandle(widgetId), fieldWidth);
+    this.compactContainer = compact.container;
+    this.contentContainer.addChild(this.compactContainer);
+    if (compact.height > 0) {
+      y += ROW_GAP;
+      this.compactContainer.y = Math.round(y);
+      y += compact.height;
+    }
+
     // delete button at the bottom (skip for singletons)
     const isSingleton = factory.metadata.singleton === true;
     this.deleteContainer = this.createDeleteButton(widgetId, isSingleton, fieldWidth);
@@ -477,6 +533,7 @@ export class PropertyTray {
     this.clearControls();
 
     this.currentWidgetId = widgetId;
+    this.currentWidgetDocId = entry.docId ?? null;
 
     // try to get a display name from the factory, fall back to the entry type
     const factory = this.registry.get(entry.type);
@@ -520,6 +577,7 @@ export class PropertyTray {
     this.closeActivePopup();
     this.clearControls();
     this.currentWidgetId = null;
+    this.currentWidgetDocId = null;
     this.root.visible = false;
   }
 
@@ -545,6 +603,12 @@ export class PropertyTray {
         btn.y = Math.round(y);
         y += FIELD_HEIGHT + ROW_GAP;
       }
+    }
+    // compact button, if shown
+    if (this.compactContainer && this.compactContainer.children.length > 0) {
+      y += ROW_GAP;
+      this.compactContainer.y = Math.round(y);
+      y += this.compactContainer.getBounds().height + ROW_GAP;
     }
     // delete button at the bottom
     if (this.deleteContainer && this.deleteContainer.children.length > 0) {
@@ -582,6 +646,11 @@ export class PropertyTray {
     if (this.deleteContainer) {
       this.deleteContainer.destroy({ children: true });
       this.deleteContainer = null;
+    }
+
+    if (this.compactContainer) {
+      this.compactContainer.destroy({ children: true });
+      this.compactContainer = null;
     }
 
     this.contentContainer.removeChildren();
@@ -2046,6 +2115,241 @@ export class PropertyTray {
   }
 
   // ---------------------------------------------------------------------------
+  // compact-doc button
+  // ---------------------------------------------------------------------------
+
+  /**
+   * "compact this doc" — gives `widgetId`'s per-widget automerge doc a
+   * fresh, history-free identity seeded from its current state (see
+   * `compact-doc.ts` and `docs/animaniac-doc-compaction-plan.md`).
+   * automerge's op-log is append-only, so this is the only way to actually
+   * shrink a doc that's accumulated a lot of history.
+   *
+   * `docHandle` is `null` for stateless widgets or a non-automerge doc
+   * override (e.g. SqliteSocialDoc) — in that case, and for a doc that
+   * isn't ready yet, this returns an empty container (no button shown),
+   * mirroring `createDeleteButton`'s isSingleton early-return.
+   *
+   * the op-count label uses `computeDocHistoryStats()`'s cheap
+   * (`A.stats()`-only) path — never the expensive decode-loop — since this
+   * doc is already resident (mounted) and must stay cheap to display.
+   *
+   * only shown once the doc crosses `COMPACT_CHANGES_THRESHOLD` (see
+   * `shouldOfferCompaction()`) — a fresh/small doc doesn't need compacting,
+   * and offering the button anyway just invites users to compact docs that
+   * don't need it (each compaction gives the doc a new identity, forcing a
+   * full resync for every other peer).
+   */
+  private createCompactButton(
+    widgetId: string,
+    docHandle: DocHandle<any> | null,
+    fieldWidth: number
+  ): { container: Container; height: number } {
+    const container = new Container();
+    if (!docHandle) return { container, height: 0 };
+
+    const stats = computeDocHistoryStats(docHandle);
+    if (!stats) return { container, height: 0 };
+    if (!shouldOfferCompaction(stats)) return { container, height: 0 };
+
+    const btnHeight = FIELD_HEIGHT;
+    const statsLineHeight = 14;
+
+    const statsText = new Text({
+      text: `history: ${formatCompactCount(stats.numChanges)} changes, ${formatCompactCount(stats.numOps)} ops`,
+      resolution: this.theme.textResolution,
+      style: {
+        fontFamily: this.theme.fontFamily,
+        fontSize: 10,
+        fill: 0x9999aa,
+      },
+    });
+    statsText.eventMode = "none";
+    statsText.y = 0;
+    container.addChild(statsText);
+
+    const buttonY = statsLineHeight + 2;
+
+    const compactBg = new Graphics();
+    const compactText = new Text({
+      text: "compact this doc",
+      resolution: this.theme.textResolution,
+      style: {
+        fontFamily: this.theme.fontFamily,
+        fontSize: this.theme.fontSizeSmall,
+        fill: 0xffffff,
+      },
+    });
+    compactText.anchor.set(0.5, 0.5);
+    compactText.eventMode = "none";
+
+    const confirmContainer = new Container();
+    confirmContainer.visible = false;
+
+    const confirmText = new Text({
+      text: "give it a fresh, history-free copy?",
+      resolution: this.theme.textResolution,
+      style: {
+        fontFamily: this.theme.fontFamily,
+        fontSize: this.theme.fontSizeSmall,
+        fill: 0xaaaaaa,
+        wordWrap: true,
+        wordWrapWidth: fieldWidth,
+        align: "center",
+      },
+    });
+    confirmText.eventMode = "none";
+
+    const yesBg = new Graphics();
+    const yesText = new Text({
+      text: "yes",
+      resolution: this.theme.textResolution,
+      style: {
+        fontFamily: this.theme.fontFamily,
+        fontSize: this.theme.fontSizeSmall,
+        fill: 0xffffff,
+      },
+    });
+    yesText.anchor.set(0.5, 0.5);
+    yesText.eventMode = "none";
+
+    const cancelBg = new Graphics();
+    const cancelText = new Text({
+      text: "cancel",
+      resolution: this.theme.textResolution,
+      style: {
+        fontFamily: this.theme.fontFamily,
+        fontSize: this.theme.fontSizeSmall,
+        fill: 0xaaaaaa,
+      },
+    });
+    cancelText.anchor.set(0.5, 0.5);
+    cancelText.eventMode = "none";
+
+    const drawCompact = () => {
+      compactBg.clear();
+      compactBg.roundRect(0, 0, fieldWidth, btnHeight, 4);
+      compactBg.fill({ color: 0x1e3a5f });
+      compactText.x = fieldWidth / 2;
+      compactText.y = btnHeight / 2;
+    };
+
+    // confirm row sits ABOVE the yes/cancel buttons (two lines total),
+    // unlike createDeleteButton's single-line confirm — this message is
+    // longer, so it wraps and needs its own row height.
+    const confirmTextHeight = 28;
+
+    const drawConfirm = () => {
+      const halfW = (fieldWidth - 4) / 2;
+
+      confirmText.x = fieldWidth / 2;
+      confirmText.y = 0;
+      confirmText.anchor.set(0.5, 0);
+
+      const rowY = confirmTextHeight;
+
+      yesBg.clear();
+      yesBg.roundRect(0, 0, halfW, btnHeight, 4);
+      yesBg.fill({ color: 0x1d4ed8 });
+      yesText.x = halfW / 2;
+      yesText.y = btnHeight / 2;
+
+      cancelBg.clear();
+      cancelBg.roundRect(0, 0, halfW, btnHeight, 4);
+      cancelBg.fill({ color: 0x374151 });
+      cancelText.x = halfW / 2;
+      cancelText.y = btnHeight / 2;
+
+      const yesContainer = new Container();
+      yesContainer.addChild(yesBg, yesText);
+      yesContainer.x = 0;
+      yesContainer.y = rowY;
+
+      const cancelContainer2 = new Container();
+      cancelContainer2.addChild(cancelBg, cancelText);
+      cancelContainer2.x = halfW + 4;
+      cancelContainer2.y = rowY;
+
+      confirmContainer.removeChildren();
+      confirmContainer.addChild(confirmText, yesContainer, cancelContainer2);
+    };
+
+    drawCompact();
+    const buttonContainer = new Container();
+    buttonContainer.y = buttonY;
+    buttonContainer.addChild(compactBg, compactText);
+    container.addChild(buttonContainer);
+
+    compactBg.eventMode = "static";
+    compactBg.cursor = "pointer";
+    compactBg.on("pointertap", (e) => {
+      e.stopPropagation();
+      buttonContainer.visible = false;
+      drawConfirm();
+      confirmContainer.visible = true;
+      confirmContainer.y = buttonY;
+      container.addChild(confirmContainer);
+      // the confirm block is taller than the plain button (two lines vs
+      // one) — without this, whatever's below (the delete button) stays
+      // at its old y and the confirm's own yes/cancel row ends up
+      // overlapping/hidden behind it.
+      this.relayoutControls();
+    });
+
+    yesBg.eventMode = "static";
+    yesBg.cursor = "pointer";
+    yesBg.on("pointertap", (e) => {
+      e.stopPropagation();
+      yesBg.cursor = "default";
+      yesText.text = "working\u2026";
+      void (async () => {
+        try {
+          // if any other peer is currently online, give them a brief
+          // window to relay any last-moment changes before snapshotting --
+          // especially relevant when a hub is relaying on behalf of a
+          // peer that's still offline. best-effort only (see
+          // waitForQuietPeriod's own doc comment); skipped entirely when
+          // solo, since there's nothing to wait for.
+          const onlinePeerIds = Object.keys(this.store.peers()).filter(
+            (id) => id !== this.store.localNodeId && this.store.isPeerOnline(id)
+          );
+          if (onlinePeerIds.length > 0) {
+            yesText.text = "waiting for peers\u2026";
+            await waitForQuietPeriod(docHandle);
+            yesText.text = "working\u2026";
+          }
+
+          const result = await compactDoc(this.store.repo, docHandle);
+          if (!result) {
+            log.warn("property-tray", `compaction failed for widget ${widgetId} (doc ${docHandle.documentId})`);
+            yesText.text = "failed";
+            return;
+          }
+          this.store.setDocId(widgetId, result.newHandle.documentId);
+          // the canvas doc change above flows through reconcile()'s
+          // docId-change check, which unmounts/remounts this widget — this
+          // tray will be rebuilt from scratch against the new doc shortly,
+          // so no further UI update is needed here.
+        } catch (err) {
+          log.warn("property-tray", `compaction threw for widget ${widgetId}:`, err);
+          yesText.text = "failed";
+        }
+      })();
+    });
+
+    cancelBg.eventMode = "static";
+    cancelBg.cursor = "pointer";
+    cancelBg.on("pointertap", (e) => {
+      e.stopPropagation();
+      confirmContainer.visible = false;
+      buttonContainer.visible = true;
+      this.relayoutControls();
+    });
+
+    return { container, height: buttonY + btnHeight };
+  }
+
+  // ---------------------------------------------------------------------------
   // delete button
   // ---------------------------------------------------------------------------
 
@@ -2210,4 +2514,16 @@ function formatHex(color: number): string {
 function formatSelectLabel(value: string): string {
   const first = value.split(",")[0].trim();
   return first || value;
+}
+
+/**
+ * abbreviate a large count for display (176990 -> "177k", 2400000 -> "2.4M") --
+ * used by the compact-doc button's history stats line, where the exact
+ * figure matters far less than the rough order of magnitude. values under
+ * 1000 are shown as-is.
+ */
+function formatCompactCount(n: number): string {
+  if (n < 1_000) return String(n);
+  if (n < 1_000_000) return `${Math.round(n / 1_000)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
 }

@@ -605,7 +605,7 @@ export class CanvasStore {
   setTitle(title: string): void {
     this.handle.change((doc) => {
       doc.title = title;
-      doc.lastModified = new Date().toISOString();
+      this.touchModified(doc);
     });
   }
 
@@ -613,7 +613,7 @@ export class CanvasStore {
   setDescription(description: string): void {
     this.handle.change((doc) => {
       doc.description = description;
-      doc.lastModified = new Date().toISOString();
+      this.touchModified(doc);
     });
   }
 
@@ -629,7 +629,7 @@ export class CanvasStore {
   setColor(color: number): void {
     this.handle.change((doc) => {
       doc.color = color;
-      doc.lastModified = new Date().toISOString();
+      this.touchModified(doc);
     });
   }
 
@@ -637,7 +637,7 @@ export class CanvasStore {
   setPreviewUrl(url: string): void {
     this.handle.change((doc) => {
       doc.previewUrl = url;
-      doc.lastModified = new Date().toISOString();
+      this.touchModified(doc);
     });
   }
 

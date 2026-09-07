@@ -5,6 +5,7 @@ import type { SkeinTheme } from "../theme/skein-theme";
 import type { KeyboardDriver } from "../widgets/keyboard-driver";
 import { createWidgetDoc } from "../widgets/widget-doc";
 import { markResolved, resolveDocReadyCached, watchDocReady } from "../p2p/doc-ready";
+import { computeDocHistoryStats } from "../p2p/doc-history-stats";
 import type { WidgetRegistry } from "../widgets/widget-registry";
 import type { WidgetController, WidgetDoc, WidgetMountContext } from "../widgets/widget-types";
 import type { CanvasDocument, WidgetEntry } from "./canvas-doc";
@@ -58,6 +59,12 @@ export interface LiveWidget {
   crashed: boolean;
   /** the zod-validated doc facade, or null for stateless/crashed widgets */
   widgetDoc: WidgetDoc<any> | null;
+  /** the raw automerge DocHandle backing `widgetDoc`, or null for
+   *  stateless/crashed widgets or ones using a non-automerge doc override
+   *  (e.g. SqliteSocialDoc) — kept alongside the zod facade specifically
+   *  for compaction (`getWidgetDocHandle()` below), which needs the raw
+   *  handle to read `A.stats()`/pass to `compactDoc()`. */
+  docHandle: DocHandle<any> | null;
 }
 
 /**
@@ -102,6 +109,11 @@ export class WidgetManager {
    *  cancelled and removed in `unmountWidget()` so a stale watcher never
    *  fires for a widget that's since been removed or replaced. */
   private readonly crashedRetryWatchers = new Map<string, () => void>();
+
+  /** one-shot callbacks to fire the next time a given widget id finishes
+   *  mounting (including a reconcile()-driven remount after its `docId`
+   *  changed, e.g. compaction) -- see `onNextMount()`'s own doc comment. */
+  private readonly nextMountWatchers = new Map<string, Set<() => void>>();
 
   /** optional hook called before a widget is permanently removed.
    *  receives the widget entry and the repo so callers can clean up
@@ -557,6 +569,9 @@ export class WidgetManager {
 
     // build the per-widget document facade
     let doc: WidgetDoc<any>;
+    // the raw handle backing `doc`, if any — see `LiveWidget.docHandle`'s
+    // own doc comment for why this is tracked separately from `doc`.
+    let rawDocHandle: DocHandle<any> | null = null;
 
     // check for doc override (e.g., SqliteSocialDoc in tauri mode)
     if (this.docOverrides.has(entry.id)) {
@@ -613,6 +628,30 @@ export class WidgetManager {
         // no ownerCanvasId — denied, no fallback") and can never sync to a
         // peer who doesn't already have it.
         backfillOwnerCanvasId(widgetDocHandle, this.store.handle.documentId);
+
+        // unconditional (not gated behind localStorage.logLevel) bloat
+        // check — a widget doc this large is itself a likely multi-second
+        // main-thread stall right at mount (A.loadIncremental is a
+        // synchronous WASM call), which is exactly the kind of freeze a
+        // user has, at most, a few moments to notice before the tab locks
+        // up — logDocHistoryStats()'s debug-gated log arrives too late to
+        // help in that window, so this prints eagerly instead.
+        //
+        // deliberately the CHEAP form (no `includeExpensive`) — a real
+        // freeze capture showed the expensive form (A.save()/decodeChange
+        // loop for maxChangeOps) itself taking 5+ seconds for one already-
+        // bloated doc, with no upper bound for a worse one, making this
+        // diagnostic a bigger stall than the thing it was meant to catch.
+        // the deep numbers are still available on demand via
+        // `diagnoseDocHistory()`/`window.__skeinDiagnose()`.
+        const bloatStats = computeDocHistoryStats(widgetDocHandle);
+        if (bloatStats && bloatStats.numOps > 20_000) {
+          console.warn(
+            `[widget-manager] widget ${entry.id} (${factory.metadata.name}, doc ${widgetDocHandle.documentId}) ` +
+              `has a large automerge history — numChanges: ${bloatStats.numChanges}, numOps: ${bloatStats.numOps} ` +
+              `(run window.__skeinDiagnose() for maxChangeOps/savedBytes)`
+          );
+        }
       } else {
         // new widget with no existing document — create one and persist the
         // docId back into the canvas document so other peers can sync it.
@@ -640,6 +679,7 @@ export class WidgetManager {
       }
 
       doc = createWidgetDoc(factory.schema, widgetDocHandle, factory.migrate);
+      rawDocHandle = widgetDocHandle;
     } else {
       // stateless widget: no-op document facade
       doc = {
@@ -726,8 +766,10 @@ export class WidgetManager {
       frame,
       crashed: false,
       widgetDoc: factory.schema ? doc : null,
+      docHandle: rawDocHandle,
     });
     this.mountingIds.delete(entry.id);
+    this.fireNextMountWatchers(entry.id);
   }
 
   /**
@@ -748,7 +790,50 @@ export class WidgetManager {
       frame,
       crashed: true,
       widgetDoc: null,
+      docHandle: null,
     });
+    this.fireNextMountWatchers(entry.id);
+  }
+
+  /** the raw automerge DocHandle backing `widgetId`'s own document, if any
+   *  — `null` for a stateless/crashed widget, a non-automerge doc override,
+   *  or an id not currently mounted. used by the property tray's "compact
+   *  this doc" button to read stats and pass to `compactDoc()` (see
+   *  `docs/animaniac-doc-compaction-plan.md`). */
+  getWidgetDocHandle(widgetId: string): DocHandle<any> | null {
+    return this.liveWidgets.get(widgetId)?.docHandle ?? null;
+  }
+
+  /** call `callback` exactly once, the next time `widgetId` finishes an
+   *  async mount -- including a reconcile()-driven remount triggered by its
+   *  `docId` changing underneath it (e.g. compaction). used by
+   *  property-tray.ts to rebuild its controls against the fresh doc facade
+   *  once a remount actually completes, instead of continuing to operate
+   *  on a stale, orphaned `DocHandle` (or guessing at remount timing via
+   *  polling). returns an unsubscribe function. */
+  onNextMount(widgetId: string, callback: () => void): () => void {
+    let watchers = this.nextMountWatchers.get(widgetId);
+    if (!watchers) {
+      watchers = new Set();
+      this.nextMountWatchers.set(widgetId, watchers);
+    }
+    watchers.add(callback);
+    return () => watchers!.delete(callback);
+  }
+
+  /** fires and clears every pending onNextMount() callback for `widgetId`
+   *  -- called once a mount (including a remount) actually completes. */
+  private fireNextMountWatchers(widgetId: string): void {
+    const watchers = this.nextMountWatchers.get(widgetId);
+    if (!watchers || watchers.size === 0) return;
+    this.nextMountWatchers.delete(widgetId);
+    for (const cb of watchers) {
+      try {
+        cb();
+      } catch (err) {
+        console.warn(`onNextMount callback threw for widget ${widgetId}:`, err);
+      }
+    }
   }
 
   /**
@@ -1178,6 +1263,13 @@ export class WidgetManager {
       if (live.entry.docId) {
         this.repo.delete(live.entry.docId as DocumentId);
       }
+
+      // a permanent removal means nothing will ever mount for this id
+      // again -- unlike a transient (permanent=false) unmount (docId swap,
+      // navigation teardown), where a watcher registered around the same
+      // time is very much still waiting for the upcoming remount and must
+      // survive regardless of listener dispatch order.
+      this.nextMountWatchers.delete(id);
     }
 
     this.liveWidgets.delete(id);
@@ -1233,6 +1325,22 @@ export class WidgetManager {
         const live = this.liveWidgets.get(id);
         if (!live) continue; // still mounting asynchronously
         const prev = live.entry;
+
+        // the widget's underlying doc was rotated (e.g. compaction gave it
+        // a fresh, history-free doc id) — the mounted instance is still
+        // bound to the OLD DocHandle and would otherwise keep rendering/
+        // writing to it forever. checked before the maximized-skip branch
+        // below since a docId change must take effect even while
+        // maximized. `permanent=false` preserves whichever doc is now
+        // current (the old one is simply no longer referenced).
+        if (prev.docId !== entry.docId) {
+          if (this.focusStack.peek()?.widgetId === id) {
+            this.restore();
+          }
+          this.unmountWidget(id, false);
+          void this.mountWidget(entry);
+          continue;
+        }
 
         // if this widget is currently maximized, snapshot the entry but skip
         // visual updates — maximize controls the frame position and size
