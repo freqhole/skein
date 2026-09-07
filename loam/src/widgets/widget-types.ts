@@ -276,6 +276,14 @@ export interface WidgetMountContext<S extends z.ZodType = z.ZodType> {
   /** the canvas store — provides read/write access to canvas-level metadata.
    *  available on regular canvases; may be undefined for headless or test contexts. */
   canvasStore?: CanvasStore;
+  /** the FULL, regular-canvas widget registry (`createTestRegistry()`) —
+   *  always this, regardless of which (possibly narrower, e.g. narthex's
+   *  own `createNarthexRegistry()`) registry this widget itself was
+   *  mounted with. only needed for a cross-canvas operation that must
+   *  resolve an ARBITRARY widget type on some OTHER canvas (currently:
+   *  canvas-card.ts's "duplicate this canvas", see `canvas-duplicate.ts`).
+   *  available on regular canvases; undefined for headless/test contexts. */
+  crossCanvasRegistry?: WidgetRegistry;
   /** the local peer's own profile doc store (docs/hub-and-profile-plan.md
    *  section 6) — lets a widget read/edit the profile's curated canvas list.
    *  only wired in for the social widget's overlay mount (boot.ts); undefined
@@ -527,6 +535,49 @@ export interface WidgetFactory<S extends z.ZodType = z.ZodType> {
   onBeforeClose?: (widgetId: string, store: CanvasStore) => boolean;
   /** create a widget instance given a mount context */
   create(ctx: WidgetMountContext<S>): WidgetController;
+}
+
+/**
+ * a registry of widget factories, keyed by type string.
+ * the canvas uses this to look up how to create a widget
+ * when it encounters a widget entry in the canvas document.
+ *
+ * lives here (not its own `widget-registry.ts` module, which now just
+ * re-exports this) because it needs `WidgetFactory`, defined right above
+ * — keeping them in separate files created a two-file circular import
+ * once anything else needed to reference `WidgetRegistry`'s type from
+ * `widget-types.ts` itself (`npm run lint:circular` catches this in CI).
+ */
+export class WidgetRegistry {
+  private factories = new Map<string, WidgetFactory>();
+
+  /** register a widget factory. throws if the type is already registered. */
+  register(factory: WidgetFactory): void {
+    if (this.factories.has(factory.type)) {
+      throw new Error(`widget type "${factory.type}" is already registered`);
+    }
+    this.factories.set(factory.type, factory);
+  }
+
+  /** look up a factory by type string. returns undefined if not found. */
+  get(type: string): WidgetFactory | undefined {
+    return this.factories.get(type);
+  }
+
+  /** check if a type is registered. */
+  has(type: string): boolean {
+    return this.factories.has(type);
+  }
+
+  /** return all registered type strings. */
+  types(): string[] {
+    return [...this.factories.keys()];
+  }
+
+  /** return all registered factories. */
+  all(): WidgetFactory[] {
+    return [...this.factories.values()];
+  }
 }
 
 /**

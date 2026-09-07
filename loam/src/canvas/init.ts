@@ -27,6 +27,15 @@ export interface InitCanvasOptions {
   canvasDocId: string | null;
   /** widget factory registry */
   registry: WidgetRegistry;
+  /** the FULL, regular-canvas widget registry — always this, even when
+   *  `registry` above is a narrower one (e.g. narthex's own
+   *  `createNarthexRegistry()`). needed for cross-canvas operations that
+   *  must resolve an arbitrary widget type on some OTHER canvas (see
+   *  `WidgetMountContext.crossCanvasRegistry`'s own doc comment). falls
+   *  back to `registry` when omitted, so existing callers (test harnesses,
+   *  dev tools) that only ever use one registry anyway don't need to
+   *  change. */
+  crossCanvasRegistry?: WidgetRegistry;
   /** optional network adapter (BroadcastChannel for tests, iroh for prod) */
   networkAdapter?: NetworkAdapter;
   /** optional storage adapter (defaults to IndexedDB) */
@@ -157,6 +166,7 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
     storageAdapter,
     theme: themeOverrides,
   } = options;
+  const crossCanvasRegistry = options.crossCanvasRegistry ?? registry;
 
   // step 1: resolve theme by merging overrides onto defaults
   const theme: SkeinTheme = { ...defaultTheme, ...themeOverrides };
@@ -269,6 +279,7 @@ export async function initCanvas(options: InitCanvasOptions): Promise<SkeinCanva
   const widgetManager = new WidgetManager(
     store,
     registry,
+    crossCanvasRegistry,
     repo,
     world,
     theme,

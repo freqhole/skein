@@ -55,7 +55,8 @@ import { loadLocalAnimaniacPrefs, saveLocalAnimaniacPrefs, isDomVideoOverlayEnab
 import { createAnimaniacDropController } from "./drop-controller";
 import { restoreWidgetFromClip } from "./clip-restore";
 import { createSnatchController, isAnimaniacNewBlobMessage, clipBlobInfo, clipGainRenditionBlobInfo, makeAnimaniacNewBlobMessage } from "./snatch-controller";
-import { clipDurationSec, computeDisplayDurationSec, nextTrackOrder, removeTrack as removeTrackFromArrays, sortedTracks } from "./track-model";
+import { clipDurationSec, computeDisplayDurationSec, nextTrackOrder, sortedTracks } from "./track-model";
+import { patchOrReplaceArray, removeMatchingInPlace } from "../../src/canvas/array-patch";
 import { createTrack, TRACK_ROW_HEIGHT, type TrackHandle } from "./tracks/track";
 import { renderAudioMixdown } from "./export/audio-mixdown";
 import { encodeAudioBufferToWav } from "./export/wav-encode";
@@ -146,6 +147,32 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     let destroyed = false;
     const prefs = loadLocalAnimaniacPrefs(ctx.widgetId);
 
+    /** the doc's raw `clips` array can carry more than one entry sharing the
+     *  same `id` — confirmed live, root cause of a permanent UI freeze: any
+     *  per-id keyed consumer (e.g. tracks/track.ts's `rows` map) alternates
+     *  between the duplicates on every re-render, which used to re-trigger
+     *  a resolve->refresh->re-render loop forever (back when a clip's
+     *  waveform envelope resolved async, since removed). every `getClips()`
+     *  passed to a sub-controller below funnels through this so none of
+     *  them can hit that loop again for any other per-id-keyed reason,
+     *  without having to fix the doc data itself (which may carry other,
+     *  still-unknown duplicates and shouldn't be rewritten here as a side
+     *  effect of a read). keeps first occurrence — stable/deterministic
+     *  since array order is doc order, same as `Array.prototype.find`'s own
+     *  semantics already relied on elsewhere in this file (e.g.
+     *  commitGainRender). */
+    function dedupedClips(): Clip[] {
+      const clips = ctx.doc.current.clips;
+      const seen = new Set<string>();
+      const out: Clip[] = [];
+      for (const c of clips) {
+        if (seen.has(c.id)) continue;
+        seen.add(c.id);
+        out.push(c);
+      }
+      return out;
+    }
+
     /** clamp a candidate preview-area height to leave the timeline shell at
      *  least `TIMELINE_MIN_HEIGHT` and the preview itself at least
      *  `PREVIEW_MIN_HEIGHT` — reads `currentHeight`, so only call this
@@ -214,7 +241,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       container: previewContent,
       getPreviewSize: () => ({ width: currentWidth, height: currentPreviewHeight }),
       getTracks: () => ctx.doc.current.tracks,
-      getClips: () => ctx.doc.current.clips,
+      getClips: () => dedupedClips(),
       getPeers,
       domVideoMode: () => isDomVideoOverlayEnabled(),
     });
@@ -224,7 +251,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       canvasElement: ctx.canvasElement,
       getPreviewSize: () => ({ width: currentWidth, height: currentPreviewHeight }),
       getTracks: () => ctx.doc.current.tracks,
-      getClips: () => ctx.doc.current.clips,
+      getClips: () => dedupedClips(),
       compositor,
     });
 
@@ -594,13 +621,16 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
 
     /** removes a track AND every clip on it (an orphaned clip with no
      *  track would be unreachable) — wired to each row's own small "×"
-     *  delete button (see `mountTrack()`). */
+     *  delete button (see `mountTrack()`). removes only the affected
+     *  entries in place rather than splice-replacing both whole arrays —
+     *  a track deletion never adds/reorders anything, so there's no need
+     *  to pay for re-representing every surviving track/clip too. */
     function removeTrackAndClips(trackId: string): void {
-      const { tracks: nextTracks, clips: nextClips } = removeTrackFromArrays(ctx.doc.current.tracks, ctx.doc.current.clips, trackId);
       ctx.doc.change((d) => {
-        d.tracks.splice(0, d.tracks.length, ...nextTracks.map((t) => ({ ...t })));
-        d.clips.splice(0, d.clips.length, ...nextClips.map((c) => ({ ...c })));
+        removeMatchingInPlace(d.tracks, (t) => t.id === trackId);
+        removeMatchingInPlace(d.clips, (c) => c.trackId === trackId);
       });
+      const nextClips = ctx.doc.current.clips;
       if (selectedClipId && !nextClips.some((c) => c.id === selectedClipId)) selectedClipId = null;
       history.push();
       syncTracks();
@@ -613,7 +643,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     const previewTransformEditor: PreviewTransformEditorHandle = createPreviewTransformEditor({
       container: previewOverlay,
       getPreviewSize: () => ({ width: currentWidth, height: currentPreviewHeight }),
-      getClips: () => ctx.doc.current.clips,
+      getClips: () => dedupedClips(),
       getTracks: () => ctx.doc.current.tracks,
       getCurrentTime: () => playbackClock.getCurrentTime(),
       getNaturalSize: (clipId) => compositor.getNaturalSize(clipId),
@@ -625,7 +655,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
     });
 
     const audioPlayback: AudioPlaybackHandle = createAudioPlayback({
-      getClips: () => ctx.doc.current.clips,
+      getClips: () => dedupedClips(),
       getPeers,
     });
 
@@ -891,7 +921,37 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
 
     function onClipsChange(nextClips: Clip[]): void {
       ctx.doc.change((d) => {
-        d.clips.splice(0, d.clips.length, ...nextClips.map((c) => ({ ...c })));
+        // targeted per-clip mutation for the common case (same clips,
+        // same order — a drag/resize tick, or the waveform self-heal
+        // backfilling one clip's sourceDurationSec) instead of
+        // unconditionally deleting and reinserting the WHOLE clips array —
+        // automerge has to fully re-represent every deleted+inserted
+        // element from scratch, so a full splice-replace here generates
+        // ops proportional to the ENTIRE clip list on every single call,
+        // not just whatever actually changed. this compounds badly with
+        // dozens of clips and very frequent calls (module doc comment:
+        // "every pixel of a move/resize is its own doc change"). falls
+        // back to the old full-replace only when the clip set itself
+        // actually changed shape (add/remove/reorder).
+        patchOrReplaceArray(d.clips, nextClips, (current, next) => {
+          // `sourceDoodle` (doodle-frame clips only) is a write-once,
+          // never-modified-after-capture snapshot of an entire stroke/
+          // point history (see its own doc comment in types.ts) — easily
+          // thousands of nested automerge objects for one elaborate
+          // drawing. `next` is always a freshly-cloned object (zod
+          // parse/deepUnwrapAmStrings never preserve identity), so a
+          // blind Object.assign re-serializes that whole subtree from
+          // scratch on every ordinary drag/resize/trim of ANY clip, not
+          // just this one — this was the single largest source of op
+          // bloat found analyzing a real bloated doc's change history.
+          // omitting it here means it's never rewritten after creation.
+          if (current.kind === "doodle-frame" && next.kind === "doodle-frame") {
+            const { sourceDoodle: _preserved, ...rest } = next;
+            Object.assign(current, rest);
+          } else {
+            Object.assign(current, next);
+          }
+        });
       });
       history.push();
       camera.setDuration(computeDisplayDurationSec(nextClips));
@@ -1159,7 +1219,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
           }
           return edges;
         },
-        getClips: () => ctx.doc.current.clips,
+        getClips: () => dedupedClips(),
         onClipsChange,
         // selecting a clip on the timeline also shows its handles in the
         // preview (and vice versa — see setSelectedClipId()'s own
@@ -1176,7 +1236,6 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
         isClipRemote: (clip: Clip) => isClipRemote(clip),
         getClipProgress: (clip: Clip) => clipProgress(clip),
         isClipMuted: (clip: Clip) => isClipMuted(clip),
-        getPeers,
         isSelected: (clipId: string) => multiSelectedClipIds.size > 1 && multiSelectedClipIds.has(clipId),
         onToggleSelect: (clipId: string) => toggleClipMultiSelect(clipId),
         onBatchDragDelta,
@@ -1434,7 +1493,7 @@ export const animaniacWidget: WidgetFactory<typeof animaniacSchema> = {
       getSize: () => ({ width: currentWidth, height: currentHeight }),
       getPreviewSize: () => ({ width: currentWidth, height: currentPreviewHeight }),
       getTracks: () => ctx.doc.current.tracks,
-      getClips: () => ctx.doc.current.clips,
+      getClips: () => dedupedClips(),
       getTrackRow: (trackId) => {
         try {
           return rowStack.getRow(trackId);

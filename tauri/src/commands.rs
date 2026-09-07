@@ -1512,19 +1512,21 @@ async fn blob_get_path(args: BlobGetArgs, state: &AppState) -> Result<Value, Dis
         .await
         .map(|m| m.len())
         .unwrap_or(meta.size);
-    // tauri's asset:// protocol (backing <audio>/<video> playback) goes
-    // through WKWebView/AVFoundation on macOS, which for some formats
-    // (confirmed: flac) needs a recognizable file EXTENSION to pick a
-    // demuxer — our own stored `mime` metadata isn't consulted at that
-    // layer at all. a content-addressed managed blob's canonical path has
-    // no extension (see blobz.rs's `insert()`/`register_ingested()` —
-    // always `<2charPrefix>/<restOfHash>`), so a perfectly valid flac blob
-    // (confirmed via a completely separate Web Audio decode succeeding,
-    // e.g. animaniac's waveform rendering) silently fails to play via
-    // <audio> for exactly this reason. `external` blobs
-    // (`register_external_path`) already reference the user's own file,
-    // which already has a real extension, so this only needs to run for
-    // managed/ingested blobs.
+    // tauri's asset:// protocol (backing <audio>/<video> playback AND
+    // PixiJS's own Assets.load() for images) goes through a consumer that,
+    // for some formats (confirmed: flac via WKWebView/AVFoundation; webp
+    // images via pixi's own loader), needs a recognizable file EXTENSION to
+    // pick a demuxer/parser — our own stored `mime` metadata isn't
+    // consulted at that layer at all. a content-addressed managed blob's
+    // canonical path has no extension (see blobz.rs's `insert()`/
+    // `register_ingested()` — always `<2charPrefix>/<restOfHash>`), so a
+    // perfectly valid blob (confirmed via a completely separate decode
+    // path succeeding, e.g. animaniac's waveform rendering for flac, or the
+    // asset:// URL resolving fine as a plain string for images) silently
+    // fails once handed to that specific consumer for exactly this reason.
+    // `external` blobs (`register_external_path`) already reference the
+    // user's own file, which already has a real extension, so this only
+    // needs to run for managed/ingested blobs.
     let playback_path = if !meta.external {
         ensure_extension_hint(&path, meta.mime.as_deref())
             .await
@@ -1539,12 +1541,19 @@ async fn blob_get_path(args: BlobGetArgs, state: &AppState) -> Result<Value, Dis
     }))
 }
 
-/// maps a mime type to the file extension AVFoundation/WKWebView needs to
-/// see in an asset:// path to correctly demux it — only the formats this
-/// app actually serves that are known to need the hint (or plausibly could)
-/// are listed; anything else returns `None` and plays via its existing
-/// extensionless path unchanged (mp3, for instance, has never shown this
-/// problem).
+/// maps a mime type to the file extension a consumer of an `asset://` path
+/// needs to see to correctly handle it — two independent consumers hit this:
+/// AVFoundation/WKWebView's native `<audio>`/`<video>` element (needs it to
+/// pick a demuxer) and PixiJS's `Assets.load()` (needs it to pick a loader/
+/// parser — confirmed live: an extensionless `asset://` image path resolved
+/// fine as a URL but crashed constructing a `Sprite` from whatever
+/// mis-parsed "texture" pixi produced without it, `TypeError: Right side of
+/// assignment cannot be destructured`). only the formats this app actually
+/// serves that are known to need the hint (or plausibly could) are listed;
+/// anything else returns `None` and loads via its existing extensionless
+/// path unchanged (mp3 and, previously, images all worked without it via
+/// their own consumer's magic-byte sniffing — until pixi's loader turned
+/// out not to sniff).
 fn extension_hint_for_mime(mime: &str) -> Option<&'static str> {
     match mime {
         "audio/flac" | "audio/x-flac" => Some("flac"),
@@ -1554,6 +1563,11 @@ fn extension_hint_for_mime(mime: &str) -> Option<&'static str> {
         "video/mp4" => Some("mp4"),
         "video/webm" => Some("webm"),
         "video/quicktime" => Some("mov"),
+        "image/webp" => Some("webp"),
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/svg+xml" => Some("svg"),
         _ => None,
     }
 }

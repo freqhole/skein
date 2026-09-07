@@ -1,8 +1,10 @@
 import { resolveImagePropUrl } from "../../src/file-utils/image-prop-blob";
 import { Assets, Container, Graphics, Sprite, Text, Texture } from "pixi.js";
 import { z } from "zod";
+import { log } from "@freqhole/reliquary/utils";
 import { canvasRoleSchema } from "../../src/canvas/canvas-doc";
 import type { CanvasStore } from "../../src/canvas/canvas-store";
+import { duplicateCanvasDeep } from "../../src/canvas/canvas-duplicate";
 import {
   getFriendInfo,
   hasKnockAckForCanvas,
@@ -273,6 +275,11 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
     let currentWidth = ctx.width;
     let currentHeight = ctx.height;
     let hovered = false;
+
+    // guards against a second click starting a redundant duplicate while
+    // one is already in flight (deep-cloning a whole canvas tree is not
+    // instant) — see the "duplicate this canvas" widgetAction below.
+    let duplicating = false;
 
     // the request-access pill is disabled until an identity exists (see
     // drawRequestAccessPill below) — declared here, before the initial
@@ -685,6 +692,7 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
         // — resolve it to an object URL; a legacy raw data: URL passes
         // through unchanged.
         const loadUrl = await resolveImagePropUrl(dataUrl);
+        log.debug("canvas-card", `resolveImagePropUrl(${JSON.stringify(dataUrl).slice(0, 60)}) -> ${JSON.stringify(loadUrl).slice(0, 80)}`);
         if (lastRequestedPreviewUrl !== dataUrl) return;
         if (!loadUrl) return;
 
@@ -714,8 +722,10 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
         previewSprite.mask = previewMask;
 
         container.addChild(previewSprite);
-      } catch {
-        // silently ignore load failures
+      } catch (err) {
+        // a texture load failure here used to be silently swallowed — now
+        // surfaced so a broken/unreachable preview image is visible.
+        log.warn("canvas-card", `updatePreviewSprite failed for ${JSON.stringify(dataUrl).slice(0, 60)}:`, err);
       }
     };
 
@@ -1018,6 +1028,10 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       drawPreview(w, h, state);
       // only reload the sprite when the URL changes
       if (state.previewUrl !== lastRequestedPreviewUrl) {
+        log.debug(
+          "canvas-card",
+          `previewUrl changed for ${ctx.widgetId}: ${JSON.stringify(lastRequestedPreviewUrl).slice(0, 60)} -> ${JSON.stringify(state.previewUrl).slice(0, 60)}`
+        );
         updatePreviewSprite(state.previewUrl, w, h);
       }
 
@@ -1281,8 +1295,80 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       layout(currentWidth, currentHeight);
     });
 
+    /** deep-clones the linked canvas (and, recursively, anything ITS own
+     *  nested canvas-cards point at) into a brand new canvas sharing no
+     *  doc identity with the original, then drops a new pointer card next
+     *  to this one — see `canvas-duplicate.ts`'s own doc comment for why
+     *  this exists (safely testing a destructive op, e.g. compaction, on
+     *  a real canvas without any risk to the original). */
+    async function duplicateThisCanvas(): Promise<void> {
+      const store = ctx.canvasStore;
+      const crossCanvasRegistry = ctx.crossCanvasRegistry;
+      const state = ctx.doc.current;
+      if (!store || !crossCanvasRegistry || !state.canvasDocId || store.isLocalViewer() || duplicating) return;
+      duplicating = true;
+      try {
+        // the FULL, regular-canvas widget registry — NOT whatever registry
+        // this card's own mount context happens to use. this card is
+        // virtually always mounted on narthex, whose own registry
+        // (`createNarthexRegistry()`) is deliberately a narrow subset (see
+        // its own doc comment) and doesn't know about animaniac/doodle/
+        // image/etc — the canvas being duplicated, though, is a REGULAR
+        // canvas that can contain any of those. confirmed live: using the
+        // wrong (narrow) registry here silently skipped every non-narthex
+        // widget as "couldn't read its doc", producing a blank duplicate.
+        const result = await duplicateCanvasDeep(store.repo, crossCanvasRegistry, state.canvasDocId, store.localNodeId);
+        if (result.skipped > 0) {
+          log.debug(
+            "canvas-card",
+            `duplicate of ${state.canvasDocId} skipped ${result.skipped} widget(s) whose doc couldn't be read`
+          );
+        }
+        const original = store.getWidget(ctx.widgetId);
+        const now = new Date().toISOString();
+        const zIndex = 1 + Math.max(0, ...store.allWidgets().map((w) => w.zIndex || 0));
+        store.addWidget({
+          id: crypto.randomUUID(),
+          type: "canvas-card",
+          x: (original?.x ?? 0) + 32,
+          y: (original?.y ?? 0) + 32,
+          width: original?.width ?? 280,
+          height: original?.height ?? 200,
+          zIndex,
+          props: {
+            canvasDocId: result.newCanvasDocId,
+            // already suffixed with " (copy)" (see canvas-duplicate.ts) —
+            // don't append again here.
+            title: result.title,
+            description: state.description,
+            previewUrl: state.previewUrl,
+            authorName: state.authorName,
+            color: state.color,
+            createdAt: now.slice(0, 10),
+            modifiedAt: now,
+          },
+          collapsed: false,
+          docId: null,
+          parentId: null,
+        });
+      } catch (err) {
+        console.warn(`[canvas-card] duplicate-canvas failed for ${state.canvasDocId}:`, err);
+      } finally {
+        duplicating = false;
+      }
+    }
+
     return {
       container,
+      widgetActions: [
+        {
+          id: "duplicate-canvas",
+          label: "duplicate this canvas",
+          onClick: () => {
+            void duplicateThisCanvas();
+          },
+        },
+      ],
       destroy() {
         clearInterval(syncPulseTimer);
         unsub();

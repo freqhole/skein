@@ -387,8 +387,10 @@ test("property tray renders controls for each editable prop", async ({ canvasPag
   });
 
   expect(result.visible).toBe(true);
-  // title control + 5 editableProps (bgColor, textColor, borderColor, fontSize, fontFamily) + delete button
-  expect(result.controlCount).toBe(7);
+  // title control + 5 editableProps (bgColor, textColor, borderColor, fontSize, fontFamily)
+  // + compact-doc placeholder container (always mounted, empty unless the doc qualifies
+  // for compaction, see createCompactButton in property-tray.ts) + delete button
+  expect(result.controlCount).toBe(8);
 });
 
 test("property tray switches when selecting a different widget", async ({ canvasPage }) => {

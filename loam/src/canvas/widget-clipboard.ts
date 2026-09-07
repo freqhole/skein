@@ -5,6 +5,16 @@
  * on whichever canvas is open at paste time. see input-router.ts's keydown
  * handling and widget-manager.ts's `start()` for where this is wired up.
  *
+ * **a pasted `canvas-card` gets its own, fully independent target canvas
+ * too** (via `canvas-duplicate.ts`'s `duplicateCanvasDeep()`, in `pasteOne`
+ * below) — a shallow copy of just the card's own field values would leave
+ * BOTH the original and the pasted card's `canvasDocId` pointing at the
+ * exact same canvas, so "editing the copy" would silently edit the
+ * original's real widgets. every other widget type already gets a real
+ * independent doc from a plain `repo.create()`; canvas-card needs the
+ * extra recursive step specifically because its own state doesn't contain
+ * the thing being duplicated, just a pointer to it.
+ *
  * every open canvas shares ONE `Repo` instance (boot.ts's `this.repo`), so
  * "cross-canvas" doesn't need any cross-repo bridging — paste just creates
  * a new doc via the same repo and adds an entry to whichever `CanvasStore`
@@ -21,7 +31,8 @@ import type { WidgetEntry } from "./canvas-doc";
 import type { WidgetRegistry } from "../widgets/widget-registry";
 import { resolveDocReadyCached } from "../p2p/doc-ready";
 import { deepUnwrapAmStrings } from "./automerge-values";
-import { addBlobCanvasRef } from "../file-utils/blob-canvas-refs";
+import { registerBlobRefs } from "./blob-ref-registration";
+import { duplicateCanvasDeep } from "./canvas-duplicate";
 
 const TAG = "canvas.widget-clipboard";
 
@@ -31,14 +42,6 @@ const TAG = "canvas.widget-clipboard";
  *  signal available at paste time (matches the classic paste-offset UX so
  *  a same-canvas paste never lands exactly on top of what was copied). */
 const PASTE_OFFSET = 32;
-
-/** known blob-id/blake3 field-name pairs across widget schemas — best
- *  effort, not exhaustive (e.g. `image`'s `url`-embedded blob refs aren't
- *  covered) — see `registerBlobRefs()`. */
-const BLOB_FIELD_PAIRS: Array<[string, string]> = [
-  ["blobId", "blake3"],
-  ["videoBlobId", "videoBlake3"],
-];
 
 interface ClipboardWidget {
   type: string;
@@ -191,20 +194,6 @@ export async function copySelectionToClipboard(
   notifyClipboardChange();
 }
 
-/** best-effort blob-canvas-ref registration for a pasted widget's state —
- *  see `BLOB_FIELD_PAIRS`'s doc comment for coverage caveats. */
-function registerBlobRefs(state: Record<string, unknown> | null, canvasDocId: string): void {
-  if (!state) return;
-  for (const [blobKey, blake3Key] of BLOB_FIELD_PAIRS) {
-    const blobId = state[blobKey];
-    if (typeof blobId !== "string" || !blobId) continue;
-    const blake3 = typeof state[blake3Key] === "string" ? (state[blake3Key] as string) : "";
-    addBlobCanvasRef(blobId, blake3, canvasDocId).catch((err) => {
-      log.debug(TAG, `addBlobCanvasRef failed (non-fatal) for ${blobId.slice(0, 12)}...:`, err);
-    });
-  }
-}
-
 export interface PasteResult {
   /** ids of the newly created TOP-LEVEL widgets (not nested bin children) —
    *  used to re-select the pasted widgets after paste completes. */
@@ -215,9 +204,13 @@ export interface PasteResult {
 }
 
 /** recreate one clipboard bundle (and, for a bin, its children) on `store`,
- *  returning the new widget's id, or null if it had to be skipped. */
+ *  returning the new widget's id, or null if it had to be skipped.
+ *  `crossCanvasRegistry` must be the FULL, regular-canvas widget registry
+ *  (see the caller's own doc comment on why — `store`'s own registry may
+ *  be a narrower one, e.g. narthex's). */
 async function pasteOne(
   store: CanvasStore,
+  crossCanvasRegistry: WidgetRegistry,
   bundle: ClipboardWidget,
   parentId: string | null,
   canvasDocId: string,
@@ -232,9 +225,40 @@ async function pasteOne(
 
   let docId: string | null = null;
   if (bundle.hadDocId) {
-    const handle = store.repo.create(bundle.state ?? {});
+    let state = bundle.state;
+    // a canvas-card is just a pointer (its `canvasDocId` field) — pasting
+    // one without this special case would leave BOTH the original and the
+    // pasted card pointing at the exact SAME target canvas, so "editing
+    // the copy" would silently edit the original's real widgets. give the
+    // pasted card its own, fully independent target canvas instead (see
+    // `canvas-duplicate.ts`'s own doc comment for why a shallow field copy
+    // isn't good enough here). uses `crossCanvasRegistry` (the full,
+    // regular-canvas widget registry), NOT whatever registry `store`'s own
+    // canvas happens to use — a canvas-card is routinely pasted while ON
+    // narthex (whose own registry is deliberately a narrow subset, see
+    // `createNarthexRegistry()`), but the canvas it POINTS TO is a regular
+    // canvas that can contain ANY widget type, so narthex's own registry
+    // would silently fail to recognize most of them (confirmed live: this
+    // exact mismatch caused a duplicated canvas to come back blank, every
+    // non-narthex widget type silently skipped as "couldn't read its doc"
+    // when really it was just "couldn't find its schema in the wrong,
+    // narrower registry"). best-effort: if the target canvas can't be
+    // reached/duplicated (e.g. offline peer), fall back to the shallow
+    // copy rather than failing the whole paste — same as every other
+    // best-effort resolve in this app.
+    if (bundle.type === "canvas-card" && state && typeof state.canvasDocId === "string" && state.canvasDocId) {
+      try {
+        const dup = await duplicateCanvasDeep(store.repo, crossCanvasRegistry, state.canvasDocId, store.localNodeId);
+        // `dup.title` is already suffixed with " (copy)" (see
+        // `canvas-duplicate.ts`) — use it as-is, don't append again here.
+        state = { ...state, canvasDocId: dup.newCanvasDocId, title: dup.title };
+      } catch (err) {
+        log.debug(TAG, `duplicateCanvasDeep failed for pasted canvas-card (falling back to a shared reference):`, err);
+      }
+    }
+    const handle = store.repo.create(state ?? {});
     docId = handle.documentId;
-    registerBlobRefs(bundle.state, canvasDocId);
+    registerBlobRefs(state, canvasDocId);
   }
 
   const widgetId = crypto.randomUUID();
@@ -257,7 +281,7 @@ async function pasteOne(
   if (bundle.children.length > 0 && docId) {
     const items: Array<{ widgetId: string; slot: { col: number; row: number } }> = [];
     for (const child of bundle.children) {
-      const childId = await pasteOne(store, child.widget, widgetId, canvasDocId, dx, dy, onSkip);
+      const childId = await pasteOne(store, crossCanvasRegistry, child.widget, widgetId, canvasDocId, dx, dy, onSkip);
       if (childId) items.push({ widgetId: childId, slot: child.slot });
     }
     const binHandle = await resolveDocReadyCached<{ items: unknown }>(store.repo, docId as DocumentId, {
@@ -283,8 +307,16 @@ export interface PasteOptions {
 }
 
 /** paste the current clipboard content onto `store`. a no-op (empty
- *  result) if the clipboard is empty or the local peer is a viewer. */
-export async function pasteClipboardIntoStore(store: CanvasStore, options?: PasteOptions): Promise<PasteResult> {
+ *  result) if the clipboard is empty or the local peer is a viewer.
+ *  `crossCanvasRegistry` must be the FULL, regular-canvas widget registry
+ *  (see `pasteOne()`'s own doc comment) — needed for a pasted canvas-card
+ *  to correctly deep-clone its linked canvas regardless of which (possibly
+ *  narrower) registry `store`'s own canvas uses. */
+export async function pasteClipboardIntoStore(
+  store: CanvasStore,
+  crossCanvasRegistry: WidgetRegistry,
+  options?: PasteOptions
+): Promise<PasteResult> {
   if (!clipboard || clipboard.length === 0 || store.isLocalViewer()) {
     return { pasted: [], skipped: 0 };
   }
@@ -302,7 +334,7 @@ export async function pasteClipboardIntoStore(store: CanvasStore, options?: Past
   let skipped = 0;
   const pastedIds: string[] = [];
   for (const bundle of clipboard) {
-    const id = await pasteOne(store, bundle, null, canvasDocId, dx, dy, () => skipped++);
+    const id = await pasteOne(store, crossCanvasRegistry, bundle, null, canvasDocId, dx, dy, () => skipped++);
     if (id) pastedIds.push(id);
   }
 

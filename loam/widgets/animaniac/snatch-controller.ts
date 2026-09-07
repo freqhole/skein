@@ -182,6 +182,42 @@ export interface SnatchControllerHandle {
  *  without needing another manual click. */
 const AUTO_SNATCH_RETRY_MS = 20_000;
 
+/** race a promise against a timeout, resolving to `fallback` instead of
+ *  hanging forever — a single never-settling `checkBlobLocality()` call
+ *  (e.g. against a blob whose stored path is stale/broken, a known,
+ *  separately-tracked reliquary bug around duplicate-content re-inserts
+ *  not always updating a stale path) must never be allowed to wedge the
+ *  whole `Promise.all()` batch it's part of, and by extension this
+ *  controller's `state`, forever — see `checkAllLocality()`'s own use of
+ *  this. */
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve(fallback);
+      }
+    }, ms);
+    promise.then(
+      (value) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        }
+      },
+      () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(fallback);
+        }
+      }
+    );
+  });
+}
+
 /** a handful of delayed re-scans after the very first `checkAllLocality()`
  *  call (mount time) — the doc a widget first mounts against may still be
  *  mid-sync (a peer just joined the canvas and the full clips[] history
@@ -192,6 +228,28 @@ const AUTO_SNATCH_RETRY_MS = 20_000;
  *  comment). bounded (not indefinite) so it doesn't turn into the exact
  *  "rescan on every change" cost this design otherwise avoids. */
 const CATCHUP_RESCAN_DELAYS_MS = [2_000, 6_000, 15_000];
+
+/** max `checkBlobLocality()` calls in flight at once within a single
+ *  `checkAllLocality()` scan — a widget can carry dozens of clips, and
+ *  since this controller is per-widget-instance (two animaniac widgets on
+ *  the same canvas each run their own, fully independent scan), an
+ *  unbounded `Promise.all()` over every clip could otherwise fire 50+
+ *  concurrent IPC/IndexedDB calls in one burst, twice over, right at
+ *  canvas-open time. chunking keeps any one scan's concurrent footprint
+ *  small regardless of clip count. */
+const LOCALITY_CHECK_BATCH_SIZE = 6;
+
+/** run `items` through `fn` in fixed-size concurrent chunks rather than all
+ *  at once — see `LOCALITY_CHECK_BATCH_SIZE`'s own doc comment for why
+ *  `checkAllLocality()` needs this. */
+async function runInBatches<T, R>(items: T[], batchSize: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const chunk = items.slice(i, i + batchSize);
+    results.push(...(await Promise.all(chunk.map(fn))));
+  }
+  return results;
+}
 
 export function createSnatchController(options: SnatchControllerOptions): SnatchControllerHandle {
   const { widgetId, getDocState, changeDoc, getLocalNodeId, getPeers, isPeerOnline, isDestroyed, onStateChange } = options;
@@ -293,9 +351,14 @@ export function createSnatchController(options: SnatchControllerOptions): Snatch
     onStateChange();
     try {
       const blobs = buildSnatchAllBlobs(getDocState());
-      const results = await Promise.all(
-        blobs.map(async (b) => ({ b, info: await checkBlobLocality(b.blobId, b.blake3 || undefined).catch(() => ({ locality: "unknown" as const })) }))
-      );
+      const results = await runInBatches(blobs, LOCALITY_CHECK_BATCH_SIZE, async (b) => ({
+        b,
+        info: await withTimeout(
+          checkBlobLocality(b.blobId, b.blake3 || undefined).catch(() => ({ locality: "unknown" as const })),
+          8_000,
+          { locality: "unknown" as const }
+        ),
+      }));
       if (isDestroyed()) return;
       remoteBlobs.clear();
       for (const { b, info } of results) {

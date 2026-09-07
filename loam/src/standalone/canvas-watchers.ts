@@ -95,6 +95,11 @@ export async function syncCanvasMetadataToCards(
         }
         // sync previewUrl from canvas doc
         if (meta.previewUrl !== undefined && meta.previewUrl !== (d.previewUrl ?? "")) {
+          log.debug(
+            TAG,
+            `one-shot-syncing previewUrl for card ${entry.id}: ` +
+              `${JSON.stringify(d.previewUrl ?? "").slice(0, 60)} -> ${JSON.stringify(meta.previewUrl).slice(0, 60)}`
+          );
           d.previewUrl = meta.previewUrl;
           changed = true;
         }
@@ -278,6 +283,34 @@ export async function watchCanvasDocsForUpdates(
         if (!canvasDoc.lastModified) return;
         if (canvasDoc.lastModified === lastSeenModified) return;
         lastSeenModified = canvasDoc.lastModified;
+
+        // sync the actual metadata (title/description/color/previewUrl)
+        // regardless of who made the edit — this used to be skipped
+        // entirely for the local peer's OWN edits (bundled into the same
+        // early-return as the "don't show a pill for my own edit" check
+        // below), which meant setting a canvas's preview image (or
+        // renaming/recoloring it) while narthex was already mounted (not
+        // freshly (re)navigated-to, which is the only thing that runs the
+        // separate one-shot `syncCanvasMetadataToCards()`) never reached
+        // the card at all until the next full narthex remount. "don't
+        // show the update pill for my own edit" and "don't sync the
+        // underlying data for my own edit" are different concerns; only
+        // the pill should stay remote-only (see below).
+        cardHandle.change((draft: any) => {
+          if (canvasDoc.title && canvasDoc.title !== (draft.title ?? "")) draft.title = canvasDoc.title;
+          if (canvasDoc.description !== undefined && canvasDoc.description !== (draft.description ?? "")) {
+            draft.description = canvasDoc.description;
+          }
+          if (canvasDoc.color && canvasDoc.color !== (draft.color ?? 0)) draft.color = canvasDoc.color;
+          if (canvasDoc.previewUrl !== undefined && canvasDoc.previewUrl !== (draft.previewUrl ?? "")) {
+            log.debug(
+              TAG,
+              `live-syncing previewUrl for card ${entry.id} (canvas ${canvasDocId.slice(0, 12)}): ` +
+                `${JSON.stringify(draft.previewUrl ?? "").slice(0, 60)} -> ${JSON.stringify(canvasDoc.previewUrl).slice(0, 60)}`
+            );
+            draft.previewUrl = canvasDoc.previewUrl;
+          }
+        });
 
         // only show the pill for remote changes — own edits are already visible
         if (!canvasDoc.lastModifiedBy || canvasDoc.lastModifiedBy === localNodeId) return;

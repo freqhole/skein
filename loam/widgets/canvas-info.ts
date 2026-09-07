@@ -6,7 +6,8 @@ import type { CanvasStore } from "../src/canvas/canvas-store";
 import { createDomOverlay, type DomOverlayHandle } from "../src/widgets/dom-overlay";
 import { colorToCss } from "../src/widgets/format";
 import { pickImageAsDataUrl } from "@freqhole/reliquary/utils";
-import { resolveImagePropUrl, saveImageDataUrlAsBlobRef } from "../src/file-utils/image-prop-blob";
+import { isImageBlobRef, resolveImagePropUrl, saveImageDataUrlAsBlobRef } from "../src/file-utils/image-prop-blob";
+import { addBlobCanvasRef } from "../src/file-utils/blob-canvas-refs";
 import type {
   WidgetController,
   WidgetFactory,
@@ -377,6 +378,12 @@ export const canvasInfoWidget: WidgetFactory<typeof canvasInfoSchema> = {
       if (url) {
         const ref = await saveImageDataUrlAsBlobRef(url);
         canvasStore.setPreviewUrl(ref);
+        if (isImageBlobRef(ref)) {
+          const blobId = ref.slice("blob:".length);
+          addBlobCanvasRef(blobId, undefined, canvasStore.handle.documentId).catch(() => {
+            // best-effort bookkeeping only — never block/fail the preview set over this
+          });
+        }
       }
     });
 

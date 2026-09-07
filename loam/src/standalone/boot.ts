@@ -1,7 +1,9 @@
 import { Repo, type DocumentId } from "@automerge/automerge-repo";
+import { installLongTaskObserver } from "../dev/longtask-observer";
 import { registerEndpointAdapter } from "../p2p/endpoint-control";
 import { resolveDocReadyCached } from "../p2p/doc-ready";
-import { logDocHistoryStats } from "../p2p/doc-history-stats";
+import { logDocHistoryStats, computeDocHistoryStats } from "../p2p/doc-history-stats";
+import { compactDoc } from "../canvas/compact-doc";
 import { createLocalKvDoc, type MessagezDocLike } from "../storage/local-kv-doc";
 import { migrateLegacyAutomergeDoc } from "../storage/legacy-doc-migration";
 import { createTestRegistry } from "../../widgets/index";
@@ -61,6 +63,8 @@ import { freeUpLocalBlobCopy, checkBlobLocality } from "../file-utils/blob-local
 import { backfillMissingFileDurations } from "../file-utils/backfill-file-durations";
 import { fixImmutableStringFields } from "../file-utils/fix-immutable-strings";
 import { diagnoseAnimaniacDrops } from "../file-utils/diagnose-animaniac-drops";
+import { diagnoseDocHistory } from "../file-utils/diagnose-doc-history";
+import { analyzeDocChanges } from "../p2p/doc-change-analysis";
 import { pauseSnatchDownload } from "../file-utils/snatch";
 import {
   getBlobCanvasRefs,
@@ -126,6 +130,10 @@ configureLogging({
 
 // indexeddb key for the well-known narthex document id
 const NARTHEX_DOC_KEY = "skein-narthex-doc-id";
+/** rough first-guess threshold for compactNarthexIfBloated() — see
+ *  docs/animaniac-doc-compaction-plan.md's resolved-open-questions section
+ *  for why this number (tune later once there are more real doc samples). */
+const NARTHEX_COMPACT_THRESHOLD_OPS = 1_000_000;
 const MESSAGEZ_DOC_KEY = "skein-messagez-doc-id";
 /** meta-db key for the standalone (browser-mode) social doc id — exported so
  *  other modules that need best-effort, read-only access to the local
@@ -598,6 +606,18 @@ class SkeinRouter {
     } else {
       log.debug(TAG, "found existing narthex doc:", this.narthexDocId);
       await ensureSingletonWidgets(this.repo, this.narthexDocId as DocumentId);
+      // proactive bloat check — narthex is the one doc that's always loaded,
+      // every session, before the user does anything, so waiting for a user
+      // to reactively find a "compact this doc" button (property-tray.ts)
+      // could come too late: by the time it's needed, the doc may already be
+      // too bloated to load quickly enough to reach that button at all (see
+      // docs/narthex-doc-history-plan.md / docs/animaniac-doc-compaction-
+      // plan.md). must run — and, if triggered, finish updating
+      // `this.narthexDocId` — strictly before anything below captures
+      // `narthexDocId` in a closure for the rest of the boot session
+      // (initFriendzWiring()/wireAclChangeHandlers()/wireKnockHandlers()
+      // etc. all take it as a plain string dep); no mid-session rotation.
+      await this.compactNarthexIfBloated();
     }
 
     // self-heal every canvas this peer owns (narthex included) that's
@@ -1122,6 +1142,58 @@ class SkeinRouter {
   }
 
   /**
+   * proactive, boot-time bloat check for the narthex doc specifically —
+   * unlike every other widget doc (manual-only, via property-tray.ts's
+   * "compact this doc" button), narthex is loaded unconditionally at the
+   * start of every session, so waiting for a user to notice trouble and go
+   * find a button could come too late (see docs/animaniac-doc-compaction-
+   * plan.md's narthex special-case section). automatic and silent (a
+   * console line only, no blocking UI prompt) — there's no UI surface
+   * ready to show a prompt in this early in boot, before the canvas has
+   * even been created; a friendlier in-app notice could be layered on top
+   * later if wanted.
+   *
+   * safety check mirrored from docs/narthex-doc-history-plan.md: this
+   * whole design assumes narthex is never actually shared with another
+   * peer (it's a private, per-install singleton — see healOwnedCanvases()'s
+   * own doc comment) — if that assumption turns out to be false for some
+   * install, silently rotating it would orphan a real collaborator, so a
+   * non-empty `.acl` skips rotation and only warns.
+   */
+  private async compactNarthexIfBloated(): Promise<void> {
+    if (!this.narthexDocId) return;
+    const handle = await resolveDocReadyCached<CanvasDocument>(this.repo, this.narthexDocId as DocumentId, {
+      context: "compactNarthexIfBloated",
+    });
+    if (!handle) return;
+
+    const stats = computeDocHistoryStats(handle);
+    if (!stats || stats.numOps <= NARTHEX_COMPACT_THRESHOLD_OPS) return;
+
+    const doc = handle.doc();
+    if (doc?.acl && Object.keys(doc.acl).length > 0) {
+      log.warn(
+        TAG,
+        `narthex doc ${this.narthexDocId} has ${stats.numOps} ops (over the ${NARTHEX_COMPACT_THRESHOLD_OPS} threshold) ` +
+          `but also has real .acl entries — skipping automatic compaction since narthex is assumed never shared`
+      );
+      return;
+    }
+
+    const result = await compactDoc(this.repo, handle);
+    if (!result) {
+      log.warn(TAG, `narthex compaction failed for doc ${this.narthexDocId} (numOps: ${stats.numOps})`);
+      return;
+    }
+
+    await setMetaValue(NARTHEX_DOC_KEY, result.newHandle.documentId);
+    this.narthexDocId = result.newHandle.documentId;
+    console.warn(
+      `[skein] narthex doc was compacted (was ${stats.numOps} ops) — old doc ${result.oldDocId}, new doc ${result.newHandle.documentId}`
+    );
+  }
+
+  /**
    * self-heal every canvas this peer created themselves: stamp an admin
    * if none is recorded yet, and migrate an existing admin stamp off the
    * anonymous device id onto a real identity once one exists.
@@ -1212,6 +1284,7 @@ class SkeinRouter {
         mountElement: this.mountElement,
         canvasDocId: this.narthexDocId,
         registry: createNarthexRegistry(),
+        crossCanvasRegistry: createTestRegistry(),
         repo: this.repo,
         isNarthex: true,
         hasIdentity: !!this.localNodeId,
@@ -1308,6 +1381,7 @@ class SkeinRouter {
         const durations = await backfillMissingFileDurations(canvas.store);
         const immutableStrings = await fixImmutableStringFields(canvas.store);
         const dropDiagnosis = await diagnoseAnimaniacDrops(canvas.store, canvas.registry);
+        const docHistory = await diagnoseDocHistory(canvas.store);
         /* eslint-disable no-console -- intentional devtools diagnostic dump */
         console.log("[skein] connection summary:", this.irohAdapter.getConnectionSummary());
         console.log("[skein] backfill durations:", durations);
@@ -1322,8 +1396,40 @@ class SkeinRouter {
           }
         }
         console.table(dropDiagnosis.widgets);
+        console.log("[skein] doc history (canvas doc + every widget's own doc, worst numOps first):");
+        console.table(docHistory);
         /* eslint-enable no-console */
-        return { durations, immutableStrings, dropDiagnosis };
+        return { durations, immutableStrings, dropDiagnosis, docHistory };
+      };
+
+      // deep forensic dump for one specific docId flagged by
+      // __skeinDiagnose()'s doc-history table above — which FIELD is
+      // actually generating the ops (a whole-list rewrite vs. per-item
+      // edits look completely different broken down this way), and
+      // whether the bloat arrived as one tight burst or organic growth.
+      // run via `await window.__skeinAnalyzeDocChanges("<docId>")`.
+      (window as any).__skeinAnalyzeDocChanges = async (docId: string) => {
+        const handle = await resolveDocReadyCached(canvas.store.repo, docId as DocumentId, { context: "skeinAnalyzeDocChanges" });
+        const analysis = analyzeDocChanges(handle);
+        if (!analysis) {
+          console.warn(`[skein] doc ${docId} isn't reachable/ready — can't analyze`);
+          return null;
+        }
+        /* eslint-disable no-console -- intentional devtools diagnostic dump */
+        console.log(`[skein] doc ${docId}: ${analysis.totalChanges} changes, ${analysis.totalOps} ops total`);
+        console.log("[skein] ops by field (worst first):");
+        console.table(analysis.byField);
+        console.log("[skein] op action totals (whole doc):");
+        console.table(analysis.actionTotals);
+        console.log("[skein] largest individual changes:");
+        console.table(analysis.largestChanges);
+        console.log("[skein] op-count-per-change histogram:");
+        console.table(analysis.opCountHistogram);
+        console.log("[skein] burstiness:", analysis.burstiness);
+        console.log("[skein] full analysis as JSON (copy/paste this):");
+        console.log(JSON.stringify(analysis, null, 2));
+        /* eslint-enable no-console */
+        return analysis;
       };
 
       // when a canvas-card is deleted from the narthex, clean up the linked
@@ -2670,6 +2776,7 @@ class SkeinRouter {
         const durations = await backfillMissingFileDurations(canvas.store);
         const immutableStrings = await fixImmutableStringFields(canvas.store);
         const dropDiagnosis = await diagnoseAnimaniacDrops(canvas.store, canvas.registry);
+        const docHistory = await diagnoseDocHistory(canvas.store);
         /* eslint-disable no-console -- intentional devtools diagnostic dump */
         console.log("[skein] connection summary:", this.irohAdapter.getConnectionSummary());
         console.log("[skein] backfill durations:", durations);
@@ -2684,8 +2791,40 @@ class SkeinRouter {
           }
         }
         console.table(dropDiagnosis.widgets);
+        console.log("[skein] doc history (canvas doc + every widget's own doc, worst numOps first):");
+        console.table(docHistory);
         /* eslint-enable no-console */
-        return { durations, immutableStrings, dropDiagnosis };
+        return { durations, immutableStrings, dropDiagnosis, docHistory };
+      };
+
+      // deep forensic dump for one specific docId flagged by
+      // __skeinDiagnose()'s doc-history table above — which FIELD is
+      // actually generating the ops (a whole-list rewrite vs. per-item
+      // edits look completely different broken down this way), and
+      // whether the bloat arrived as one tight burst or organic growth.
+      // run via `await window.__skeinAnalyzeDocChanges("<docId>")`.
+      (window as any).__skeinAnalyzeDocChanges = async (docId: string) => {
+        const handle = await resolveDocReadyCached(canvas.store.repo, docId as DocumentId, { context: "skeinAnalyzeDocChanges" });
+        const analysis = analyzeDocChanges(handle);
+        if (!analysis) {
+          console.warn(`[skein] doc ${docId} isn't reachable/ready — can't analyze`);
+          return null;
+        }
+        /* eslint-disable no-console -- intentional devtools diagnostic dump */
+        console.log(`[skein] doc ${docId}: ${analysis.totalChanges} changes, ${analysis.totalOps} ops total`);
+        console.log("[skein] ops by field (worst first):");
+        console.table(analysis.byField);
+        console.log("[skein] op action totals (whole doc):");
+        console.table(analysis.actionTotals);
+        console.log("[skein] largest individual changes:");
+        console.table(analysis.largestChanges);
+        console.log("[skein] op-count-per-change histogram:");
+        console.table(analysis.opCountHistogram);
+        console.log("[skein] burstiness:", analysis.burstiness);
+        console.log("[skein] full analysis as JSON (copy/paste this):");
+        console.log(JSON.stringify(analysis, null, 2));
+        /* eslint-enable no-console */
+        return analysis;
       };
 
       // expose a share helper for quick testing via browser console
@@ -4341,6 +4480,10 @@ class SkeinRouter {
 // ---------------------------------------------------------------------------
 
 async function boot(): Promise<void> {
+  // opt-in only (`localStorage.skein.debugLongTask = "1"`) — no cost paid
+  // by default; enable when chasing a main-thread stall.
+  if (localStorage.getItem("skein.debugLongTask") === "1") installLongTaskObserver();
+
   // preload custom fonts before any PixiJS Text objects are created
   await preloadFonts();
 

@@ -7,6 +7,7 @@
  */
 
 import { createUndoHistory, type UndoHistory } from "../../src/widgets/undo-history";
+import { patchOrReplaceArray } from "../../src/canvas/array-patch";
 import type { AnimaniacState, Clip, Track } from "./types";
 
 export interface HistorySnapshot {
@@ -67,15 +68,24 @@ export function createHistoryController(options: HistoryControllerOptions): Hist
     onHistoryChanged();
   }
 
-  /** applies a history snapshot back to the doc — splices doc arrays in
+  /** applies a history snapshot back to the doc — patches doc arrays in
    *  place rather than reassigning them outright (reassigning a doc array
-   *  built from that array's own proxied elements throws in automerge;
-   *  splicing in plain-value copies from a snapshot is safe — see
-   *  automerge-gotchas memory notes). */
+   *  built from that array's own proxied elements throws in automerge —
+   *  see automerge-gotchas memory notes). uses the same same-shape-fast-
+   *  path/full-replace-fallback as `onClipsChange` (excluding `sourceDoodle`
+   *  from the fast path for the same reason) since most undo/redo entries
+   *  revert a plain field edit (move/resize/trim), not an add/remove. */
   function applyHistorySnapshot(snap: HistorySnapshot): void {
     changeDoc((d) => {
-      d.tracks.splice(0, d.tracks.length, ...snap.tracks.map((t) => ({ ...t })));
-      d.clips.splice(0, d.clips.length, ...snap.clips.map((c) => ({ ...c })));
+      patchOrReplaceArray(d.tracks, snap.tracks, (current, next) => Object.assign(current, next));
+      patchOrReplaceArray(d.clips, snap.clips, (current, next) => {
+        if (current.kind === "doodle-frame" && next.kind === "doodle-frame") {
+          const { sourceDoodle: _preserved, ...rest } = next;
+          Object.assign(current, rest);
+        } else {
+          Object.assign(current, next);
+        }
+      });
     });
     onApplied();
   }
