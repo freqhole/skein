@@ -1,5 +1,11 @@
 # skein
 
+## 0.1.17
+
+### Patch Changes
+
+- fd9e4d0: zomg yank animaniac clip segment waveform display cuz it was buggy as hell
+
 ## 0.1.16
 
 ### Patch Changes
