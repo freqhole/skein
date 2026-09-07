@@ -692,8 +692,7 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
         // — resolve it to an object URL; a legacy raw data: URL passes
         // through unchanged.
         const loadUrl = await resolveImagePropUrl(dataUrl);
-        // TEMP diagnostic (see layout()'s matching log above).
-        console.warn(`[canvas-card-diag] resolveImagePropUrl(${JSON.stringify(dataUrl).slice(0, 60)}) -> ${JSON.stringify(loadUrl).slice(0, 80)}`);
+        log.debug("canvas-card", `resolveImagePropUrl(${JSON.stringify(dataUrl).slice(0, 60)}) -> ${JSON.stringify(loadUrl).slice(0, 80)}`);
         if (lastRequestedPreviewUrl !== dataUrl) return;
         if (!loadUrl) return;
 
@@ -724,9 +723,9 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
 
         container.addChild(previewSprite);
       } catch (err) {
-        // TEMP diagnostic: this was a silent catch-all before — surface it
-        // while tracing the freshly-set-preview-image report.
-        console.warn(`[canvas-card-diag] updatePreviewSprite failed for ${JSON.stringify(dataUrl).slice(0, 60)}:`, err);
+        // a texture load failure here used to be silently swallowed — now
+        // surfaced so a broken/unreachable preview image is visible.
+        log.warn("canvas-card", `updatePreviewSprite failed for ${JSON.stringify(dataUrl).slice(0, 60)}:`, err);
       }
     };
 
@@ -1029,10 +1028,9 @@ export const canvasCardWidget: WidgetFactory<typeof canvasCardSchema> = {
       drawPreview(w, h, state);
       // only reload the sprite when the URL changes
       if (state.previewUrl !== lastRequestedPreviewUrl) {
-        // TEMP diagnostic: tracing a live report of freshly-set canvas
-        // preview images not showing up on the narthex card.
-        console.warn(
-          `[canvas-card-diag] previewUrl changed for ${ctx.widgetId}: ${JSON.stringify(lastRequestedPreviewUrl).slice(0, 60)} -> ${JSON.stringify(state.previewUrl).slice(0, 60)}`
+        log.debug(
+          "canvas-card",
+          `previewUrl changed for ${ctx.widgetId}: ${JSON.stringify(lastRequestedPreviewUrl).slice(0, 60)} -> ${JSON.stringify(state.previewUrl).slice(0, 60)}`
         );
         updatePreviewSprite(state.previewUrl, w, h);
       }

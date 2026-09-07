@@ -95,10 +95,9 @@ export async function syncCanvasMetadataToCards(
         }
         // sync previewUrl from canvas doc
         if (meta.previewUrl !== undefined && meta.previewUrl !== (d.previewUrl ?? "")) {
-          // TEMP diagnostic: tracing a live report of freshly-set canvas
-          // preview images not showing up on the narthex card.
-          console.warn(
-            `[canvas-watchers-diag] one-shot-syncing previewUrl for card ${entry.id}: ` +
+          log.debug(
+            TAG,
+            `one-shot-syncing previewUrl for card ${entry.id}: ` +
               `${JSON.stringify(d.previewUrl ?? "").slice(0, 60)} -> ${JSON.stringify(meta.previewUrl).slice(0, 60)}`
           );
           d.previewUrl = meta.previewUrl;
@@ -304,10 +303,9 @@ export async function watchCanvasDocsForUpdates(
           }
           if (canvasDoc.color && canvasDoc.color !== (draft.color ?? 0)) draft.color = canvasDoc.color;
           if (canvasDoc.previewUrl !== undefined && canvasDoc.previewUrl !== (draft.previewUrl ?? "")) {
-            // TEMP diagnostic: tracing a live report of freshly-set canvas
-            // preview images not showing up on the narthex card.
-            console.warn(
-              `[canvas-watchers-diag] live-syncing previewUrl for card ${entry.id} (canvas ${canvasDocId.slice(0, 12)}): ` +
+            log.debug(
+              TAG,
+              `live-syncing previewUrl for card ${entry.id} (canvas ${canvasDocId.slice(0, 12)}): ` +
                 `${JSON.stringify(draft.previewUrl ?? "").slice(0, 60)} -> ${JSON.stringify(canvasDoc.previewUrl).slice(0, 60)}`
             );
             draft.previewUrl = canvasDoc.previewUrl;
